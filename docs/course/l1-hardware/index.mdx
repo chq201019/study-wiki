@@ -1,0 +1,34 @@
+---
+title: L1 硬件与最小系统
+sidebar_position: 1
+description: 芯片选型、开发板识读、供电与启动机制、IDF 工程搭建。
+---
+
+# L1 硬件与最小系统
+
+这一章的目标是：你能看着原理图和规格书，判断一块板子能不能满足需求，并独立把一个 IDF 工程编译烧录跑起来。
+
+| 章节 | 内容 |
+| --- | --- |
+| [开发板与硬件原理](./board) | 原理图识读、供电链路、strapping 启动脚、Flash/PSRAM 接线 |
+| [搭建自己的 IDF 工程](./project-setup) | 工程结构、编译流程、menuconfig、烧录与监视 |
+
+## 芯片选型对照
+
+虽然本教程固定用 ESP32-S3，但工程中选型是基本功：
+
+| 型号 | 内核 | 特点 | 典型场景 |
+| --- | --- | --- | --- |
+| ESP32-S3 | 双核 Xtensa LX7 @240MHz | **向量指令**、原生 USB、LCD CAM、8MB PSRAM | 图像/音频/AI、机器视觉 |
+| ESP32-C3 | 单核 RISC-V @160MHz | 便宜、面积小、无 PSRAM | 成本敏感的简单 IoT |
+| ESP32-C6 | 单核 RISC-V @160MHz | WiFi 6 + BLE + 802.15.4 | 新一代低功耗 IoT |
+| ESP32-H2 | 单核 RISC-V @96MHz | **只有 802.15.4，没有 WiFi** | Zigbee / Thread 网关 |
+| ESP32-P4 | 双核 RISC-V @400MHz | 外设极多、带 MIPI/ISP | 边缘 AI、带屏终端 |
+
+选型时看五件事：算力需求（要不要向量指令）、内存（图像/音频需要 PSRAM）、无线制式（WiFi / BLE / Zigbee 要哪个）、功耗（电池项目优先 C 系列）、成本与供货。
+
+选定之后，型号之间的差异对照见[跨型号移植指南](../../reference/porting)。
+
+## 下一步
+
+[从开发板与硬件原理开始](./board)

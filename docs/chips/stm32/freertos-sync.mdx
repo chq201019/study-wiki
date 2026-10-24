@@ -1,0 +1,393 @@
+---
+id: freertos-sync
+title: "16 FreeRTOS 同步机制"
+sidebar_position: 16
+description: 队列/二值信号量/计数信号量/互斥锁/事件组/任务通知各自解决什么问题、优先级继承怎么破优先级反转、任务通知为什么比信号量快。
+---
+
+# 16 FreeRTOS 同步机制
+
+**本课目标**：面对一个场景能立刻选出正确的机制。
+
+## 六种机制速查
+
+![FreeRTOS 六种同步原语按解决的问题分类：队列传数据、信号量通知、互斥锁独占、事件组等多个条件、任务通知最快](/img/diagrams/stm32-freertos-sync.svg)
+
+
+| 机制 | 传递数据 | 用途 | 典型场景 |
+| --- | --- | --- | --- |
+| **队列（Queue）** | ✅ 拷贝值 | 任务间传数据 | 串口收到的数据处理 |
+| **二值信号量** | ❌ | 通知"事件发生了" | 中断通知任务 |
+| **计数信号量** | ❌ | 记录"有几个资源" | 缓冲池、事件计数 |
+| **互斥锁（Mutex）** | ❌ | **独占资源** | 保护共享外设 / 变量 |
+| **事件组** | ❌ | 等多个事件 | 等"网络就绪 + 数据到了" |
+| **任务通知** | ✅ 一个 32 位值 | 点对点通知 | **最快，优先考虑** |
+
+:::tip[选择顺序]
+1. **点对点通知 → 任务通知**（最快，省内存）
+2. **传数据 → 队列**
+3. **独占资源 → 互斥锁**（有优先级继承）
+4. **等多个条件 → 事件组**
+5. **中断唤醒任务 → 二值信号量或任务通知**
+:::
+
+## 队列：传数据
+
+```c
+QueueHandle_t q = xQueueCreate(8, sizeof(my_msg_t));   /* 8 个元素，每个多大 */
+
+/* 发送（拷贝进去） */
+my_msg_t msg = { .id = 1, .value = 42 };
+xQueueSend(q, &msg, pdMS_TO_TICKS(100));      /* 队列满时最多等 100ms */
+
+/* 接收（拷贝出来） */
+my_msg_t got;
+if (xQueueReceive(q, &got, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    /* 收到了 */
+}
+```
+
+:::danger[队列传的是"值拷贝"，不是指针]
+```c
+uint8_t buf[100];
+xQueueSend(q, &buf, 0);        /* 拷贝 100 字节进队列 */
+```
+
+**所以**：
+
+- 队列元素大小 × 队列长度 = 占用的 RAM（这里 100 × 长度）
+- **不要往队列里塞大数组**（RAM 吃不住），改传指针 + 自己管理生命周期
+- 拷贝是原子的（队列内部用临界区保护）
+
+**传指针时要保证缓冲区在消费完之前不被覆盖** —— 常见做法是配一个内存池。
+:::
+
+:::warning[队列长度设太小会丢数据，设太大会吃 RAM]
+```c
+/* 串口 115200 波特率 ≈ 11.5 KB/s */
+/* 如果任务每 10ms 处理一次，10ms 内最多来 115 字节 */
+xQueueCreate(16, sizeof(uint8_t));     /* ❌ 只能缓冲 16 字节，会丢 */
+```
+
+**正确做法**：按"最大累积量 × 安全系数 2"算队列深度。
+:::
+
+## 二值信号量：中断通知任务
+
+```c
+SemaphoreHandle_t sem = xSemaphoreCreateBinary();
+
+/* 中断里给 */
+void EXTI0_IRQHandler(void)
+{
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(sem, &woken);
+    portYIELD_FROM_ISR(woken);
+}
+
+/* 任务里等 */
+void my_task(void *arg)
+{
+    for (;;) {
+        if (xSemaphoreTake(sem, portMAX_DELAY) == pdTRUE) {
+            /* 事件到了 */
+        }
+    }
+}
+```
+
+:::danger[二值信号量"连着给两次"只算一次]
+```text
+给 → 计数 = 1
+给 → 计数还是 1（已经满了，多的丢了）
+```
+
+**如果中断可能在任务处理前连续来 5 次，二值信号量会丢 4 次。**
+
+**要记录次数就用计数信号量，或者用队列（长度 = 最大事件数）。**
+:::
+
+## 互斥锁：解决优先级反转
+
+:::danger[优先级反转：这是 RTOS 里最经典的坑]
+```text
+低优先级任务 L 拿到了锁
+   ↓
+高优先级任务 H 要这把锁 → 阻塞等待
+   ↓
+中优先级任务 M 就绪了（它不需要锁）
+   ↓
+M 抢占了 L（因为 M > L）
+   ↓
+L 拿不到 CPU，锁一直不释放
+   ↓
+H 被无限期阻塞 ← 高优先级任务被中优先级任务"间接"压住了
+```
+
+**这是 1997 年火星探路者号反复重启的真实原因。**
+:::
+
+:::tip[互斥锁有"优先级继承"，二值信号量没有]
+```c
+/* 互斥锁：H 等锁时，L 的优先级会被临时提升到 H 的优先级 */
+SemaphoreHandle_t mutex = xSemaphoreCreateMutex();
+```
+
+**优先级继承的作用**：L 的优先级被提到和 H 一样高，**M 就抢不走 CPU 了**，L 能尽快跑完释放锁。
+
+**所以：保护共享资源必须用互斥锁，不能用二值信号量。**
+
+```c
+/* ❌ 这是错的 */
+SemaphoreHandle_t bad = xSemaphoreCreateBinary();
+xSemaphoreTake(bad, ...);      /* 用来保护资源 → 会有优先级反转 */
+
+/* ✅ 正确 */
+SemaphoreHandle_t good = xSemaphoreCreateMutex();
+xSemaphoreTake(good, ...);
+```
+:::
+
+:::warning[互斥锁不能在中断里用]
+```c
+xSemaphoreTake(mutex, ...);        /* ❌ 中断里不能用（它有优先级继承逻辑） */
+```
+
+**中断里要保护数据，用临界区**：
+
+```c
+taskENTER_CRITICAL();
+/* 临界区代码 */
+taskEXIT_CRITICAL();
+```
+:::
+
+## 计数信号量：资源池
+
+```c
+/* 有 3 个可用的缓冲区 */
+SemaphoreHandle_t pool = xSemaphoreCreateCounting(3, 3);
+
+/* 取一个 */
+xSemaphoreTake(pool, portMAX_DELAY);
+/* 用完还回去 */
+xSemaphoreGive(pool);
+```
+
+**也可以用计数信号量统计事件次数**（中断太频繁、二值会丢时）：
+
+```c
+SemaphoreHandle_t events = xSemaphoreCreateCounting(100, 0);
+
+/* 中断里 */
+xSemaphoreGiveFromISR(events, &woken);
+
+/* 任务里 */
+uint32_t count = 0;
+while (xSemaphoreTake(events, 0) == pdTRUE) count++;   /* 一次取走全部 */
+```
+
+## 事件组：等多个条件
+
+:::tip[一个任务要等"网络就绪 且 数据到达"]
+```c
+EventGroupHandle_t eg = xEventGroupCreate();
+
+#define BIT_NET_READY   (1 << 0)
+#define BIT_DATA_READY  (1 << 1)
+
+/* 某个任务置位 */
+xEventGroupSetBits(eg, BIT_NET_READY);
+xEventGroupSetBits(eg, BIT_DATA_READY);
+
+/* 等两个都满足（并且等完后清掉） */
+EventBits_t bits = xEventGroupWaitBits(
+    eg,
+    BIT_NET_READY | BIT_DATA_READY,   /* 要等的位 */
+    pdTRUE,                            /* 等到后清除 */
+    pdTRUE,                            /* 全部满足才返回（pdFALSE 是任一满足） */
+    portMAX_DELAY
+);
+```
+
+**比"开两个信号量分别等"清晰得多，也只占一个内核对象。**
+:::
+
+## 任务通知：最快的选择
+
+:::danger[任务通知比二值信号量快约 45%]
+**原因**：任务通知不需要单独创建一个内核对象，它**直接写目标任务控制块里的一个 32 位值**。
+
+| 对比 | 二值信号量 | **任务通知** |
+| --- | --- | --- |
+| RAM 占用 | 一个 `Queue_t` 结构（几十字节） | **0（用任务自带的字段）** |
+| 速度 | 基准 | **快约 45%** |
+| 数量 | 可创建任意多个 | **每个任务只有一个通知槽** |
+| 多任务广播 | ✅ 可以 | ❌ 只能点对点 |
+:::
+
+```c
+/* 中断里通知某个任务 */
+vTaskNotifyGiveFromISR(task_handle, &woken);
+
+/* 任务里等（可以累积多次） */
+uint32_t count = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+/* pdTRUE = 等到了清零；pdFALSE = 递减计数 */
+
+/* 或者带值通知 */
+xTaskNotify(task_handle, value, eSetValueWithOverwrite);
+```
+
+:::tip[什么时候不能用任务通知]
+- **一个事件要通知多个任务** → 用事件组或信号量
+- **要排队传多个数据项** → 用队列
+- **要给中断发通知** → 任务通知只能任务→任务 / 中断→任务，不能任务→中断
+:::
+
+## 死锁：三个真实场景
+
+:::danger[场景一：两个锁，反序获取]
+```c
+/* 任务 A */
+xSemaphoreTake(m1, ...);
+xSemaphoreTake(m2, ...);   /* 等 m2 */
+
+/* 任务 B */
+xSemaphoreTake(m2, ...);
+xSemaphoreTake(m1, ...);   /* 等 m1 */
+
+/* 结果：互相等，永远卡住 */
+```
+
+**解决**：**规定全局加锁顺序**（永远先 m1 再 m2），或者用超时 + 重试。
+:::
+
+:::danger[场景二：在锁里等另一个同步对象]
+```c
+xSemaphoreTake(mutex, ...);
+xQueueReceive(q, &data, portMAX_DELAY);    /* ❌ 如果没人往 q 发，锁永远不释放 */
+xSemaphoreGive(mutex);
+```
+
+**解决**：锁里不要做任何可能阻塞的操作。
+:::
+
+:::danger[场景三：忘了释放]
+```c
+if (error) {
+    return -1;          /* ❌ 这里直接返回，mutex 没释放 */
+}
+xSemaphoreGive(mutex);
+```
+
+**解决**：用"单一出口"结构，或者在 `goto cleanup` 里统一释放。
+
+```c
+int ret = -1;
+xSemaphoreTake(mutex, portMAX_DELAY);
+if (ok1 && ok2) {
+    do_work();
+    ret = 0;
+}
+xSemaphoreGive(mutex);      /* 只有一个出口 */
+return ret;
+```
+:::
+
+:::warning[用超时能缓解但不能根治]
+```c
+if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    /* 超时了 —— 但这说明设计有问题 */
+    log_error("mutex timeout");
+}
+```
+
+**超时是兜底，不是解决方案**。频繁超时说明有死锁或锁持有时间过长。
+:::
+
+## 一个完整的生产者-消费者例子
+
+```c
+#define Q_LEN  16
+static QueueHandle_t s_q;
+
+/* 生产者：串口中断里把字节送进队列 */
+void USART1_IRQHandler(void)
+{
+    BaseType_t woken = pdFALSE;
+    uint8_t b = USART1->DR;
+
+    xQueueSendFromISR(s_q, &b, &woken);    /* 队列满时静默丢弃 */
+    portYIELD_FROM_ISR(woken);
+}
+
+/* 消费者：攒够一行就处理 */
+void parser_task(void *arg)
+{
+    char line[80];
+    int n = 0;
+    uint8_t b;
+
+    s_q = xQueueCreate(Q_LEN, sizeof(uint8_t));   /* 实际应在 main 里创建 */
+
+    for (;;) {
+        if (xQueueReceive(s_q, &b, portMAX_DELAY) == pdTRUE) {
+            if (b == '\n' || n >= (int)sizeof(line) - 1) {
+                line[n] = 0;
+                handle_line(line);
+                n = 0;
+            } else {
+                line[n++] = b;
+            }
+        }
+    }
+}
+```
+
+:::warning[中断里"队列满"要不要处理]
+```c
+if (xQueueSendFromISR(s_q, &b, &woken) != pdTRUE) {
+    /* 队列满了，丢了一个字节 */
+    rx_overflow++;      /* 计数，便于诊断 */
+}
+```
+
+**中断里不能阻塞等待**，满了只能丢。**所以要留足够深度，并统计溢出次数**。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 高优先级任务被饿死 | 锁被低优先级任务占着 | 用互斥锁（优先级继承） |
+| 数据偶尔丢 | 队列太浅 | 加深队列 + 统计溢出 |
+| 只收到一次通知 | 用了二值信号量但事件连续来 | 改计数信号量或队列 |
+| 中断里死机 | 用了非 FromISR 版本 | 改 `xxxFromISR` |
+| 唤醒延迟 1ms | 漏 `portYIELD_FROM_ISR` | 补上 |
+| 两个任务互相卡死 | 反序加锁 | 规定全局加锁顺序 |
+| 锁永不释放 | 提前 return 忘了 Give | 单一出口 |
+| 偶尔一次超时 | 锁里做了阻塞操作 | 缩小临界区 |
+
+## 本课自检
+
+- [ ] 能对「传数据/通知/独占/等多个条件」四类需求选出正确机制
+- [ ] **知道队列是值拷贝，不要塞大数组**
+- [ ] **知道二值信号量连续给两次只算一次**
+- [ ] **理解优先级反转，知道只有互斥锁有优先级继承**
+- [ ] **知道互斥锁不能在中断里用**
+- [ ] 知道计数信号量可做资源池或事件计数
+- [ ] 知道事件组能等多个条件（`pdTRUE` 全部/`pdFALSE` 任一）
+- [ ] **知道任务通知比二值信号量快约 45% 且不占 RAM**
+- [ ] 知道任务通知只能点对点，不能广播
+- [ ] 能说出三种死锁场景与各自的解法
+- [ ] **知道超时是兜底不是解决方案**
+- [ ] 知道中断里队列满只能丢弃，要统计溢出
+
+## 第四阶段小结
+
+| 课 | 你现在知道 |
+| --- | --- |
+| 13 CAN | 仲裁机制、位时序、14 个过滤器组 |
+| 14 USB CDC | 免驱串口、描述符、枚举失败排查 |
+| 15 FreeRTOS 深入 | 调度规则、栈单位、五种内存方案 |
+| 16 FreeRTOS 同步 | 六种机制选型、优先级反转、死锁 |

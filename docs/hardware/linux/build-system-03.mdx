@@ -1,0 +1,290 @@
+---
+id: build-system-03
+title: "03 pkg-config"
+sidebar_position: 4
+description: "构建系统 第 3 部分：pkg-config"
+---
+
+# 03 pkg-config
+### 6.1 解决什么问题
+
+要用一个第三方库，你得知道：
+
+- 头文件在哪 → `-I/usr/include/foo`
+- 库名和路径 → `-L/usr/lib -lfoo`
+- 还要哪些传递依赖 → `-lbar -lbaz`
+
+手工记这些很痛苦。pkg-config 让库自己**声明**这些参数。
+
+### 6.2 实测
+
+```bash
+$ pkg-config --version
+1.8.1
+
+$ pkg-config --exists zlib && echo "zlib found"
+zlib found
+
+$ pkg-config --cflags --libs zlib
+-lz 
+
+$ pkg-config --list-all | wc -l
+220
+
+$ pkg-config --variable=pc_path pkg-config
+/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig
+```
+
+**注意 `--cflags zlib` 输出为空**：因为 zlib 的头文件在系统默认搜索路径（`/usr/include`），不需要额外的 `-I`。这是正常现象，不是出错。
+
+### 6.3 .pc 文件长什么样
+
+pkg-config 的信息来自 `.pc` 文件：
+
+```
+prefix=/usr
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: zlib
+Description: zlib compression library
+Version: 1.3.1
+Libs: -L${libdir} -lz
+Cflags: -I${includedir}
+```
+
+`${libdir}` 这种写法在 .pc 里是变量引用（**注意这是 pkg-config 自己的语法，不是 shell 语法**）。
+
+### 6.4 在 Makefile / CMake 里使用
+
+Makefile：
+
+```makefile
+CFLAGS  += $(shell pkg-config --cflags libfoo)
+LDFLAGS += $(shell pkg-config --libs libfoo)
+```
+
+CMake：
+
+```cmake
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FOO REQUIRED libfoo)
+target_include_directories(app PRIVATE ${FOO_INCLUDE_DIRS})
+target_link_libraries(app PRIVATE ${FOO_LIBRARIES})
+```
+
+### 6.5 交叉编译时的陷阱（重点）
+
+实测中 `PKG_CONFIG_PATH` 是未设置的：
+
+```bash
+echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH:-<unset>}"
+PKG_CONFIG_PATH=<unset>
+```
+
+交叉编译时有三个变量要设对：
+
+| 变量 | 作用 | 交叉编译时应该指向 |
+| --- | --- | --- |
+| `PKG_CONFIG_PATH` | 额外的 `.pc` 搜索路径 | **sysroot 里的 pkgconfig 目录** |
+| `PKG_CONFIG_LIBDIR` | **覆盖**默认搜索路径（比 PATH 更强） | sysroot 的 pkgconfig，防止找到宿主机的 |
+| `PKG_CONFIG_SYSROOT_DIR` | 给输出的 `-I`/`-L` 路径**加前缀** | sysroot 根目录 |
+
+典型设置：
+
+```bash
+export PKG_CONFIG_LIBDIR=$SYSROOT/usr/lib/pkgconfig:$SYSROOT/usr/share/pkgconfig
+export PKG_CONFIG_SYSROOT_DIR=$SYSROOT
+```
+
+:::danger[最常见的交叉编译事故]
+不设这些变量，pkg-config 会返回**宿主机**的路径：
+
+```
+-I/usr/include/foo -L/usr/lib -lfoo      ← 这是 x86 的！
+```
+
+结果链接器要么成功链接了 x86 的库（运行时在板子上崩溃），要么报架构不匹配。**症状是"编译过了但板子上跑不起来"**，非常隐蔽。
+
+**判断方法**：交叉编译前先跑一下 `pkg-config --cflags --libs <库>`，**肉眼看输出路径是不是在 sysroot 里**。
+:::
+
+## 7. 构建脚本自动化
+
+### 7.1 一个实用的构建脚本骨架
+
+```bash
+#!/bin/sh
+# build.sh —— 嵌入式项目的构建入口
+set -e                      # 任何命令失败立即退出
+set -u                      # 使用未定义变量时报错
+
+# ---- 可配置项（可被环境变量覆盖）----
+: "${ARCH:=aarch64}"
+: "${CROSS_COMPILE:=aarch64-linux-gnu-}"
+: "${SYSROOT:=/opt/sysroot/${ARCH}}"
+: "${BUILD_TYPE:=Release}"
+: "${JOBS:=$(nproc)}"
+
+TOPDIR=$(cd "$(dirname "$0")" && pwd)
+BUILDDIR="${TOPDIR}/build-${ARCH}"
+INSTALLDIR="${TOPDIR}/output-${ARCH}"
+
+echo "=== 构建配置 ==="
+echo "  ARCH          = ${ARCH}"
+echo "  CROSS_COMPILE = ${CROSS_COMPILE}"
+echo "  SYSROOT       = ${SYSROOT}"
+echo "  JOBS          = ${JOBS}"
+
+# ---- 版本信息注入 ----
+GIT_VER=$(git -C "${TOPDIR}" describe --tags --dirty --always 2>/dev/null || echo "unknown")
+BUILD_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+echo "  VERSION       = ${GIT_VER}"
+
+# ---- 生成版本头文件 ----
+cat > "${TOPDIR}/src/version.h" <<EOF
+#ifndef VERSION_H
+#define VERSION_H
+#define APP_VERSION  "${GIT_VER}"
+#define BUILD_TIME   "${BUILD_TIME}"
+#define TARGET_ARCH  "${ARCH}"
+#endif
+EOF
+
+# ---- 构建 ----
+mkdir -p "${BUILDDIR}"
+cd "${BUILDDIR}"
+
+cmake "${TOPDIR}" \
+    -DCMAKE_TOOLCHAIN_FILE="${TOPDIR}/toolchain-${ARCH}.cmake" \
+    -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+    -DCMAKE_INSTALL_PREFIX="${INSTALLDIR}"
+
+cmake --build . -- -j"${JOBS}"
+cmake --install .
+
+echo "=== 完成，产物在 ${INSTALLDIR} ==="
+```
+
+**脚本里的关键实践**：
+
+| 技巧 | 作用 |
+| --- | --- |
+| `set -e` | 任何命令失败立即退出，**不要让错误静默传播** |
+| `set -u` | 使用未定义变量时报错（防止 `${SYSROOT}` 为空导致路径变成 `/usr/...`） |
+| `: "${VAR:=default}"` | 给变量设默认值，且**允许外部环境变量覆盖** |
+| `$(nproc)` | 自动取 CPU 核数做并行度 |
+| `dirname "$0"` | 让脚本在任何目录下被调用都能找到自己的位置 |
+| 版本注入 | 把 git 版本和构建时间编译进程序，板子上 `./app --version` 能查 |
+
+### 7.2 交叉编译的目录规范
+
+推荐布局：
+
+```
+project/
+├── build-x86/          # 本机构建（用于单元测试、快速迭代）
+├── build-aarch64/      # 交叉构建
+├── output-aarch64/     # 安装产物（这个目录的内容直接拷到板子）
+│   ├── bin/
+│   ├── lib/
+│   └── share/
+├── toolchain-aarch64.cmake
+└── build.sh
+```
+
+**`output/` 目录的设计原则**：它的内容应该可以**整个 rsync 到板子的根目录**，不留多余文件。
+
+### 7.3 辅助工具
+
+| 工具 | 用途 |
+| --- | --- |
+| `ccache` | **编译缓存**，重复编译相同代码时秒过。交叉编译大型项目必备 |
+| `distcc` | 分布式编译，把编译任务分发到多台机器 |
+| `ninja` | 比 make 快的构建器（CMake 用 `-G Ninja` 生成） |
+| `bear` | 生成 `compile_commands.json`，供 clangd/VSCode 做代码补全和跳转 |
+
+:::tip[ccache 在交叉编译中收益极大]
+```bash
+export CCACHE_DIR=/tmp/ccache
+export CMAKE_C_COMPILER_LAUNCHER=ccache
+```
+
+反复 `make clean && make` 时，ccache 能命中缓存直接返回之前的 `.o`，把几十分钟的构建压到几十秒。**改代码时只重编变化的少数文件，其余全部命中缓存**。
+:::
+
+## 8. 验证
+
+```bash
+# 1. 复现本页的 Makefile 实验
+mkdir -p /tmp/mk/src /tmp/mk/include && cd /tmp/mk
+# （按第 2.2 节创建源文件和 Makefile）
+make -n              # 干跑，看会执行什么
+make                 # 构建
+cat build/main.d     # 看自动生成的依赖
+touch src/util.c && make   # 验证增量编译
+make                 # 应输出 "Nothing to be done"
+make clean
+
+# 2. 检查 TAB 缩进（排查 missing separator）
+cat -A Makefile | grep -n '^\^I' | head
+cat -A Makefile | sed -n '20,25p'    # TAB 显示为 ^I
+
+# 3. pkg-config
+pkg-config --version
+pkg-config --list-all | wc -l
+pkg-config --cflags --libs zlib
+echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH:-<unset>}"
+
+# 4. 交叉编译时必查
+echo "sysroot 的 .pc 路径是否存在："
+ls /opt/sysroot/*/usr/lib/pkgconfig 2>/dev/null || echo "（未安装 sysroot）"
+```
+
+## 常见坑
+
+| 症状 | 病根 |
+| --- | --- |
+| `*** missing separator. Stop.` | 命令行前用了**空格**不是 **TAB**。这是 Makefile 第一大错 |
+| 改了 `.h` 文件但没重新编译 | 没有 `-MMD -MP` 生成依赖，make 不知道 `.c` 依赖头文件 |
+| 删除头文件后 make 报 "No rule to make target" | 少了 `-MP`（它为每个头文件生成伪目标） |
+| 每次 make 都全量重编 | `build/` 目录用了普通依赖而非 order-only（`\|`），目录 mtime 一直变 |
+| `make clean` 提示 up to date | 没加 `.PHONY: clean`，且目录里有同名文件 |
+| 变量值不是预期的 | `=` 是递归展开，用到时才求值。改用 `:=` |
+| `Recursive variable references itself` | `VAR = $(VAR) xxx` 造成无限递归，改用 `:=` 或 `+=` |
+| 交叉编译后链接的是 x86 库 | pkg-config 没设 `PKG_CONFIG_LIBDIR`/`SYSROOT_DIR`，返回了宿主机路径 |
+| CMake 切换编译器后报错 | `CMakeCache.txt` 缓存了旧编译器。**删掉 build 目录重来** |
+| 在源码目录直接 `cmake .` | 污染源码树。应该 `mkdir build && cd build && cmake ..` |
+| 构建产物混在源码里 | 没有 out-of-tree build，`.gitignore` 也难写 |
+| 换了机器后增量编译结果不对 | 文件 mtime 不一致（NFS/拷贝）。先 `make clean` |
+| `CC` 不是 gcc 导致找不到编译器 | make 内置 `CC` 默认是 `cc`。交叉编译时显式指定 |
+| 脚本里变量为空导致路径变成 `/usr/include` | 没用 `set -u`，拼出了错误路径。加上 `set -u` 并给默认值 |
+| 并行编译偶发失败 | 依赖关系写错（缺依赖）。`-j1` 能过、`-j8` 挂，基本就是依赖缺失 |
+
+## 自检清单
+
+- [ ] 说出 make 判断"是否需要重建"的依据
+- [ ] 说出 Makefile 命令行前必须是 TAB
+- [ ] 写出一个带 `-MMD -MP` 的模式规则
+- [ ] 解释 `-MMD` 和 `-MP` 各自解决什么问题
+- [ ] 说出 `$@`、`$<`、`$^` 分别是什么
+- [ ] 说出 `:=` 与 `=` 的区别，以及为什么推荐 `:=`
+- [ ] 解释 order-only 前置条件（`|`）的用途
+- [ ] 说出 `.PHONY` 的作用
+- [ ] 解释 `-include` 前面减号的含义
+- [ ] 说出递归 make 的主要缺点
+- [ ] 说出 CMake 的定位（不是编译器而是生成器）
+- [ ] 说出 toolchain file 里 `CMAKE_FIND_ROOT_PATH_MODE_LIBRARY` 的作用
+- [ ] 说出交叉编译时 pkg-config 要设置的变量及其作用
+- [ ] 说出 `set -e` 和 `set -u` 在构建脚本里的作用
+- [ ] 知道本页 CMake 部分**未经实测**（服务器无 cmake），使用前需自行验证
+
+## 下一步
+
+- [交叉编译与工具链](./cross-compile)——工具链三元组、sysroot、动静态链接、第三方库移植
+- [系统编程入门](./sysprog)——回顾本页构建的那些程序到底在调用什么
+
+---
+
+**翻页**：[← 上一页](./build-system-02) · [返回目录](./)

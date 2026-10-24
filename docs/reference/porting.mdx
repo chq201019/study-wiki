@@ -1,0 +1,161 @@
+---
+title: 跨型号移植指南
+sidebar_position: 6
+description: 本教程基于 ESP32-S3——换到经典 ESP32、C3、C6 等型号时哪些会变、哪些不变，以及怎么写一次写对、全家族可跑的代码。
+---
+
+# 跨型号移植指南
+
+本教程全程基于 **ESP32-S3-WROOM-1**。但乐鑫是个家族——经典 ESP32、C3、C6、S2、H2、P4 各有各的脾气。这一页回答两个问题：
+
+1. **换型号时，教程里的代码哪些照跑、哪些会翻车？**（差异地图）
+2. **怎么写代码，让它在整个家族上都活得舒服？**（可移植性实践）
+
+先安心：**你在本教程学的 90% 内容是全家族通用的**——C 语言、FreeRTOS 的任务/队列/信号量、esp_err_t 错误约定、NVS、分区表与 OTA、WiFi/BLE 协议栈用法、lwIP、HTTP/MQTT/JSON、功耗模型、日志与崩溃定位……这些 API 和思路一模一样。会变的集中在**引脚约束和外设数量**上。
+
+## 1. 家族速览：每个型号一句话
+
+| 型号 | 内核 | 无线 | 一句话定位 |
+| --- | --- | --- | --- |
+| 经典 ESP32 | 双核 LX7 前身 LX6 @240MHz | WiFi + **经典蓝牙** + BLE | 老兵，生态最大，带 DAC |
+| ESP32-S2 | 单核 @240MHz | **只有 WiFi，没有蓝牙** | 带原生 USB 的低成本 WiFi 芯片 |
+| **ESP32-S3** | 双核 @240MHz + 向量指令 | WiFi + BLE（无经典蓝牙） | 本教程主角：AI/音频/视觉全能 |
+| ESP32-C3 | 单核 RISC-V @160MHz | WiFi + BLE | 便宜小杯，引脚少 |
+| ESP32-C6 | 单核 RISC-V @160MHz | WiFi 6 + BLE + **802.15.4**（Zigbee/Thread） | 新一代低功耗 IoT |
+| ESP32-H2 | 单核 RISC-V @96MHz | **没有 WiFi**，BLE + 802.15.4 | Zigbee/Thread 专用 |
+| ESP32-P4 | 双核 RISC-V @400MHz | **没有无线**（配伴侣芯片才有） | 高性能显示/AI，MIPI 接口 |
+
+（[L1 的选型对照](../course/l1-hardware/)有更细的对比。以下差异地图以最常用的"经典 / C3 / S3"三角为主，其他型号拿到手先查各自数据手册。）
+
+## 2. 差异地图：三大常用品类的逐项对照
+
+### 2.1 引脚约束（移植翻车重灾区）
+
+| 约束 | 经典 ESP32 | ESP32-C3 | ESP32-S3（本教程） |
+| --- | --- | --- | --- |
+| strapping 启动采样脚 | GPIO0 / 2 / 5 / 12 / 15 | GPIO2 / 8 / 9 | GPIO0 / 3 / 45 / 46 |
+| 仅输入脚 | **GPIO34～39**（连输出都不行） | 无 | 无（S3 全是双向脚） |
+| Flash/PSRAM 占用 | 视模组（WROVER 占部分脚） | 视型号 | GPIO35～37（Octal PSRAM） |
+| 深睡眠可唤醒脚（RTC 域） | GPIO0/2/4/12-15/25-27/32-39 | GPIO0～5 | GPIO0～21 |
+
+经典 ESP32 的 strapping 脚比 S3 **多两个**（GPIO12 还决定 Flash 电压），老项目"接了 MISO 就启动不了"多半是它。C3 总共只有 22 个 GPIO，规划前先数引脚预算。
+
+### 2.2 模拟外设：ADC / DAC / 触摸
+
+| | 经典 ESP32 | ESP32-C3 | ESP32-S3 |
+| --- | --- | --- | --- |
+| ADC 通道 | ADC1（GPIO32～39）+ ADC2（部分） | ADC1（GPIO0～4）+ ADC2（GPIO5） | ADC1（GPIO1～10）+ ADC2（GPIO11～20） |
+| ADC2 与 WiFi 冲突 | 有 | 有 | 有 |
+| **DAC** | **有 2 路（GPIO25/26）** | 无 | **无** |
+| **触摸传感器** | 10 路 | **无** | 14 路（GPIO1～14） |
+| I2S 控制器 | 2 | 1 | 2 |
+| 原生 USB | 无 | USB-Serial-JTAG（无 OTG） | USB-Serial-JTAG + USB OTG |
+
+移植提示：**`dacWrite` 在 C3/S3 上不存在**（教程 ADC 章给过替代方案）；**touch API 只有经典/S2/S3 有**，C3 项目里删掉触摸相关代码。
+
+### 2.3 PWM / 定时资源
+
+| | 经典 ESP32 | ESP32-C3 | ESP32-S3 |
+| --- | --- | --- | --- |
+| LEDC 通道数 | **16**（8 高速 + 8 低速） | 6（全低速） | 8（全低速） |
+| MCPWM | 有 | 无 | 有 |
+
+经典 ESP32 有"高速模式"概念，S3/C3 只有低速模式——`LEDC_HIGH_SPEED_MODE` 在 S3 上编译不过。**通道数别写死**，用能力宏查（第 3 节）。
+
+### 2.4 内存与资源
+
+| | 经典 ESP32 | ESP32-C3 | ESP32-S3 |
+| --- | --- | --- | --- |
+| 片内 RAM | 520KB | 400KB | 512KB |
+| PSRAM | WROVER 模组带（Quad） | 无 | N16R8 带 8MB（Octal） |
+| BLE 协议栈 | Bluedroid（经典+BLE） | NimBLE 为主 | NimBLE 优先 |
+
+**C3 的 400KB 内存 + 无 PSRAM** 意味着：教程里"大数组进 PSRAM""音频/AI 缓冲"的方案在 C3 上要重新掂量——C3 跑不动摄像头和音频流，选型时就该避开。
+
+## 3. 怎么写"全家族可跑"的代码
+
+### 3.1 引脚号永远配置化
+
+把所有引脚号收进一个头文件或 Kconfig，**代码里零魔数**：
+
+```kconfig
+config APP_LED_PIN
+    int "LED GPIO number"
+    default 4
+```
+
+```c
+#define LED_PIN  CONFIG_APP_LED_PIN     // 移植时只改配置，不改代码
+```
+
+散落在代码各处的 `GPIO_NUM_4` 是移植的头号敌人。
+
+### 3.2 用 SOC 能力宏问"有没有"，而不是靠记忆
+
+IDF 为每个型号生成了一张"能力清单"（`soc/soc_caps.h`），代码里直接查：
+
+```c
+#include "soc/soc_caps.h"
+
+#if SOC_TOUCH_SENSOR_SUPPORTED        // 这颗芯片有触摸吗？
+    // 触摸相关代码
+#endif
+
+#if SOC_LEDC_CHANNEL_NUM >= 8         // LEDC 通道够吗？
+    // 需要 8 路 PWM 的逻辑
+#endif
+```
+
+常用宏：`SOC_DAC_SUPPORTED`、`SOC_TOUCH_SENSOR_SUPPORTED`、`SOC_USB_OTG_SUPPORTED`、`SOC_BLE_SUPPORTED`、`SOC_I2S_NUM`、`SOC_LEDC_CHANNEL_NUM`……**判断"某功能这型号有没有"，先 grep soc_caps，别背表格**。
+
+### 3.3 按型号条件编译
+
+```c
+#if CONFIG_IDF_TARGET_ESP32S3
+    // S3 特有：向量指令、Octal PSRAM
+#elif CONFIG_IDF_TARGET_ESP32C3
+    // C3 替代路径：功能裁剪
+#else
+    // 通用实现
+#endif
+```
+
+官方示例里大量这种写法——**每换一个型号，`idf.py set-target esp32c3 && idf.py build` 全量编译一次**，编译器会把"这型号没有的东西"全部揪出来（不存在的宏、超界的引脚、缺失的头文件），比上机踩坑便宜一百倍。
+
+### 3.4 别在固件里写死"家族常识"
+
+教程里反复强调的几个"硬事实"——strapping 脚、Flash 占用脚、深睡眠唤醒脚——**全是型号相关的**。写代码时的正确姿势是查当前型号的约束表（数据手册或 soc_caps），把结论做成注释或静态断言：
+
+```c
+#if CONFIG_IDF_TARGET_ESP32S3
+    #define PIN_VSLEEP_WAKE_MAX 21      // S3 的 RTC 域到 GPIO21
+#else
+    #error "换型号了？重新核对深睡眠唤醒脚范围（见参考-跨型号移植指南）"
+#endif
+```
+
+## 4. 移植翻车清单（换型号后最常撞的墙）
+
+| 症状 | 病根 |
+| --- | --- |
+| `LEDC_HIGH_SPEED_MODE` 编译不过 | 经典 ESP32 专有，S3/C3 只有低速模式 |
+| `dacWrite` / dac API 不存在 | C3/S3 没有 DAC |
+| 触摸代码编译失败 | C3/C6/H2 没有触摸外设 |
+| 换 C3 后 PSRAM 相关 API 全失败 | C3 没有 PSRAM，menuconfig 里相关项是灰的 |
+| 烧录后设备不启动、进下载模式 | 新型号的 strapping 脚被外设拉错电平（对照 2.1 表） |
+| 深睡眠怎么都唤不醒 | 唤醒脚不在该型号的 RTC 域范围 |
+| BLE 初始化内存不足 | C3 内存小，Bluedroid 直接 OOM——NimBLE + 精简配置 |
+| 经典蓝牙教程跑不了 | 只有经典 ESP32 支持 BR/EDR |
+
+## 5. 给本站教程读者的建议
+
+1. **先在 S3 上把教程走完**——它资源最多、外设最全，学起来没有掣肘
+2. **第二块板子建议买 C3**（十几块钱）：把教程里两三个项目移植过去，**移植是最好的复习**——你会被迫把"哪些是通用套路、哪些是 S3 特供"真正分清
+3. 移植时的固定动作：`set-target` 换芯片 → 全量编译 → 对照本文第 4 节清单修 → 上机
+
+## 下一步
+
+- [引脚映射速查](./pinout)——S3 的完整引脚能力表
+- [库与版本对照](./libraries)
+- [其他芯片专栏](../chips/)——换的不是型号而是厂商（STM32 等）时看这里
+- 回 [完整教程](../course/)

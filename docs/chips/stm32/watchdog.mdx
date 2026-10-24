@@ -1,0 +1,373 @@
+---
+id: watchdog
+title: "08 看门狗：IWDG 与 WWDG"
+sidebar_position: 8
+description: 两个看门狗的本质区别、超时时间怎么算、LSI 频率偏差带来的不确定性、喂狗策略与多任务场景下的正确做法、复位原因诊断。
+---
+
+# 08 看门狗：IWDG 与 WWDG
+
+**本课目标**：会用看门狗，并且喂对。
+
+## 两个看门狗不是一回事
+
+| 特性 | **IWDG（独立看门狗）** | **WWDG（窗口看门狗）** |
+| --- | --- | --- |
+| 时钟源 | **LSI（内部约 40kHz RC）** | **PCLK1（来自系统时钟）** |
+| 独立于主时钟 | ✅ **是**（主时钟挂了它还在跑） | ❌ 不是 |
+| Stop/Standby 模式 | ✅ **继续运行** | ❌ 停止 |
+| 超时行为 | 到了就复位 | 有"早期唤醒中断"可选 |
+| **窗口限制** | 无（随时可喂） | **有**（喂早了也复位） |
+| 精度 | **差**（LSI 有 ±50% 偏差） | **好**（跟主时钟同源） |
+| 典型用途 | 防死机 | 防"程序跑飞但还在喂狗" |
+
+:::tip[选择原则]
+- **只要防止程序卡死 → IWDG**（最常用，因为它独立于主时钟）
+- **还要检测"程序时序错乱"（喂狗太快） → WWDG**
+
+**绝大多数项目用 IWDG 就够了。**
+:::
+
+## IWDG：算超时时间
+
+:::info[公式]
+```text
+超时时间 = (4 × 2^PRESCALER × RELOAD) / F_LSI
+
+其中：
+  PRESCALER = 0..6（对应分频 4/8/16/32/64/128/256）
+  RELOAD    = 12 位，1..4095
+  F_LSI     ≈ 40000 Hz（典型值）
+```
+:::
+
+**常用的几组配置**（按 LSI = 40kHz）：
+
+| 分频 | RELOAD | 超时 |
+| --- | --- | --- |
+| /4 | 1000 | **100 ms** |
+| /16 | 1000 | **400 ms** |
+| /64 | 1000 | **1.6 s** |
+| **/64** | **1250** | **2.0 s** |
+| /256 | 4095 | **26.2 s** |
+
+```c
+/* CubeMX 生成 */
+hiwdg.Instance = IWDG;
+hiwdg.Init.Prescaler = IWDG_PRESCALER_64;    /* /64 */
+hiwdg.Init.Reload = 1250;                     /* 2 秒 */
+HAL_IWDG_Init(&hiwdg);
+
+/* 喂狗 */
+HAL_IWDG_Refresh(&hiwdg);
+```
+
+:::danger[LSI 频率偏差能到 ±50%，超时时间跟着变]
+**LSI 是内部 RC 振荡器，手册给的典型值 40kHz，范围约 30~60kHz。**
+
+```text
+按 40kHz 算出 2.0 秒
+实际可能是 2.0 × (40/30) = 2.67 秒
+或者       2.0 × (40/60) = 1.33 秒
+```
+
+**所以喂狗周期至少要留 2 倍余量**：
+
+```text
+配 2 秒超时 → 喂狗周期不要超过 1 秒
+```
+:::
+
+:::warning[IWDG 一旦启动就无法关闭]
+```c
+HAL_IWDG_Init(&hiwdg);      /* 启动后就关不掉了 */
+```
+
+**只能靠复位停止。**
+
+**调试时的麻烦**：程序停在断点上超过超时时间 → 看门狗复位 → 断点丢失。
+
+**解决办法**：调试时开 DBGMCU 的 IWDG 停止位（见本节末尾）。
+:::
+
+## WWDG：窗口机制
+
+![WWDG 窗口看门狗时序：计数值从 0x7F 递减，只有在 0x50 到 0x40 之间喂狗才算数，喂早喂晚都复位](/img/diagrams/stm32-wwdg-window.svg)
+
+
+:::info[WWDG 的核心是"不能太早喂"]
+```text
+计数值从 0x7F 递减到 0x40
+   ↑                ↑
+窗口上限           窗口下限（到 0x3F 就复位）
+
+喂狗只能在 [上限, 0x40] 这个区间里
+   喂早了（计数器 > 窗口上限）→ 复位！
+   喂晚了（计数器 < 0x40）→ 复位！
+```
+
+**为什么这样设计**：如果程序跑飞但恰好跳到了喂狗代码，IWDG 会认为正常；WWDG 因为"时机不对"能抓出来。
+:::
+
+```c
+/* CubeMX 生成 */
+hwwdg.Instance = WWDG;
+hwwdg.Init.Prescaler = WWDG_PRESCALER_8;
+hwwdg.Init.Window = 0x50;        /* 窗口上限，喂狗时 CNT 必须 ≤ 0x50 */
+hwwdg.Init.Counter = 0x7F;       /* 起始值 */
+hwwdg.Init.EWIMode = WWDG_EWI_ENABLE;    /* 早期唤醒中断 */
+HAL_WWDG_Init(&hwwdg);
+
+/* 喂狗 */
+HAL_WWDG_Refresh(&hwwdg);
+```
+
+:::tip[WWDG 的早期唤醒中断很有用]
+计数器降到 0x40 之前会先触发 EWI 中断（可配置在 0x40 附近）。
+
+**可以用它做最后一刻的抢救**：保存关键数据到 Flash、记录错误日志，然后再让复位发生。
+
+```c
+void HAL_WWDG_EarlyWakeupCallback(WWDG_HandleTypeDef *hwwdg)
+{
+    save_critical_data();       /* 抢救 */
+    /* 不喂狗，让复位发生 */
+}
+```
+:::
+
+## 喂狗策略：这是最容易做错的部分
+
+:::danger[在定时器中断里喂狗 = 看门狗失效]
+```c
+void TIM3_IRQHandler(void)
+{
+    HAL_IWDG_Refresh(&hiwdg);      /* ❌ 主循环卡死了它还在喂 */
+    /* ... */
+}
+```
+
+**主循环死循环、任务卡死、内存溢出——只要中断还在跑，狗就一直被喂。**
+
+**看门狗就完全失去意义了。**
+:::
+
+:::tip[正确的喂狗：由"确实完成了工作"来证明]
+```c
+/* 方式一：主循环末尾喂 */
+while (1) {
+    do_task_a();
+    do_task_b();
+    do_task_c();
+
+    HAL_IWDG_Refresh(&hiwdg);      /* ✅ 走到这里说明这轮都干完了 */
+}
+```
+
+```c
+/* 方式二（更好）：每个任务都置标志，全部置位才喂 */
+static volatile uint8_t task_flags = 0;
+#define FLAG_A  0x01
+#define FLAG_B  0x02
+#define FLAG_C  0x04
+#define FLAG_ALL (FLAG_A | FLAG_B | FLAG_C)
+
+while (1) {
+    if (do_task_a()) task_flags |= FLAG_A;
+    if (do_task_b()) task_flags |= FLAG_B;
+    if (do_task_c()) task_flags |= FLAG_C;
+
+    if (task_flags == FLAG_ALL) {       /* 全做完了才喂 */
+        task_flags = 0;
+        HAL_IWDG_Refresh(&hiwdg);
+    }
+}
+```
+
+**这样任何一个任务卡住，狗都不会被喂，系统会复位。**
+:::
+
+### FreeRTOS 下的喂狗
+
+:::warning[多任务场景要特别小心]
+**错误做法**：在最高优先级任务里喂狗（其他任务卡死了它照样跑）。
+
+**正确做法一：用"任务存活表"**
+
+```c
+static volatile uint32_t alive_bitmap = 0;
+
+void task_a(void *arg) {
+    for (;;) {
+        alive_bitmap |= (1 << 0);
+        /* ... 干活 ... */
+    }
+}
+
+void task_wdg(void *arg) {          /* 专门的看门狗任务（低优先级） */
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        if (alive_bitmap == ALL_TASKS_BITS) {
+            alive_bitmap = 0;
+            HAL_IWDG_Refresh(&hiwdg);
+        }
+    }
+}
+```
+
+**正确做法二：用 FreeRTOS 的 Idle Hook + 状态检查**
+
+**核心原则一样：狗被喂 = 所有该跑的东西都跑了。**
+:::
+
+## 初始化时机
+
+:::danger[什么时候该启动 IWDG]
+**太早启动**：初始化代码还没跑完就被复位了（初始化可能超过超时时间）。
+
+**太晚启动**：初始化阶段卡死没人管。
+
+**推荐：在初始化接近结束时启动**
+
+```c
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_USART1_UART_Init();
+    /* ... 其他初始化 ... */
+
+    MX_IWDG_Init();              /* ← 这里才启动看门狗 */
+
+    /* 主循环 */
+    while (1) {
+        /* ... */
+        HAL_IWDG_Refresh(&hiwdg);
+    }
+}
+```
+
+**如果初始化确实很慢**（比如等外部模块上电），把超时配长一点，或者中途也喂几次。
+:::
+
+## 复位原因诊断
+
+:::tip[知道为什么复位，比复位本身更重要]
+```c
+void check_reset_cause(void)
+{
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST)) {
+        printf("原因: IWDG 看门狗复位\r\n");
+    }
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_WWDGRST)) {
+        printf("原因: WWDG 看门狗复位\r\n");
+    }
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_SFTRST)) {
+        printf("原因: 软件复位\r\n");
+    }
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_PORRST)) {
+        printf("原因: 上电复位\r\n");
+    }
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_PINRST)) {
+        printf("原因: 复位引脚\r\n");
+    }
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_LPWRRST)) {
+        printf("原因: 低功耗异常复位\r\n");
+    }
+
+    __HAL_RCC_CLEAR_RESET_FLAGS();      /* 必须清，否则下次判断不准 */
+}
+```
+:::
+
+:::warning[上电复位时会同时置多个标志]
+刚上电时 `PORRST` 和 `PINRST` 都可能置位。
+
+**判断顺序有讲究**：先判最具体的（看门狗、软件），再判上电。
+:::
+
+**产品里应该做的**：把复位原因写进 Flash 或备份寄存器，这样现场出的问题能追溯。
+
+```c
+/* 用 BKP 寄存器累计复位次数 */
+if (__HAL_PWR_GET_FLAG(PWR_FLAG_SB) == RESET) {
+    uint32_t cnt = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR1);
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR1, cnt + 1);
+}
+```
+
+## 调试时怎么不被看门狗打断
+
+:::warning[断点一停，狗就复位]
+程序停在断点上超过超时时间 → IWDG 复位 → 调试会话丢失。
+
+**两个解决办法**：
+**① 开 DBGMCU 的 IWDG 停止位**
+
+```c
+__HAL_RCC_DBGMCU_CLK_ENABLE();
+__HAL_DBGMCU_FREEZE_IWDG();      /* 调试暂停时冻结 IWDG 计数器 */
+__HAL_DBGMCU_FREEZE_WWDG();
+```
+
+**只有接了调试器时才生效**（DBGMCU 会自动检测），**生产环境不受影响**。
+
+**② 调试期间临时把超时配到最大**
+
+```c
+#ifdef DEBUG
+    hiwdg.Init.Prescaler = IWDG_PRESCALER_256;
+    hiwdg.Init.Reload = 4095;        /* 约 26 秒 */
+#endif
+```
+
+**别忘了发布前改回来。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 程序反复复位 | 喂狗周期 > 超时 | 加长超时或缩短周期 |
+| 程序反复复位（周期不定） | LSI 偏差导致超时变短 | 留 2 倍余量 |
+| 主循环卡死但不复位 | 在中断里喂狗 | 改到主循环 / 用存活标志 |
+| WWDG 一启动就复位 | 窗口上限配得比初始 CNT 小 | 调 `Window` 值 |
+| 调试时不停复位 | 断点超过超时 | 开 DBGMCU freeze |
+| 看门狗没生效 | 初始化太晚或根本没调 Init | 检查 `MX_IWDG_Init()` |
+| 判断不出复位原因 | 没清标志 | `__HAL_RCC_CLEAR_RESET_FLAGS()` |
+
+:::danger[`HAL_IWDG_Refresh` 的返回值可以忽略]
+它几乎总是返回 `HAL_OK`。**不要用返回值判断看门狗是否"正常工作"** —— 它没有"不正常"这个状态。
+
+**验证看门狗有效性只能靠实测**：故意让主循环死循环，看看 2 秒后是不是真的复位了。
+:::
+
+## 本课自检
+
+- [ ] **知道 IWDG 用 LSI、独立于主时钟，Stop/Standby 下仍运行**
+- [ ] **知道 WWDG 用 PCLK1、有窗口限制**
+- [ ] 会选择：防死机用 IWDG，防时序错乱用 WWDG
+- [ ] **会算 IWDG 超时：`4 × 2^PSC × RELOAD / 40000`**
+- [ ] **知道 LSI 偏差 ±50%，喂狗周期要留 2 倍余量**
+- [ ] **知道 IWDG 启动后无法关闭**
+- [ ] 理解 WWDG 的窗口机制（喂早也复位）
+- [ ] 知道 WWDG 的早期唤醒中断可用于抢救数据
+- [ ] **知道在中断里喂狗会让看门狗完全失效**
+- [ ] 会用"任务存活标志"在 FreeRTOS 下正确喂狗
+- [ ] 知道 IWDG 应在初始化接近结束时启动
+- [ ] 会读 `RCC_FLAG_xxxRST` 判断复位原因
+- [ ] **知道调试时要开 DBGMCU freeze，否则断点会丢**
+
+## 第二阶段小结
+
+| 课 | 你现在知道 |
+| --- | --- |
+| 05 定时器 | 输入捕获、编码器、互补输出与死区 |
+| 06 ADC | 有效精度、采样时间匹配、VREFINT 校准 |
+| 07 低功耗 | 三种模式、Stop 唤醒重配时钟、引脚漏电 |
+| 08 看门狗 | IWDG/WWDG 区别、正确喂狗策略 |
+
+## 下一步
+
+[09 启动流程与链接脚本](./advanced-index) —— `.data` 是怎么从 Flash 搬到 RAM 的。

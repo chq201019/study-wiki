@@ -1,0 +1,320 @@
+---
+id: dataclass
+title: dataclass 深入
+sidebar_position: 17
+description: 自动生成的方法与"默认不可哈希"（实测）、frozen 与 slots 的实际效果、继承时的字段顺序、为什么默认值顺序有报错、以及什么时候该换 pydantic。
+---
+
+# dataclass 深入
+
+**本课目标**：知道 `@dataclass` 到底给你生成了什么，避开五个静态陷阱。
+
+## 它生成了哪些方法
+
+:::info[默认生成的]
+| 方法 | 默认 |
+| --- | --- |
+| `__init__` | ✅ |
+| `__repr__` | ✅ |
+| `__eq__` | ✅ |
+| `__hash__` | ❌ **变成 `None`** |
+| `__lt__` / `__gt__` | ❌（要 `order=True`） |
+:::
+
+:::danger[默认的 dataclass 是不可哈希的（实测）]
+```python
+@dataclasses.dataclass
+class P:
+    x: int
+```
+
+**本机实测（Python 3.11.9）**：
+
+```text
+__eq__ 存在: True
+可哈希吗: None          ← __hash__ 被设成了 None
+```
+
+**所以 `hash(P(1))` 会报 `TypeError: unhashable type`** —— 不能放进 `set` 或当 `dict` 的键。
+
+**原因**：一旦自定义了 `__eq__`，Python 就会把 `__hash__` 置空（因为"相等"和"哈希一致"必须配套，默认无法保证）。
+:::
+
+**三种处理方式**：
+
+```python
+@dataclass(frozen=True)     # ✅ 最常用：不可变 ⇒ 可以安全哈希
+class A: ...
+
+@dataclass(eq=False)        # 只按身份比较（等同普通对象）
+class B: ...
+
+@dataclass
+class C:
+    x: int
+    def __hash__(self):                  # 手动实现
+        return hash(self.x)
+```
+
+## `frozen`：不可变
+
+```python
+@dataclasses.dataclass(frozen=True)
+class F:
+    x: int
+```
+
+**实测**：
+
+```text
+frozen 可哈希: True   hash 值一致: True
+```
+
+- `f.x = 2` → `FrozenInstanceError`
+- **可哈希** → 能当 dict 键 / 放 set
+- **可与其他不可变对象组合成嵌套结构而不担心被改**
+
+:::warning[`frozen` 只是浅层不可变]
+```python
+@dataclass(frozen=True)
+class F:
+    items: list          # ← 这个 list 里的元素照样能改
+
+f = F([1,2])
+f.items.append(3)        # ✅ 不会报错
+```
+
+**`frozen` 阻止的是"重新绑定属性"，不是"修改可变对象的内容"。**
+
+**要真正不可变，字段也必须用不可变类型**（`tuple`、`frozenset`）。
+:::
+
+## `slots=True`：省内存
+
+```python
+@dataclasses.dataclass(slots=True)
+class S:
+    x: int
+    y: int
+```
+
+**实测**：
+
+```text
+slots 有 __dict__ 吗: False
+```
+
+:::tip[省了多少]
+普通实例有一个 `__dict__`（一个哈希表），**创建成本高、内存占用大**。
+
+```text
+普通 dataclass 实例：对象头 + __dict__（约 100+ 字节）
+slots 实例：     对象头 + 两个指针（约 50 字节）
+```
+
+**大量小对象时差距明显**（十万个实例能省几 MB）。
+
+**代价**：不能再动态加属性（`obj.new_attr = 1` 会报错）。
+:::
+
+## 继承时的字段顺序
+
+**实测**：
+
+```python
+@dataclass
+class Base:
+    a: int
+    b: int = 1
+
+@dataclass
+class Child(Base):
+    c: int = 2
+
+[ f.name for f in fields(Child) ]     # ['a', 'b', 'c']
+```
+
+**字段顺序 = 基类先说，再按子类声明顺序** —— 所以 `__init__` 的签名是 `Child(a, b=1, c=2)`。
+
+:::danger[默认值顺序的硬限制（实测报错）]
+```python
+@dataclasses.dataclass
+class Bad:
+    x: int = 0
+    y: int          # y 没默认值，但在 x 后面
+```
+
+**实测直接抛 `TypeError`**：
+
+```text
+non-default argument 'y' follows default argument
+```
+
+**原因**：`__init__` 的参数不能"有默认值的在前、没默认值的在后"。
+
+**这个限制在继承时更容易踩**：
+
+```python
+@dataclass
+class Base:
+    a: int = 0          # 基类有默认值
+
+@dataclass
+class Child(Base):
+    b: int              # ❌ 子类新增了无默认值的字段 → 报错
+```
+
+**解法**：子类也给默认值，或者用 `field(default=...)` / `kw_only=True`。
+:::
+
+```python
+@dataclass(kw_only=True)      # Python 3.10+
+class Child(Base):
+    b: int                    # ✅ 关键字参数不参与位置顺序限制
+```
+
+## `field()` 的三个常用参数
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass
+class A:
+    items: list = field(default_factory=list)      # 可变默认值必须这样写
+    name: str = field(default="", repr=False)      # 不出现在 repr 里
+    _cache: dict = field(default_factory=dict, compare=False)   # 不参与 ==
+```
+
+:::danger[直接写可变默认值会被拒绝]
+```python
+@dataclass
+class A:
+    items: list = []        # ❌ ValueError: mutable default
+```
+
+**这是 dataclass 的保护机制** —— 否则所有实例会共享同一个 list（普通函数里的经典坑）。
+
+**`default_factory` 每次调用都产生新对象**，实测 `D().items is not D().items` → `True`。
+:::
+
+:::tip[`compare=False` 的用途]
+缓存、时间戳这类字段不该参与相等比较：
+
+```python
+@dataclass
+class B:
+    id: int
+    _cache: dict = field(default_factory=dict, compare=False)
+
+B(1) == B(1)     # True（如果 _cache 参与比较就是 False）
+```
+:::
+
+## `__post_init__`：派生字段
+
+```python
+@dataclass
+class Rect:
+    w: float
+    h: float
+    area: float = field(init=False)     # 不参与 __init__ 参数
+
+    def __post_init__(self):
+        self.area = self.w * self.h
+```
+
+**`init=False` + `__post_init__` 是"根据其他字段计算派生值"的标准写法。**
+
+```python
+# frozen 类里也可以用 object.__setattr__ 赋值
+@dataclass(frozen=True)
+class R:
+    w: float
+    area: float = field(init=False)
+    def __post_init__(self):
+        object.__setattr__(self, "area", self.w * self.w)
+```
+
+## 什么时候该换 pydantic
+
+:::info[dataclass 与 pydantic 的分工]
+| 需求 | dataclass | **pydantic** |
+| --- | --- | --- |
+| 纯数据容器 | ✅ | 也行但更重 |
+| **运行时类型校验** | ❌ **不做** | ✅ |
+| **从 JSON/dict 解析** | ❌ 要自己写 | ✅ `model_validate` |
+| 序列化 | 要自己写 `asdict` | ✅ `model_dump` |
+| 性能 | **更快** | 慢（要校验） |
+| 依赖 | **标准库** | 第三方 |
+:::
+
+:::danger[dataclass 完全不做运行时类型检查]
+```python
+@dataclass
+class P:
+    x: int
+
+P(x="不是整数")        # ✅ 完全正常，不报错
+```
+
+**注解对 dataclass 来说只是"给 IDE 和类型检查器看的"** —— 运行时不校验。
+
+**要校验就用 pydantic**：
+
+```python
+from pydantic import BaseModel
+
+class P(BaseModel):
+    x: int
+
+P(x="abc")      # ❌ ValidationError
+```
+:::
+
+:::tip[判断标准]
+- **数据来自外部（JSON、用户输入、配置文件）** → **pydantic**（校验是刚需）
+- **数据在内部流转、已可信** → **dataclass**（轻、快、零依赖）
+- **需要极高性能** → `slots=True` 的 dataclass 或 `NamedTuple`
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `unhashable type` | 默认 `__hash__ = None` | `frozen=True` 或手动实现 |
+| `ValueError: mutable default` | 用了 `= []` | `field(default_factory=list)` |
+| `TypeError: non-default follows default` | 默认值顺序 | 都给默认值或 `kw_only` |
+| 子类报字段顺序错 | 基类有默认值、子类没有 | `kw_only=True` |
+| 实例不能加属性 | `slots=True` | 去掉 slots 或提前定义全部字段 |
+| 传错类型没报错 | dataclass 不校验 | 改用 pydantic |
+| `frozen` 但内容还是被改了 | 浅不可变 | 字段也用不可变类型 |
+| `asdict` 很慢 | 深拷贝递归 | 手写序列化或换 pydantic |
+
+:::warning[`dataclasses.asdict()` 是深拷贝]
+```python
+d = dataclasses.asdict(obj)      # 递归复制所有嵌套结构
+```
+
+**大对象会很慢**。如果只是要转 JSON，用 `pydantic` 或手写 `to_dict()` 更快。
+:::
+
+## 本课自检
+
+- [ ] 知道默认会生成 `__init__`/`__repr__`/`__eq__`
+- [ ] **知道默认 `__hash__` 被置为 `None`（实测），dataclass 不可哈希**
+- [ ] 知道三种解决哈希的方式（`frozen` / `eq=False` / 手写）
+- [ ] **知道 `frozen` 只是浅不可变**
+- [ ] 知道 `slots=True` 能省内存（实测无 `__dict__`）且代价是不能动态加属性
+- [ ] **知道继承时字段顺序是"基类在前"（实测 `['a','b','c']`）**
+- [ ] **知道默认值顺序报 `TypeError`，继承时更容易踩**
+- [ ] 知道用 `kw_only=True` 绕开顺序限制
+- [ ] **知道可变默认值必须用 `default_factory`**
+- [ ] 会用 `compare=False` 排除缓存字段
+- [ ] 会用 `init=False` + `__post_init__` 做派生字段
+- [ ] **知道 dataclass 不做运行时校验，外部数据要用 pydantic**
+- [ ] 知道 `asdict()` 是深拷贝，大对象慢
+
+## 下一步
+
+[类型注解与静态检查](./typing) 是同一层的配套；
+或者看 [迭代器协议与 itertools](./iterators)。

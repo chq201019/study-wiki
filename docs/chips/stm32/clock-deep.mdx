@@ -1,0 +1,310 @@
+---
+id: clock-deep
+title: "02 时钟系统深入"
+sidebar_position: 2
+description: PLL 分频倍频怎么算、时钟树每一段的硬限制、为什么 USB 必须是 48MHz、时钟门控能省多少电，以及时钟出问题的表现。
+---
+
+# 02 时钟系统深入
+
+**本课目标**：能自己算出任意时钟配置，知道每一段的红线在哪。
+
+## 完整时钟树（STM32F103）
+
+```text
+ HSI 8MHz ─┬─────────────────────────────────┐
+           │                                 │
+           └─/2→ 4MHz ─┐                     │
+                       ├→ PLL ×2..×16 ──→ PLL输出 ─┐
+ HSE 4~16MHz ──/1→ ────┘   （最高 72MHz）          │
+                                                   ├→ SYSCLK 选择器
+ HSI 8MHz ─────────────────────────────────────────┤   ├─ HSI
+                                                   │   ├─ HSE
+                                                   │   └─ PLL
+                                                   ↓
+                                              SYSCLK ≤72MHz
+                                                   ↓
+                                          AHB 预分频 /1../512
+                                                   ↓
+                                              HCLK ≤72MHz
+                                        ┌──────────┴──────────┐
+                                   APB1 /1../16          APB2 /1../16
+                                        ↓                     ↓
+                                  PCLK1 ≤36MHz          PCLK2 ≤72MHz
+```
+
+:::danger[三条硬限制，超了行为不可预测]
+| 段 | 上限 | 超了会怎样 |
+| --- | --- | --- |
+| **SYSCLK** | 72 MHz | 芯片过热、时序错乱、随机死机 |
+| **PCLK1（APB1）** | **36 MHz** | 挂在上面的外设（TIM2-7、USART2/3、I2C、SPI2）异常 |
+| **ADC 时钟** | **14 MHz** | 转换结果不准、乱跳 |
+
+**CubeMX 会自动挡，但你手写寄存器时没人拦你。**
+:::
+
+## PLL 怎么算
+
+**公式**：
+
+```text
+PLL 输入 = HSE（或 HSI/2）
+PLL 输出 = PLL 输入 × PLLMUL
+要求：PLL 输出 ≤ 72 MHz
+```
+
+**用 8MHz 晶振要 72MHz**：
+
+```text
+8 MHz × 9 = 72 MHz      ✅
+```
+
+:::warning[为什么不能用别的倍数]
+| 倍数 | 输出 | 结果 |
+| --- | --- | --- |
+| ×8 | 64 MHz | 能用，但没跑满 |
+| **×9** | **72 MHz** | **正好满速** |
+| ×10 | 80 MHz | ❌ **超频，不保证稳定** |
+
+**STM32F103 标称最高 72MHz。超到 80MHz 有些片子能跑，但那叫超频，不是规格。**
+:::
+
+:::tip[用 12MHz 晶振怎么办]
+```text
+12 MHz × 6 = 72 MHz      ✅
+```
+
+**所以换晶振要重算倍数**——不是所有板子都是 8MHz。
+
+**规矩：先确认板上晶振频率（看丝印或量波形），再算 PLLMUL。**
+:::
+
+## 为什么 USB 必须是 48MHz
+
+:::danger[USB 对时钟有硬性要求]
+**USB 全速（Full Speed）要求 48 MHz ±0.25% 的时钟。**
+
+STM32F103 的 USB 时钟来源是 **PLL 输出 ÷ 1.5**：
+
+```text
+72 MHz ÷ 1.5 = 48 MHz    ✅
+```
+
+**所以用 USB 时 SYSCLK 必须是 72MHz** —— 用 64MHz 就得不到准确的 48MHz，USB 枚举会失败。
+
+（如果晶振不是 8MHz，就得用 `USB 预分频 = 1` 配合不同的 PLL 配置，CubeMX 会自动帮你算。）
+:::
+
+## Flash 等待周期必须跟着改
+
+:::danger[时钟提上去了，Flash 没跟上 → 读到错误指令]
+Flash 的读取速度跟不上 CPU。频率越高，要插入越多等待周期。
+
+| SYSCLK | FLASH_LATENCY |
+| --- | --- |
+| ≤ 24 MHz | **0** |
+| 24 ~ 48 MHz | **1** |
+| **48 ~ 72 MHz** | **2** |
+
+```c
+HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_2);    /* 72MHz 必须用 2 */
+```
+
+**配少了会跑飞**（读到错误的指令或数据，表现是随机死机、HardFault、函数返回错值）。
+:::
+
+:::warning[降频时也要改回来]
+从 72MHz 降到 24MHz，**必须先降频率再降 latency**（顺序反了会在高 latency 下跑高频）。
+
+HAL 内部处理了这个顺序，但你自己写寄存器时要留意。
+:::
+
+## 定时器时钟的隐藏 ×2
+
+:::danger[这是算 PWM 周期最容易错的地方]
+**规则**：
+
+```text
+APB 预分频 = 1  →  定时器时钟 = PCLK
+APB 预分频 ≠ 1  →  定时器时钟 = PCLK × 2
+```
+
+**F103 的实际情况**：
+
+```text
+PCLK1 = 36 MHz（APB1 分频 = 2，≠1）
+  → TIM2~TIM7 的时钟 = 36 × 2 = 72 MHz
+```
+
+**所以你算定时器周期时，要用 72MHz，不是 36MHz。**
+
+**忘了这一点，周期会差一倍。**
+:::
+
+:::tip[怎么确认]
+CubeMX 的 Clock Configuration 页面上，**每个定时器旁边显示的就是实际的定时器时钟**。
+
+或者调 `HAL_RCC_GetPCLK1Freq() * 2`：
+
+```c
+uint32_t tim_clk = HAL_RCC_GetPCLK1Freq();
+if ((RCC->CFGR & RCC_CFGR_PPRE1) != RCC_CFGR_PPRE1_DIV1) {
+    tim_clk *= 2;      /* APB1 分频 ≠ 1，定时器翻倍 */
+}
+```
+:::
+
+## 时钟门控：省电的第一手段
+
+:::info[所有外设时钟上电默认是关的]
+```c
+/* 复位后 GPIOA 的时钟是关的 */
+HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);   /* 完全没反应 */
+```
+
+**必须先开时钟**：
+
+```c
+__HAL_RCC_GPIOA_CLK_ENABLE();        /* RCC->APB2ENR |= RCC_APB2ENR_IOPAEN */
+```
+
+**这是 STM32「配了没反应」的头号原因**（[零基础第 2 课](../../hardware/stm-basics/02-vs-esp32)讲过）。
+:::
+
+**总线与使能寄存器对应关系**：
+
+| 总线 | 使能寄存器 | 挂的设备 |
+| --- | --- | --- |
+| AHB | `RCC->AHBENR` | DMA、SRAM、Flash 接口 |
+| **APB1** | `RCC->APB1ENR` | TIM2-7、USART2/3、I2C1/2、SPI2、CAN、USB、WWDG |
+| **APB2** | `RCC->APB2ENR` | GPIOA-E、TIM1、USART1、SPI1、ADC1/2 |
+
+:::tip[门控是低功耗的关键]
+**每个外设即使不使用，只要时钟开着就在耗电**（几 µA 到几百 µA 不等）。
+
+进低功耗前：
+
+```c
+__HAL_RCC_GPIOA_CLK_DISABLE();
+__HAL_RCC_GPIOB_CLK_DISABLE();
+__HAL_RCC_USART1_CLK_DISABLE();
+__HAL_RCC_ADC1_CLK_DISABLE();
+```
+
+**实测经验：关掉不用的外设时钟，常能把 mA 级电流降到几百 µA 级。**
+
+（[零基础第 19 课](../../hardware/stm-basics/19-lowpower)讲了低功耗模式的用法。）
+:::
+
+## 时钟出问题的表现
+
+| 现象 | 最可能原因 | 怎么查 |
+| --- | --- | --- |
+| 程序慢约 9 倍 | 跑在 HSI 8MHz | 读 `SystemCoreClock` |
+| **卡在 `Error_Handler`** | HSE 起振失败 | 看 `RCC->CR` 的 HSERDY 位 |
+| 串口乱码 | 波特率算错（时钟不对） | 用 HSE，核对时钟 |
+| 定时器周期差一倍 | 忘了 APB1 的 ×2 | 用 CubeMX 显示的值 |
+| USB 识别不了 | 不是 72MHz（48MHz 不准） | 确认 SYSCLK=72M |
+| ADC 读数乱跳 | ADC 时钟 >14MHz | 检查 ADC 预分频 |
+| 随机 HardFault | FLASH_LATENCY 配错 | 72MHz 要 LATENCY_2 |
+| 某些外设无响应 | 外设时钟没使能 | 查 APBxENR |
+
+:::danger[HSE 起振失败的三种原因]
+1. **板上没焊晶振**（超便宜的板子会省）
+2. **晶振坏了**（摔过、虚焊）
+3. **负载电容不对**（一般 8~22pF，看晶振规格）
+
+**急救**：CubeMX 里把时钟源改成 **HSI**，能跑起来但不精确（串口会偏）。
+
+**确认方法**：读寄存器看 HSERDY 位是否置位：
+
+```c
+if (!(RCC->CR & RCC_CR_HSERDY)) {
+    /* HSE 没起来 */
+    Error_Handler();
+}
+```
+:::
+
+## 把时钟输出到引脚验证
+
+:::tip[MCO：把内部时钟输出到 PA8，用示波器量]
+```c
+/* 把 SYSCLK/1 输出到 PA8（MCO） */
+__HAL_RCC_GPIOA_CLK_ENABLE();
+HAL_GPIO_Init 配置 PA8 为 AF_PP;
+HAL_RCC_MCOConfig(RCC_MCO1, RCC_MCO1SOURCE_SYSCLK, RCC_MCODIV_1);
+```
+
+**示波器量 PA8 的频率，直接就知道时钟对不对**——比任何间接推断都可靠。
+
+**注意**：MCO 引脚驱动能力有限，有些引脚需要配置成最大速度才能输出到 72MHz。
+:::
+
+## 完整的手写时钟配置（📋 示例）
+
+:::warning[这段代码结构标准，但本站未在硬件上验证]
+实际项目请用 CubeMX 生成。这里贴出来是为了让你看懂每一步在做什么。
+:::
+
+```c
+void clock_72mhz_from_8mhz_hse(void)
+{
+    /* ① 开 HSE 并等就绪 */
+    RCC->CR |= RCC_CR_HSEON;
+    while (!(RCC->CR & RCC_CR_HSERDY)) { }      /* 死等，实际要加超时 */
+
+    /* ② 配 Flash 等待周期（必须在提频之前） */
+    FLASH->ACR &= ~FLASH_ACR_LATENCY;
+    FLASH->ACR |= FLASH_ACR_LATENCY_2;          /* 72MHz 用 2 */
+    FLASH->ACR |= FLASH_ACR_PRFTBE;             /* 开预取缓冲 */
+
+    /* ③ 配 PLL：HSE × 9 = 72MHz */
+    RCC->CFGR &= ~(RCC_CFGR_PLLSRC | RCC_CFGR_PLLMULL);
+    RCC->CFGR |= RCC_CFGR_PLLSRC;               /* PLL 源 = HSE */
+    RCC->CFGR |= RCC_CFGR_PLLMULL9;             /* ×9 */
+    RCC->CR |= RCC_CR_PLLON;
+    while (!(RCC->CR & RCC_CR_PLLRDY)) { }
+
+    /* ④ 配总线分频：AHB/1, APB1/2, APB2/1 */
+    RCC->CFGR &= ~(RCC_CFGR_HPRE | RCC_CFGR_PPRE1 | RCC_CFGR_PPRE2);
+    RCC->CFGR |= RCC_CFGR_HPRE_DIV1;
+    RCC->CFGR |= RCC_CFGR_PPRE1_DIV2;           /* APB1 = 36MHz */
+    RCC->CFGR |= RCC_CFGR_PPRE2_DIV1;           /* APB2 = 72MHz */
+
+    /* ⑤ 切换 SYSCLK 到 PLL */
+    RCC->CFGR &= ~RCC_CFGR_SW;
+    RCC->CFGR |= RCC_CFGR_SW_PLL;
+    while ((RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_PLL) { }
+
+    /* ⑥ 更新 HAL 的全局变量（否则 HAL_Delay 会按旧频率算） */
+    SystemCoreClockUpdate();
+}
+```
+
+:::danger[最后一行 `SystemCoreClockUpdate()` 不能漏]
+**HAL 的所有超时、波特率计算都依赖 `SystemCoreClock` 这个全局变量。**
+
+手写时钟配置后不更新它 → `HAL_Delay(1000)` 实际延时完全不对、串口波特率也错。
+
+（CubeMX 生成的 `SystemClock_Config()` 内部会调这个。）
+:::
+
+## 本课自检
+
+- [ ] 能画出完整的时钟树（HSI/HSE → PLL → SYSCLK → AHB → APB1/APB2）
+- [ ] **会算 PLL：`输入 × PLLMUL ≤ 72MHz`**
+- [ ] **知道三条硬限制：SYSCLK ≤72M、APB1 ≤36M、ADC ≤14M**
+- [ ] **知道 USB 要求 72MHz（÷1.5 = 48MHz）**
+- [ ] **知道 FLASH_LATENCY 要跟着频率改（72M → 2）**
+- [ ] **知道 APB 分频 ≠1 时定时器时钟 ×2**
+- [ ] 知道所有外设时钟上电默认关闭
+- [ ] 能说出 AHB/APB1/APB2 各挂了什么
+- [ ] **知道关外设时钟是低功耗第一手段**
+- [ ] 会读 `RCC->CR` 的 HSERDY 判断 HSE 是否起振
+- [ ] 知道可以用 MCO 输出时钟到引脚验证
+- [ ] **知道手写时钟后必须 `SystemCoreClockUpdate()`**
+
+## 下一步
+
+[03 中断系统深入](./interrupt-deep) —— NVIC 的优先级到底怎么算。

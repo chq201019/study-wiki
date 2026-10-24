@@ -1,0 +1,124 @@
+---
+id: debug-02
+title: "02 性能工具：有什么用什么"
+sidebar_position: 3
+description: "调试与优化 第 2 部分：性能工具：有什么用什么"
+---
+
+# 02 性能工具：有什么用什么
+### 5.1 实测工具可用性
+
+```bash
+$ for t in top htop iostat vmstat mpstat sar perf strace ltrace tcpdump slabtop; do ... done
+top       OK
+htop      MISSING
+iostat    MISSING
+vmstat    OK
+mpstat    MISSING
+sar       MISSING
+perf      MISSING
+strace    MISSING
+ltrace    MISSING
+tcpdump   MISSING
+slabtop   OK
+```
+
+| 工具 | 属于哪个包 | 用途 |
+| --- | --- | --- |
+| `top` | procps | 实时进程 CPU/内存 |
+| `vmstat` | procps | 进程/内存/IO/CPU 汇总 |
+| `slabtop` | procps | **内核 slab 缓存**（查内核内存泄漏） |
+| `iostat` / `mpstat` | **sysstat** | 磁盘 IO / 每核 CPU |
+| `perf` | **linux-perf**（包名因版本而异） | **性能剖析**，火焰图 |
+| `strace` | strace | 系统调用追踪 |
+| `tcpdump` | tcpdump | 抓包 |
+
+**安装**：
+
+```bash
+apt install sysstat strace tcpdump linux-perf    # Debian/Ubuntu 包名可能随版本变化
+```
+
+### 5.2 没有工具时的替代方案
+
+**这是本页最实用的一节**——板子上往往什么都没装。
+
+| 想看什么 | 没工具时的做法 |
+| --- | --- |
+| **CPU 占用** | `cat /proc/stat`（算两次差值）；`ps -eo pcpu,comm` |
+| **内存** | `cat /proc/meminfo`；`grep VmRSS /proc/<pid>/status` |
+| **每进程内存** | `cat /proc/<pid>/status` 的 `VmRSS` / `VmSize` |
+| **IO** | `cat /proc/<pid>/io`；`cat /proc/diskstats` |
+| **系统调用** | **`strace` 没有就用 gdb 的 `catch syscall`**（第 5 页演示过） |
+| **进程卡在哪** | **`cat /proc/<pid>/wchan`**（见下节）；`cat /proc/<pid>/stack` |
+| **打开文件** | `ls -l /proc/<pid>/fd` |
+| **内存映射** | `cat /proc/<pid>/maps` |
+| **网络连接** | `cat /proc/net/tcp`；`ss`（属于 iproute2 包） |
+| **内核内存** | `cat /proc/slabinfo`；`cat /proc/meminfo` 的 `Slab` 项 |
+| **中断** | `cat /proc/interrupts`；`cat /proc/softirqs` |
+
+### 5.3 实测：/proc 提供的性能数据
+
+```bash
+$ cat /proc/loadavg
+0.10 0.13 0.37 1/636 700238
+```
+
+四个字段：**1分钟/5分钟/15分钟平均负载**、**运行进程数/总进程数**、**最后创建的 PID**。
+
+```bash
+$ grep -E '^(MemTotal|MemFree|MemAvailable|Buffers|Cached)' /proc/meminfo
+MemTotal:        4004252 kB
+MemFree:          658432 kB
+MemAvailable:    2112672 kB
+Buffers:           28968 kB
+Cached:          1059660 kB
+```
+
+:::warning[不要只看 MemFree]
+`MemFree`(658MB) 看起来不多，但 **`MemAvailable`(2112MB) 才是真正可用的**——因为 `Buffers` + `Cached`（约 1GB）是可以回收的页缓存。
+
+嵌入式上内存紧张时，**Cached 大是好事**（说明缓存命中率高），不是问题。
+:::
+
+```bash
+$ cat /proc/stat | head -1
+cpu  4693243 714824 1898273 132271835 81731 0 61272 0 0 0
+```
+
+`/proc/stat` 的 cpu 行各字段（单位通常是 jiffies）：**user、nice、system、idle、iowait、irq、softirq、steal、guest、guest_nice**。
+
+**CPU 使用率 = 1 - idle增量 / 总增量**，取两次采样计算：
+
+```bash
+# 简易 CPU 使用率（两次采样间隔 1 秒）
+a=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $5}' /proc/stat); sleep 1
+b=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $5}' /proc/stat)
+# 计算 1 - idle差/总差
+```
+
+### 5.4 实测：进程状态与排序
+
+```bash
+$ ps -eo pid,ppid,stat,ni,pri,%cpu,%mem,etime,comm --sort=-%cpu --no-headers | head -5
+ 700241  700228 R      0  19  400  0.0       00:00 ps
+ 700199       1 Ss     0  19 56.4  0.3       00:01 systemd
+ 700228  700225 S      0  19  4.4  0.0       00:00 bash
+ 700194     680 Ss     0  19  3.7  0.2       00:02 sshd-session
+    660       1 Ssl    0  19  2.5  2.4  4-02:24:35 dockerd
+```
+
+（注意 `%cpu` 列是这个进程**整个生命周期的平均**占用，不是瞬时值；要看瞬时用 `top`）
+
+常用 ps 组合：
+
+```bash
+ps -eo pid,ppid,stat,comm --forest     # 树形显示进程关系
+ps -eo pid,etime,cmd                   # 看进程跑了多久
+ps -eLf                                # 显示线程
+ps -eo pid,stat,wchan:30,comm          # ★ 看进程卡在哪个内核函数
+```
+
+---
+
+**翻页**：[← 上一页](./debug-01) · [下一页 →](./debug-03) · [返回目录](./)

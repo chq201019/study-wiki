@@ -1,0 +1,37 @@
+---
+title: L6 系统能力
+sidebar_position: 1
+description: 存储、功耗、安全、USB、图形界面与 AI，把原型变成产品。
+---
+
+# L6 系统能力
+
+原型和产品的差距，通常就在这一层：数据存哪、断电会不会丢、别人能不能刷固件进去、界面好不好用。
+
+| 章节 | 内容 |
+| --- | --- |
+| [存储](./storage) | NVS、LittleFS、SPIFFS、SD 卡、磨损均衡 |
+| [功耗管理](./power) | 电源管理、深睡眠、电池预算 |
+| [安全](./security) | Flash 加密、Secure Boot、eFuse、mTLS |
+| [USB](./usb) | TinyUSB、HID、MIDI、CDC、MSC |
+| [图形界面](./gui-lvgl) | LVGL 内存规划、字体、性能优化 |
+| [AI 能力](./ai) | ESP-DL、TFLM、语音唤醒、人脸检测 |
+| [大项目实战：AI 语音管家](./llm-voice) | 协议全景（TCP/TLS/HTTP/WebSocket/SSE/MQTT/JSON/Opus）+ Function Calling + MCP + 全屋架构与实施计划 |
+
+## 判断标准
+
+一个项目做到什么程度算"产品化"？对照这张表自查：
+
+| 维度 | 原型 | 产品 |
+| --- | --- | --- |
+| 断电恢复 | 重新配网 | 自动恢复，配置持久化 |
+| 升级 | 手动烧录 | OTA + 回滚保护 |
+| 固件安全 | 无 | Secure Boot + 加密 |
+| 功耗 | 一直开着 | 深睡眠，电池能用几个月 |
+| 数据 | 存内存 | 掉电不丢 |
+| 界面 | 串口打印 | 本地显示 + 远程配置 |
+| 日志 | 到处 printf | 分级可关闭 |
+
+## 下一步
+
+[存储](./storage)

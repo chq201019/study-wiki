@@ -1,0 +1,89 @@
+---
+id: shell-05
+title: "05 验证：把这些连起来跑一遍"
+sidebar_position: 6
+description: "Shell 与命令行 第 5 部分：验证：把这些连起来跑一遍"
+---
+
+# 05 验证：把这些连起来跑一遍
+在服务器上复现本节的核心结论（**下面这些都是实测执行过的**）：
+
+```bash
+# 1. 权限与 umask
+$ umask
+0022
+$ (umask 077; touch /tmp/t1; stat -c '%a %n' /tmp/t1)
+600 /tmp/t1
+
+# 2. 目录权限语义（缺 x 时 cat 失败）
+$ mkdir -p /tmp/permtest && chmod 600 /tmp/permtest
+$ ls -l /tmp/permtest 2>&1 | head -2
+total 0
+-rw-r--r-- 1 root root 0 Oct 18 00:45 inside
+
+# 3. find 与 xargs 组合
+$ find /etc -maxdepth 1 -name '*.conf' -print0 | xargs -0 -n1 basename | sort | head -5
+adduser.conf
+ca-certificates.conf
+debconf.conf
+deluser.conf
+dhcpcd.conf
+
+# 4. 重定向顺序
+$ { echo out; echo err >&2; } >/tmp/o.txt 2>&1; cat /tmp/o.txt
+out
+err
+
+# 5. awk 汇总（读内核伪文件）
+$ awk '/^MemTotal/ {print "MemTotal KB =", $2}' /proc/meminfo
+MemTotal KB = 4004252
+
+# 6. usrmerge 确认
+$ ls -ld /bin /lib /sbin
+lrwxrwxrwx 1 root root 7 Aug 11 15:17 /bin -> usr/bin
+lrwxrwxrwx 1 root root 7 Aug 11 15:17 /lib -> usr/lib
+lrwxrwxrwx 1 root root 8 Aug 11 15:17 /sbin -> usr/sbin
+```
+
+## 常见坑
+
+| 症状 | 病根 |
+| --- | --- |
+| `command not found`，但文件明明在 | 当前目录不在 PATH，要写 `./program`；或文件没有 `x` 权限 |
+| `Permission denied` 但 `ls -l` 看着有 r | **是父目录缺 `x`**，穿不过去 |
+| 文件删不掉，但自己是文件属主 | 需要的是**所在目录的 `w`** 权限，不是文件的 |
+| 目录里有 `r` 却 `cat` 不了里面的文件 | 目录缺 `x`（搜索）权限 |
+| 改了 umask，已有文件权限没变 | umask 只对**新建**生效，改旧的要用 `chmod` |
+| `find ... \| xargs rm` 删错文件 | 文件名含空格被拆开。用 `-print0` + `xargs -0` |
+| `-exec ... {} ;` 不工作 | 少了反斜杠，正确是 `{} \;` |
+| `sed -i` 在 macOS 上报"invalid command code" | BSD sed 要写 `sed -i '' '...'` |
+| `2>&1 > file` 后 stderr 还在屏幕上 | 顺序反了，应写 `> file 2>&1` |
+| 脚本里变量值被拆成两个参数 | 变量引用没加双引号，用 `"$VAR"` |
+| 单引号里的 `$VAR` 没展开 | 单引号是字面量，要展开用双引号 |
+| 交叉编译时 `PATH` 找不到工具链 | 工具链的 `bin/` 没有加进 PATH，或加在了后面被系统 gcc 抢先 |
+| 在 `/tmp` 里删不掉别人的文件 | `/tmp` 有 sticky 位，只能删自己的（这是**设计如此**，不是 bug） |
+| `grep -r` 很慢 | 加 `--include='*.c'` 限定文件名，或用 `rg`(ripgrep) |
+
+## 自检清单
+
+- [ ] 说出 `/proc`、`/sys`、`/dev` 三者为什么"不占磁盘"
+- [ ] 能用 `echo` 重定向控制一个 GPIO（写出 sysfs 路径）
+- [ ] 说出目录的 `w` 和 `x` 权限各允许什么操作
+- [ ] 已知 umask 为 `027`，能算出新建文件是 `640`、目录是 `750`
+- [ ] 解释 `/usr/bin/passwd` 上的 `s` 位意味着什么
+- [ ] 说出 `/tmp` 上 `t` 位的作用
+- [ ] 区分 `find / grep / sed / awk / xargs` 各自的职责
+- [ ] 写出"找所有 .c 文件并统计总行数"的命令链
+- [ ] 解释 `2>&1 > file` 与 `> file 2>&1` 的区别
+- [ ] 说出 `export` 的作用，以及 `VAR=val cmd` 的生效范围
+- [ ] 说出双引号与单引号在变量展开上的区别
+- [ ] 知道为什么脚本里变量引用要加双引号
+
+## 下一步
+
+- [进程与信号](./process)——理解你的程序是怎么被启动和管理的：fork/exec/wait、COW、僵尸进程
+- 想直接上手交叉编译？先看 [文件系统与存储](./filesystem) 打好 inode 与挂载的基础
+
+---
+
+**翻页**：[← 上一页](./shell-04) · [返回目录](./)

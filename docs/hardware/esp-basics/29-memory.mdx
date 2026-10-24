@@ -1,0 +1,318 @@
+---
+id: 29-memory
+title: 29 内存与性能
+sidebar_position: 29
+description: ESP32 的内存地图、堆和栈的区别、栈溢出怎么查、PSRAM 什么时候有用，以及几条实用优化。
+---
+
+# 29 内存与性能
+
+**本课目标**：知道内存都花在哪，会查内存问题。
+
+## ESP32 的内存地图
+
+![ESP32 内存分布：片内 IRAM/DRAM/RTC 内存与片外 Flash/PSRAM 的容量、用途和访问速度差异](/img/diagrams/esp32-memory-map.svg)
+
+
+| 区域 | 大小 | 存什么 |
+| --- | --- | --- |
+| **IRAM** | 约 200 KB | 代码（部分）、中断处理函数 |
+| **DRAM** | 约 300 KB | 全局变量、堆 |
+| **RTC 内存** | 约 8 KB | 深睡保留的数据 |
+| **PSRAM**（外挂） | 2~8 MB | 大缓冲、图像 |
+| **Flash** | 4~16 MB | 固件、文件系统、NVS |
+
+:::warning[可用堆通常只有 200~300 KB]
+```c
+ESP_LOGI(TAG, "空闲堆: %d 字节", esp_get_free_heap_size());
+```
+
+**实际能 `malloc` 的总量大概 200~300 KB**——WiFi 启动后会更少。
+
+**在电脑上随手 `new` 一个 10 MB 数组，在这里直接失败。**
+:::
+
+## 堆 vs 栈
+
+| | 堆（heap） | 栈（stack） |
+| --- | --- | --- |
+| 分配方式 | `malloc` / `new` | 函数调用自动 |
+| 大小 | 全局共享（约 300 KB） | **每个任务独立**（2~8 KB） |
+| 速度 | 慢 | 快 |
+| 溢出后果 | `malloc` 返回 NULL | **崩溃** |
+| 谁管理 | 你 | 编译器 |
+
+:::danger[任务栈默认只有几 KB]
+```c
+void my_task(void *arg)
+{
+    char buf[8192];          /* ❌ 8 KB 局部数组 → 栈溢出 */
+}
+```
+
+**ESP-IDF 任务栈是你创建时指定的**（[第 20 课](./20-freertos-task)）：
+
+```c
+xTaskCreate(my_task, "t", 4096, NULL, 5, NULL);   /* 4 KB 栈 */
+```
+
+**在 4 KB 栈上放 8 KB 数组 → 立刻崩溃。**
+:::
+
+### 栈溢出的表现
+
+```text
+***ERROR*** A stack overflow in task my_task has been detected.
+```
+
+或者（更麻烦的情况）**没有明确报错，只是随机崩溃**——因为栈溢出踩到了相邻内存。
+
+:::tip[查栈用了多少]
+```c
+UBaseType_t left = uxTaskGetStackHighWaterMark(NULL);
+ESP_LOGI(TAG, "剩余栈 %d 字节", left * sizeof(StackType_t));
+```
+
+**返回"历史最小剩余量"**：
+
+- 剩 > 50% → 安全
+- 剩 25~50% → 留意
+- **剩 < 25% → 该加大了**
+:::
+
+## 几条硬性限制
+
+:::danger[这些数字要记住]
+| 限制 | 数值 |
+| --- | --- |
+| 单个任务栈 | 建议 2~8 KB |
+| 可用总堆 | 约 200~300 KB |
+| **单次 `malloc` 上限** | **约 100~160 KB**（连续内存块） |
+| 同时任务数 | 十几到几十个（受内存限制） |
+| HTTPS 请求 | 40~60 KB |
+| WiFi 启动后 | 堆减少约 50~80 KB |
+| BLE 协议栈 | 约 50~70 KB |
+:::
+
+:::warning[`malloc` 大块会失败但小块可以]
+```c
+void *p = malloc(150 * 1024);      /* 可能失败 */
+```
+
+**因为堆是碎片化的**——总量够，但没有连续的 150 KB。
+
+**大量小块分配再释放后，碎片会变严重。**
+
+**解决**：大缓冲用**静态分配**或 PSRAM，避免运行时大块 `malloc`。
+:::
+
+![内存预算：可用堆约 200~300KB，WiFi 启动吃掉 50~80KB、BLE 协议栈约 50~70KB、一次 HTTPS 请求 40~60KB，单次连续 malloc 上限约 100~160KB——所以 malloc(150KB) 会失败](/img/diagrams/esp32-memory-budget.svg)
+
+## 内存泄漏怎么查
+
+```c
+ESP_LOGI(TAG, "free=%d, min=%d",
+         esp_get_free_heap_size(),
+         esp_get_minimum_free_heap_size());
+```
+
+:::tip[看趋势，不看单点]
+```text
+启动时:     free=250000 min=230000
+1 小时后:   free=248000 min=200000
+6 小时后:   free=245000 min=120000     ← min 在持续下降！
+```
+
+**`min`（历史最小）持续下降 → 有泄漏。**
+
+**方法**：每秒打印一次，把日志导出来看趋势。
+:::
+
+### 常见泄漏点
+
+| 位置 | 漏了什么 |
+| --- | --- |
+| `cJSON_Parse` 后没 `cJSON_Delete` | 整个 JSON 树 |
+| `esp_http_client_init` 后没 `cleanup` | 客户端上下文 |
+| `malloc` 后某分支没 `free` | 该块内存 |
+| `xQueueCreate` 反复创建 | 队列对象 |
+| 循环里 `strdup` 不释放 | 字符串 |
+
+:::danger[提前 `return` 是最容易漏的地方]
+```c
+char *buf = malloc(100);
+if (err1) return;          /* ❌ 漏了 free(buf) */
+if (err2) return;          /* ❌ 漏了 free(buf) */
+free(buf);
+```
+
+**规矩：所有提前返回的分支都要释放。**
+
+**更安全的做法：用 `goto cleanup` 统一出口**：
+
+```c
+char *buf = malloc(100);
+if (err1) goto cleanup;
+if (err2) goto cleanup;
+/* 正常逻辑 */
+cleanup:
+    free(buf);
+```
+:::
+
+## PSRAM 什么时候有用
+
+```c
+/* 检查有没有 PSRAM */
+ESP_LOGI(TAG, "PSRAM: %d 字节", heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
+```
+
+:::tip[PSRAM 适合存"大而慢"的数据]
+| 用途 | 适合 PSRAM |
+| --- | --- |
+| 图像帧缓冲 | ✅ |
+| 音频缓冲 | ✅ |
+| 字库 | ✅ |
+| 大 JSON | ✅ |
+| **任务栈** | ❌ 太慢 |
+| **中断处理用的数据** | ❌ 太慢 |
+| **高频访问的变量** | ❌ 太慢 |
+
+**分配方式**：
+
+```c
+void *p = heap_caps_malloc(100 * 1024, MALLOC_CAP_SPIRAM);
+```
+
+**注意：PSRAM 通过 SPI 访问，比内部 RAM 慢 3~10 倍。**
+:::
+
+## 性能优化：先测量再优化
+
+:::danger[别凭感觉优化]
+**ESP32 跑 240 MHz，很多"看起来慢"的操作其实够快。**
+
+**先测**：
+
+```c
+int64_t t0 = esp_timer_get_time();      /* 微秒 */
+do_something();
+int64_t t1 = esp_timer_get_time();
+ESP_LOGI(TAG, "耗时 %lld us", t1 - t0);
+```
+:::
+
+### 真正值得优化的地方
+
+| 现象 | 优化手段 |
+| --- | --- |
+| 刷屏慢 | 提高 SPI 频率（[第 13 课](./13-spi)） |
+| 循环里有 `printf` | **去掉打印**（最有效） |
+| 大量 `malloc`/`free` | 用静态缓冲或内存池 |
+| WiFi 连接慢 | 固定 IP、记住信道（[第 23 课](./23-sleep)） |
+| HTTPS 慢 | 减少请求次数、复用连接 |
+| 频繁 I2C 小读 | 一次读多个字节 |
+| 浮点运算多 | 考虑定点运算（ESP32-S3 有 FPU，影响较小） |
+
+:::warning[`printf` 是最常见的性能杀手]
+```c
+while (1) {
+    ESP_LOGI(TAG, "循环");        /* ❌ 115200 波特率下每秒最多几百行 */
+}
+```
+
+**串口输出是阻塞的**——打印比计算慢几个数量级。
+
+**排查性能问题时，第一件事就是注释掉所有打印。**
+:::
+
+## 优化编译选项
+
+```bash
+idf.py menuconfig
+# → Compiler options → Optimization Level
+```
+
+| 级别 | 效果 | 适合 |
+| --- | --- | --- |
+| `-Og` | 调试友好 | 开发期 |
+| `-Os`（默认） | **优化体积** | 大多数情况 |
+| `-O2` | 优化速度 | 计算密集 |
+| `-O3` | 最强优化 | 极端性能需求 |
+
+:::tip[`-Os` 是 ESP-IDF 默认，通常最好]
+**Flash 和 RAM 都紧张，`-Os` 在体积和速度间平衡得不错。**
+
+**只在确实需要时才换 `-O2`**——体积会明显变大。
+:::
+
+## 完整示例：内存监控任务
+
+```c
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "esp_heap_caps.h"
+
+static const char *TAG = "mem";
+
+static void mem_monitor_task(void *arg)
+{
+    TickType_t last = xTaskGetTickCount();
+
+    while (1) {
+        ESP_LOGI(TAG, "堆: free=%6d  min=%6d  最大连续块=%6d",
+                 esp_get_free_heap_size(),
+                 esp_get_minimum_free_heap_size(),
+                 heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+
+        vTaskDelayUntil(&last, pdMS_TO_TICKS(10000));
+    }
+}
+
+void app_main(void)
+{
+    xTaskCreate(mem_monitor_task, "mem", 3072, NULL, 2, NULL);
+}
+```
+
+:::tip[`堆_caps_get_largest_free_block` 是关键指标]
+**"空闲总量"够但"最大连续块"很小 → 碎片化严重。**
+
+```text
+free=200000  largest=120000     ← 有 12 万连续，还行
+free=180000  largest=2000       ← 总量够但都是碎片！大块 malloc 会失败
+```
+
+**这时候要减少小块分配，或改用静态缓冲。**
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 任务里放大数组 | 栈溢出崩溃 | 栈只有几 KB | 改静态/全局，或加大栈 |
+| 提前 `return` 漏 free | 内存缓慢下降 | 泄漏 | `goto cleanup` |
+| `cJSON_Parse` 不 Delete | 每次请求泄漏 | 忘了释放 | 补上 |
+| 循环里 `printf` | 程序变慢 | 串口阻塞 | 去掉打印 |
+| 运行时 `malloc` 大块 | 偶发失败 | 碎片化 | 静态分配 |
+| PSRAM 当栈用 | 性能暴跌 | SPI 访问慢 | 只放大缓冲 |
+| 凭感觉优化 | 白费功夫 | 没测量 | 先 `esp_timer_get_time` |
+
+## 本课自检
+
+- [ ] 知道 IRAM/DRAM/PSRAM/Flash 各自存什么
+- [ ] **知道可用总堆约 200~300 KB**
+- [ ] **知道任务栈是独立的，默认只有几 KB**
+- [ ] **知道"栈溢出"是随机崩溃的常见原因**
+- [ ] 会用 `uxTaskGetStackHighWaterMark` 查剩余栈
+- [ ] 会用 `esp_get_minimum_free_heap_size` 看泄漏趋势
+- [ ] **知道 `heap_caps_get_largest_free_block` 能发现碎片化**
+- [ ] 知道提前 `return` 容易漏 `free`
+- [ ] 知道 PSRAM 适合大缓冲、不适合栈
+- [ ] **知道 `printf` 是最常见的性能杀手**
+- [ ] 会用 `esp_timer_get_time` 测量耗时
+
+## 下一步
+
+[30 下一步](./30-next) —— 往哪个方向继续深入。

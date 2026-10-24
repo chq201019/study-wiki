@@ -1,0 +1,171 @@
+---
+id: project-template
+title: 项目模板与规范
+sidebar_position: 2
+description: 可直接复用的 ESP-IDF 项目结构、命名约定、错误处理宏逐行讲解、Kconfig 统一配置与提交前检查清单。
+---
+
+# 项目模板与规范
+
+前面学的都是"能力"，这一章是"纪律"。项目小的时候怎么写都行；超过两三个文件后，**统一的目录、命名和错误处理**决定它是"能长大的项目"还是"越写越怕改的泥球"。这一页是可以直接抄进自己项目的模板。
+
+## 1. 推荐的项目结构
+
+```text
+my_project/
+├── CMakeLists.txt
+├── sdkconfig.defaults           # 默认配置（提交）
+├── sdkconfig                    # 本地配置（不提交）
+├── partitions.csv
+├── dependencies.lock            # 组件版本锁定（提交）
+├── components/
+│   ├── app_driver/              # 硬件驱动
+│   │   ├── CMakeLists.txt
+│   │   ├── include/app_driver.h
+│   │   └── src/app_driver.c
+│   ├── app_net/                 # 网络
+│   ├── app_storage/             # 存储
+│   └── app_ui/                  # 界面
+└── main/
+    ├── CMakeLists.txt
+    ├── app_main.c               # 只做初始化和任务创建
+    └── Kconfig.projbuild
+```
+
+**为什么按"功能域"拆组件**（driver/net/storage/ui），而不是按文件类型：改一个功能只动一个文件夹——"加个传感器"只碰 app_driver；"改上报频率"只碰 app_net。**组件边界 = 修改的隔离墙**。
+
+**原则**：`app_main.c` 只写"初始化 + 建任务"，业务逻辑全在组件里。
+
+```c
+// app_main.c 应该长这样
+void app_main(void) {
+    ESP_LOGI(TAG, "=== %s v%s 启动 ===", "my_project", "1.2.0");
+
+    nvs_flash_init();
+    app_driver_init();       // 驱动：自己 init
+    app_storage_init();      // 存储：自己 init
+    app_net_init();          // 网络：里面自己建任务
+
+    xTaskCreatePinnedToCore(main_task, "main", 8192, NULL, 5, NULL, 0);
+}
+```
+
+**自检标准**：打开你的 app_main.c，如果超过一屏——它在干业务逻辑的活，该拆出去了。
+
+## 2. 命名规范
+
+| 对象 | 规范 | 例 |
+| --- | --- | --- |
+| 文件名 | 全小写 + 下划线 | `app_driver.c` |
+| 函数 | `模块_动作_对象` | `driver_sensor_read` |
+| 全局变量 | `g_` 前缀 | `g_is_connected` |
+| 静态变量 | `s_` 前缀（文件私有） | `s_retry_count` |
+| 宏（常量） | 全大写 | `MAX_RETRY_COUNT` |
+| typedef 类型 | `_t` 后缀 | `sensor_data_t` |
+| 日志标签 | 模块名大写 | `"SENSOR"` |
+
+**为什么前缀值得坚持**：看到 `g_` 就知道"全工程可见，改之前想想影响面"；看到 `s_` 就知道"文件私有，随便改"；看到函数名就知道它属于哪个组件——**名字本身就是文档**。
+
+ESP-IDF 官方组件的命名可以直接照抄，看 `components/driver/include/driver/gpio.h` 就知道风格。
+
+## 3. 错误处理模式
+
+```c
+// 统一的错误检查宏（放在项目的公共头文件里）。
+// 用法：CHECK_ERR(某个返回 esp_err_t 的调用);
+// 作用：失败时打印"哪个文件哪一行、哪句话、什么错误"，然后把错误码往上返回
+#define CHECK_ERR(x) do { \
+    esp_err_t err_rc_ = (x); \
+    if (err_rc_ != ESP_OK) { \
+        ESP_LOGE(TAG, "%s:%d %s 失败: %s", \
+                 __func__, __LINE__, #x, esp_err_to_name(err_rc_)); \
+        return err_rc_; \
+    } \
+} while (0)
+```
+
+逐段读懂这个宏（L0 宏一节的实战）：
+
+- `\` 是续行符：宏必须写成"一行"，`\` 告诉编译器"下一行还是这一句"
+- `err_rc_` 带下划线后缀：避免和调用者的变量名撞车
+- `__func__` / `__LINE__` 是编译器内置的"当前函数名/行号"
+- `#x` 把参数原样变成字符串——报错里能看到出错的那个调用原文（`gpio_config(&io) 失败`）
+- `do { ... } while (0)` 是宏的标准包裹——保证宏在任何语法位置（哪怕没加花括号的 if 里）都正确工作
+
+```c
+// 顶层统一处理
+void app_main(void) {
+    esp_err_t err = app_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "初始化失败: %s", esp_err_to_name(err));
+        fallback_mode();     // 失败后的降级策略：至少保证能联网上报故障
+        return;
+    }
+}
+```
+
+关键约定：**每个函数返回 `esp_err_t`，成功返回 `ESP_OK`，失败返回具体错误码，绝不吞掉错误**。"吞错误"的代码（调用后不看返回值）在三个月后变成"不知道为什么数据不对"的无头案。
+
+## 4. 日志规范
+
+```c
+// 分级约定（L2 日志一节的落地版）
+ESP_LOGE(TAG, "传感器无响应");                    // 发生了，不能继续
+ESP_LOGW(TAG, "重试第 %d 次", i);                  // 发生了，但能兜住
+ESP_LOGI(TAG, "初始化完成, 共 %d 个设备", n);      // 关键状态变更
+ESP_LOGD(TAG, "原始值=%d 校准后=%d", raw, cal);   // 排查问题
+```
+
+**发布版本关闭 D/V 日志**（menuconfig 里设默认级别 Info），既省 flash 又省电。日志里该打什么：状态变更、错误及上下文、重试次数。不该打什么：循环里的高频数据、密码和密钥。
+
+## 5. 配置项统一
+
+把可调参数放 Kconfig，不要散落在代码里（[组件模型的 Kconfig 一节](../l2-programming-model/component-cmake)）：
+
+```kconfig
+# main/Kconfig.projbuild
+menu "Application"
+
+config APP_SAMPLE_RATE_HZ
+    int "Sampling rate (Hz)"
+    range 1 100
+    default 10
+
+config APP_LOG_LEVEL
+    int "Log level"
+    range 0 5
+    default 3
+
+endmenu
+```
+
+```c
+TickType_t interval = pdMS_TO_TICKS(1000 / CONFIG_APP_SAMPLE_RATE_HZ);
+```
+
+**价值**：改采样率不用改代码重编（menuconfig 一改就行）；同一份源码编出不同配置的固件；参数有 range 校验和说明文档。
+
+## 6. 版本号与固件标识
+
+```c
+// 用 git 描述或编译日期自动生成版本号
+ESP_LOGI(TAG, "固件 %s，编译于 %s %s", "1.2.0+" GIT_HASH, __DATE__, __TIME__);
+```
+
+出问题反馈"设备不工作了"时，第一句反问是"固件什么版本"——**没有版本号的固件等于没有名字的人**。版本号和 OTA 配合（见 [OTA 章节](../l5-wireless/ota)）。
+
+## 7. 提交前检查清单
+
+- [ ] `idf.py fullclean && idf.py build` 无警告（开了 `-Werror` 就是硬约束）
+- [ ] `sdkconfig.defaults` 已更新并提交
+- [ ] `dependencies.lock` 已提交
+- [ ] `sdkconfig`（本地配置）已加入 `.gitignore`
+- [ ] 没有硬编码的密码、密钥、token
+- [ ] 所有 `esp_err_t` 都检查了
+- [ ] 版本号已更新
+- [ ] 新加的功能有日志、错误有处理
+- [ ] README 或注释说明了这次改了什么
+
+## 下一步
+
+[测试](./testing)

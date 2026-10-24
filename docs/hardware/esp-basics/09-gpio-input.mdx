@@ -1,0 +1,285 @@
+---
+id: 09-gpio-input
+title: 09 GPIO 输入与按键消抖
+sidebar_position: 9
+description: 上拉下拉电阻、按键为什么必须消抖、软件消抖的三种写法，以及长按与双击的思路。
+---
+
+# 09 GPIO 输入与按键消抖
+
+**本课目标**：正确读按键，理解抖动，学会消抖。
+
+## 先把引脚设为输入
+
+```c
+gpio_reset_pin(BTN_GPIO);
+gpio_set_direction(BTN_GPIO, GPIO_MODE_INPUT);
+gpio_set_pull_mode(BTN_GPIO, GPIO_PULLUP_ONLY);   /* 启用内部上拉 */
+
+int level = gpio_get_level(BTN_GPIO);             /* 读电平：0 或 1 */
+```
+
+## 上拉和下拉：为什么必须有
+
+:::danger[引脚不能"悬空"]
+如果按键只是"一端接 GPIO、一端接 GND"，**没按下时 GPIO 什么都没接**。
+
+这叫**悬空（floating）**，电平会随机跳变，读到的值不可靠。
+
+**所以必须有上拉或下拉电阻给它一个确定的默认电平。**
+:::
+
+```text
+上拉接法（最常见）
+                    3.3V
+                     │
+                   [R 10k]   ← 上拉电阻
+                     │
+GPIO ────────────────┤
+                     │
+                   [按键]
+                     │
+                    GND
+
+未按下：GPIO 被上拉到 3.3V → 读到 1
+按下：  GPIO 直接接 GND    → 读到 0
+```
+
+| 接法 | 未按下 | 按下 | 常用 |
+| --- | --- | --- | --- |
+| **上拉**（按键接 GND） | 1 | **0** | ✅ 最常见 |
+| 下拉（按键接 3.3V） | 0 | **1** | 较少 |
+
+:::tip[ESP32 内置上拉，不用外接电阻]
+```c
+gpio_set_pull_mode(BTN_GPIO, GPIO_PULLUP_ONLY);    /* 用内部的 */
+```
+
+**省一个电阻、少一根线。**
+
+但注意：内部上拉约 **45 kΩ**，比较弱。**线长、干扰大的场合建议外接 10 kΩ。**
+:::
+
+:::danger[按键按下是低电平，这个反直觉要记住]
+```c
+if (gpio_get_level(BTN_GPIO) == 0) {
+    /* 按下了 */
+}
+```
+
+**很多人写成 `== 1` 结果逻辑反了。**
+
+用宏定义会清晰很多：
+
+```c
+#define BTN_PRESSED  0
+if (gpio_get_level(BTN_GPIO) == BTN_PRESSED) { ... }
+```
+:::
+
+## 按键抖动：机械开关的物理问题
+
+:::danger[按一下，程序却检测到几十次]
+机械触点在闭合瞬间会**弹跳**几十微秒到几十毫秒：
+
+```text
+理想：  ────┐
+            └────────
+
+实际：  ────┐┌┐┌─┐┌──┐┌──────
+            └┘└┘ └┘  └┘
+        ↑ 这段就是抖动（5~20ms）
+```
+
+**结果**：按一次，`gpio_get_level` 可能读到几十次跳变。
+
+**如果不消抖**：按一下灯切换了 7 次（看起来"没反应"或"随机"）。
+:::
+
+![按键抖动波形与三种消抖：机械触点闭合瞬间弹跳 5~20ms，理想波形上的一次按下在实际波形上是几十次跳变；延时消抖 vTaskDelay(20)、状态机消抖每 10ms 采样连续 3 次一致、边沿检测只在 1→0 下降沿触发一次](/img/diagrams/esp32-button-debounce.svg)
+
+## 三种消抖方法
+
+### ① 延时消抖（最简单）
+
+```c
+if (gpio_get_level(BTN_GPIO) == 0) {
+    vTaskDelay(pdMS_TO_TICKS(20));      /* 等抖动过去 */
+    if (gpio_get_level(BTN_GPIO) == 0) {
+        /* 确认真的按下了 */
+        do_something();
+    }
+}
+```
+
+:::warning[延时消抖会阻塞]
+`vTaskDelay(20)` 让当前任务睡 20 ms。
+
+**在简单程序里没问题**，但如果这个循环还要做别的事（比如刷新屏幕），就会卡顿。
+:::
+
+### ② 状态机消抖（推荐，不阻塞）
+
+```c
+/* 每 10ms 调用一次 */
+bool debounce(uint8_t raw)
+{
+    static uint8_t count = 0;
+    static bool    stable = false;
+    const uint8_t  THRESHOLD = 3;        /* 连续 3 次一致才算稳定 */
+
+    if (raw != stable) {
+        if (++count >= THRESHOLD) {
+            stable = raw;
+            count = 0;
+            return true;                 /* 状态真的变了 */
+        }
+    } else {
+        count = 0;
+    }
+    return false;
+}
+```
+
+**用法**：
+
+```c
+while (1) {
+    bool pressed = (gpio_get_level(BTN_GPIO) == 0);
+    if (debounce(pressed)) {
+        ESP_LOGI(TAG, "按键状态变为 %s", pressed ? "按下" : "松开");
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));       /* 固定 10ms 采样 */
+}
+```
+
+**优点**：不阻塞，只在实际变化的瞬间返回一次。
+
+### ③ 只用"边沿检测"（最省事）
+
+```c
+static int last = 1;
+
+int now = gpio_get_level(BTN_GPIO);
+if (last == 1 && now == 0) {        /* 1 → 0 的下降沿 */
+    /* 按下瞬间，只触发一次 */
+    toggle_led();
+}
+last = now;
+```
+
+:::tip[边沿检测能缓解但不算完整消抖]
+抖动期间可能产生**多个下降沿**，所以还是要配合 ①②。
+
+**实践中最常用：边沿检测 + 20ms 延时确认。**
+:::
+
+## 完整示例
+
+```c
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+
+static const char *TAG = "btn";
+
+#define BTN_GPIO   0        /* 板载 BOOT 键通常是 GPIO0 */
+#define LED_GPIO   4
+
+void app_main(void)
+{
+    /* LED 输出 */
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+
+    /* 按键输入 + 上拉 */
+    gpio_reset_pin(BTN_GPIO);
+    gpio_set_direction(BTN_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BTN_GPIO, GPIO_PULLUP_ONLY);
+
+    bool led_on = false;
+    int  last   = 1;
+
+    while (1) {
+        int now = gpio_get_level(BTN_GPIO);
+
+        /* 下降沿 → 延时确认 */
+        if (last == 1 && now == 0) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            if (gpio_get_level(BTN_GPIO) == 0) {
+                led_on = !led_on;
+                gpio_set_level(LED_GPIO, led_on);
+                ESP_LOGI(TAG, "LED %s", led_on ? "ON" : "OFF");
+            }
+        }
+        last = gpio_get_level(BTN_GPIO);
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+```
+
+:::danger[别用 GPIO0 做纯输入之外的事]
+GPIO0 决定启动模式（[第 6 课](./06-first-blink)讲过 BOOT 键就是它）。
+
+**上电时如果 GPIO0 被按下（拉低），板子会进入下载模式而不是运行程序。**
+
+**表现**：一直按着键上电 → 程序不跑。**这是正常的，不是坏了。**
+
+做实验时可以用 GPIO0，但**正式产品要换别的引脚**。
+:::
+
+## 长按与双击怎么做
+
+:::tip[思路：记录按下的持续时间]
+**长按**：
+
+```c
+/* 按下时记时间，松开时算差值 */
+if (按下) {
+    press_start = xTaskGetTickCount();
+} else if (松开) {
+    uint32_t held = (xTaskGetTickCount() - press_start) * portTICK_PERIOD_MS;
+    if (held > 1000) { /* 长按 */ }
+    else             { /* 短按 */ }
+}
+```
+
+**双击**：短按后开一个 300 ms 定时器，期间再按一次就是双击。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 没上拉 | 读数乱跳 | 引脚悬空 | `gpio_set_pull_mode` |
+| 判断电平反了 | 逻辑相反 | 按下是 0 不是 1 | 用宏定义 |
+| 没消抖 | 按一次触发多次 | 机械抖动 | 延时或状态机 |
+| 延时消抖太久 | 响应迟钝 | 20ms 已够 | 别用 200ms |
+| 用 GPIO0 做产品输入 | 上电偶尔不启动 | 影响启动模式 | 换引脚 |
+| 循环无延时 | 看门狗复位 | 不让出 CPU | 至少 10ms |
+
+:::danger[输入引脚不要接 5V]
+很多 Arduino 传感器输出 **5V 电平**。
+
+**接到 ESP32 的 GPIO 会烧。**
+
+需要电平转换（电阻分压或专用模块）。
+:::
+
+## 本课自检
+
+- [ ] 会把引脚设为 `GPIO_MODE_INPUT`
+- [ ] **知道引脚悬空会读到随机值，必须有上拉/下拉**
+- [ ] 会用 `gpio_set_pull_mode` 启用内部上拉
+- [ ] **知道按键按下通常是低电平（0）**
+- [ ] **理解机械抖动是什么、为什么必须消抖**
+- [ ] 会三种消抖方法（延时/状态机/边沿检测）
+- [ ] 会用边沿检测实现"按一次切换一次"
+- [ ] **知道 GPIO0 影响启动模式，别做产品输入**
+- [ ] 知道输入引脚不能接 5V
+
+## 下一步
+
+[10 ADC 读模拟量](./10-adc) —— 读电位器、光敏电阻这些"连续变化"的信号。

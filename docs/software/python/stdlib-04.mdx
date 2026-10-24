@@ -1,0 +1,191 @@
+---
+id: stdlib-04
+title: "04 一个完整例子：日志分析器"
+sidebar_position: 5
+description: "标准库精讲 第 4 部分：一个完整例子：日志分析器"
+---
+
+# 04 一个完整例子：日志分析器
+把本页九个模块里的七个串起来：
+
+```python
+from __future__ import annotations
+
+import json
+import logging
+import re
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
+from functools import cached_property
+from itertools import islice
+from pathlib import Path
+from typing import Iterator
+
+log = logging.getLogger(__name__)
+
+LINE_RE = re.compile(
+    r"(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
+    r"\s+(?P<level>\w+)"
+    r"\s+(?P<msg>.*)"
+)
+
+
+class LogAnalyzer:
+    """分析日志文件：按级别计数、按小时分布、提取错误。"""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+
+    def _iter_lines(self) -> Iterator[str]:
+        with self.path.open(encoding="utf-8") as f:
+            for line in f:
+                yield line.rstrip("\n")
+
+    def parse(self) -> Iterator[dict]:
+        for lineno, line in enumerate(self._iter_lines(), start=1):
+            match = LINE_RE.match(line)
+            if not match:
+                log.warning("第 %d 行无法解析: %r", lineno, line[:40])
+                continue
+            yield match.groupdict()
+
+    @cached_property
+    def records(self) -> list[dict]:
+        return list(self.parse())
+
+    @property
+    def level_counts(self) -> Counter[str]:
+        return Counter(r["level"] for r in self.records)
+
+    def by_hour(self) -> dict[str, int]:
+        buckets: dict[str, int] = defaultdict(int)
+        for r in self.records:
+            hour = datetime.strptime(r["ts"], "%Y-%m-%d %H:%M:%S").replace(
+                minute=0, second=0
+            )
+            buckets[hour.isoformat()] += 1
+        return dict(buckets)
+
+    def errors(self, limit: int = 5) -> list[str]:
+        return list(islice((r["msg"] for r in self.records
+                            if r["level"] == "ERROR"), limit))
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "file": str(self.path),
+                "levels": dict(self.level_counts),
+                "by_hour": self.by_hour(),
+                "errors": self.errors(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+
+    sample = Path("sample.log")
+    sample.write_text(
+        "2024-03-01 10:15:00 INFO started\n"
+        "2024-03-01 10:45:00 ERROR db timeout\n"
+        "this line is garbage\n"
+        "2024-03-01 11:05:00 WARN slow query\n"
+        "2024-03-01 11:30:00 ERROR disk full\n"
+        "2024-03-01 11:59:00 INFO finished\n",
+        encoding="utf-8",
+    )
+
+    analyzer = LogAnalyzer(sample)
+    print(analyzer.to_json())
+    print("\n最常见的级别:", analyzer.level_counts.most_common(1))
+    sample.unlink()
+```
+
+预期输出：
+
+```text
+WARNING: 第 3 行无法解析: 'this line is garbage'
+{
+  "file": "sample.log",
+  "levels": {
+    "INFO": 2,
+    "ERROR": 2,
+    "WARN": 1
+  },
+  "by_hour": {
+    "2024-03-01T10:00:00": 2,
+    "2024-03-01T11:00:00": 3
+  },
+  "errors": [
+    "db timeout",
+    "disk full"
+  ]
+}
+
+最常见的级别: [('INFO', 2)]
+```
+
+注意 `most_common(1)` 只返回一个——`INFO` 和 `ERROR` 都是 2 次，`Counter` 按**先出现顺序**打破平局，所以是 `INFO`（它有 `started` 打头）。
+
+这个例子用到了：`pathlib`（读写文件）、`re`（命名分组解析）、`logging`（警告坏行）、`Counter` / `defaultdict`（计数与分桶）、`datetime`（按小时归组）、`cached_property`（解析结果只算一次）、`itertools.islice`（限制条数）、`json`（导出）、`typing`（注解）。
+
+## 11. 验证：该用哪个模块
+
+| 需求 | 模块 |
+| --- | --- |
+| 统计出现次数 | `collections.Counter` |
+| 按键分组 | `collections.defaultdict` |
+| 队列 / 滑动窗口 | `collections.deque` |
+| 配置分层覆盖 | `collections.ChainMap` |
+| 前缀和 / 笛卡尔积 / 排列组合 | `itertools` |
+| 只算一次的属性 | `functools.cached_property` |
+| 按类型分派 | `functools.singledispatch` |
+| 路径拼接与遍历 | `pathlib` |
+| 配置 / 数据交换 | `json` |
+| 从文本里提取结构 | `re`（能不用就不用） |
+| 时间计算 | `datetime`（一律 UTC） |
+| 替代 print 调试 | `logging` |
+
+## 常见坑
+
+| 现象 | 真实原因 | 解决 |
+| --- | --- | --- |
+| `groupby` 结果不对 | 只合并相邻元素 | 先 `sorted(data, key=...)` |
+| `defaultdict` 查询后多出键 | 访问会创建条目 | 只想查询就用 `dict.get` |
+| `TypeError: can't compare offset-naive and offset-aware` | 混用带时区和不带时区的 datetime | 统一用 UTC aware |
+| Windows 上 `ZoneInfoNotFoundError` | 缺 tzdata 包 | `pip install tzdata`，或只用 `timezone.utc` |
+| `json.dumps` 报 set 不可序列化 | JSON 没有集合类型 | 转成 `list` |
+| `json.dumps` 输出 `NaN` | 不是合法 JSON | 先清理 NaN/Infinity |
+| 反序列化后 tuple 变 list | JSON array 只对应 list | 手动转回 tuple |
+| 正则不生效 | 忘了写 raw 字符串 | 用 `r"..."` |
+| 用 `re.match` 校验通过了不该通过的值 | match 只匹配开头 | 校验一律 `fullmatch` |
+| 日志用 f-string 导致性能差 | 提前拼接字符串 | 用 `%s` 惰性占位符 |
+| `cached_property` 报错 | 类用了 `__slots__`，没有 `__dict__` | 去掉 slots 或改用 `property` |
+| `itertools.batched` 不存在 | 它是 3.12 新增的 | 用 `islice` 或 `more-itertools` |
+| `typing.override` 导入失败 | 它是 3.12 新增的 | 用 `typing_extensions` |
+
+## 自检清单
+
+- [ ] 见到「统计频次」能立刻想到 `Counter`
+- [ ] 知道 `groupby` 必须先排序
+- [ ] 知道 `defaultdict` 会创建条目这个副作用
+- [ ] 知道 `deque` 两端都是 O(1)，以及 `maxlen` 的效果
+- [ ] 能用 `/` 运算符拼路径，知道 `pathlib` 的核心方法
+- [ ] 知道 JSON 的类型映射，以及 tuple→list、set 不可序列化
+- [ ] 知道 `match` / `search` / `fullmatch` 的区别，校验用哪个
+- [ ] 知道正则要写 raw 字符串
+- [ ] 能区分 naive 和 aware datetime，知道该用哪个存储
+- [ ] 知道日志要用 `%s` 惰性格式化，以及每个模块用 `getLogger(__name__)`
+- [ ] 知道 3.10+ 用 `X | None` 代替 `Optional[X]`
+
+## 下一步
+
+最后一页把这些变成可交付的项目：[工程化](./engineering)。
+
+**参考链接**：[collections](https://docs.python.org/zh-cn/3/library/collections.html) · [itertools](https://docs.python.org/zh-cn/3/library/itertools.html) · [functools](https://docs.python.org/zh-cn/3/library/functools.html) · [pathlib](https://docs.python.org/zh-cn/3/library/pathlib.html) · [json](https://docs.python.org/zh-cn/3/library/json.html) · [re](https://docs.python.org/zh-cn/3/library/re.html) · [datetime](https://docs.python.org/zh-cn/3/library/datetime.html) · [logging](https://docs.python.org/zh-cn/3/library/logging.html) · [typing](https://docs.python.org/zh-cn/3/library/typing.html)
+
+---
+
+**翻页**：[← 上一页](./stdlib-03) · [返回目录](./)

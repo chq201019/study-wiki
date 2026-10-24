@@ -1,0 +1,248 @@
+---
+id: project-setup
+title: 搭建自己的 IDF 工程
+sidebar_position: 3
+description: 从装环境到跑通第一个工程——ESP-IDF 是什么、命令行入门、工程结构逐文件讲解、menuconfig、编译烧录监视的完整流程。
+---
+
+# 搭建自己的 IDF 工程
+
+快速上手用的是米思齐（图形化）和 Arduino IDE，而完整教程的主线工具是 **ESP-IDF**——乐鑫官方的正式开发框架，本站 L2 之后的全部内容都在它上面展开。
+
+先解释几个会让你望而却步的名词，其实每个都很好懂：
+
+- **ESP-IDF**（IoT Development Framework）：乐鑫官方的"工具箱"，里面装着交叉编译器、几百个驱动组件、两百多个官方示例、构建脚本。它跑在**命令行**里——你在终端窗口里敲 `idf.py build` 这种短命令，而不是点按钮
+- **命令行 / 终端（Terminal）**：通过打字向电脑下指令的界面。没有图标没有按钮，一个提示符一行命令。它是嵌入式开发的"母语"——所有专业工具链、CI 服务器、网上教程的复现步骤都以命令行为准
+- **CMake**：一个"施工计划生成器"。它读你写的 `CMakeLists.txt`（用来说明"我这个工程有哪些源码文件、依赖哪些组件"），自动生成完整的编译步骤。你不需要学透 CMake，看懂本页出现的十几行就够
+- **menuconfig**：一个键盘操作的图形化配置菜单，管理 IDF 的几百个开关（内存、日志、外设……），改完存进 `sdkconfig` 文件
+
+## 0. 命令行三十秒入门（只会这几条就够）
+
+| 命令 | 干什么 | 例 |
+| --- | --- | --- |
+| `cd 路径` | 进入某个文件夹 | `cd my_smart_box` |
+| `cd ..` | 回到上一级 | |
+| `dir` / `ls` | 列出当前文件夹内容 | Windows 用 `dir` |
+| `Tab 键` | 自动补全文件名（最好用的键） | 输 `cd my` 按 Tab 补全 |
+| `↑ 方向键` | 调出上一条命令 | 改个参数重跑 |
+| `Ctrl + C` | 中断当前正在跑的命令 | 卡住了就按 |
+
+命令行的工作逻辑：**你现在"站在"某个文件夹里**（提示符显示的就是当前位置），敲的命令都在这个文件夹里生效。`idf.py build` 的前提就是你站在工程目录里。
+
+## 1. 环境准备
+
+Windows 用户：打开 **[ESP-IDF 下载页](https://developer.espressif.com/tags/esp-idf/zh-cn/)**，下载 Windows 离线安装包（v5.5.x，约 1.5GB），一路下一步装完。装好后开始菜单里会出现 **"ESP-IDF 5.5 PowerShell"**——以后每次开发都从这个入口打开终端。
+
+:::caution[为什么必须从那个入口开终端？]
+`idf.py` 不是系统自带的命令，它需要知道"编译器在哪、IDF 组件在哪"（一堆**环境变量**）。"ESP-IDF PowerShell"这个入口就是"打开一个已经配好所有环境变量的终端"。从普通 cmd 打开敲 `idf.py` 会报"不是内部或外部命令"——**不是坏了，是走错门了**。
+:::
+
+装完验证：
+
+```bash
+idf.py --version        # 应输出 v5.5.x
+
+# 首次配置目标芯片（只需一次）
+idf.py set-target esp32s3
+```
+
+`set-target` 做的事：告诉构建系统"我的芯片是 S3"——不同芯片用不同编译器和驱动集。它会跑一两分钟并重新生成配置。
+
+Linux/macOS：
+
+```bash
+git clone -b v5.5.2 --recursive https://github.com/espressif/esp-idf.git ~/esp-idf
+~/esp-idf/install.sh esp32s3
+. ~/esp-idf/export.sh        # 相当于 Windows 的"专用入口"，每个新终端都要执行一次
+```
+
+:::caution[克隆 IDF 必须带 `--recursive`]
+IDF 内部引用了几十个子仓库（子模块）。漏了这个参数，编译时会报一堆"文件不存在"。如果忘了，执行 `git submodule update --init --recursive` 补齐。
+:::
+
+:::tip[网络不畅用国内镜像]
+GitHub 拉取慢/失败时，设置两个镜像环境变量再克隆：
+
+```bash
+export IDF_GITHUB_ASSETS="dl.espressif.com/github_assets"
+git clone -b v5.5.2 --recursive https://gitee.com/EspressifSystems/esp-idf.git ~/esp-idf
+```
+安装工具链时也可以在 install 命令后加国内源参数，详见乐鑫官方文档"版本与安装"一节。
+:::
+
+## 2. 创建与编译：第一个工程
+
+```bash
+idf.py create-project my_smart_box    # 新建工程（在当前目录下生成文件夹）
+cd my_smart_box                       # 进去
+idf.py build                          # 编译
+idf.py -p COM5 flash monitor          # 烧录 + 打开串口监视器
+```
+
+第一次 `build` 会花几分钟——它在编译**整个 IDF**（几百个组件只编译你用到的，但也不少），之后增量编译只重编改过的文件，几秒完成。
+
+烧录前把板子用 USB 线接电脑，`COM5` 换成你实际的端口。不知道是哪个口？设备管理器里看"端口（COM 和 LPT）"，或者干脆不写 `-p` 让它自动找。
+
+`monitor` 是串口监视器——相当于快速上手里的"串口窗口"，能看到芯片打印的日志。退出它按 **Ctrl + ]**。
+
+### 常用命令速查
+
+| 命令 | 作用 |
+| --- | --- |
+| `idf.py build` | 编译 |
+| `idf.py flash` | 烧录（会自动先 build） |
+| `idf.py monitor` | 开串口监视器 |
+| `idf.py -p COM5 flash monitor` | 指定端口，烧录并直接看日志（最常用组合） |
+| `idf.py app-flash` | 只重烧应用分区（比整包快，分区表没变时用） |
+| `idf.py menuconfig` | 打开图形化配置菜单 |
+| `idf.py fullclean` | 彻底清理 build 目录（"配置怎么改都不生效"时的救命命令） |
+| `idf.py size` | 查看 Flash / RAM 占用 |
+| `idf.py erase-flash` | 整片擦除 Flash（数据全清，恢复出厂） |
+
+:::tip[monitor 里的快捷键]
+`Ctrl+]` 退出；`Ctrl+T` 后再按 `Ctrl+H` 看帮助；重置板子按 `Ctrl+T` `Ctrl+R`——不用拔插 USB 就能重启程序。
+:::
+
+## 3. 工程结构：每个文件是干嘛的
+
+```text
+my_smart_box/
+├── CMakeLists.txt              # 顶层施工计划：声明"这是个 IDF 工程"
+├── sdkconfig.defaults          # 默认配置，提交到 git
+├── sdkconfig                   # 本地实际配置（自动生成，别手动改、别提交）
+├── partitions.csv              # 分区表（可选，自定义 Flash 划分时用）
+├── dependencies.lock           # 组件版本锁定，自动生成
+├── build/                      # 编译产物（自动生成，别提交）
+└── main/
+    ├── CMakeLists.txt          # main 组件的施工计划
+    └── app_main.c              # 程序入口
+```
+
+逐个说清楚：
+
+| 文件 | 是什么 | 你会动它吗 |
+| --- | --- | --- |
+| `CMakeLists.txt`（顶层） | 三行，声明工程名 | 建工程后基本不动 |
+| `sdkconfig` | menuconfig 改完的**实际生效**配置，几千行自动生成 | **不手动改**（改了会被覆盖），不提交 git |
+| `sdkconfig.defaults` | 你**关心的那几十项**配置的默认值。换个电脑重新生成 sdkconfig 时以它为准 | ✓ 提交 git，配置变更改这里 |
+| `partitions.csv` | Flash 分区表 | 要 OTA/文件系统时动（L2 专章） |
+| `build/` | 所有编译中间产物 | 永远不提交；出诡异问题先 `fullclean` |
+
+### 顶层 CMakeLists.txt（三行，几乎不用动）
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(my_smart_box)
+```
+
+第一行声明最低 CMake 版本；第二行把 IDF 的构建规则引进来（相当于"加载施工规范手册"）；第三行给工程起名。**逐字照抄即可**。
+
+### main/CMakeLists.txt（要动的）
+
+```cmake
+idf_component_register(
+    SRCS "app_main.c" "sensor.c" "net.c"    # 工程里有哪些 .c 源文件
+    INCLUDE_DIRS "."                          # 头文件搜索路径
+    REQUIRES driver esp_wifi nvs_flash       # 依赖哪些组件
+)
+
+target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Werror)
+# 最后一行打开所有警告并当错误处理，强烈推荐——警告就是还没爆的 bug
+```
+
+- **`SRCS`**：新增 .c 文件后必须加进来，否则它**根本不会被编译**（典型惨案：写了新文件、编译通过、运行时 `undefined reference`——因为文件压根没参与编译）
+- **`REQUIRES`**：声明"我用到了哪些官方组件"。写错直接编译失败，详见 [组件模型](../l2-programming-model/component-cmake)
+- 最后一行的 `-Werror`：把警告升级为错误。初学会被它烦到，但它逼着你写出干净代码，值得
+
+## 4. menuconfig 关键配置
+
+```bash
+idf.py menuconfig
+```
+
+操作方式：上下键移动、回车进入、ESC 返回、按 `/` 直接搜索配置项（最好用——搜 "psram" 直接跳到相关配置）。
+
+| 路径 | 项 | 建议值 | 不对的后果 |
+| --- | --- | --- | --- |
+| Serial flasher config | Flash size | 与模组一致（16MB） | 偏小 → 文件系统/OTA 不够用 |
+| Component config → ESP PSRAM | Support for external RAM | 打开（勾选 Octal PSRAM） | 8MB PSRAM 白买了，大数组全失败 |
+| Partition Table | 分区方案 | 自定义（见 [分区表章节](../l2-programming-model/partition-ota)） | 默认 1MB app 装不下 WiFi+BLE 固件 |
+| Component config → ESP System Settings | CPU frequency | 240 MHz | 白瞎性能 |
+| Component config → Log output | Default log verbosity | 开发 Debug / 发布 Info | 发布版日志刷屏费电 |
+
+**改完配置一定要 `idf.py fullclean && idf.py build`**——因为部分配置只影响编译初期生成的文件，缓存不清理就不会重新生成，出现"配置没生效"的诡异现象。
+
+## 5. 最小可运行示例：Blink
+
+```c
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "driver/gpio.h"
+
+static const char *TAG = "MAIN";
+
+void app_main(void) {
+    // 1. 配置 GPIO4 为输出（结构体 + 指定初始化器，L0 讲过）
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << GPIO_NUM_4,   // 位掩码：要配置哪些脚（第 4 位是 1）
+        .mode         = GPIO_MODE_OUTPUT,     // 输出模式
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,    // 不用中断
+    };
+    ESP_ERROR_CHECK(gpio_config(&io));        // &io：把配置"递房间号"给 API
+    ESP_LOGI(TAG, "配置完成");
+
+    // 2. 死循环：亮 0.5 秒、灭 0.5 秒
+    while (1) {
+        gpio_set_level(GPIO_NUM_4, 1);
+        vTaskDelay(pdMS_TO_TICKS(500));       // 让出 CPU 500ms（L2 细讲）
+        gpio_set_level(GPIO_NUM_4, 0);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+```
+
+跑起来后：LED 每秒闪一次，`monitor` 里每隔一秒打印一行日志。
+
+**这个 30 行的程序里，藏着后面所有章节的四个模式**，先认个脸：
+
+1. **`#include "driver/gpio.h"`**——用官方组件，配 `REQUIRES driver`（组件模型）
+2. **结构体 + 指定初始化器 + 传指针**——几乎所有 IDF 配置 API 的统一形态
+3. **`ESP_ERROR_CHECK`**——错误检查宏（L0 的 esp_err_t）
+4. **`vTaskDelay`**——FreeRTOS 的延时（L2 主角）
+
+注意：`app_main` 里直接写 `while(1)` 是官方例程的常见写法，**正式项目应该开任务**，原因见 [FreeRTOS 章节](../l2-programming-model/freertos)。
+
+### 出了问题往哪查
+
+| 现象 | 原因 |
+| --- | --- |
+| `error: 'driver/gpio.h' file not found` | main/CMakeLists.txt 的 REQUIRES 漏了 driver |
+| 烧录时报 `Failed to connect` | 端口不对；板子被别的程序占着（关掉其他串口窗口）；按住 BOOT 再烧 |
+| 灯不闪但日志正常 | LED 接的引脚和代码不一致；LED 正负接反（换向再试） |
+| monitor 全是乱码 | 波特率不对（monitor 默认 115200 正确的话，检查程序里改没改）；或供电不稳 |
+
+## 6. 官方示例：最好的教科书
+
+IDF 自带 200 多个可编译示例，覆盖所有外设和协议：
+
+```bash
+ls $IDF_PATH/examples                      # 全部列出来逛一逛
+ls $IDF_PATH/examples/peripherals/gpio    # 某个主题的全部示例
+```
+
+把示例复制到自己目录再改（别在 IDF 目录里直接改）：
+
+```bash
+cp -r $IDF_PATH/examples/peripherals/gpio/generic_gpio ./my_gpio
+cd my_gpio && idf.py set-target esp32s3 && idf.py build
+```
+
+**"永远从 example 开始改，不要从零写"**——这是 L4 外设调试的第一原则，现在就养成习惯：每学一个外设，先把官方示例烧进去跑通，再改成自己的需求。
+
+## 下一步
+
+[L2 编程模型](../l2-programming-model/) —— 整套教程的核心章节。

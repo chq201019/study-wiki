@@ -1,0 +1,291 @@
+---
+id: profiler
+title: 性能分析：perf 与火焰图
+sidebar_position: 16
+description: DWT 与 GPIO 翻转如何精确测量、被中断干扰时怎么排除、编译优化对测量的影响、以及嵌入式性能优化的三条实用路径。
+---
+
+# 嵌入式性能测量
+
+**本课目标**：能精确测出一段代码的真实耗时，不被优化和中断骗。
+
+## 三种测量手段
+
+| 手段 | 精度 | 侵入性 | 需要工具 |
+| --- | --- | --- | --- |
+| **DWT 周期计数器** | **1 个周期** | 极小 | 无需外部工具 |
+| **GPIO 翻转 + 示波器** | 纳秒级 | 2 条 IO 指令 | **示波器** |
+| 系统滴答（`HAL_GetTick`） | 1 ms | 小 | 无 |
+
+:::danger[`HAL_GetTick()` 只能测毫秒级]
+```c
+uint32_t t0 = HAL_GetTick();
+do_work();
+uint32_t dt = HAL_GetTick() - t0;     /* 精度只有 1ms */
+```
+
+**测 100µs 的代码会得到 0 或 1** —— 完全没意义。
+
+**微秒及以下必须用 DWT 或示波器。**
+:::
+
+## DWT：Cortex-M 内置的免费秒表
+
+```c
+void dwt_init(void)
+{
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;   /* 使能跟踪 */
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;              /* 启动计数器 */
+}
+
+static inline uint32_t dwt_now(void) { return DWT->CYCCNT; }
+```
+
+```c
+dwt_init();
+
+uint32_t t0 = dwt_now();
+do_work();
+uint32_t cycles = dwt_now() - t0;
+
+printf("耗时 %lu 周期 = %lu us\n", cycles, cycles / (SystemCoreClock / 1000000));
+```
+
+:::warning[三个必须注意的点]
+**① 溢出**：32 位计数器在 72MHz 下约 **59 秒**回绕一次。
+
+**用无符号减法能自动处理回绕**（只要单次测量不跨多次回绕）：
+
+```c
+uint32_t cycles = dwt_now() - t0;     /* ✅ 回绕时也正确 */
+```
+
+**② 测量本身有开销**：`dwt_now()` 是几条指令（5~10 周期）。测极短代码时要减掉。
+
+**③ 不同芯片可能没实现**：少数 Cortex-M0 没有 DWT，要查手册。
+:::
+
+## GPIO 翻转 + 示波器
+
+```c
+GPIOC->BSRR = GPIO_BSRR_BS13;      /* 拉高 */
+do_work();
+GPIOC->BSRR = GPIO_BSRR_BR13;      /* 拉低 */
+```
+
+:::tip[这是嵌入式最经典的性能测量手段]
+**优点**：
+
+- **几乎不影响被测代码**（只多两条 IO 写）
+- **能看到抖动和分布**（不只是一个平均值）
+- **能同时测多段**（用不同引脚）
+- **不需要改代码逻辑**（临时加两行，测完删掉）
+
+**缺点**：需要示波器或逻辑分析仪。
+:::
+
+:::warning[用 BSRR 而不是 ODR]
+```c
+GPIOA->ODR |= (1 << 5);        /* ❌ 读-改-写，多几个周期 */
+GPIOA->BSRR = (1 << 5);        /* ✅ 单次写，原子且快 */
+```
+
+**测量代码本身要尽量轻** —— 否则你测的是"IO 翻转 + 业务逻辑"。
+:::
+
+## 排除中断的干扰
+
+:::danger[中断会污染测量结果]
+```c
+uint32_t t0 = dwt_now();
+do_work();                    /* 中途被打断 3 次，每次 20µs */
+uint32_t cycles = dwt_now() - t0;   /* ❌ 结果包含 60µs 中断时间 */
+```
+
+**三种处理方式**：
+:::
+
+**① 测量时关中断（最直接）**
+
+```c
+__disable_irq();
+uint32_t t0 = dwt_now();
+do_work();
+uint32_t cycles = dwt_now() - t0;
+__enable_irq();
+```
+
+:::warning[关中断会改变被测代码的行为]
+**如果被测代码依赖中断（比如等 DMA 完成中断），关中断会导致死等。**
+
+**只适合"纯计算"的测量。**
+:::
+
+**② 多次测量取最小值**
+
+```c
+uint32_t best = UINT32_MAX;
+for (int i = 0; i < 100; i++) {
+    uint32_t t0 = dwt_now();
+    do_work();
+    uint32_t d = dwt_now() - t0;
+    if (d < best) best = d;
+}
+```
+
+:::tip["最小值"最接近真实耗时]
+**因为中断只会让耗时变长，不会变短。**
+
+**取最小值 = 剔除了所有中断干扰的那一次测量。**
+:::
+
+**③ 统计中断次数并扣除**
+
+```c
+/* 在 SysTick / 定时器中断里累加计数 */
+volatile uint32_t g_irq_count;
+
+/* 测量前后对比，乘以平均中断耗时 */
+```
+
+**最麻烦但最精确** —— 适合需要报告"平均 + 最坏情况"的场景。
+
+## 编译优化对测量的影响
+
+:::danger[`-O2` 下很多测量会失效]
+```c
+/* ❌ 整个循环可能被优化掉 */
+uint32_t t0 = dwt_now();
+for (int i = 0; i < 1000; i++) { }
+uint32_t cycles = dwt_now() - t0;    /* 结果接近 0 */
+```
+
+**编译器发现循环没有副作用 → 直接删除。**
+
+**解决**：
+
+```c
+for (volatile int i = 0; i < 1000; i++) { }     /* volatile 阻止优化 */
+```
+
+**但这已经不是"真实代码"的性能了。**
+:::
+
+:::warning[被测函数可能被内联或常量折叠]
+```c
+static int square(int x) { return x * x; }
+
+uint32_t t0 = dwt_now();
+int r = square(5);            /* ❌ 编译期就算出 25，运行时零开销 */
+uint32_t cycles = dwt_now() - t0;
+```
+
+**要测真实调用开销**：
+
+```c
+volatile int input = 5;       /* 让编译器无法预知 */
+int r = square(input);
+```
+
+**或者用 `__attribute__((noinline))` 阻止内联。**
+:::
+
+## 三条优化路径
+
+:::tip[按收益排序]
+**① 换算法/数据结构**（收益 10~1000 倍）
+
+**② 把热点循环放 RAM 执行**
+
+Flash 有等待周期（72MHz 下要插 2 个），RAM 没有。
+:::
+
+```c
+/* 放到 RAM 执行（F1 需链接脚本配合） */
+__attribute__((section(".ramfunc"))) void hot_loop(void) { ... }
+```
+
+```ld
+/* 链接脚本 */
+.ramfunc :
+{
+  . = ALIGN(4);
+  *(.ramfunc)
+  . = ALIGN(4);
+} >RAM AT> FLASH
+```
+
+:::tip[**③ 查表代替实时计算**]
+```c
+/* 91 个 int16 = 182 字节，换几十倍速度 */
+static const int16_t sin_table[91] = { 0, 286, 572, ... };
+
+int16_t fast_sin(uint16_t deg)
+{
+    deg %= 360;
+    if (deg <= 90)  return sin_table[deg];
+    if (deg <= 180) return sin_table[180 - deg];
+    if (deg <= 270) return -sin_table[deg - 180];
+    return -sin_table[360 - deg];
+}
+```
+
+**在 F103（无 FPU）上，`sinf()` 约 800 周期，查表约 20 周期。**
+:::
+
+:::danger[不要过早优化]
+**先把代码写正确、可读，再优化。**
+
+**只有`测量证明是热点`的地方才优化，并且要在代码里写清理由**：
+
+```c
+/* 这里用查表而不是 sinf()：
+ * 每 100us 调用一次，sinf() 需约 800 周期，
+ * 查表只需约 20 周期，实测让主循环周期从 130us 降到 45us。
+ */
+```
+
+**没有注释的优化，半年后连你自己都不敢改。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| DWT 测出 0 | 没使能 TRCENA/CYCCNTENA | 按顺序初始化 |
+| DWT 结果乱跳 | 溢出了 | 用无符号减法并缩短测量 |
+| 测出的时间不稳定 | 被中断打断 | 取最小值或关中断 |
+| 循环测出 0 周期 | `-O2` 优化掉了 | 加 `volatile` |
+| 函数测出 0 周期 | 被内联/常量折叠 | `volatile` 输入或 `noinline` |
+| 换 `-O2` 后行为变了 | 依赖了未定义行为 | 修代码，别降优化级别 |
+| 查表反而更慢 | 表太大导致 Flash 缺页 | 表放 RAM 或缩小 |
+| 优化后没变快 | 优化了非热点 | 先测量 |
+
+:::warning[`SystemCoreClock` 可能不是你想要的]
+```c
+cycles / (SystemCoreClock / 1000000)     /* 换算成 µs */
+```
+
+**如果手写了时钟配置却没调 `SystemCoreClockUpdate()`，这个值是错的** → 换算结果整体偏差。
+
+（[时钟系统深入](./clock-deep) 讲过这个陷阱。）
+:::
+
+## 本课自检
+
+- [ ] **知道 `HAL_GetTick` 只能测毫秒级**
+- [ ] 会用 DWT 周期计数器并正确初始化
+- [ ] **知道 DWT 在 72MHz 下约 59 秒溢出，无符号减法可自动处理**
+- [ ] **知道用 GPIO 翻转 + 示波器能看出抖动分布**
+- [ ] 知道翻转要用 BSRR 而非 ODR
+- [ ] **知道中断会污染测量，取最小值最能反映真实耗时**
+- [ ] 知道关中断测量的适用边界
+- [ ] **知道 `-O2` 会删掉空循环、内联函数、常量折叠**
+- [ ] 会用 `volatile` 与 `noinline` 对抗优化
+- [ ] 知道三条优化路径（换算法 / 放 RAM / 查表）
+- [ ] **知道 `SystemCoreClock` 不对会导致换算全错**
+
+## 下一步
+
+[内存管理深入](../../hardware/linux/memory-deep) 或 [多线程与原子操作](../../software/c/concurrency)。

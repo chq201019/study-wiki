@@ -1,0 +1,353 @@
+---
+id: 06-first-project
+title: 06 第一个工程：CubeMX 生成
+sidebar_position: 6
+description: 从头走一遍：新建工程、配 PC13 输出、配时钟到 72MHz、生成代码、编译、烧录、看到灯亮。
+---
+
+# 06 第一个工程：CubeMX 生成
+
+**本课目标**：完整走一遍从零到点灯，每一步都截图式的说明。
+
+## 目标
+
+让蓝板上**板载 LED（PC13）每 500 ms 闪一次**。
+
+:::info[为什么先点板载 LED]
+**不需要接任何线**，纯粹验证"工具链 + 烧录 + 代码"这条链路。
+
+等这条链路通了，再接外接 LED 或传感器。
+:::
+
+## 第一步：新建工程
+
+```text
+File → New → STM32 Project
+```
+
+在弹出的"目标选择器"里：
+
+1. 点 **MCU/MPU Selector** 标签
+2. 搜索框输入 **STM32F103C8**
+3. 在右侧列表里选中 `STM32F103C8Tx`
+4. 点 **Next**
+
+:::warning[选错芯片会怎样]
+Flash/RAM 大小、外设数量都会不对，**编译可能通过但运行异常**。
+
+**选完在右侧信息栏确认**：
+
+```text
+Flash: 64 KB
+RAM:   20 KB
+```
+
+（如果是 128 KB / 20 KB，那是 C8T6 的高容量兼容型号，通常也能用。）
+:::
+
+### 填工程信息
+
+| 字段 | 填什么 |
+| --- | --- |
+| **Project Name** | `blink`（**纯英文，不带空格**） |
+| **Project Location** | `D:\stm\`（**纯英文路径**） |
+| Application Structure | Basic（默认） |
+| Toolchain / IDE | STM32CubeIDE（默认） |
+
+点 **Finish**，会问"是否初始化外设为默认值"→ 选 **Yes**。
+
+## 第二步：配置 PC13 为输出
+
+工程建好后，中间会显示**芯片引脚图**（一个方块有很多引脚）。
+
+1. 在图上**找到 PC13**（引脚 2 的位置，通常标注 `PC13`）
+2. **左键点它** → 弹出菜单 → 选 **GPIO_Output**
+
+:::tip[怎么快速找到 PC13]
+有两个办法：
+
+- **在引脚图上找**：芯片左侧靠上的位置
+- **在左下角"引脚搜索"里输入 `PC13`**，会高亮定位
+
+（蓝板上的板载 LED 就接在 PC13，且是**低电平点亮**。）
+:::
+
+### 细化配置（可选但建议）
+
+左侧 **System Core → GPIO** → 点 `PC13` 那一行：
+
+| 参数 | 设为 | 原因 |
+| --- | --- | --- |
+| GPIO output level | **Low** | 上电默认亮（低电平点亮） |
+| GPIO mode | Output Open Drain 或 Push Pull | 推挽即可 |
+| **Maximum output speed** | Low | LED 不需要高速，降低干扰 |
+| User Label | `LED` | **生成 `LED_Pin` 宏，代码更可读** |
+
+:::tip[设置 User Label 的好处]
+填了 `LED` 之后，生成的代码里会有：
+
+```c
+#define LED_Pin GPIO_PIN_13
+#define LED_GPIO_Port GPIOC
+```
+
+**代码里写 `HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin)`**，比写死 `GPIOC, GPIO_PIN_13` 清晰得多。
+
+**换引脚时只要改配置，不用改代码。**
+:::
+
+## 第三步：配时钟到 72 MHz
+
+这是 STM32 必做、ESP32 不用做的一步。
+
+打开 **Clock Configuration** 标签页（顶部）。
+
+### 最简单的做法
+
+在 **HCLK (MHz)** 输入框里**直接填 `72`**，然后回车。
+
+CubeMX 会**自动算出** PLL 倍频和分频参数，并提示：
+
+```text
+Do you want to run the automatic clock solver?  → Yes
+```
+
+:::danger[如果自动求解失败]
+通常是因为**外部晶振（HSE）没配**。
+
+先到 **Pinout 视图**，找到 `RCC` → **High Speed Clock (HSE)** → 选 **Crystal/Ceramic Resonator**。
+
+蓝板上有一颗 8 MHz 晶振，所以选 Crystal 是对的。
+
+**如果你的板子没有晶振**（有些最小系统板省了），就选 `Bypass` 或改用内部 HSI。
+:::
+
+### 配完检查
+
+```text
+Input frequency:  8 MHz（HSE）
+PLL Source:       HSE
+PLLMul:           ×9
+SYSCLK:           72 MHz
+AHB Prescaler:    /1  → 72 MHz
+APB1 Prescaler:   /2  → 36 MHz   ← APB1 最高只能 36MHz！
+APB2 Prescaler:   /1  → 72 MHz
+```
+
+:::warning[APB1 不能超过 36 MHz]
+STM32F103 的 **APB1 总线最高 36 MHz**（APB2 是 72 MHz）。
+
+CubeMX 会自动加 `/2` 分频。**如果你手动改成 /1，会配出超频的时钟，外设行为异常。**
+
+**规矩：用自动求解，别手动改分频。**
+:::
+
+## 第四步：生成代码
+
+```text
+Project → Generate Code   （或点工具栏的齿轮图标）
+```
+
+第一次生成会问是否下载固件包，选 Yes（或提前装好）。
+
+生成成功后，左侧 `Core/Src/main.c` 就是你的主文件。
+
+:::tip[生成时会保留你的代码]
+CubeMX 只在特定注释之间插入代码，**你自己写的部分不会丢**：
+
+```c
+/* USER CODE BEGIN 2 */
+你的代码写在这里，重新生成不会被删
+/* USER CODE END 2 */
+```
+
+**规矩：所有自己的代码都写在 `USER CODE BEGIN/END` 之间**，否则重新生成就会被覆盖。
+
+（[第 7 课](./07-understand-code)详细讲这些区块。）
+:::
+
+## 第五步：写点灯逻辑
+
+打开 `Core/Src/main.c`，找到 `while (1)`：
+
+```c
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);   /* 翻转 LED */
+      HAL_Delay(500);                                /* 等 500ms */
+
+      /* USER CODE END WHILE */
+
+      /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+```
+
+:::danger[代码要写在 USER CODE 区块里]
+```c
+  while (1)
+  {
+    /* USER CODE BEGIN WHILE */
+    HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+    HAL_Delay(500);
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+```
+
+**如果你的代码写在这两个区块外面，下次 CubeMX 重新生成时会被删掉。**
+
+**这是新手最常丢代码的原因。**
+:::
+
+## 第六步：编译
+
+```text
+Project → Build Project   （Ctrl+B）
+```
+
+控制台应该出现：
+
+```text
+Build Finished. 0 errors, 0 warnings
+```
+
+:::warning[如果报错找不到 `LED_Pin`]
+说明你**没设 User Label**（第三步的细化配置）。
+
+两个选择：
+
+- 回到 `.ioc` 补上 Label，重新生成
+- 或者代码里直接写 `GPIOC, GPIO_PIN_13`
+
+**推荐补 Label**，以后好维护。
+:::
+
+## 第七步：烧录与运行
+
+### 方式一：在 IDE 里点运行
+
+```text
+Run → Run   （或点工具栏的绿色播放按钮）
+```
+
+第一次会让你选调试器配置，选 **STM32 C/C++ Application** → 确认 ST-Link。
+
+### 方式二：点调试（能单步）
+
+```text
+Run → Debug   （或点小虫子图标）
+```
+
+会问是否切换到 Debug 视图 → Yes。
+
+烧录后程序停在 `main()` 开头，你可以：
+
+| 操作 | 快捷键 |
+| --- | --- |
+| 单步跳过（不进函数） | `F6` |
+| 单步进入 | `F5` |
+| 继续运行 | `F8` |
+| 暂停 | 点暂停按钮 |
+
+:::tip[第一次建议用 Debug 而不是 Run]
+**能看到程序真的在跑**——单步几下，观察 PC13 的寄存器值变化。
+
+**这是 ESP32 体验不到的**（[第 2 课](./02-vs-esp32)讲过）。
+:::
+
+## 预期现象
+
+:::tip[蓝板 LED 每 500ms 亮灭]
+**注意：PC13 是低电平点亮**。
+
+所以：
+- `GPIO_PIN_RESET`（低）→ **亮**
+- `GPIO_PIN_SET`（高）→ **灭**
+
+**用 `HAL_GPIO_TogglePin` 就不用关心这个**——它只翻转。
+:::
+
+## 完整代码（供对照）
+
+`Core/Src/main.c` 里关键部分（CubeMX 生成 + 你的两行）：
+
+```c
+int main(void)
+{
+  HAL_Init();                     /* HAL 库初始化 */
+  SystemClock_Config();           /* 时钟配到 72MHz（CubeMX 生成） */
+  MX_GPIO_Init();                 /* GPIO 初始化（CubeMX 生成） */
+
+  while (1)
+  {
+      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+      HAL_Delay(500);
+  }
+}
+```
+
+:::info[为什么只有三行初始化]
+因为**这个工程只用了 GPIO**。
+
+接上串口、定时器、ADC 之后，`main()` 里会多出 `MX_USART1_UART_Init()`、`MX_TIM2_Init()` 等等——**都是 CubeMX 生成的，你不用手写**。
+:::
+
+## 改一改：三个实验
+
+:::tip[实验比读代码有用]
+**① 改闪烁频率**
+
+`HAL_Delay(500)` → `100`（很快）、`2000`（很慢）。重新 Build + Run。
+
+**② 改成常亮**
+
+```c
+HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);   /* 低电平亮 */
+while (1) { }
+```
+
+**③ 用调试器看变量**
+
+```c
+uint32_t cnt = 0;
+while (1) {
+    cnt++;
+    HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+    HAL_Delay(500);
+}
+```
+
+在 Debug 里把 `cnt` 加到 Watch 窗口，**每 500ms 看它加一**——这是 ESP32 做不到的体验。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 代码写在 USER CODE 外 | 重新生成后丢了 | 被覆盖 | 写进区块内 |
+| `LED_Pin` 未定义 | 编译报错 | 没设 User Label | 补 Label 或写死 |
+| 灯一直不亮 | 反转逻辑 | PC13 低电平点亮 | 用 `TogglePin` |
+| 时钟没配 | 闪得极慢 | 跑在 8MHz | Clock Configuration 配 72MHz |
+| APB1 手动改 /1 | 外设异常 | 超 36MHz 上限 | 用自动求解 |
+| 烧录失败 | 连不上 | ST-Link 问题 | 见[第 4 课](./04-hardware) |
+| 中文路径 | 编译/生成失败 | 工具链限制 | 换纯英文路径 |
+
+## 本课自检
+
+- [ ] 会新建工程并正确选芯片
+- [ ] 会在引脚图上把 PC13 设为 GPIO_Output
+- [ ] **会设 User Label，生成 `LED_Pin` 宏**
+- [ ] **会在 Clock Configuration 把 HCLK 填 72 并自动求解**
+- [ ] **知道 APB1 最高 36MHz**
+- [ ] 会 Generate Code / Build / Run
+- [ ] **知道自己的代码必须写在 `USER CODE BEGIN/END` 之间**
+- [ ] 会用 Debug 单步执行
+- [ ] **知道 PC13 是低电平点亮**
+- [ ] 做出灯每 500ms 闪一次
+
+## 下一步
+
+[07 读懂生成的代码](./07-understand-code) —— 那几百行初始化到底在干什么。

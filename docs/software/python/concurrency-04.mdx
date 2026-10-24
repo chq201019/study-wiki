@@ -1,0 +1,74 @@
+---
+id: concurrency-04
+title: "04 验证：预测这些行为"
+sidebar_position: 5
+description: "并发 第 4 部分：验证：预测这些行为"
+---
+
+# 04 验证：预测这些行为
+```python
+import threading
+
+counter = 0
+def bump():
+    global counter
+    for _ in range(100_000):
+        counter += 1
+
+ts = [threading.Thread(target=bump) for _ in range(4)]
+for t in ts: t.start()
+for t in ts: t.join()
+print(counter)          # 一定是 400000 吗？
+```
+
+:::info[答案]
+**不一定，而且你绝不能依赖它。**
+
+在 Python 3.11.9 上，这个特定写法碰巧会得到 `400000`（因为切换点不在读-写之间）。但：
+
+- 换个 Python 版本可能就错
+- 循环体里加一个函数调用就可能错
+- 线程数更多时更容易错
+
+**正确的心态是**：把 `counter += 1` 视为不安全，一律加锁或用 `queue`。靠运气正确的代码，是最难排查的 bug 来源——它会在你最不期待的时候失败。
+:::
+
+## 常见坑
+
+| 现象 | 真实原因 | 解决 |
+| --- | --- | --- |
+| 多线程跑 CPU 任务反而更慢 | GIL + 上下文切换开销 | 用 `ProcessPoolExecutor` |
+| Windows 上多进程报 bootstrapping 错 | `spawn` 重新导入主模块，没加 `__main__` 保护 | 把所有进程创建代码放进 `if __name__ == "__main__":` |
+| `PicklingError: Can't pickle <lambda>` | lambda / 局部函数不能序列化 | 改用模块级函数 |
+| asyncio 里所有任务一起卡住 | 用了 `time.sleep` / `requests` 等同步阻塞调用 | 用 `await asyncio.sleep` / `aiohttp` |
+| `await coro` 没有并发效果 | await 是等待，不是并发 | 用 `gather` / `create_task` / `TaskGroup` |
+| 共享计数器结果偏小 | check-then-act 竞态 | 加锁，或用 `queue` |
+| 多进程改了全局变量没生效 | 进程内存独立 | 用 `Queue` / `Value` / `Manager` 通信 |
+| 线程数开到几百个后变慢甚至失败 | 每线程约 8MB 栈，且调度开销大 | 用线程池限制数量，或转 asyncio |
+| 死锁 | 多个锁获取顺序不一致 | 固定获取顺序；或用 `RLock` |
+| 以为 GIL 保证线程安全 | GIL 只保护解释器，不保护业务逻辑 | 复合操作一律加锁 |
+| `fork` 后子程序挂死 | 继承了父进程的锁状态 | 用 `spawn` 或 `forkserver` |
+
+## 自检清单
+
+- [ ] 能解释 GIL 存在的原因（引用计数不是线程安全的）
+- [ ] 能说清 GIL 在什么情况下会释放
+- [ ] 知道 IO 密集用线程、CPU 密集用进程，且能引用实测数据
+- [ ] 知道「GIL 不保证业务逻辑原子性」，并能举例
+- [ ] 会用 `ThreadPoolExecutor` 和 `ProcessPoolExecutor`
+- [ ] 知道 Windows 上多进程必须加 `if __name__ == "__main__":`
+- [ ] 能解释 `await` 是让出控制权，以及阻塞调用会卡住整个事件循环
+- [ ] 知道 `gather` / `create_task` / `TaskGroup` 的区别
+- [ ] 知道 `TaskGroup` 会在一个任务失败时取消其他任务
+- [ ] 能对着一个具体场景说出该选哪种并发模型
+- [ ] 知道哪些单字节码操作是原子的（list.append 等）
+
+## 下一步
+
+并发的细节需要标准库配合，接下来：[标准库精讲](./stdlib)。
+
+**参考链接**：[threading 文档](https://docs.python.org/zh-cn/3/library/threading.html) · [multiprocessing 文档](https://docs.python.org/zh-cn/3/library/multiprocessing.html) · [asyncio 文档](https://docs.python.org/zh-cn/3/library/asyncio.html) · [concurrent.futures](https://docs.python.org/zh-cn/3/library/concurrent.futures.html) · [Python FAQ：GIL](https://docs.python.org/zh-cn/3/faq/library.html#can-t-we-get-rid-of-the-global-interpreter-lock)
+
+---
+
+**翻页**：[← 上一页](./concurrency-03) · [返回目录](./)

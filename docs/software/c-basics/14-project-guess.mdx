@@ -1,0 +1,353 @@
+---
+id: 14-project-guess
+title: 14 阶段实战：猜数字游戏
+sidebar_position: 14
+description: 用前 9 课的知识做一个完整可玩的猜数字游戏，含随机数、输入校验、范围提示和次数统计。
+---
+
+# 14 阶段实战：猜数字游戏
+
+**本课目标**：把变量、输入输出、条件、循环、类型转换**全部串起来**，做出一个真正能玩的程序。
+
+## 游戏规则
+
+电脑随机想一个 1~100 的数字，你来猜：
+
+- 猜小了 → 提示「小了」
+- 猜大了 → 提示「大了」
+- 猜中 → 结束，告诉你猜了几次
+
+## 第一步：生成随机数
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+int main(void) {
+    srand((unsigned)time(NULL));      /* 用当前时间做种子 */
+    int target = rand() % 100 + 1;    /* 1~100 */
+
+    printf("答案是 %d\n", target);
+    return 0;
+}
+```
+
+运行几次，每次都不同。
+
+:::danger[必须调 `srand()`，否则每次一样]
+```c
+int target = rand() % 100 + 1;      /* ❌ 每次运行都是同一个数 */
+```
+
+`rand()` 产生的是**伪随机数列**，如果不设种子，每次运行都从同一个起点开始——**同一个程序每次生成的数字完全一样**。
+
+**正确做法**：
+
+```c
+srand((unsigned)time(NULL));    /* 用当前时间当种子，每次都不同 */
+```
+
+**只需要在程序开头调用一次**，不要在循环里反复 `srand`。
+:::
+
+### `rand() % 100 + 1` 是什么
+
+| 部分 | 作用 |
+| --- | --- |
+| `rand()` | 返回 0 到 `RAND_MAX` 之间的伪随机整数 |
+| `% 100` | 取余，得到 0~99 |
+| `+ 1` | 平移到 1~100 |
+
+:::tip[通用公式：生成 [a, b] 范围的随机数]
+```c
+int random_range(int a, int b) {
+    return a + rand() % (b - a + 1);
+}
+```
+
+`rand() % (b-a+1)` 得到 `0 ~ (b-a)`，加上 `a` 就是 `a ~ b`。
+
+**注意括号**：`b - a + 1` 不能写成 `b - a`（会少一个值）。
+:::
+
+## 第二步：读入一次猜测
+
+```c
+int guess;
+printf("猜一个 1-100 的数字：");
+
+if (scanf("%d", &guess) != 1) {
+    printf("输入无效\n");
+    return 1;
+}
+
+if (guess == target) {
+    printf("猜对了！\n");
+} else if (guess < target) {
+    printf("小了\n");
+} else {
+    printf("大了\n");
+}
+```
+
+:::warning[`scanf` 要检查返回值]
+```c
+scanf("%d", &guess);              /* ⚠️ 如果用户输入 "abc" 会怎样？ */
+if (scanf("%d", &guess) != 1) {   /* ✅ 返回成功读取的项数 */
+```
+
+`scanf` 返回**成功读取的变量个数**。输入不是数字时返回 0，我们要处理这种情况。
+
+**不检查的话，`guess` 是未初始化的垃圾值**，后续判断全乱。
+:::
+
+## 第三步：让它一直猜
+
+```c
+while (1) {
+    int guess;
+    printf("猜一个 1-100 的数字：");
+
+    if (scanf("%d", &guess) != 1) {
+        printf("请输入整数！\n");
+        /* 清空输入缓冲区，防止死循环 */
+        while (getchar() != '\n');
+        continue;
+    }
+
+    if (guess == target) {
+        printf("猜对了！\n");
+        break;
+    } else if (guess < target) {
+        printf("小了\n");
+    } else {
+        printf("大了\n");
+    }
+}
+```
+
+:::danger[`scanf` 失败后不清缓冲区会死循环]
+```c
+while (1) {
+    if (scanf("%d", &g) != 1) {
+        printf("请输入数字\n");
+        continue;            /* ❌ 死循环！ */
+    }
+}
+```
+
+**原因**：用户输入 `abc`，`scanf` 读不走它，`abc` 一直留在输入缓冲区。下次循环 `scanf` 又读同一个 `abc`，又失败——**无限打印提示**。
+
+**解决**：清空缓冲区
+
+```c
+while (getchar() != '\n');      /* 把这一行剩下的字符全吃掉 */
+```
+
+`getchar()` 一次读一个字符，循环到读到换行为止。
+:::
+
+## 第四步：加范围提示
+
+只提示"大了/小了"帮助有限。**告诉用户有效范围**体验好得多：
+
+```c
+int low = 1, high = 100;
+
+while (1) {
+    printf("请输入 %d-%d：", low, high);
+    int guess;
+
+    if (scanf("%d", &guess) != 1) {
+        printf("请输入整数！\n");
+        while (getchar() != '\n');
+        continue;
+    }
+
+    /* 超出已确定范围，不计入次数 */
+    if (guess < low || guess > high) {
+        printf("超出范围了，请在 %d 到 %d 之间猜\n", low, high);
+        continue;
+    }
+
+    if (guess == target) {
+        printf("猜对了！\n");
+        break;
+    } else if (guess < target) {
+        low = guess + 1;        /* 范围内缩小 */
+        printf("小了，再大一点\n");
+    } else {
+        high = guess - 1;
+        printf("大了，再小一点\n");
+    }
+}
+```
+
+:::tip[为什么 `low = guess + 1` 而不是 `low = guess`]
+因为已经知道 `guess` 本身**不是答案**（前面判断过了），所以下一个最小值应该是 `guess + 1`。
+
+**这个细节让范围收得更快**，玩家少猜几次。
+:::
+
+## 第五步：统计次数
+
+```c
+int attempts = 0;
+/* 每次有效猜测后 */
+attempts++;
+```
+
+## 完整版
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+#define MIN_NUM 1
+#define MAX_NUM 100
+
+void clear_input(void) {
+    while (getchar() != '\n') {
+        /* 丢弃这一行剩余字符 */
+    }
+}
+
+int main(void) {
+    srand((unsigned)time(NULL));
+
+    int target = MIN_NUM + rand() % (MAX_NUM - MIN_NUM + 1);
+    int low = MIN_NUM, high = MAX_NUM;
+    int attempts = 0;
+    int guess;
+
+    printf("=====================\n");
+    printf("   猜数字游戏\n");
+    printf("=====================\n");
+    printf("我想好了一个 %d~%d 的数字\n\n", MIN_NUM, MAX_NUM);
+
+    while (1) {
+        printf("[第 %d 次] 请输入 %d-%d：", attempts + 1, low, high);
+
+        if (scanf("%d", &guess) != 1) {
+            printf("  这不是整数，请重新输入\n");
+            clear_input();
+            continue;
+        }
+
+        if (guess < low || guess > high) {
+            printf("  超出范围，请输入 %d 到 %d 之间\n", low, high);
+            continue;
+        }
+
+        attempts++;
+
+        if (guess == target) {
+            printf("\n  猜对了！答案是 %d\n", target);
+            printf("  你一共猜了 %d 次\n", attempts);
+
+            if (attempts <= 3) {
+                printf("  太强了，简直二分查找本查！\n");
+            } else if (attempts <= 6) {
+                printf("  不错，思路很清晰\n");
+            } else if (attempts <= 9) {
+                printf("  还行，再练练\n");
+            } else {
+                printf("  有点慢哦，试试每次猜中间值\n");
+            }
+            break;
+        } else if (guess < target) {
+            low = guess + 1;
+            printf("  小了，再大一点\n");
+        } else {
+            high = guess - 1;
+            printf("  大了，再小一点\n");
+        }
+    }
+
+    printf("\n游戏结束\n");
+    return 0;
+}
+```
+
+### 运行示例
+
+```text
+=====================
+   猜数字游戏
+=====================
+我想好了一个 1~100 的数字
+
+[第 1 次] 请输入 1-100：50
+  小了，再大一点
+[第 2 次] 请输入 51-100：75
+  小了，再大一点
+[第 3 次] 请输入 76-100：88
+  大了，再小一点
+[第 4 次] 请输入 76-87：82
+  猜对了！答案是 82
+  你一共猜了 4 次
+  不错，思路很清晰
+
+游戏结束
+```
+
+## 这段代码用了哪些知识点
+
+| 代码 | 知识点 | 出自 |
+| --- | --- | --- |
+| `int target;` | 变量声明 | [05](./05-variables) |
+| `rand() % 100 + 1` | 整数运算、取余 | [06](./06-integers)、[09](./09-operators) |
+| `if / else if / else` | 条件判断 | [10](./10-if) |
+| `while (1)` + `break` | 循环控制 | [11](./11-loops) |
+| `scanf("%d", &guess)` | 格式化输入 | [08](./08-printf) |
+| `while (getchar() != '\n')` | 字符输入、循环 | [11](./11-loops) |
+| `#define MIN_NUM 1` | 宏定义 | [26](./26-preprocessor) |
+| `void clear_input(void)` | 函数 | [15](./15-functions) |
+
+**一个小小的游戏，几乎用上了前 9 课的全部内容。**
+
+## 想自己加的功能
+
+| 挑战 | 提示 |
+| --- | --- |
+| 难度选择（1-10 / 1-100 / 1-1000） | 把 MAX_NUM 变成变量 |
+| 限制最多猜 7 次 | 用 `while (attempts < 7)` |
+| 记录历史猜测 | 用一个数组存每次的值（第 12 课） |
+| 提示"很接近了" | `abs(guess - target) <= 3` |
+| 支持重玩 | 外层再套一个循环，问 y/n |
+| 猜对了播放音效 | 需要平台相关 API，先跳过 |
+
+:::tip[先能跑，再优化]
+如果写不出完整版，**先写第三步那个 30 行的版本**。能跑起来最重要。
+
+函数（`clear_input`）、宏（`#define`）这些在第 15、26 课会细讲，现在照抄即可。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 忘了 `srand` | 每次答案一样 | 伪随机没种子 | 开头调一次 |
+| `rand() % 101` 想得 1-100 | 出现 0 | 范围算错 | `% 100 + 1` |
+| `scanf` 不检查返回值 | 输入字母后乱跳 | 垃圾值参与运算 | 检查 `!= 1` |
+| `scanf` 失败不清缓冲区 | 死循环打印提示 | 无效输入卡在缓冲区 | `while(getchar()!='\n')` |
+| `low = guess` 而不是 `+1` | 多猜几次 | 范围收得不够 | `guess + 1` |
+| `while (guess != target)` | 猜完还在问 | 循环条件错 | 用 `while(1)` + `break` |
+
+## 第二阶段小结
+
+**你已经学完 C 的基础语法了。** 现在你会：
+
+- 声明变量、选对类型
+- 做运算、转换类型
+- 用 `printf` / `scanf` 交互
+- 写条件和循环
+- 用数组和字符串
+
+接下来进入 C 最核心也最难的部分。
+
+## 下一步
+
+[15 函数](./15-functions) —— 第三阶段开始。学会打包代码，程序才能越写越大。

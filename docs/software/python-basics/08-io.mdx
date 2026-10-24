@@ -1,0 +1,313 @@
+---
+title: 08 输入与输出
+sidebar_position: 8
+description: print 的完整用法、input 拿到的一定是字符串、以及类型转换这个新手必踩的坑。
+id: 08-io
+---
+
+# 08 输入与输出
+
+**本课目标**：掌握 print 的各种输出技巧，会用 input 让程序和用户对话。
+
+## print 的完整用法
+
+最简单的形式你已经会了：
+
+```python
+print("你好")
+print(42)
+print(3.14)
+print(True)
+```
+
+输出：
+
+```text
+你好
+42
+3.14
+True
+```
+
+### 一次打印多个值
+
+```python
+print("小明", 18, "岁")
+print("a", "b", "c", sep="-")
+```
+
+输出：
+
+```text
+小明 18 岁
+a-b-c
+```
+
+`sep` 是**分隔符**，默认是一个空格。
+
+### 控制结尾
+
+```python
+print("不换行", end="")
+print("接着打")
+print("用逗号结尾", end=", ") 
+print("继续")
+```
+
+输出：
+
+```text
+不换行接着打
+用逗号结尾, 继续
+```
+
+`end` 是**结尾字符**，默认是换行符 `\n`。
+
+:::tip[`end=""` 的实用场景]
+做进度条、倒计时这类「在同一行不断刷新」的效果：
+
+```python
+import time
+for i in range(3, 0, -1):
+    print(f"{i}...", end=" ", flush=True)
+    time.sleep(0.3)
+print("出发！")
+```
+
+输出（逐步显示）：
+
+```text
+3... 2... 1... 出发！
+```
+:::
+
+## input：从键盘读入
+
+```python
+name = input("请输入你的名字：")
+print(f"你好，{name}")
+```
+
+运行后终端会停下等你输入：
+
+```text
+请输入你的名字：小明
+你好，小明
+```
+
+`input()` 的参数是**提示语**，可以不写：
+
+```python
+x = input()
+```
+
+## 最重要的坑：input 返回的一定是字符串
+
+:::danger[这是零基础最经典的报错来源]
+```python
+age = input("请输入年龄：")
+print(age + 1)
+```
+
+输入 `18`，结果报错：
+
+```text
+TypeError: can only concatenate str (not "int") to str
+```
+
+**原因**：`input()` 永远返回**字符串**。哪怕你输入的是 `18`，拿到的也是 `"18"` 这个字符串，不是数字 18。
+:::
+
+验证一下：
+
+```python
+age = input("请输入年龄：")
+print(type(age))
+```
+
+输入 `18`，输出：
+
+```text
+<class 'str'>
+```
+
+### 正确做法：先转换
+
+```python
+age = int(input("请输入年龄："))
+print(f"明年你 {age + 1} 岁")
+```
+
+输入 `18`，输出：
+
+```text
+明年你 19 岁
+```
+
+| 想要什么 | 怎么写 |
+| --- | --- |
+| 整数 | `int(input("提示"))` |
+| 小数 | `float(input("提示"))` |
+| 字符串 | `input("提示")`（不用转） |
+
+## 输入不合法怎么办
+
+如果用户输入的不是数字：
+
+```python
+age = int(input("请输入年龄："))
+```
+
+输入 `abc`，会直接崩溃：
+
+```text
+ValueError: invalid literal for int() with base 10: 'abc'
+```
+
+**真实程序必须处理这种情况**。基础版用 `isdigit()` 判断：
+
+```python
+raw = input("请输入年龄：")
+if raw.isdigit():
+    age = int(raw)
+    print(f"明年你 {age + 1} 岁")
+else:
+    print("请输入数字！")
+```
+
+更好的方法是 `try/except`（[第 20 课](./20-exceptions)会详细讲）：
+
+```python
+try:
+    age = int(input("请输入年龄："))
+    print(f"明年你 {age + 1} 岁")
+except ValueError:
+    print("这不是一个有效的数字")
+```
+
+:::warning[`isdigit()` 的局限]
+`isdigit()` 对 `-5`、`3.14` 都返回 `False`，只认纯数字。
+
+要允许负数和小数，用 `try/except` 才靠谱。**这就是为什么真实项目都用 try/except 而不是 isdigit。**
+:::
+
+## 组合示例：一个简单计算器
+
+```python
+print("=== 两数相加 ===")
+
+raw_a = input("第一个数：")
+raw_b = input("第二个数：")
+
+try:
+    a = float(raw_a)
+    b = float(raw_b)
+except ValueError:
+    print("输入的不是有效数字")
+else:
+    print(f"{a} + {b} = {a + b}")
+```
+
+运行示例：
+
+```text
+=== 两数相加 ===
+第一个数：3.5
+第二个数：4.5
+3.5 + 4.5 = 8.0
+```
+
+:::tip[为什么用 `float` 而不是 `int`]
+用 `float` 能同时接受 `3` 和 `3.5`（`float("3")` 得到 `3.0`），容错性更好。
+
+只有确定要整数时才用 `int`。
+:::
+
+## 多行输入
+
+如果用户会输入多行内容，可以循环读：
+
+```python
+lines = []
+print("输入内容，直接回车结束：")
+while True:
+    line = input()
+    if line == "":
+        break
+    lines.append(line)
+
+print(f"共输入 {len(lines)} 行：")
+for l in lines:
+    print("  " + l)
+```
+
+运行示例：
+
+```text
+输入内容，直接回车结束：
+第一行
+第二行
+
+共输入 2 行：
+  第一行
+  第二行
+```
+
+## 输出字符串的常见需求
+
+```python
+name = "小明"
+score = 95.678
+rank = 3
+
+# 保留小数位
+print(f"成绩：{score:.2f}")
+
+# 千分位
+print(f"金额：{1234567:,}")
+
+# 百分比
+print(f"完成度：{0.856:.1%}")
+
+# 补零
+print(f"编号：{rank:03d}")
+
+# 对齐
+print(f"{'项目':<10}{'值':>10}")
+print(f"{'温度':<10}{36.5:>10.2f}")
+```
+
+输出：
+
+```text
+成绩：95.68
+金额：1,234,567
+完成度：85.6%
+编号：003
+项目              值
+温度              36.50
+```
+
+## 常见错误
+
+| 代码 | 问题 | 解决 |
+| --- | --- | --- |
+| `age = input(); age + 1` | TypeError | `int(input())` |
+| `int(input())` 输入字母 | ValueError 崩溃 | 用 try/except |
+| `"总值：" + 100` | TypeError | f-string 或 str() |
+| `input("提示")` 没显示提示 | 缓冲区问题 | 一般不会；检查是否被 IDE 重定向 |
+| `isdigit()` 判断 `-5` | 返回 False | 用 try/except |
+| `print` 结果不换行 | 需要 `end=""` | 加上 end 参数 |
+
+## 本课自检
+
+- [ ] 会用 `sep` 和 `end` 参数
+- [ ] 知道 `input()` 永远返回字符串
+- [ ] 会写 `int(input("提示"))`
+- [ ] 知道输入不合法会 ValueError 崩溃，并会用 try/except 处理
+- [ ] 会用 f-string 做小数位、千分位、对齐
+- [ ] 能独立写出「两数相加」的小程序
+
+## 下一步
+
+[09 条件判断 if](./09-if) —— 让程序会根据情况做不同的事，这是「智能」的起点。

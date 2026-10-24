@@ -1,0 +1,307 @@
+---
+id: 09-uart
+title: 09 串口与 printf 重定向
+sidebar_position: 9
+description: CubeMX 配 USART1、HAL_UART_Transmit 用法、printf 重定向的两种写法、为什么 printf 会阻塞，以及串口乱码怎么查。
+---
+
+# 09 串口与 printf 重定向
+
+**本课目标**：让 `printf` 输出到串口——这是后面所有调试的基础。
+
+## 为什么 STM32 的 printf 不能用
+
+:::danger[C 标准库的 printf 默认输出到"标准输出"]
+在电脑上，"标准输出"是终端。
+
+**在单片机上，根本没有"终端"这个概念**——`printf` 调用底层的 `_write()` 函数，而它是空的（或指向不存在的东西）。
+
+**结果**：`printf` 什么都不输出，或者直接卡死（某些实现里半主机模式会卡住等待调试器）。
+:::
+
+**解决办法：重定向**——告诉标准库"输出字符时，请调用我的串口发送函数"。
+
+## 第一步：CubeMX 配 USART1
+
+1. 打开 `.ioc`，在引脚图上找到 **PA9 / PA10**
+2. 点 **PA9** → 选 **USART1_TX**
+3. 点 **PA10** → 选 **USART1_RX**
+   （通常点一个，另一个会自动配上）
+
+然后在左侧 **Connectivity → USART1**：
+
+| 参数 | 值 |
+| --- | --- |
+| Mode | **Asynchronous**（异步） |
+| Baud Rate | **115200** |
+| Word Length | 8 Bits |
+| Parity | None |
+| Stop Bits | 1 |
+| Hardware Flow Control | None |
+
+这组参数就是 **8N1、115200**——最通用的配置。
+
+:::warning[波特率必须和电脑端一致]
+CubeMX 里填 115200，串口助手也必须开 115200。
+
+**不一致就是满屏乱码**（[ESP32 第 7 课](../esp-basics/07-serial)也讲过）。
+:::
+
+:::danger[波特率准不准取决于时钟]
+USART 的分频系数是根据**外设时钟**算出来的。
+
+**如果时钟树没配对（比如实际 8MHz 而不是 72MHz），波特率会跟着错**，电脑收到乱码。
+
+**所以先确认时钟配对了**（[第 10 课](./10-clock)）。
+:::
+
+## 第二步：用 `HAL_UART_Transmit` 发数据
+
+```c
+#include "usart.h"
+
+uint8_t msg[] = "Hello STM32\r\n";
+HAL_UART_Transmit(&huart1, msg, sizeof(msg) - 1, 100);
+/*               ↑句柄   ↑数据  ↑长度           ↑超时(ms) */
+```
+
+:::tip[`sizeof(msg) - 1` 为什么要减一]
+```c
+uint8_t msg[] = "Hello\r\n";
+/* 实际内容：'H','e','l','l','o','\r','\n','\0'  → sizeof = 8 */
+```
+
+**`sizeof` 包含结尾的 `\0`。** 发出去会把 `\0` 也发走（多数串口助手显示成黑块或什么都不显示）。
+
+**所以要减 1，只发可见部分。**
+
+**或者直接写长度**：
+
+```c
+HAL_UART_Transmit(&huart1, (uint8_t*)"Hello\r\n", 7, 100);
+```
+:::
+
+### 超时参数怎么填
+
+```c
+HAL_UART_Transmit(&huart1, buf, len, 100);
+/*                                   ↑ 100ms 超时 */
+```
+
+| 值 | 含义 |
+| --- | --- |
+| `100` | 最多阻塞 100ms（常用） |
+| `HAL_MAX_DELAY` | 永久等待（可能卡死） |
+
+**别用 `HAL_MAX_DELAY`**——串口出问题时程序会永远卡在这里。
+
+## 第三步：重定向 printf
+
+在 `main.c` 里加这段（放在 `USER CODE 4` 区，即 `main` 函数之后）：
+
+```c
+/* USER CODE BEGIN 4 */
+
+#ifdef __GNUC__
+/* GCC（CubeIDE 用的就是 GCC） */
+int __io_putchar(int ch)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+    return ch;
+}
+#else
+/* Keil / IAR */
+int fputc(int ch, FILE *f)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+    return ch;
+}
+#endif
+
+/* USER CODE END 4 */
+```
+
+然后在 `USER CODE Includes` 区加：
+
+```c
+#include <stdio.h>
+```
+
+:::danger[别用 `HAL_MAX_DELAY` 在这里]
+上面的示例为了简单用了 `HAL_MAX_DELAY`。
+
+**更安全的是给小超时**：
+
+```c
+HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 10);
+```
+
+**因为串口出问题时，`printf` 会卡死整个程序。**
+:::
+
+### 为什么是 `__io_putchar`
+
+:::info[GCC 的重定向链]
+```text
+printf()
+  ↓
+_write()          ← newlib 系统调用
+  ↓
+__io_putchar()    ← ST 的 syscalls.c 里定义的钩子
+  ↓
+你的实现（发串口）
+```
+
+**ST 提供的 `syscalls.c` 已经把 `_write` 接到了 `__io_putchar`**，所以只实现它就行。
+
+**如果你用的工程没有 `syscalls.c`**，需要自己实现 `_write`：
+
+```c
+int _write(int file, char *ptr, int len)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t *)ptr, len, 100);
+    return len;
+}
+```
+:::
+
+## 完整示例
+
+```c
+/* main.c */
+#include "main.h"
+#include "usart.h"
+#include "gpio.h"
+#include <stdio.h>          /* ← USER CODE Includes 区 */
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_USART1_UART_Init();      /* ← CubeMX 生成 */
+
+    printf("\r\n=== 启动 ===\r\n");
+    printf("系统时钟: %lu Hz\r\n", SystemCoreClock);
+
+    uint32_t cnt = 0;
+    while (1)
+    {
+        printf("计数 %lu\r\n", cnt++);
+
+        HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+        HAL_Delay(1000);
+    }
+}
+
+/* USER CODE BEGIN 4 */
+int __io_putchar(int ch)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 10);
+    return ch;
+}
+/* USER CODE END 4 */
+```
+
+串口助手应该看到：
+
+```text
+=== 启动 ===
+系统时钟: 72000000 Hz
+计数 0
+计数 1
+计数 2
+```
+
+:::tip[`\r\n` 而不是 `\n`]
+串口助手（尤其 Windows 上的）**只认 `\r\n`**。
+
+只发 `\n` 时可能换行不回车，显示成阶梯状：
+
+```text
+计数 0
+       计数 1
+              计数 2
+```
+
+**所以串口输出一律用 `\r\n`。**
+:::
+
+## printf 为什么"很慢"
+
+:::danger[每次 printf 都阻塞]
+`__io_putchar` **一次只发一个字节**，而且 `HAL_UART_Transmit` 是**阻塞**的。
+
+**估算**：115200 波特率下，约 **11.5 KB/s**。
+
+打印一行 30 字节 → 约 **2.6 ms**。
+
+**看起来不多，但如果你在主循环里每圈都打印，程序就被串口拖住了。**
+:::
+
+| 打印频率 | 影响 |
+| --- | --- |
+| 每秒 1 次 | 无所谓 |
+| 每 10ms 一次 | 占 26% 时间 |
+| 主循环每圈 | **严重拖慢** |
+
+:::warning[性能问题先去掉打印]
+这和 ESP32 一样（[ESP32 第 29 课](../esp-basics/29-memory)）——**排查性能时第一件事是注释掉 printf**。
+
+**要高频输出时**，用下面讲的 DMA 方式。
+:::
+
+## 更高效的方式：DMA + printf
+
+后面 [第 17 课](./17-dma)会讲用 DMA 发串口——不占 CPU，适合大量输出。
+
+现在不用管，先让 `printf` 能用。
+
+## 串口乱码怎么查
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| **满屏乱码** | 波特率不对 | 两边都设 115200 |
+| 同上 | **时钟没配对**（波特率算错） | 查时钟树 |
+| 完全没输出 | TX/RX 接反 | 交叉接线 |
+| 同上 | 没调 `MX_USART1_UART_Init` | 检查 CubeMX 配置 |
+| 同上 | `printf` 没重定向 | 实现 `__io_putchar` |
+| 只有第一个字符对 | 波特率偏差大 | 用外部晶振（HSE）而非 HSI |
+| 输出卡住不动 | `HAL_MAX_DELAY` + 串口异常 | 改小超时 |
+
+:::danger[用内部 RC（HSI）时波特率可能偏差大]
+**HSI 精度约 ±1%**，累积到 115200 波特率上可能导致误码。
+
+**用外部晶振（HSE）就没这个问题**，精度 ±20 ppm。
+
+**蓝板上有 8MHz 晶振**，CubeMX 里一定要选 HSE → Crystal。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `sizeof(msg)` 不减 1 | 多发一个 `\0` | 包含结束符 | `- 1` |
+| 用 `\n` 不用 `\r\n` | 阶梯状换行 | 串口助手要求 | 用 `\r\n` |
+| 重定向写在 USER CODE 外 | 重新生成后失效 | 被覆盖 | 写进区块 |
+| 用 `HAL_MAX_DELAY` | 卡死 | 无超时 | 改小 |
+| 主循环高频 printf | 程序慢 | 阻塞 | 降频或用 DMA |
+| TX/RX 没交叉 | 无输出 | 接错 | 交叉 |
+
+## 本课自检
+
+- [ ] 会在 CubeMX 里配 USART1 异步模式
+- [ ] 知道 8N1、115200 是最通用配置
+- [ ] 会用 `HAL_UART_Transmit`，**知道长度要减 1**
+- [ ] **会重定向 printf（实现 `__io_putchar`）**
+- [ ] 知道重定向代码要写在 `USER CODE 4` 区
+- [ ] **知道串口输出要用 `\r\n`**
+- [ ] 知道重定向里不该用 `HAL_MAX_DELAY`
+- [ ] **理解 `printf` 是阻塞的，会拖慢程序**
+- [ ] 能排查乱码（波特率、时钟、接线）
+- [ ] **知道要用 HSE 外部晶振保证波特率精度**
+
+## 下一步
+
+[10 时钟树与时基](./10-clock) —— 72MHz 到底从哪来，`HAL_Delay` 为什么准。

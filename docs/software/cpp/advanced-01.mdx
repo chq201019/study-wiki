@@ -1,0 +1,191 @@
+---
+id: advanced-01
+title: "01 进阶特性"
+sidebar_position: 2
+description: "进阶特性 第 1 部分：进阶特性"
+---
+
+# 01 进阶特性
+**这里解决一个问题：虚函数调用到底多贵？`constexpr` 到底能做到什么程度？异常安全怎么保证？**
+
+这一页全是"面试会问、工程会踩"的内容，而且每一点都用**实测**来回答，不靠记忆。
+
+## 本页学什么
+
+- 异常安全的三个保证等级
+- `constexpr` / `consteval` / `constinit`：编译期计算
+- `decltype` / `decltype(auto)` 推导规则
+- **vtable 原理**：对象内存布局实测
+- `dynamic_cast` 的代价与替代
+
+## 1. 异常安全：三大保证
+
+异常安全不是"不抛异常"，而是"抛异常时不破坏程序状态"。标准库按严格程度定义了三个等级：
+
+```mermaid
+flowchart LR
+  A["no-throw guarantee<br/>不抛异常，一定成功"] --> B["strong guarantee<br/>失败则完全回滚<br/>（要么成功，要么状态不变）"]
+  B --> C["basic guarantee<br/>失败也不泄漏<br/>但状态可能改变"]
+  C --> D["no guarantee<br/>可能泄漏 / 状态损坏"]
+```
+
+| 保证等级 | 含义 | 典型例子 |
+| --- | --- | --- |
+| **不抛保证**（nothrow / no-fail） | 操作一定成功且不抛异常 | `std::vector::swap`（多数）、析构函数、`noexcept` 函数 |
+| **强保证**（strong） | 失败时程序状态**完全回滚**到操作前 | `std::vector::push_back`（元素拷贝可抛时） |
+| **基本保证**（basic） | 失败时**不泄漏资源**，对象仍有效，但状态可能改变 | 某些容器的赋值 |
+| 无保证 | 可能泄漏 / 状态损坏 | 手写的有 bug 的代码 |
+
+### 为什么 push_back 是强保证
+
+`vector::push_back` 在需要扩容时：
+1. 分配新内存
+2. 拷贝/移动元素到新内存
+3. 若第 2 步抛异常 → 释放新内存，原 vector 完全不变
+4. 成功后才替换内部指针
+
+**这是强保证的标准实现方式：先在"副产品"上做完所有可能失败的操作，成功后用一个不抛的操作（指针交换）提交。**
+
+这个模式叫 **copy-and-swap**：
+
+```cpp
+// copy_and_swap.cpp
+#include <vector>
+#include <cstdio>
+#include <algorithm>
+#include <utility>
+
+class Buffer {
+    std::vector<int> data_;
+public:
+    explicit Buffer(size_t n) : data_(n) {}
+    size_t size() const { return data_.size(); }
+    int& operator[](size_t i) { return data_[i]; }
+
+    // 强异常安全的赋值：拷贝一份，然后不抛地交换
+    Buffer& operator=(const Buffer& other) {
+        if (this != &other) {
+            Buffer tmp(other);        // 1. 拷贝构造（可能抛，但不影响 *this）
+            swap(tmp);                // 2. 交换（noexcept）
+        }
+        return this == &other ? *this : *this;
+    }
+
+    void swap(Buffer& o) noexcept { data_.swap(o.data_); }   // vector::swap 是 noexcept
+};
+
+int main() {
+    Buffer a(3), b(5);
+    std::printf("a.size=%zu b.size=%zu\n", a.size(), b.size());
+    a = b;
+    std::printf("after a=b: a.size=%zu\n", a.size());
+}
+```
+
+**实测输出：**
+
+```text
+a.size=3 b.size=5
+after a=b: a.size=5
+```
+
+### noexcept 的作用
+
+`noexcept` 有两个作用：
+
+1. **文档**：告诉调用者"这个函数不会抛"
+2. **优化 + 语义**：如果函数声明 `noexcept` 却抛了异常，直接 `std::terminate()`
+
+**它对 `std::vector` 有实际影响**：`vector` 在扩容时，只有当元素的移动构造是 `noexcept` 才会用**移动**，否则保守地用**拷贝**（因为移动中途抛异常会破坏强保证）。
+
+```cpp
+// noexcept_vector.cpp
+#include <vector>
+#include <cstdio>
+
+struct NoexceptMove {
+    int v = 1;
+    NoexceptMove() = default;
+    NoexceptMove(const NoexceptMove&) { std::printf("  copy\n"); }
+    NoexceptMove(NoexceptMove&&) noexcept { std::printf("  MOVE\n"); }
+};
+
+struct ThrowingMove {
+    int v = 1;
+    ThrowingMove() = default;
+    ThrowingMove(const ThrowingMove&) { std::printf("  copy\n"); }
+    ThrowingMove(ThrowingMove&&) { std::printf("  move(no noexcept)\n"); }  // 没有 noexcept
+};
+
+int main() {
+    std::printf("=== NoexceptMove: vector 会用移动\n");
+    {
+        std::vector<NoexceptMove> v;
+        v.reserve(1);
+        v.emplace_back(); v.emplace_back(); v.emplace_back();   // 触发扩容
+    }
+
+    std::printf("=== ThrowingMove: vector 保守地用拷贝\n");
+    {
+        std::vector<ThrowingMove> v;
+        v.reserve(1);
+        v.emplace_back(); v.emplace_back(); v.emplace_back();   // 触发扩容
+    }
+}
+```
+
+**实测输出：**
+
+```text
+=== NoexceptMove: vector 会用移动
+  MOVE
+  MOVE
+  MOVE
+=== ThrowingMove: vector 保守地用拷贝
+  copy
+  copy
+  copy
+```
+
+**这个差异非常实际：给你的移动构造/移动赋值加 `noexcept`，容器扩容就会变快。**
+
+:::warning[什么时候不该加 noexcept]
+只在"你确定不会抛"时加。一个 `noexcept` 函数抛异常会直接 `std::terminate()` 终止程序——**比异常本身严重得多**。
+
+**经验规则：**
+- 移动构造/移动赋值、swap、析构函数 → **应该** `noexcept`
+- 会分配内存、会调用可能抛的 API → 不要加
+:::
+
+### 析构函数与异常
+
+**析构函数默认是 `noexcept` 的**（C++11 起）。如果在栈展开过程中析构抛异常 → `std::terminate()`。
+
+```cpp
+// dtor_throw.cpp —— 错误示范
+#include <cstdio>
+
+struct Bad {
+    ~Bad() { throw 1; }   // 危险！
+};
+
+int main() {
+    try {
+        Bad b;
+        throw 2;          // 栈展开时 ~Bad() 又抛 → terminate
+    } catch (...) {
+        std::printf("caught\n");
+    }
+}
+```
+
+**实测输出：**
+
+```text
+terminate called after throwing an instance of 'int'
+（进程被终止；catch(...) 没有被执行到）
+```
+
+---
+
+**翻页**：[下一页 →](./advanced-02) · [返回目录](./)

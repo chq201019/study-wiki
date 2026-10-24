@@ -1,0 +1,234 @@
+---
+id: link-script
+title: 链接脚本与内存布局
+sidebar_position: 24
+description: 段与节的映射、MEMORY 与 SECTIONS 的写法、把变量放到指定地址、CCM RAM 与 DMA 缓冲区的正确放置。
+---
+
+# 链接脚本与内存布局
+
+**本课目标**：能修改链接脚本把数据放到指定位置。
+
+## 段的层次
+
+```text
+C 源码里的东西          →  节(section)      →  段(segment)
+函数、常量              →  .text / .rodata  →  LOAD
+有初值的全局变量        →  .data            →  LOAD
+无初值/零初值全局变量   →  .bss             →  LOAD
+局部变量                →  栈（运行时）
+动态分配                →  堆（运行时）
+```
+
+:::info[`.data` 在 Flash 和 RAM 里各有一份]
+**加载地址（LMA）在 Flash，运行地址（VMA）在 RAM。**
+
+启动代码负责把 Flash 里的初值拷到 RAM：
+
+```asm
+ldr r0, =_sidata      /* Flash 里的初值起始 */
+ldr r1, =_sdata       /* RAM 里的目标起始 */
+ldr r2, =_edata
+/* 循环拷贝 */
+```
+:::
+
+## MEMORY：声明可用区域
+
+```ld
+MEMORY
+{
+  /* 名字  属性    起始地址      长度 */
+  FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 512K
+  RAM   (xrw) : ORIGIN = 0x20000000, LENGTH = 128K
+  CCMRAM (rw) : ORIGIN = 0x10000000, LENGTH = 64K
+}
+```
+
+| 属性 | 含义 |
+| --- | --- |
+| `r` | 可读 |
+| `w` | 可写 |
+| `x` | 可执行 |
+| `a` | 可分配 |
+| `l` | 已初始化 |
+
+## SECTIONS：把节放到区域
+
+```ld
+SECTIONS
+{
+  .text :
+  {
+    KEEP(*(.isr_vector))        /* 向量表必须最前 */
+    *(.text*)
+    *(.rodata*)
+    . = ALIGN(4);
+    _etext = .;
+  } >FLASH
+
+  .data :
+  {
+    _sdata = .;
+    *(.data*)
+    . = ALIGN(4);
+    _edata = .;
+  } >RAM AT> FLASH              /* 关键：运行在 RAM，加载自 FLASH */
+
+  .bss :
+  {
+    _sbss = .;
+    *(.bss*)
+    *(COMMON)
+    . = ALIGN(4);
+    _ebss = .;
+  } >RAM
+}
+```
+
+:::danger[`.data` 少了 `AT> FLASH` 就错]
+```ld
+  .data : { ... } >RAM              /* 错：初值没地方存 */
+  .data : { ... } >RAM AT> FLASH    /* 对：VMA=RAM, LMA=FLASH */
+```
+
+**没有 LMA 时，启动代码拷的是垃圾数据**，表现为"全局变量初值不对"。
+:::
+
+## `KEEP()` 为什么必须加
+
+:::danger[链接器的垃圾回收会删掉"没人引用"的节]
+**向量表、中断处理函数、`__attribute__((used))` 之外的初始化函数，在代码里都没有显式调用点。**
+
+**`--gc-sections` 会把它们当垃圾删掉。**
+
+- **向量表被删** → 一上电就 HardFault
+- **中断函数被删** → 中断进来跳到错误地址
+
+**所以要 `KEEP(*(.isr_vector))`。**
+:::
+
+## 把变量放到指定位置
+
+```c
+/* 放到 CCM RAM（F4 才有，不参与 DMA，但 CPU 访问更快） */
+__attribute__((section(".ccmram"))) uint32_t fast_buf[1024];
+
+/* 放到"不掉电清除"的段 */
+__attribute__((section(".noinit"))) uint32_t boot_count;
+
+/* 放到 RAM 执行（加速热点循环） */
+__attribute__((section(".ramfunc"))) void hot_loop(void) { }
+```
+
+```ld
+  .ccmram :
+  {
+    *(.ccmram)
+  } >CCMRAM
+
+  .noinit (NOLOAD) :
+  {
+    *(.noinit)
+  } >RAM              /* NOLOAD：启动时不初始化，保留上次的值 */
+
+  .ramfunc :
+  {
+    *(.ramfunc)
+  } >RAM AT> FLASH    /* 需要从 Flash 拷贝到 RAM */
+```
+
+:::warning[`section` 属性只是"声明"，还得链接脚本接收]
+**如果 `.ccmram` 在链接脚本里没有被任何输出节收集，它会被丢弃或放到默认位置。**
+
+**两边必须配套。**
+:::
+
+## DMA 缓冲区的位置
+
+:::danger[F4/F7 上 DMA 不能访问 CCM RAM]
+**CCM RAM（0x10000000）只连到 CPU 的 D-bus，DMA 控制器访问不到。**
+
+**如果把 DMA 缓冲区放进 CCM：**
+
+- **不报错**（链接通过）
+- **DMA 传输静默失败或搬垃圾**
+:::
+
+:::warning[H7 上还有 Cache 一致性问题]
+**H7 的 RAM 有 D-Cache** —— DMA 和 CPU 看到的数据可能不一致。
+
+**两种解法**：
+
+1. 把 DMA 缓冲放到**不可 Cache 的 RAM 区**（链接脚本里标 `(NOLOAD)` 并用 MPU 配 non-cacheable）
+2. 每次传输前 `SCB_CleanDCache_by_Addr` / `InvalidateDCache_by_Addr`
+:::
+
+```c
+/* 方案 1：放到链接脚本指定的非 Cache 区 */
+__attribute__((section(".dma_buffer"))) uint8_t dma_buf[4096];
+
+/* 方案 2：手动维护 Cache */
+SCB_CleanDCache_by_Addr((uint32_t *)dma_buf, sizeof(dma_buf));
+HAL_ADC_Start_DMA(&hadc, (uint32_t *)dma_buf, len);
+```
+
+## 检查内存布局
+
+```bash
+# 看各段大小
+arm-none-eabi-size -A build/app.elf
+
+# 看所有符号地址（找变量落在哪个区域）
+arm-none-eabi-nm -n build/app.elf | grep my_var
+
+# 看生成的 map 文件（最详细）
+# 链接时加 -Wl,-Map=build/app.map
+```
+
+:::tip[`.map` 文件是排查链接问题的唯一真相]
+**它能告诉你**：
+
+- 每个目标文件贡献了多少字节
+- 每个符号的最终地址
+- 哪些节被垃圾回收了
+- 内存区域还剩多少
+
+**"Flash 突然不够了"这类问题，答案一定在 map 文件里。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 全局变量初值不对 | `.data` 少了 `AT> FLASH` | 补上 |
+| 一上电就 HardFault | 向量表被 gc 删了 | `KEEP()` |
+| 中断跳错地址 | 中断函数被优化掉 | 加 `KEEP()` 或 `used` |
+| 变量没在指定位置 | 链接脚本没接收该节 | 补输出节 |
+| DMA 失败但无报错 | 缓冲区在 CCM RAM | 移到普通 RAM |
+| H7 上数据不一致 | Cache 没维护 | Clean/Invalidate 或非 Cache 区 |
+| `.noinit` 变量被清零 | 缺 `(NOLOAD)` | 加上 |
+| Flash 不够用 | 不知道谁占的 | 看 `.map` 文件 |
+
+:::danger[改链接脚本前先备份]
+**链接脚本写错会导致"编译通过但运行全错"**，而且症状千奇百怪。**
+
+**建议**：先用 `arm-none-eabi-size` 记录当前各段大小，改完对比。
+:::
+
+## 本课自检
+
+- [ ] 能说出 `.text` / `.data` / `.bss` 分别放什么
+- [ ] **知道 `.data` 的 LMA 在 Flash、VMA 在 RAM**
+- [ ] 会写 `MEMORY` 与 `SECTIONS`
+- [ ] **知道 `.data` 必须 `AT> FLASH`**
+- [ ] **知道 `KEEP()` 不加会被 gc 删掉向量表**
+- [ ] 会用 `__attribute__((section())) ` 放变量到指定段
+- [ ] 知道 `NOLOAD` 让启动时不初始化
+- [ ] **知道 F4 的 DMA 不能访问 CCM RAM**
+- [ ] 知道 H7 有 Cache 一致性问题
+- [ ] 会用 `size -A` / `nm` / `.map` 检查布局
+
+## 下一步
+
+[启动流程与链接脚本](./startup-linker) 或 [Bootloader 与 IAP](./bootloader)。

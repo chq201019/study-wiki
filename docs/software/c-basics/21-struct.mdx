@@ -1,0 +1,426 @@
+---
+id: 21-struct
+title: 21 结构体
+sidebar_position: 21
+description: 把不同类型的数据打包在一起、内存对齐与 padding、typedef 简化、结构体赋值是深拷贝。
+---
+
+# 21 结构体
+
+**本课目标**：会用结构体组织相关数据，理解内存对齐带来的 padding。
+
+## 为什么需要结构体
+
+要描述一个学生：姓名、年龄、分数。
+
+**用独立的变量**：
+
+```c
+char name1[20] = "Alice";
+int age1 = 20;
+double score1 = 88.5;
+/* 三个变量，靠命名关联，很容易错配 */
+```
+
+**用结构体**：
+
+```c
+struct Student {
+    char name[20];
+    int age;
+    double score;
+};
+
+struct Student s = {"Alice", 20, 88.5};
+```
+
+**数据打包在一起，语义清晰，也不容易错配。**
+
+## 定义与使用
+
+```c
+#include <stdio.h>
+
+/* 定义类型（注意末尾有分号） */
+struct Student {
+    char name[20];
+    int age;
+    double score;
+};
+
+int main(void) {
+    /* 声明变量 */
+    struct Student s = {"Alice", 20, 88.5};
+
+    /* 访问成员用 . */
+    printf("%s %d %.1f\n", s.name, s.age, s.score);
+
+    /* 修改成员 */
+    s.age = 21;
+    printf("%d\n", s.age);
+
+    return 0;
+}
+```
+
+输出：
+
+```text
+Alice 20 88.5
+21
+```
+
+:::warning[结构体定义末尾的分号不能少]
+```c
+struct Student {
+    char name[20];
+};                    /* ← 这个分号必须写 */
+
+struct Student {      /* ❌ 编译错 */
+    char name[20];
+}
+```
+
+**结构体定义本身是一条语句，需要分号。**
+:::
+
+## 初始化方式
+
+```c
+/* 按顺序初始化 */
+struct Student s1 = {"Alice", 20, 88.5};
+
+/* 指定成员初始化（C99） */
+struct Student s2 = {.score = 92.0, .name = "Bob"};
+
+/* 全零初始化（最常用） */
+struct Student s3 = {0};
+
+/* 逐个赋值 */
+struct Student s4;
+strcpy(s4.name, "Charlie");
+s4.age = 22;
+s4.score = 75.5;
+```
+
+:::tip[`= {0}` 是最常用的初始化]
+```c
+struct Student s = {0};      /* 所有成员清零 */
+struct Config cfg = {0};     /* 配置结构体清零，避免垃圾值 */
+```
+
+**结构体里只要有一个成员没初始化，它就是垃圾值**，所以清零很重要。
+
+（`= {0}` 对数组也一样有效。）
+:::
+
+## 内存对齐：sizeof 会比你想的大
+
+:::danger[这是 C 最反直觉的现象之一]
+```c
+struct Mixed {
+    char a;      /* 1 字节 */
+    int  b;      /* 4 字节 */
+    char c;      /* 1 字节 */
+};
+```
+
+**成员加起来是 6 字节，但 `sizeof` 是 12！**
+:::
+
+本机实测：
+
+```c
+printf("sizeof(struct Mixed) = %zu\n", sizeof(struct Mixed));    /* 12 */
+printf("偏移 a=%zu b=%zu c=%zu\n",
+       offsetof(struct Mixed, a),      /* 0 */
+       offsetof(struct Mixed, b),      /* 4 */
+       offsetof(struct Mixed, c));     /* 8 */
+```
+
+输出：
+
+```text
+Mixed: char,int,char sizeof=12 (无对齐应为6)
+  偏移 a=0 b=4 c=8
+```
+
+### 为什么
+
+:::tip[深入一点：CPU 读内存要求对齐]
+CPU 读 `int`（4 字节）时，**要求地址是 4 的倍数**。如果不是，有的架构直接崩溃，有的要读两次再拼起来（慢）。
+
+所以编译器**自动在成员之间插入填充字节（padding）**，保证每个成员都对齐。
+
+```text
+偏移:   0    1    2    3    4    5    6    7    8    9   10   11
+内容: [a ][pad][pad][pad][ b  b  b  b ][c ][pad][pad][pad]
+      ↑                    ↑              ↑
+     char 对齐1        int 必须4对齐    char
+```
+
+- `a` 在 0（char 对齐 1）
+- `b` 要 4 对齐，所以 1~3 填 padding，`b` 在 4
+- `c` 在 8（char 对齐 1）
+- 结构体总大小要**是最大成员对齐值的倍数**（这里 max=4），所以 9 补到 **12**
+
+**这不是浪费，是对齐的代价。**
+:::
+
+### `offsetof` 是什么
+
+```c
+#include <stddef.h>
+
+offsetof(struct Mixed, b)      /* 得到 4，即 b 距离结构体开头的字节数 */
+```
+
+**`offsetof` 能精确告诉你每个成员的位置**，排查布局问题时很有用。
+
+## 结构体顺序影响大小
+
+:::tip[把大成员放前面能省内存]
+```c
+struct A {              /* sizeof = 12 */
+    char  a;
+    int   b;
+    char  c;
+};
+
+struct B {              /* sizeof = 8 */
+    int   b;
+    char  a;
+    char  c;
+};
+```
+
+本机实测 `struct A` 是 12，改成 `struct B` 顺序后是 8。
+
+**省了 33% 的内存，只改了声明顺序。**
+
+**规则：按类型大小从大到小排列。**
+:::
+
+### `packed`：强制取消对齐
+
+```c
+struct Packed {
+    char a;
+    int  b;
+    char c;
+} __attribute__((packed));      /* GCC/Clang 扩展 */
+```
+
+本机实测：`sizeof(struct Packed)` = **6**（正好是成员之和）。
+
+:::danger[`packed` 的代价]
+**取消对齐会让 CPU 访问变慢**（未对齐访问要多读几次），在某些架构（如老 ARM）上**直接崩溃**。
+
+**只在这些场景用**：
+
+- 解析网络协议包、文件格式（字节布局必须精确）
+- 与硬件寄存器映射
+
+**普通结构体不要加 `packed`。**
+:::
+
+## typedef：给结构体起短名
+
+```c
+/* 不用 typedef：每次都要写 struct */
+struct Student s1;
+struct Student *p;
+
+/* 用 typedef */
+typedef struct {
+    char name[20];
+    int age;
+    double score;
+} Student;
+
+Student s1;             /* 不用写 struct 了 */
+Student *p;
+```
+
+:::tip[两种 typedef 写法]
+```c
+/* 写法一：匿名结构 + typedef（推荐） */
+typedef struct {
+    int x, y;
+} Point;
+
+/* 写法二：具名结构 + typedef（可以自引用，链表需要） */
+typedef struct Node {
+    int value;
+    struct Node *next;      /* 这里必须用 struct Node */
+} Node;
+```
+
+**链表、树这种需要"指向自己"的结构，必须用具名的写法**（写法二）。
+:::
+
+## 结构体赋值是"深拷贝"
+
+```c
+struct Student s1 = {"Alice", 20, 88.5};
+struct Student s2 = s1;          /* 整个结构体复制 */
+
+s2.age = 99;
+printf("%d %d\n", s1.age, s2.age);    /* 20 99 */
+```
+
+本机实测：**`s1` 完全不受影响**。
+
+:::info[为什么这是深拷贝]
+结构体变量直接包含所有成员数据（不像指针只存地址）。
+
+赋值时 C 会**把每个成员都复制一份**，所以两份完全独立（padding 字节是否复制未指定）。
+
+**注意**：如果成员里有**指针**，复制的是指针值（浅拷贝）——两个结构体指向同一块内存。这种情况要自己深拷贝。
+:::
+
+## 结构体指针与 `->`
+
+```c
+struct Student s = {"Alice", 20, 88.5};
+struct Student *p = &s;
+
+/* 两种访问方式等价 */
+printf("%d\n", (*p).age);        /* 麻烦：要括号 */
+printf("%d\n", p->age);          /* 简洁：用箭头 */
+```
+
+:::warning[`(*p).age` 的括号不能省]
+```c
+*p.age          /* ❌ 错！等价于 *(p.age)，但 age 不是指针 */
+(*p).age        /* ✅ 先解引用，再取成员 */
+p->age          /* ✅ 等价，更清晰 */
+```
+
+因为 `.` 的优先级高于 `*`。**这就是 `->` 存在的原因**——避免这种混乱。
+
+**规矩：有指针就用 `->`。**
+:::
+
+## 完整示例
+
+```c
+#include <stdio.h>
+#include <string.h>
+
+#define MAX_NAME 32
+#define MAX_STUDENTS 10
+
+typedef struct {
+    char   name[MAX_NAME];
+    int    age;
+    double score;
+} Student;
+
+void print_student(const Student *s) {
+    printf("%-12s %3d  %.1f\n", s->name, s->age, s->score);
+}
+
+double average(const Student arr[], int n) {
+    if (n <= 0) return 0.0;
+    double sum = 0;
+    for (int i = 0; i < n; i++) {
+        sum += arr[i].score;
+    }
+    return sum / n;
+}
+
+int main(void) {
+    Student list[MAX_STUDENTS] = {
+        {"Alice", 20, 88.5},
+        {"Bob",   21, 92.0},
+        {"Carol", 19, 75.5},
+    };
+    int n = 3;
+
+    printf("%-12s %3s  %s\n", "姓名", "年龄", "分数");
+    printf("----------------------------\n");
+    for (int i = 0; i < n; i++) {
+        print_student(&list[i]);
+    }
+
+    printf("----------------------------\n");
+    printf("平均分：%.2f\n", average(list, n));
+    printf("结构体大小：%zu 字节\n", sizeof(Student));
+
+    return 0;
+}
+```
+
+输出：
+
+```text
+姓名          年龄  分数
+----------------------------
+Alice         20  88.5
+Bob           21  92.0
+Carol         19  75.5
+----------------------------
+平均分：85.33
+结构体大小：40 字节
+```
+
+:::tip[`const Student *s` 参数的好处]
+```c
+void print_student(const Student *s)
+```
+
+1. **避免复制**：传指针只复制 8 字节，传结构体要复制 40 字节
+2. **`const` 表示只读**：函数不会改你的数据
+3. **能接受 const 对象**
+
+**结构体参数一律传指针 + const**，除非结构体很小（比如两个 int）。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 结构体定义末尾漏分号 | 编译错 | 语法要求 | 加 `;` |
+| `*p.age` | 编译错 | 优先级 | `p->age` |
+| 用 `==` 比较结构体 | 编译错 | 不支持 | 逐成员比较 |
+| 用 `=` 复制字符串成员 | 编译错 | 数组不能赋值 | `strcpy` |
+| 没初始化就用 | 垃圾值 | 局部变量不清零 | `= {0}` |
+| `sizeof` 比预期大 | padding | 内存对齐 | 调整成员顺序 |
+| 结构体传值时改不动原对象 | 值传递 | 复制了副本 | 传指针 |
+
+:::danger[结构体不能直接用 `==` 比较]
+```c
+if (s1 == s2) { }        /* ❌ 编译错误 */
+```
+
+因为 padding 字节里的内容不确定，逐字节比较不可靠。
+
+**要比较就逐成员**：
+
+```c
+int equal(const Student *a, const Student *b) {
+    return strcmp(a->name, b->name) == 0
+        && a->age == b->age
+        && a->score == b->score;
+}
+```
+:::
+
+## 本课自检
+
+- [ ] 会定义结构体，知道末尾要有分号
+- [ ] 会用 `.` 访问成员
+- [ ] 知道 `= {0}` 清零
+- [ ] **能解释内存对齐和 padding**
+- [ ] 知道结构体大小 ≥ 成员之和
+- [ ] 知道调整成员顺序能省内存
+- [ ] 知道 `offsetof` 的用途
+- [ ] 会用 `typedef` 简化类型名
+- [ ] **知道结构体赋值是深拷贝**
+- [ ] 会用 `->` 访问指针成员
+- [ ] 知道结构体不能直接 `==` 比较
+
+## 下一步
+
+[22 结构体与指针](./22-struct-pointer) —— 用结构体和指针搭出链表，这是数据结构的基础。

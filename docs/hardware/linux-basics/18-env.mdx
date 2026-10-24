@@ -1,0 +1,301 @@
+---
+id: 18-env
+title: 18 环境变量与 PATH
+sidebar_position: 18
+description: 环境变量是什么、PATH 怎么让命令能被找到、export 的作用，以及 .bashrc/.profile 该放什么。
+---
+
+# 18 环境变量与 PATH
+
+**本课目标**：搞懂为什么命令能找到、环境变量怎么配、配置文件该改哪个。
+
+## 环境变量是什么
+
+**环境变量 = 有名字的字符串，会被子进程继承。**
+
+```bash
+echo "$HOME"                # /root
+echo "$USER"                # root
+echo "$SHELL"               # /bin/bash
+echo "$PWD"                 # 当前目录
+```
+
+本机实测：
+
+```text
+HOME=/root USER=root SHELL=/bin/bash PWD=/root
+```
+
+| 变量 | 含义 |
+| --- | --- |
+| `HOME` | 家目录 |
+| `USER` | 当前用户名 |
+| `SHELL` | 登录 shell |
+| `PWD` | 当前目录 |
+| `PATH` | **命令搜索路径** |
+| `LANG` | 语言编码 |
+| `EDITOR` | 默认编辑器 |
+
+## `PATH`：命令为什么能找到
+
+```bash
+echo "$PATH"
+```
+
+本机实测：
+
+```text
+/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+```
+
+:::tip[`PATH` 是一串用冒号分隔的目录]
+当你敲 `ls` 时，shell **按顺序在 `PATH` 里的每个目录找名为 `ls` 的可执行文件**：
+
+```text
+① /usr/local/sbin/ls   → 没有
+② /usr/local/bin/ls    → 没有
+③ /usr/sbin/ls         → 没有
+④ /usr/bin/ls          → ✅ 找到了！执行它
+⑤ /sbin/ls            （不找了）
+```
+
+**这就是为什么 `which ls` 输出 `/usr/bin/ls`。**
+:::
+
+:::danger[`command not found` 的三个原因]
+```bash
+foo
+# bash: foo: command not found
+```
+
+1. **没装这个软件**
+2. 装了但**不在 PATH 里**
+3. 你敲错了
+
+**排查**：
+
+```bash
+which foo                   # 在 PATH 里吗
+ls /usr/local/bin/foo       # 装了吗
+find / -name foo -type f 2>/dev/null | head
+```
+:::
+
+### 注意 PATH 的顺序
+
+```text
+/usr/local/bin:/usr/bin
+     ↑              ↑
+   先找这里      后找这里
+```
+
+**`/usr/local/bin` 在 `/usr/bin` 前面**——所以手动装在 `/usr/local/bin` 的版本**会覆盖**包管理器装在 `/usr/bin` 的同名程序。
+
+:::warning[这就是"装了新版但还是老版本"的原因]
+```bash
+which python3
+# /usr/bin/python3          ← 用的是系统自带的
+# 你新装的在 /usr/local/bin/python3
+```
+
+**解决**：
+
+```bash
+echo "$PATH"                # 确认顺序
+/usr/local/bin/python3 -V   # 显式用全路径测试
+```
+
+（这是 Python 环境混乱的头号原因。）
+:::
+
+## `export`：让子进程看到
+
+本机实测：
+
+```bash
+FOO=bar
+bash -c 'echo ${FOO:-未导出}'        # 未导出
+export FOO
+bash -c 'echo $FOO'                 # bar
+```
+
+:::danger[普通变量不会被继承]
+```bash
+FOO=bar                     # ❌ 只是当前 shell 的局部变量
+bash -c 'echo $FOO'         # 空
+```
+
+```bash
+export FOO=bar              # ✅ 导出成环境变量
+bash -c 'echo $FOO'         # bar
+```
+
+**`export` 才让变量进入"环境"，被子进程继承。**
+:::
+
+### 为什么这对脚本很重要
+
+```bash
+#!/bin/bash
+FOO=bar                     # 脚本内部变量，不污染外部
+export BAZ=qux              # 传给脚本调用的其他程序
+```
+
+**默认不 export 是好设计**——避免变量到处泄漏。
+
+## `env` 和 `set` 的区别
+
+本机实测：
+
+```bash
+env | wc -l          # 19   ← 只有环境变量（会传给子进程的）
+set | wc -l          # 46   ← 所有变量 + 函数
+```
+
+| 命令 | 看什么 |
+| --- | --- |
+| `env` | **环境变量**（export 过的） |
+| `set` | 所有变量（含未 export 的）+ shell 函数 |
+
+## 配置文件：`.bashrc` 还是 `.profile`
+
+:::danger[这是最容易搞错的地方]
+| 文件 | 何时加载 | 放什么 |
+| --- | --- | --- |
+| `~/.bashrc` | **每次打开交互式 bash** | 别名、提示符、**PATH** |
+| `~/.profile` | **登录时**（一次） | 环境变量、启动程序 |
+| `/etc/bash.bashrc` | 全局（所有用户） | 系统级 bash 配置 |
+| `/etc/profile` | 全局登录 | 系统级环境变量 |
+:::
+
+本机实测（root 家目录）：
+
+```text
+-rw-r--r-- 1 root root 607  7月 4日 17:05 /root/.bashrc
+-rw-r--r-- 1 root root 287  8月11日 15:19 /root/.profile
+```
+
+### 实用判断
+
+:::tip[该改哪个文件]
+| 你想做的事 | 改哪 |
+| --- | --- |
+| 加 `PATH` | **`~/.bashrc`**（交互式最可靠） |
+| 加别名 `alias` | **`~/.bashrc`** |
+| 改提示符 `PS1` | **`~/.bashrc`** |
+| 设 `EDITOR`/`LANG` | **`~/.profile`**（或 `.bashrc` 也能用） |
+| 开机自动跑程序 | **systemd**（[第 19 课](./19-systemd)），不是这里 |
+:::
+
+:::warning[改完要重新加载]
+```bash
+source ~/.bashrc            # ✅ 立即生效
+. ~/.bashrc                 # ✅ 同上（. 是 source 的简写）
+```
+
+**不开新终端也能生效。**
+:::
+
+## 加别名（`alias`）
+
+```bash
+alias ll='ls -lh'
+alias gs='git status'
+alias ..='cd ..'
+```
+
+永久生效：写进 `~/.bashrc`。
+
+:::danger[别名用单引号]
+```bash
+alias ll="ls -lh"           # ⚠️ 双引号会在定义时展开变量
+alias ll='ls -lh'           # ✅ 单引号，用时才展开
+```
+
+**别名几乎总是用单引号。**
+:::
+
+:::tip[查看已有别名]
+```bash
+alias                       # 列出所有
+type ll                     # 看某个是什么
+\ls                         # 加反斜杠绕过别名
+command ls                  # 同上
+```
+:::
+
+## 临时修改 PATH
+
+```bash
+export PATH="$HOME/bin:$PATH"        # 加在最前面（优先）
+export PATH="$PATH:$HOME/bin"        # 加在最后面（最后才找）
+```
+
+:::danger[别把 `$PATH` 漏掉]
+```bash
+export PATH="/new/dir"              # ❌ 覆盖！所有命令都找不到了
+export PATH="/new/dir:$PATH"        # ✅ 追加
+```
+
+**`PATH` 被覆盖后，几乎所有外部命令都找不到了**——只有 `export PATH=...`（或临时敲绝对路径 `/bin/ls`）能救回来。
+
+（`cd`、`echo` 是内建命令，不受影响，所以还能打字。）
+:::
+
+## 完整示例
+
+```bash
+# ① 看当前环境
+echo "PATH=$PATH"
+env | sort | head -10
+
+# ② 临时变量 vs 导出
+TEMP1="local"
+export TEMP2="exported"
+bash -c 'echo "TEMP1=${TEMP1:-空}  TEMP2=${TEMP2:-空}"'
+
+# ③ 加自己的 bin 目录
+mkdir -p ~/bin
+export PATH="$HOME/bin:$PATH"
+which mytool 2>/dev/null || echo "还没这个命令"
+
+# ④ 写个工具进去
+cat > ~/bin/hello << 'EOF'
+#!/bin/bash
+echo "我的工具跑起来了"
+EOF
+chmod +x ~/bin/hello
+hello
+
+# ⑤ 永久生效
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
+tail -1 ~/.bashrc
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `export PATH="/x"` | 所有命令失效 | 覆盖了 PATH | `export PATH="/x:$PATH"` |
+| 变量不 export | 子进程看不到 | 只是局部变量 | `export VAR=x` |
+| 改了 `.bashrc` 没生效 | 还是老样子 | 没 source | `source ~/.bashrc` |
+| 装新版还是用老版 | 版本没变 | PATH 顺序 | 查 `which` |
+| 别名用双引号 | 提前展开 | 引号类型 | 用单引号 |
+| 改了 `.profile` 交互式没用 | 没生效 | 只登录时加载 | 改 `.bashrc` |
+
+## 本课自检
+
+- [ ] 知道环境变量被子进程继承
+- [ ] **理解 `PATH` 是按顺序搜索目录**
+- [ ] 知道 `command not found` 的三个原因
+- [ ] **知道 `/usr/local/bin` 在 `/usr/bin` 前面**
+- [ ] **知道 `export` 才能让子进程看到**
+- [ ] 分清 `env` 和 `set`
+- [ ] **知道 `~/.bashrc`（交互式）和 `~/.profile`（登录）的区别**
+- [ ] 会用 `source` 重新加载
+- [ ] 会设 `alias`，**知道要用单引号**
+- [ ] **知道改 PATH 不能漏 `$PATH`**
+
+## 下一步
+
+[19 systemd 服务管理](./19-systemd) —— 让程序开机自启、挂了自动重启。

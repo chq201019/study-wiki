@@ -1,0 +1,322 @@
+---
+id: dma-deep
+title: "04 DMA 深入"
+sidebar_position: 4
+description: 通道映射表与冲突、普通模式与循环模式、半传输中断做双缓冲、优先级与仲裁，以及 F7/H7 的 Cache 一致性问题。
+---
+
+# 04 DMA 深入
+
+**本课目标**：会处理通道冲突，会用双缓冲做无缝数据流。
+
+## DMA 控制器与通道
+
+:::warning[STM32F103 的 DMA 通道是"固定映射"的]
+| 控制器 | 通道数 | 说明 |
+| --- | --- | --- |
+| **DMA1** | 7 个通道 | 挂在外设较多的 APB1/APB2 上 |
+| DMA2 | 5 个（大容量型号才有） | 挂 AHB，可做存储器到存储器 |
+
+**每个通道能被哪些外设使用是芯片设计死的**，不能自由分配。
+
+**这是和 ESP32 完全不同的地方**——ESP32 的 DMA 由驱动自动分配，STM32 要你查表。
+:::
+
+### DMA1 请求映射表（STM32F103）
+
+| 通道 | 可服务的外设 |
+| --- | --- |
+| **CH1** | **ADC1**、TIM2_CH3、TIM4_CH1 |
+| CH2 | SPI1_RX、USART3_TX、TIM1_CH1、TIM2_UP、TIM3_CH3 |
+| CH3 | SPI1_TX、USART3_RX、TIM1_CH2、TIM3_CH4、TIM3_UP |
+| CH4 | **USART1_TX**、SPI2_RX、I2C2_TX、TIM1_CH4、TIM4_CH2 |
+| CH5 | **USART1_RX**、SPI2_TX、I2C2_RX、TIM1_UP、TIM2_CH1、TIM4_CH3 |
+| CH6 | USART2_RX、I2C1_TX、TIM1_CH3、TIM3_CH1 |
+| CH7 | USART2_TX、I2C1_RX、TIM2_CH2、TIM2_CH4、TIM4_UP |
+
+:::danger[通道冲突是真实会踩的坑]
+**CH1 同时被 ADC1 和 TIM2_CH3 使用。**
+
+```text
+你的项目：
+  ADC1 用 DMA 连续采样    → 占用 CH1
+  TIM2_CH3 也想用 DMA     → 冲突！
+```
+
+**同一时刻一个通道只能服务一个外设。**
+
+**解决**：
+
+- 换一个定时器通道（用 TIM2_CH1 → CH5）
+- 或者不用 DMA，改用中断
+- 或者复用同一个通道分时使用（复杂，不推荐）
+:::
+
+## 三种传输方向
+
+| 方向 | 典型场景 | 配置 |
+| --- | --- | --- |
+| **外设 → 内存** | ADC 采样、串口接收 | `DMA_PERIPH_TO_MEMORY` |
+| **内存 → 外设** | 串口发送、SPI 刷屏 | `DMA_MEMORY_TO_PERIPH` |
+| 内存 → 内存 | 快速拷贝（只有 DMA2 支持） | `DMA_MEMORY_TO_MEMORY` |
+
+:::tip[外设 → 内存时，外设地址不递增]
+```c
+/* ADC 采样：ADC->DR 是固定的一个地址 */
+hdma.Init.PeriphInc = DMA_PINC_DISABLE;   /* 外设地址不变 */
+hdma.Init.MemInc    = DMA_MINC_ENABLE;    /* 内存地址递增，依次填 buf[0]、buf[1]… */
+```
+
+**反过来（内存→外设）也一样**：外设地址固定，内存地址递增。
+
+**唯一两个都不递增的情况**：外设到外设（F103 不支持）。
+:::
+
+## Normal vs Circular
+
+| 模式 | 行为 | 适合 |
+| --- | --- | --- |
+| **Normal** | 搬完指定数量就停，清使能位 | 收一包完整数据 |
+| **Circular** | 搬完自动从头开始，**永不停止** | 连续采样、音频、串口持续接收 |
+
+:::danger[Normal 模式只搬一次]
+```c
+HAL_UART_Receive_DMA(&huart1, buf, 64);
+
+/* 收完 64 字节后 DMA 停了 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *h) {
+    HAL_UART_Receive_DMA(h, buf, 64);    /* ✅ 必须重新启动 */
+}
+```
+
+**忘了重启 → 只收到第一包，后续全丢。**
+:::
+
+:::tip[Circular 模式配合"半传输中断"做双缓冲]
+DMA 有两个中断：
+
+| 中断 | 触发时机 |
+| --- | --- |
+| **半传输（HT）** | 搬完一半时 |
+| **传输完成（TC）** | 搬完全部时 |
+
+**双缓冲的原理**：
+
+```text
+buffer 大小 2N，分成前后两半
+  前半 [0 .. N-1]    后半 [N .. 2N-1]
+
+HT 中断 → 前半已满 → 处理前半（此时 DMA 在填后半）
+TC 中断 → 后半已满 → 处理后半（此时 DMA 在填前半）
+```
+
+**这样 CPU 处理和处理之间没有空档，数据不丢。**
+
+（这就是音频、示波器的标准做法。）
+:::
+
+```c
+/* CubeMX 里勾选 Circular + 使能 HT 中断 */
+uint16_t adc_buf[256];      /* 前后两半各 128 */
+
+HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buf, 256);
+
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *h) {
+    /* 前半 [0..127] 就绪 */
+    process(adc_buf, 0, 128);
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *h) {
+    /* 后半 [128..255] 就绪 */
+    process(adc_buf, 128, 128);
+}
+```
+
+## 优先级与仲裁
+
+![DMA 双缓冲时序：DMA 填前半时 CPU 处理后半，靠半传输与传输完成两个中断交替驱动](/img/diagrams/stm32-dma-double-buffer.svg)
+
+
+:::info[DMA 通道之间有优先级]
+| 等级 | 宏 |
+| --- | --- |
+| 最高 | `DMA_PRIORITY_VERY_HIGH` |
+| 高 | `DMA_PRIORITY_HIGH` |
+| 中 | `DMA_PRIORITY_MEDIUM` |
+| 低 | `DMA_PRIORITY_LOW` |
+
+**同一时刻多个通道请求 → 优先级高的先服务。**
+
+**优先级相同时，通道号小的优先**（硬件固定）。
+:::
+
+:::warning[优先级只影响"同时请求"的情况]
+**它不保证"实时性"**——DMA 会在总线空闲时搬数据，本身不抢 CPU 的执行。
+
+**所以一般不需要纠结优先级**，除非你同时开了多个高带宽 DMA（比如 SPI 刷屏 + ADC 采样 + 串口接收）。
+:::
+
+## Cache 一致性问题（F7/H7 才有）
+
+:::danger[F1/F4 没有 D-Cache，可以忽略这一节]
+**F7/H7 有数据 Cache**，带来了新问题：
+
+```text
+CPU 写数据 → 先写进 Cache，还没落到内存
+DMA 从内存读 → 读到的是旧数据！
+```
+
+**反过来也一样**：
+
+```text
+DMA 把新数据写进内存
+CPU 读 → 读到 Cache 里的旧值
+```
+:::
+
+**解决办法：在交接点做 Cache 维护**
+
+```c
+/* 内存 → 外设（要发出去）：先把 Cache 刷到内存 */
+SCB_CleanDCache_by_Addr((uint32_t *)buf, len);
+HAL_UART_Transmit_DMA(&huart1, buf, len);
+
+/* 外设 → 内存（要读进来）：先让 Cache 失效，再去读 */
+SCB_InvalidateDCache_by_Addr((uint32_t *)buf, len);
+HAL_UART_Receive_DMA(&huart1, buf, len);
+```
+
+:::tip[更省事的两个办法]
+**① 把缓冲区放到不可 Cache 的区域**
+
+```c
+/* 用链接脚本或 __attribute__ 指定到非 Cache 区 */
+static uint8_t buf[1024] __attribute__((section(".nocache")));
+```
+
+**② 用 MPU 把这块内存配成 non-cacheable**
+
+一次性配置，之后不用管。
+
+**F1/F4 用户完全不用操心这些**——这也是很多人推荐用 F4 入门的原因之一。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| DMA 根本不搬 | 通道冲突 | 查映射表换通道 |
+| 只搬一次 | Normal 模式没重启 | 回调里重启 |
+| 数据全是 0 | 内存地址没递增 | 勾 `MemInc` |
+| 只收到第一个字节 | 同上 | 勾 `MemInc` |
+| 数据错位一半 | 数据宽度不匹配 | 检查 Periph/Mem DataSize |
+| 传输中改缓冲区 | 竞争 | 等回调或双缓冲 |
+| F7 上数据不对 | Cache 一致性 | Clean/Invalidate 或非 Cache 区 |
+| 出错中断频繁进 | 传输错误 | 查错误码并重新初始化 |
+
+:::danger[DMA 传输期间绝对不要碰缓冲区]
+```c
+HAL_UART_Transmit_DMA(&huart1, buf, len);
+buf[0] = 'x';        /* ❌ DMA 可能正在读这块内存 */
+```
+
+**必须等 `HAL_UART_TxCpltCallback` 回调后才能复用。**
+
+**要连续发送多包 → 用双缓冲，一块发的时候改另一块。**
+:::
+
+:::warning[数据宽度不匹配会导致数据错位]
+```c
+/* ADC 是 12 位结果，要按 16 位搬 */
+hdma.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;   /* 16 位 */
+hdma.Init.MemDataAlignment    = DMA_MDATAALIGN_HALFWORD;
+```
+
+**如果配成 `BYTE`，会把 16 位数据拆成两个字节错位存放。**
+
+**但传给 `HAL_ADC_Start_DMA` 的指针参数要强转成 `uint32_t*`**（HAL 的历史接口）。
+
+**这个"类型不一致"是 HAL 的设计遗留，照它要求写就好。**
+:::
+
+## 一个完整的双缓冲录音示例（📋 示例）
+
+:::warning[结构标准，本站未在硬件上验证]
+:::
+
+```c
+#define BUF_LEN  512
+static int16_t s_buf[BUF_LEN];
+static volatile bool s_half_ready = false;
+static volatile bool s_full_ready = false;
+
+void audio_start(void)
+{
+    /* Circular + 半传输中断 */
+    HAL_ADC_Start_DMA(&hadc1, (uint32_t *)s_buf, BUF_LEN);
+}
+
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *h)
+{
+    s_half_ready = true;        /* 前半可读 */
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *h)
+{
+    s_full_ready = true;        /* 后半可读 */
+}
+
+/* 主循环里处理 */
+void audio_task(void)
+{
+    if (s_half_ready) {
+        s_half_ready = false;
+        process(s_buf, 0, BUF_LEN / 2);
+    }
+    if (s_full_ready) {
+        s_full_ready = false;
+        process(s_buf, BUF_LEN / 2, BUF_LEN / 2);
+    }
+}
+```
+
+:::danger[`volatile` 必须加，但还不够]
+```c
+volatile bool s_half_ready;
+```
+
+**`volatile` 保证主循环每次都真读内存**（否则 `if (s_half_ready)` 可能被优化成只读一次）。
+
+**但如果处理逻辑涉及多个变量的一致性，还要加临界区。**
+:::
+
+## 本课自检
+
+- [ ] 知道 F103 有 DMA1（7 通道）和 DMA2（5 通道，大容量型号）
+- [ ] **知道每个通道能服务哪些外设是固定的，必须查表**
+- [ ] **知道 CH1 被 ADC1 和 TIM2_CH3 共享，会冲突**
+- [ ] 会配三种传输方向，**知道外设→内存时外设地址不递增**
+- [ ] **知道 Normal 模式要在回调里重启，Circular 不用**
+- [ ] **理解半传输 + 传输完成中断做双缓冲**
+- [ ] 知道 DMA 优先级只在同时请求时起作用
+- [ ] **知道 F7/H7 有 Cache 一致性问题（F1/F4 没有）**
+- [ ] 知道 Cache 问题的三种解法（Clean/Invalidate、非 Cache 区、MPU）
+- [ ] **知道传输期间不能碰缓冲区**
+- [ ] 知道数据宽度要匹配（ADC 用 HALFWORD）
+
+## 第一阶段小结
+
+这四课把底层机制讲清了：
+
+| 课 | 你现在知道 |
+| --- | --- |
+| 01 抽象层 | HAL/LL/寄存器各自的代价，什么时候该降级 |
+| 02 时钟 | 完整时钟树、三条硬限制、门控与低功耗 |
+| 03 中断 | 优先级分组、抢占规则、临界区、ISR 红线 |
+| 04 DMA | 通道映射与冲突、双缓冲、Cache 一致性 |
+
+**这四块是所有 STM32 项目的共同地基。**
+
+## 下一步
+
+[05 定时器高级用法](./advanced-index) —— 输入捕获、编码器、互补输出与死区。

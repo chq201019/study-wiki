@@ -1,0 +1,319 @@
+---
+id: git
+title: Git 内部原理
+sidebar_position: 16
+description: 实测四种对象的结构、内容寻址带来的自动去重、为什么小文件单独存储反而变大、引用与 HEAD 的本质、以及 reflog 为什么能救回丢失的提交。
+---
+
+# Git 内部原理
+
+**本课目标**：知道 `.git` 里到底存了什么，遇到"提交丢了"不再慌。
+
+## 四种对象
+
+![Git 四种对象关系：commit 指向根 tree，tree 指向子 tree 与 blob，内容相同的文件共用同一个 blob](/img/diagrams/git-objects.svg)
+
+
+:::info[Git 本质上是一个内容寻址的键值数据库]
+| 对象 | 存什么 |
+| --- | --- |
+| **blob** | **文件内容**（不含文件名！） |
+| **tree** | 目录：文件名 → blob/tree 的映射 |
+| **commit** | 指向一个 tree + 父提交 + 作者/时间/说明 |
+| **tag** | 附注标签（指向某个对象） |
+
+**关键：文件名存在 tree 里，不在 blob 里。** 所以内容相同的文件只存一份。
+:::
+
+**实测（一个只有两个文件 a.txt / b.txt 的仓库）**：
+
+```text
+$ git cat-file --batch-all-objects --batch-check
+# 按类型统计：
+#   tree    1
+#   blob    2
+#   commit  1
+```
+
+**四个对象（1 个 tree + 2 个 blob + 1 个 commit）就构成了一个提交。**
+
+### blob：只有内容
+
+```text
+$ git cat-file -t HEAD:a.txt
+blob
+
+$ git cat-file -p HEAD:a.txt
+hello
+```
+
+### tree：目录结构
+
+```text
+$ git cat-file -p "HEAD^{tree}"
+100644 blob ce013625030ba8dba906f756967f9e9ca394464a	a.txt
+100644 blob cc628ccd10742baea8241c5924df992b5c019f71	b.txt
+```
+
+**格式**：`<模式> <类型> <SHA>\t<文件名>`
+
+- `100644` 普通文件
+- `100755` 可执行文件
+- `040000` 子目录（类型是 `tree`）
+- `120000` 符号链接
+
+### commit：指向 tree
+
+```text
+$ git cat-file -p HEAD
+tree 18eb80fbbbf9160491c007668d5298f1e86cd40a
+author t <t@t> 1792333020 +0800
+committer t <t@t> 1792333020 +0800
+
+first
+```
+
+:::warning[提交里没有"改动"的信息]
+**commit 只记录"整个项目在这一刻的完整快照"（通过 tree 的 SHA 指向）。**
+
+**它不存 diff**。你看到的 diff 是 `git diff` 现场比对两个 tree 算出来的。
+
+**这也解释了为什么 Git 的分支切换那么快** —— 只是改一个指针，不涉及文件内容重算。
+:::
+
+## 内容寻址带来的自动去重
+
+:::tip[实测：两个内容相同的文件只占一份空间]
+```bash
+echo "hello" > a.txt
+echo "hello" > c.txt
+git add . && git commit
+```
+
+```text
+blob 总数: 2                      ← 只有 a.txt 和 b.txt 两个 blob
+a.txt 与 c.txt 的 blob id 相同: True
+```
+
+**`a.txt` 和 `c.txt` 共用同一个 blob 对象** —— 因为 blob 的 SHA 完全由内容决定。
+:::
+
+**SHA 的计算方式**：
+
+```text
+SHA1("blob " + <内容长度> + "\0" + <内容>)
+```
+
+**前面加了 `blob 5\0` 这个头**，所以不同长度的内容不会碰撞到同一个哈希。
+
+:::danger[这也意味着：改一个字节就产生全新对象]
+**没有"增量修改"这回事。** 一个 10MB 的文件改一个字节 → 新的 blob（10MB）。
+
+**那为什么仓库不会爆炸？** 靠 **packfile**：
+
+```bash
+git gc          # 把松散对象打包，用 delta 压缩
+```
+
+**packfile 里相近的对象用增量存储** —— 这才是 Git 真正的空间优化。
+:::
+
+:::warning[小文件单独存储反而更大（实测）]
+```text
+$ git cat-file -s <blob>          # 解压后 6 字节
+$ ls -l .git/objects/ce/0136...   # 磁盘上 21 字节
+```
+
+**6 字节的内容占了 21 字节磁盘** —— zlib 头 + 长度信息，**小对象的压缩开销超过了收益**。
+
+**所以大量小文件的项目，`git gc` 后的体积会明显下降。**
+:::
+
+## 引用（ref）：分支和标签的真相
+
+![Git 分支本质：main 和 feature 只是存着 commit SHA 的文件，HEAD 指向其中一个；切换分支只改一行](/img/diagrams/git-branches.svg)
+
+
+:::info[分支就是一个存着 SHA 的文件]
+```bash
+cat .git/refs/heads/main
+# 18eb80fbbbf9160491c007668d5298f1e86cd40a
+```
+
+**`git log` 的本质**：从这个 SHA 开始，沿着每个 commit 的 `parent` 一路回溯。
+:::
+
+```bash
+# 这些是等价的
+git rev-parse main
+git rev-parse refs/heads/main
+cat .git/refs/heads/main
+```
+
+:::tip[HEAD 是个"指向引用的引用"]
+```bash
+cat .git/HEAD
+# ref: refs/heads/main
+```
+
+**所以"在某个分支上"的含义就是"HEAD 指向那个分支的 ref"。**
+
+**分离头指针（detached HEAD）** 就是 HEAD 直接存了 SHA 而不是 `ref:` 行：
+
+```bash
+git checkout <sha>
+cat .git/HEAD
+# 18eb80fbbbf9160491c007668d5298f1e86cd40a     ← 没有 ref: 前缀
+```
+
+**这时新提交不属于任何分支** —— 切走后只能靠 reflog 找回。
+:::
+
+## 引用日志（reflog）：丢东西时的救命绳
+
+:::danger[`git reset --hard` 之后提交还在，只是没人指向它]
+```bash
+git reset --hard HEAD~3        # 丢掉最近 3 个提交
+```
+
+**那 3 个 commit 对象并没有被删除** —— Git 只是把分支 ref 移了过去。
+
+**它们仍在 reflog 里**：
+
+```bash
+git reflog
+# 18eb80f HEAD@{0}: reset: moving to HEAD~3
+# a1b2c3d HEAD@{1}: commit: 第三个提交     ← 就是它
+```
+
+```bash
+git reset --hard HEAD@{1}      # 救回来
+# 或者更精确
+git reset --hard a1b2c3d
+```
+:::
+
+:::warning[reflog 不是永久的]
+- 默认保留 **90 天**（可达对象），**30 天**（不可达对象）
+- `git gc --prune=now` 会立刻清掉不可达对象
+- **reflog 是本地的，不会随 clone/push 走**
+
+**所以：出问题后别急着 `git gc`，先 `git reflog` 看。**
+:::
+
+```bash
+# 找"丢了的提交"（包括已无引用但还没被回收的）
+git fsck --lost-found
+# 会在 .git/lost-found/commit/ 里列出悬垂提交
+```
+
+## 工作区、暂存区、仓库
+
+:::info[三个区域的本质]
+| 区域 | 实际是什么 |
+| --- | --- |
+| **工作区** | 你看到的文件 |
+| **暂存区（index）** | `.git/index` —— 一个二进制文件，记录"下次提交要包含什么" |
+| **仓库** | `.git/objects` 里的对象 |
+
+**`git add` 就是往 index 里写一条记录**（指向某个 blob）。
+**`git commit` 就是把 index 当前的样子固化成 tree + commit。**
+:::
+
+:::tip[这就是为什么"改了又改回去"，状态会变干净]
+```bash
+echo "x" > a.txt
+git add a.txt
+git status              # 显示"已暂存"
+git checkout -- a.txt   # 把工作区恢复成 index 里的内容
+git status              # 只剩"已暂存"，"未暂存"那一半变干净了
+```
+
+**因为 index 里的 blob SHA 和工作区文件的 blob SHA 一致** —— Git 比较的是内容哈希，不是时间戳。
+:::
+
+:::warning[这也是大文件误提交后"改不回来"的原因]
+```bash
+git add big.iso            # 500MB 已经进了 objects
+git rm --cached big.iso    # 只是从 index 移除
+```
+
+**但 `.git/objects` 里那个 500MB 的 blob 还在** —— 而且会被推到远端。
+
+**彻底清掉要改写历史**：
+
+```bash
+git filter-repo --path big.iso --invert-paths     # 或 git-filter-branch
+```
+
+**这非常危险（会改变所有 SHA），必须在协作前和团队沟通。**
+:::
+
+## 常用排查命令
+
+```bash
+# 查看任意对象
+git cat-file -t <sha>          # 类型
+git cat-file -s <sha>          # 大小
+git cat-file -p <sha>          # 内容（美化）
+
+# 列出所有对象
+git cat-file --batch-all-objects --batch-check
+
+# 某个提交的完整树
+git ls-tree -r HEAD
+
+# 看看某个路径在哪个提交里改过
+git log --oneline --follow -- path/to/file
+
+# 找引入某行的那次提交
+git log -S "某段代码" --oneline
+
+# 检查仓库完整性 + 悬垂对象
+git fsck --lost-found
+```
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `reset --hard` 后提交"没了" | ref 移了但对象还在 | `git reflog` 找回 |
+| 大文件提交后仓库巨大 | blob 仍在 objects | `git filter-repo` 改写历史 |
+| 空目录没被跟踪 | Git 只跟踪文件 | 放一个 `.gitkeep` |
+| 改了换行符导致整文件 diff | CRLF/LF 转换 | 配 `.gitattributes` |
+| 分支切换很快 | 只改指针 | 正常（不是 bug） |
+| `git add` 后又改，提交的是旧内容 | 提交的是 index 快照 | 再 `git add` |
+| 分离头指针后提交丢失 | 不属于任何分支 | `git reflog` 或建分支 |
+
+:::tip[实测：空目录确实不产生任何对象]
+```bash
+mkdir emptydir
+git status --short          # 无输出
+```
+
+**Git 的 tree 只能表示文件，没有"空目录"这个概念。**
+
+**需要占位就放一个空的 `.gitkeep`（Git 不关心文件名，只是需要一个文件）。**
+:::
+
+## 本课自检
+
+- [ ] **知道四种对象：blob / tree / commit / tag**
+- [ ] **知道文件名在 tree 里，blob 只存内容**
+- [ ] **知道 commit 存的是完整快照（通过 tree SHA），不是 diff**
+- [ ] **理解内容寻址带来的自动去重（实测两文件同 blob）**
+- [ ] 知道 SHA 计算带 `blob <len>\0` 前缀
+- [ ] **知道改一个字节就产生全新对象，靠 packfile 做增量压缩**
+- [ ] **知道小文件单独存储反而更大（实测 6 字节内容占 21 字节）**
+- [ ] 知道分支就是一个存 SHA 的文件，HEAD 指向分支 ref
+- [ ] 知道分离头指针是 HEAD 直接存 SHA
+- [ ] **会用 `git reflog` 救回 `reset --hard` 丢掉的提交**
+- [ ] 知道 reflog 默认保留 90/30 天，且是本地的不随 push
+- [ ] 理解三个区域，知道 `git add` 写的是 index
+- [ ] **知道"改回原内容后 status 变干净"是因为比内容哈希**
+- [ ] **知道大文件误提交要 `git filter-repo` 才能彻底清掉**
+- [ ] **知道 Git 不跟踪空目录**
+
+## 下一步
+
+[Shell 脚本进阶](./shell-advanced) 或者 [构建系统](./build-system)。

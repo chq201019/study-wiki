@@ -1,0 +1,246 @@
+---
+id: strings
+title: 字符串处理
+sidebar_position: 17
+description: std::string 的 SSO 与容量、string_view 的生命周期陷阱、C++20 的 starts_with 与 format、编码问题、以及高频场景的性能取舍。
+---
+
+# 字符串处理
+
+**本课目标**：知道 `string_view` 什么时候不能用，避免它的头号坑。
+
+## `std::string` 的一块小秘密：SSO
+
+:::info[短字符串不分配堆内存]
+大多数实现有**小字符串优化（SSO）**：短字符串直接存在 `std::string` 对象内部的缓冲区里。
+
+```text
+libstdc++：15 字节以内不分配堆
+MSVC：    15 字节以内不分配堆
+```
+
+```cpp
+std::string a = "hi";                       // 无堆分配
+std::string b = "this is a longer string";  // 堆分配
+```
+
+**所以短字符串的构造/拷贝非常快** —— 没有 `malloc`。
+:::
+
+:::warning[`sizeof(std::string)` 通常是 32 字节]
+```cpp
+sizeof(std::string)     // libstdc++ 上 32
+```
+
+**因为要容纳 SSO 缓冲区 + 指针 + 大小**。**所以别把一堆小字符串按值到处传**。
+:::
+
+## `string_view`：不拷贝的"窗口"
+
+```cpp
+#include <string_view>
+
+void log(std::string_view msg);      // 接受 string、const char*、字面量，都不拷贝
+```
+
+:::danger[头号坑：`string_view` 不拥有数据]
+```cpp
+std::string_view sv = std::string("temp") + " string";
+// 这一行结束后临时 string 被销毁 → sv 悬垂
+
+log(sv);        // ❌ 读已释放内存
+```
+
+**`string_view` 只存"指针 + 长度"**，底层数据的生命周期完全由调用方负责。
+:::
+
+:::tip[三条安全规则]
+```cpp
+// ① 函数参数用它（调用方保证数据活着）
+void parse(std::string_view s);            // ✅
+
+// ② 绝不返回指向局部/临时的 string_view
+std::string_view bad() {
+    std::string s = "x";
+    return s;                              // ❌ 悬垂
+}
+
+// ③ 不要从一个临时 string 构造后长期保存
+auto sv = std::string("a") + "b";          // ❌ 表达式结束就悬垂
+auto str = std::string("a") + "b";
+std::string_view sv2 = str;                // ✅ str 活着
+```
+:::
+
+:::warning[`string_view` 不保证以 `\0` 结尾]
+```cpp
+std::string_view sv = "hello world";
+sv = sv.substr(0, 5);        // "hello"，但底层没被截断
+
+printf("%s", sv.data());     // ❌ 会打印 "hello world"
+```
+
+**需要 C 字符串时，必须自己保证空终止**：
+
+```cpp
+std::string tmp(sv);                 // ✅ 拷贝一份
+printf("%s", tmp.c_str());
+```
+
+**或者检查 `sv.data()[sv.size()] == '\0'`**（只有从 C 字符串构造且未切片时才成立）。
+:::
+
+## C++20 的便利函数
+
+```cpp
+#include <string>
+
+std::string s = "hello world";
+
+s.starts_with("hello");      // true
+s.ends_with("world");        // true
+s.contains("lo wo");         // true
+```
+
+:::tip[C++17 及以前要手写]
+```cpp
+bool starts_with(const std::string& s, const std::string& p) {
+    return s.size() >= p.size() && s.compare(0, p.size(), p) == 0;
+}
+```
+
+**C++20 起直接用标准函数，且能作用于 `string_view`。**
+:::
+
+## `std::format`（C++20）
+
+```cpp
+#include <format>
+
+std::string s = std::format("{} + {} = {}", 1, 2, 3);
+// "1 + 2 = 3"
+
+std::format("{:08.3f}", 3.14159);     // "0003.142"
+std::format("{:>10}", "right");        // "     right"
+```
+
+:::danger[`std::format` 在 GCC 上需要额外配置]
+**GCC 13+ 才有 `<format>`**（GCC 12 及以前没有）。Clang 需要 libc++ 较新版本。
+
+**降级方案**：
+
+- `fmt` 库（`std::format` 就是它的标准化）
+- 或者继续用 `snprintf`（但要注意返回值陷阱）
+
+```cpp
+char buf[64];
+int n = snprintf(buf, sizeof(buf), "%d", 42);
+// n 是"需要的总长度"，可能 ≥ sizeof(buf) → 说明被截断了
+```
+:::
+
+## 高频场景的性能取舍
+
+:::info[拼接：别用 `+=` 堆很多次]
+```cpp
+std::string s;
+for (auto& part : parts) s += part;        // ⚠️ 多次重新分配
+```
+
+**建议先算总长或 `reserve`**：
+
+```cpp
+std::string s;
+size_t total = 0;
+for (auto& p : parts) total += p.size();
+s.reserve(total);                          // 一次分配
+for (auto& p : parts) s += p;
+```
+:::
+
+| 场景 | 推荐 |
+| --- | --- |
+| 少量拼接 | `+` 就行（SSO 会帮忙） |
+| 循环里大量拼接 | **先 `reserve`** |
+| 数字转字符串 | `std::to_string` / `std::format` |
+| 字符串转数字 | **`std::from_chars`（最快，无异常无分配）** |
+| 按分隔符切分 | `string_view` + 手写循环（不拷贝） |
+| 大小写不敏感比较 | 自己写或用 `strcasecmp` |
+
+:::tip[`from_chars` 比 `stoi` 好在哪]
+```cpp
+int v;
+auto [p, ec] = std::from_chars(s.data(), s.data()+s.size(), v);
+if (ec != std::errc{}) { /* 解析失败 */ }
+```
+
+**三个优势**：
+
+1. **不抛异常**（`stoi` 失败会抛 `invalid_argument`）
+2. **不分配内存**（`stoi` 内部会构造 `std::string`）
+3. **不需要空终止**（直接给两个指针）
+:::
+
+## 编码问题
+
+:::danger[`std::string` 只是"字节数组"]
+**它不知道编码。** `s.size()` 是字节数，不是字符数。
+
+```cpp
+std::string s = "中文";
+s.size();              // 6（UTF-8 下每个汉字 3 字节）
+s[0];                  // 0xE4 —— 半个字符
+```
+
+**要正确处理 UTF-8，必须用专门的库**（如 `utf8proc`、`ICU`），或者至少自己按字节解析。
+:::
+
+:::warning[`std::filesystem::path` 才是路径的正确类型]
+```cpp
+std::string p = dir + "/" + name;            // ❌ Windows 上分隔符是 \
+std::filesystem::path p = dir / name;        // ✅ 自动处理分隔符
+```
+
+**跨平台代码一律用 `std::filesystem::path`。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 崩溃在 `string_view` 上 | 底层数据已销毁 | 检查生命周期 |
+| `printf` 打印出一堆多余字符 | `string_view` 不保证 `\0` 结尾 | 转 `std::string` |
+| 中文字符数算错 | `size()` 是字节数 | 用 UTF-8 库 |
+| 拼接很多次很慢 | 反复重新分配 | `reserve` |
+| `stoi` 抛异常 | 非法输入 | 改 `from_chars` |
+| 路径在 Windows 上错 | 硬编码 `/` | 用 `filesystem::path` |
+| `std::format` 编译不过 | 编译器太旧 | 用 `fmt` 库 |
+| `c_str()` 指针失效 | string 被修改/移动 | 不要长期保存 `c_str()` |
+
+:::danger[`c_str()` 的指针随时可能失效]
+```cpp
+const char* p = s.c_str();
+s += "more";        // 可能触发重新分配
+use(p);             // ❌ p 已悬垂
+```
+
+**只在"立刻使用"的场景用 `c_str()`**（比如传进 C 函数）。
+:::
+
+## 本课自检
+
+- [ ] 知道 SSO：短字符串不分配堆内存
+- [ ] **知道 `sizeof(std::string)` 通常 32 字节，别按值乱传**
+- [ ] **知道 `string_view` 不拥有数据，临时对象会悬垂**
+- [ ] **知道 `string_view` 不保证以 `\0` 结尾**
+- [ ] 会用 C++20 的 `starts_with` / `ends_with` / `contains`
+- [ ] 知道 `std::format` 需要较新编译器，降级用 `fmt`
+- [ ] **知道循环拼接要先 `reserve`**
+- [ ] **知道 `from_chars` 比 `stoi` 快且不抛异常**
+- [ ] **知道 `std::string` 只是字节数组，不处理编码**
+- [ ] 知道跨平台路径要用 `std::filesystem::path`
+- [ ] **知道 `c_str()` 指针会因修改/移动而失效**
+
+## 下一步
+
+[STL 容器](./stl-containers) 或 [STL 算法](./stl-algorithms)。

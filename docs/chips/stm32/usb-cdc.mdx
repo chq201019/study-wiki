@@ -1,0 +1,253 @@
+---
+id: usb-cdc
+title: "14 USB 设备：CDC 虚拟串口"
+sidebar_position: 14
+description: USB 描述符是什么、CDC 虚拟串口怎么做到免驱、时钟必须是 48MHz、收发缓冲的正确写法，以及枚举失败的排查顺序。
+---
+
+# 14 USB 设备：CDC 虚拟串口
+
+**本课目标**：让 STM32 插上电脑就是一个免驱串口。
+
+## 为什么用 USB 而不是串口
+
+| 对比 | UART + CH340 | **USB CDC 直连** |
+| --- | --- | --- |
+| 额外芯片 | 需要（CH340/CP2102） | **不需要** |
+| 驱动 | Windows 要装（Win10 后免驱） | **系统自带** |
+| 速度 | 通常 115200 ~ 921600 | **12 Mbps（全速）** |
+| 占用引脚 | 2 个（TX/RX） | 2 个（D+/D-） |
+| 复杂度 | 极低 | **较高** |
+
+**产品上省一颗芯片 + 省一个接口，值这个复杂度。**
+
+## 硬件要求
+
+:::danger[三个硬性条件]
+**① D+ 需要 1.5kΩ 上拉到 3.3V**
+
+这告诉主机"我是个全速设备"。
+
+**STM32F103 的部分型号内置了这个上拉**（可以用软件控制），但**很多开发板还是外置一个 1.5k 电阻**。
+
+**② 时钟必须是准 48 MHz**
+
+USB 全速要求 48 MHz ±0.25%。F103 的做法是 **PLL 输出 72MHz ÷ 1.5**。
+
+**所以用 USB 时 SYSCLK 必须是 72MHz**（[第 02 课](./clock-deep)讲过）。
+
+**③ D+/D- 是差分对，要走 90Ω 差分阻抗**
+
+短距离（`<10cm`）飞线一般能工作，产品必须按差分规则布线。
+:::
+
+:::warning[USB 不能直接接 5V]
+**D+/D- 是 3.3V 电平**，不能接到 5V 的 USB 信号线上。
+
+**VBUS（5V）只用来检测"是否插入"**，需要分压到 3.3V 以下再进 GPIO，或者用专门的 VBUS 检测引脚。
+:::
+
+## 描述符是什么
+
+:::info[USB 枚举的本质：主机问"你是什么"，设备递名片]
+```text
+主机：复位总线
+主机：读设备描述符（8 字节）  ← 先知道你是谁
+主机：再读完整设备描述符（18 字节）
+主机：读配置描述符（含接口、端点）
+主机：读字符串描述符（厂商名、产品名）
+主机：设置配置（SET_CONFIGURATION）
+主机：开始通信
+```
+
+**这一整套"名片"就是描述符，全部是数据结构。**
+:::
+
+**关键描述符的作用**：
+
+| 描述符 | 内容 |
+| --- | --- |
+| **设备描述符** | VID/PID、USB 版本、设备类 |
+| **配置描述符** | 供电方式、接口数量 |
+| **接口描述符** | 接口类（CDC = 0x02）、子类、协议 |
+| **端点描述符** | 端点号、方向、类型、最大包长 |
+
+:::tip[CDC 的两个接口]
+CDC-ACM 设备在 USB 层面是**两个接口**：
+
+- **通信接口**（Communication Class）：控制线，走中断端点
+- **数据接口**（Data Class）：真正收发数据，走两个批量端点
+:::
+
+## CubeMX 配置步骤
+
+:::tip[六步配好]
+1. **RCC** → HSE 选晶振，时钟树配到 72MHz
+2. **Connectivity → USB** → Device (FS)
+3. **Middleware → USB_DEVICE** → Class 选 **Communication Device Class (Virtual Port Com)**
+4. 确认 `PA11 (DM)` / `PA12 (DP)` 已分配
+5. **USBD_CDC** 参数里设缓冲区大小（默认 512 字节够用）
+6. 生成代码
+:::
+
+## 收发代码
+
+:::danger[不要直接调用 `CDC_Transmit_FS` 就以为完事了]
+```c
+/* ❌ 危险写法 */
+CDC_Transmit_FS(buf, len);
+```
+
+**如果上一次传输还没完成，这个函数会返回 `USBD_BUSY`，数据就丢了。**
+
+**正确写法**：
+:::
+
+```c
+/* ✅ 检查返回值，忙就等或重试 */
+int usb_send(const uint8_t *buf, uint16_t len)
+{
+    /* 如果上一次没发完，会返回 USBD_BUSY */
+    uint8_t ret = CDC_Transmit_FS((uint8_t *)buf, len);
+
+    if (ret == USBD_OK)   return 0;
+    if (ret == USBD_BUSY) return -1;      /* 稍后重试 */
+    return -2;                            /* 其他错误 */
+}
+
+/* 或者用"等待上一次发完"的写法 */
+int usb_send_blocking(const uint8_t *buf, uint16_t len, uint32_t timeout_ms)
+{
+    uint32_t start = HAL_GetTick();
+    while (CDC_Transmit_FS((uint8_t *)buf, len) == USBD_BUSY) {
+        if (HAL_GetTick() - start > timeout_ms) return -1;
+    }
+    return 0;
+}
+```
+
+:::warning[`CDC_Transmit_FS` 是"启动传输"就返回，不是"发完"才返回]
+它把数据交给 USB 外设就返回了。
+
+**真正发完是在 `CDC_TransmitCplt_FS` 回调里**：
+
+```c
+/* 在 usbd_cdc_if.c 里 */
+static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
+{
+    usb_tx_done_flag = true;        /* 你可以在这里置标志 */
+    return USBD_OK;
+}
+```
+
+**要连续发大量数据，必须用这个回调串起来，不能靠延时猜。**
+:::
+
+### 接收
+
+```c
+/* 在 usbd_cdc_if.c 里有这个函数（CubeMX 生成） */
+static int8_t CDC_Receive_FS(uint8_t *Buf, uint32_t *Len)
+{
+    /* Buf 里有 *Len 字节新数据 */
+    /* ⚠ 注意：这里如果处理太慢，后续数据可能覆盖 Buf */
+
+    memcpy(rx_buffer, Buf, *Len);
+    rx_len = *Len;
+    rx_ready = true;
+
+    /* 必须重新武装接收，否则收不到下一包 */
+    USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
+    USBD_CDC_ReceivePacket(&hUsbDeviceFS);
+
+    return USBD_OK;
+}
+```
+
+:::danger[忘了重新武装接收 = 只收到第一包]
+```c
+USBD_CDC_ReceivePacket(&hUsbDeviceFS);
+```
+
+**这一句不能少**。漏了它，USB 只收第一个包，后面全部无响应。
+
+**这是 USB CDC 最常见的 bug。**
+:::
+
+## 枚举失败的排查顺序
+
+:::tip[按这个顺序查，能定位 90% 的问题]
+**① 电脑完全没反应（设备管理器里连"未知设备"都没有）**
+
+- D+ 上拉电阻有没有？1.5kΩ 到 3.3V
+- USB 线是充电线还是数据线？（很多线只有电源）
+- 时钟真的是 48MHz 吗？用 MCO 输出量一下
+
+**② 显示"未知设备 / 设备描述符请求失败"**
+
+- 时钟不准（48MHz 偏差太大）
+- 描述符长度写错
+- 中断优先级或堆栈问题导致枚举中途失败
+
+**③ 显示为 COM 口但打不开 / 一开就断**
+
+- `CDC_Receive_FS` 里忘了重新武装接收
+- 收发缓冲区溢出
+- 中断处理时间过长
+
+**④ 能打开但数据乱**
+
+- 波特率设置不影响 USB CDC 的实际速度（但有些终端软件会因此限制）
+- 数据被覆盖（处理太慢）
+:::
+
+:::warning[Linux 下用 dmesg 看得最清楚]
+```bash
+dmesg -w            # 插上设备时实时输出
+lsusb               # 看 VID/PID 是否出现
+ls /dev/ttyACM*     # CDC 设备节点
+```
+
+**Windows 下设备管理器 → 属性 → 事件 里也能看到详细的枚举失败原因。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 完全识别不到 | D+ 缺 1.5k 上拉 | 加上拉 |
+| 完全识别不到 | 用了充电线 | 换数据线 |
+| 识别为未知设备 | 时钟不是准 48MHz | SYSCLK 必须 72MHz |
+| 只收到第一包数据 | 没调 `USBD_CDC_ReceivePacket` | 在回调里重新武装 |
+| 发送偶发丢数据 | 没检查 `USBD_BUSY` | 检查返回值或等完成回调 |
+| 插上就重启 | 供电不足（USB 限流 500mA） | 外部供电或减少负载 |
+| **休眠后连不上** | 进了低功耗模式 | USB 需要保持时钟 |
+| 换个电脑就不行 | 差分线太长 / 没屏蔽 | 缩短线、用屏蔽线 |
+| 拔插几次后死机 | 没处理 USB 复位/挂起回调 | 实现 `USBD_Reset`/`USBD_Suspend` |
+
+:::danger[USB 和低功耗是冲突的]
+**USB 需要 48MHz 时钟持续运行**，而这在 Stop 模式下是没有的。
+
+**所以"USB 设备 + 低功耗"基本无法同时做到**（除非用带 USB 唤醒功能的型号，且只在挂起时降功耗）。
+
+**产品上要二选一**：要么一直有 USB（耗电），要么用串口 + 低功耗。
+:::
+
+## 本课自检
+
+- [ ] 知道 USB CDC 相比 UART + CH340 省了一颗芯片
+- [ ] **知道 D+ 需要 1.5kΩ 上拉到 3.3V**
+- [ ] **知道 USB 全速要求 48MHz，F103 必须 SYSCLK = 72MHz**
+- [ ] 知道 D+/D- 是 3.3V 差分信号，不能接 5V
+- [ ] 理解描述符是"设备递名片"的过程
+- [ ] 知道 CDC 在 USB 层面是两个接口（通信 + 数据）
+- [ ] **知道 `CDC_Transmit_FS` 返回 `USBD_BUSY` 时必须处理**
+- [ ] **知道 `CDC_Transmit_FS` 只是启动传输，完成在回调里**
+- [ ] **知道 `CDC_Receive_FS` 里必须重新武装接收**
+- [ ] 能按四步排查枚举失败
+- [ ] 会用 `dmesg -w` 和 `lsusb` 在 Linux 下诊断
+- [ ] **知道 USB 与低功耗基本冲突**
+
+## 下一步
+
+[15 FreeRTOS 深入](./freertos-deep) —— 调度器到底怎么选下一个任务。

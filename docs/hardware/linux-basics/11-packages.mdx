@@ -1,0 +1,291 @@
+---
+id: 11-packages
+title: 11 软件安装
+sidebar_position: 11
+description: 包管理器为什么比下载 exe 好、apt/dnf/pacman 用法对照、软件源，以及编译安装。
+---
+
+# 11 软件安装
+
+**本课目标**：会用包管理器装软件，理解它为什么比手动下载好。
+
+## 包管理器解决什么问题
+
+:::danger[Windows 式安装的痛点]
+从网站下载 exe → 双击 → 下一步 → 装完发现还要装 .NET 运行库 → 又去找……
+:::
+
+**包管理器的做法**：
+
+```bash
+apt install nginx
+```
+
+**一条命令解决**：
+
+- 从官方仓库下载
+- 自动装好所有依赖
+- 装到标准位置（`/usr/bin`、`/etc`）
+- 记录到数据库，随时能升级/卸载
+
+## 三大主流包管理器
+
+| 发行版 | 包管理器 | 包格式 |
+| --- | --- | --- |
+| **Debian / Ubuntu** | **`apt`** | `.deb` |
+| Fedora / RHEL / CentOS | `dnf`（旧的是 `yum`） | `.rpm` |
+| Arch | `pacman` | `.pkg.tar.zst` |
+| Alpine | `apk` | `.apk` |
+
+**学会一个，其他都是换名字。**
+
+## `apt` 完整用法（Debian/Ubuntu）
+
+### 更新软件列表
+
+```bash
+sudo apt update
+```
+
+:::warning[`apt update` 不是升级软件]
+```bash
+sudo apt update            # ✅ 更新"可安装软件清单"
+sudo apt upgrade           # ✅ 真正升级已装的软件
+```
+
+`update` 只是**刷新本地缓存的软件包列表**（从源的 `Packages` 文件）。
+
+**新装系统后第一件事就是 `apt update`**——否则可能装到老版本，甚至报"找不到软件包"。
+:::
+
+### 安装
+
+```bash
+sudo apt install nginx
+sudo apt install -y nginx          # -y 自动确认
+sudo apt install nginx curl git    # 一次装多个
+```
+
+### 搜索
+
+```bash
+apt search nginx
+apt-cache search nginx             # 老写法，也行
+```
+
+### 查看信息
+
+```bash
+apt show nginx                     # 详情（版本、依赖、大小）
+apt list --installed               # 已安装的
+apt list --installed | grep nginx
+```
+
+### 卸载
+
+```bash
+sudo apt remove nginx              # 卸载，保留配置
+sudo apt purge nginx               # 卸载 + 删配置
+sudo apt autoremove                # 清理不再需要的依赖
+```
+
+:::tip[`remove` vs `purge`]
+```bash
+apt remove nginx        # 删程序，/etc/nginx 配置还在
+apt purge nginx         # 连配置一起删
+```
+
+**想彻底重装就 `purge`**；只是想临时卸载、以后还要用就 `remove`。
+:::
+
+### 升级系统
+
+```bash
+sudo apt update && sudo apt upgrade        # 升级所有可升级的
+sudo apt full-upgrade                      # 允许删除/新增依赖的完整升级
+```
+
+## `dnf` 用法对照（Fedora/RHEL）
+
+| 操作 | apt | dnf |
+| --- | --- | --- |
+| 更新列表 | `apt update` | `dnf check-update` |
+| 安装 | `apt install x` | `dnf install x` |
+| 卸载 | `apt remove x` | `dnf remove x` |
+| 搜索 | `apt search x` | `dnf search x` |
+| 查看信息 | `apt show x` | `dnf info x` |
+| 升级全部 | `apt upgrade` | `dnf upgrade` |
+| 清理缓存 | `apt clean` | `dnf clean all` |
+
+## `pacman` 用法对照（Arch）
+
+| 操作 | 命令 |
+| --- | --- |
+| 同步+升级 | `pacman -Syu` |
+| 安装 | `pacman -S x` |
+| 卸载 | `pacman -R x` |
+| 卸载+依赖 | `pacman -Rns x` |
+| 搜索 | `pacman -Ss x` |
+| 已安装列表 | `pacman -Q` |
+
+:::tip[Arch 的 `-Syu` 必须一起用]
+`pacman -Sy` 只更新列表不升级系统，**单独用会导致"部分升级"**——系统库和程序版本不匹配，很容易崩。
+
+**规矩：永远 `pacman -Syu` 一起。**
+:::
+
+## 软件源（repository）
+
+包管理器从"源"下载。源配置在哪：
+
+| 系统 | 配置文件 |
+| --- | --- |
+| Debian/Ubuntu | `/etc/apt/sources.list` 和 `/etc/apt/sources.list.d/` |
+| Fedora/RHEL | `/etc/yum.repos.d/*.repo` |
+| Arch | `/etc/pacman.conf` |
+
+### 换国内源（加速）
+
+```bash
+# 先备份
+sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
+
+# 编辑（换成国内镜像地址）
+sudo nano /etc/apt/sources.list
+```
+
+:::warning[换源要注意版本代号]
+Debian 13 是 `trixie`，Ubuntu 24.04 是 `noble`。
+
+**代号写错会导致 `apt update` 404。**
+
+```bash
+cat /etc/os-release          # 先确认自己的版本
+```
+:::
+
+## 手动装 `.deb` 包
+
+有些软件只提供 `.deb` 文件：
+
+```bash
+sudo dpkg -i package.deb           # 安装
+sudo apt install -f                # 修复缺失的依赖（关键！）
+```
+
+:::danger[`dpkg -i` 不会自动装依赖]
+```bash
+sudo dpkg -i foo.deb
+# 报错：dependency problems
+sudo apt install -f                # ✅ 让它自动补齐依赖
+```
+
+**`dpkg` 只是"解包安装"，依赖要靠 `apt -f` 补。**
+:::
+
+## 编译安装（源码）
+
+有些软件只能从源码编译：
+
+```bash
+# ① 装编译工具
+sudo apt install build-essential
+
+# ② 解压
+tar -xzf software-1.0.tar.gz
+cd software-1.0
+
+# ③ 配置（检查依赖、生成 Makefile）
+./configure --prefix=/usr/local
+
+# ④ 编译
+make -j$(nproc)
+
+# ⑤ 安装
+sudo make install
+```
+
+:::warning[编译安装的三个坑]
+1. **不会出现在包管理器里**——`apt list` 看不到，升级要手动重来
+2. **卸载靠 `make uninstall`**（很多项目没实现）
+3. **/usr/local 里的东西优先级可能和系统包冲突**
+
+**能装包就用包管理器**，编译安装是最后选择。
+:::
+
+## 完整示例：装一个 Web 服务器
+
+```bash
+# ① 更新软件列表
+sudo apt update
+
+# ② 搜索
+apt search nginx | head -5
+
+# ③ 看详情
+apt show nginx
+
+# ④ 安装
+sudo apt install -y nginx
+
+# ⑤ 确认装好了
+which nginx
+nginx -v
+dpkg -l | grep nginx
+
+# ⑥ 看服务状态（systemd，第 19 课细讲）
+systemctl status nginx
+
+# ⑦ 测试
+curl -I http://localhost
+
+# ⑧ 卸载
+sudo apt purge -y nginx
+sudo apt autoremove -y
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 没 `apt update` 就装 | 找不到软件包 | 本地列表旧 | 先 `apt update` |
+| 以为 `apt update` 是升级 | 软件版本没变 | 只是刷列表 | 用 `apt upgrade` |
+| `dpkg -i` 后程序跑不起来 | 缺依赖 | 没装依赖 | `apt install -f` |
+| 换源后 404 | 版本代号写错 | 不匹配 | 查 `os-release` |
+| 不加 `sudo` | Permission denied | 需要写系统目录 | 加 `sudo` |
+| 装完找不到命令 | `command not found` | 不在 PATH 或没装成功 | `dpkg -l` 确认 |
+
+:::danger[别用 `curl ... | sudo bash` 装软件]
+网上很多教程让你：
+
+```bash
+curl https://xxx.com/install.sh | sudo bash        # ⚠️ 危险
+```
+
+**问题**：你根本没看这个脚本在干什么，它**以 root 权限**执行任意代码。
+
+**安全做法**：先下载，看一眼，再执行：
+
+```bash
+curl -O https://xxx.com/install.sh
+less install.sh          # 看看它做什么
+bash install.sh
+```
+:::
+
+## 本课自检
+
+- [ ] 知道包管理器解决了什么问题（依赖、统一位置、可卸载）
+- [ ] **知道 `apt update` 和 `apt upgrade` 的区别**
+- [ ] 会 `install` / `remove` / `purge` / `search` / `show`
+- [ ] 知道 `remove` 和 `purge` 的区别
+- [ ] 能对照 `apt` / `dnf` / `pacman` 的命令
+- [ ] **知道 Arch 必须 `pacman -Syu` 一起用**
+- [ ] 知道软件源配置文件在哪
+- [ ] **知道 `dpkg -i` 后要 `apt install -f` 补依赖**
+- [ ] 知道编译安装的三个坑
+- [ ] **知道不该盲目 `curl | bash`**
+
+## 下一步
+
+[12 用户与组](./12-users) —— 多用户系统怎么管，`sudo` 到底做了什么。

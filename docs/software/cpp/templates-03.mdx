@@ -1,0 +1,252 @@
+---
+id: templates-03
+title: "03 SFINAE"
+sidebar_position: 4
+description: "模板 第 3 部分：SFINAE"
+---
+
+# 03 SFINAE
+**SFINAE = Substitution Failure Is Not An Error**（替换失败不是错误）。
+
+这是 C++11/14 时代做"模板重载决议"的核心机制。原理：编译器在把模板参数**替换**进函数签名时，如果替换导致**无效类型/表达式**，这个候选函数就被**静默地从候选集中移除**，而不是报错。
+
+### 经典例子
+
+```cpp
+// sfinae.cpp
+#include <cstdio>
+#include <type_traits>
+#include <vector>
+
+// 版本 A：只有当 T 有 .size() 时才有效
+// 第二个参数 int 用来提升重载优先级（见下方说明）
+template<typename T>
+auto print_size(const T& c, int) -> decltype(c.size(), void()) {
+    std::printf("  has .size(): %zu\n", c.size());
+}
+
+// 版本 B：兜底（第二个参数是 long，优先级低于 int）
+template<typename T>
+void print_size(const T&, long) {
+    std::printf("  no .size()\n");
+}
+
+int main() {
+    std::vector<int> v{1,2,3};
+    int x = 5;
+    print_size(v, 0);   // 走 A
+    print_size(x, 0);   // 走 B
+}
+```
+
+**实测输出：**
+
+```text
+  has .size(): 3
+  no .size()
+```
+
+:::warning[我最初写的版本其实是错的 —— 实测打脸]
+第一版我把兜底函数写成 `void print_size(const T&, ...)`，只有一个参数。实测结果是**编译错误**：
+
+```text
+sfinae.cpp:6:59: error: call of overloaded 'print_size(std::vector<int>&)' is ambiguous
+```
+
+原因：对 `vector<int>` 来说**两个候选都可行**——`...` 能匹配任意实参，而 `int`→`int` 的精确匹配和"省略号转换"在重载决议里无法分出优劣。
+
+**正确做法是给两个重载不同的"优先级标签"参数**（`int` vs `long`，或 `int` vs `...`）。这是 SFINAE 时代的标准技巧——也正说明了它有多别扭：**C++20 的 Concepts 完全不需要这一套。**
+:::
+
+### std::enable_if：SFINAE 的标准工具
+
+```cpp
+// enable_if.cpp
+#include <cstdio>
+#include <type_traits>
+
+// 只对整数类型启用
+template<typename T>
+std::enable_if_t<std::is_integral_v<T>, T> process(T v) {
+    std::printf("  integral: %lld\n", (long long)v);
+    return v * 2;
+}
+
+// 只对浮点类型启用
+template<typename T>
+std::enable_if_t<std::is_floating_point_v<T>, T> process(T v) {
+    std::printf("  floating: %.3f\n", (double)v);
+    return v / 2;
+}
+
+int main() {
+    process(10);
+    process(3.14);
+    // process("hello");   // 编译错误：没有匹配的重载
+}
+```
+
+**实测输出：**
+
+```text
+  integral: 10
+  floating: 3.140
+```
+
+**取消注释 `process("hello")` 后的真实错误：**
+
+```text
+err_sfinae.cpp:5:20: error: no matching function for call to 'process(const char [6])'
+    5 | int main(){ process("hello"); }
+      |             ~~~~~~~^~~~~~~~~
+  • there are 2 candidates
+    • candidate 1: 'template<class T> std::enable_if_t<((bool)is_integral_v<T>), T> process(T)'
+      • template argument deduction/substitution failed:
+        • ... type_traits: In substitution of 'template<bool _Cond, class _Tp>
+          using std::enable_if_t = typename std::enable_if::type
+          [with bool _Cond = false; _Tp = const char*]':
+```
+
+:::danger[SFINAE 的代价：错误信息]
+上面那个错误信息就是 SFINAE 的著名问题——**"no matching function"**，不告诉你为什么。
+
+实际项目里，一个失败的 `enable_if` 可能产生**几百行**模板实例化回溯。**这正是 C++20 引入 Concepts 的主要动机。**
+:::
+
+## 6. C++20 Concepts
+
+Concepts 把"对模板参数的约束"变成**一等语言特性**，带来三个好处：
+
+1. **错误信息可读**（直接说"哪个约束没满足"）
+2. **约束可以被复用和组合**
+3. **重载决议更清晰**
+
+### 基本语法
+
+```cpp
+// concepts_demo.cpp
+#include <cstdio>
+#include <concepts>
+#include <string>
+#include <vector>
+
+// 定义一个 concept
+template<typename T>
+concept Integral = std::integral<T>;
+
+template<typename T>
+concept HasSize = requires(T t) {
+    { t.size() } -> std::convertible_to<size_t>;
+};
+
+// 用 concept 约束模板参数
+template<Integral T>
+T process(T v) {
+    std::printf("  integral: %lld\n", (long long)v);
+    return v * 2;
+}
+
+// requires 子句写法
+template<typename T> requires HasSize<T>
+void show_size(const T& c) {
+    std::printf("  size = %zu\n", c.size());
+}
+
+// 简写函数模板语法
+void print_integral(std::integral auto v) {
+    std::printf("  short form: %lld\n", (long long)v);
+}
+
+int main() {
+    process(10);
+    // process(3.14);   // 编译错误（但错误信息很清楚！）
+
+    std::vector<int> v{1,2,3};
+    show_size(v);
+    // show_size(5);    // 编译错误
+
+    print_integral(42);
+}
+```
+
+编译（**必须用 C++20**）：
+
+```bash
+g++ -std=c++20 -o concepts_demo.exe concepts_demo.cpp && ./concepts_demo.exe
+```
+
+**实测输出：**
+
+```text
+  integral: 10
+  size = 3
+  short form: 42
+```
+
+### Concepts vs SFINAE：错误信息实测对比
+
+这是 Concepts 最有说服力的地方。看同一个错误在两种写法下的提示：
+
+**SFINAE 版本（`enable_if`）：**
+
+```text
+err_sfinae.cpp:5:20: error: no matching function for call to 'process(const char [6])'
+    5 | int main(){ process("hello"); }
+      |             ~~~~~~~^~~~~~~~~
+  • there are 2 candidates
+    • candidate 1: 'template<class T> std::enable_if_t<((bool)is_integral_v<T>), T> process(T)'
+      • template argument deduction/substitution failed:
+        • ... type_traits: In substitution of 'template<bool _Cond, class _Tp>
+          using std::enable_if_t = typename std::enable_if::type
+          [with bool _Cond = false; _Tp = const char*]':
+```
+
+**Concepts 版本：**
+
+```text
+err_concept.cpp:4:20: error: no matching function for call to 'process(const char [6])'
+    4 | int main(){ process("hello"); }
+      |             ~~~~~~~^~~~~~~~~
+  • there are 2 candidates
+    • candidate 1: 'template<class T>  requires  integral<T> T process(T)'
+      • template argument deduction/substitution failed:
+        • constraints not satisfied
+        • ... concepts: In substitution of
+          'template<class T>  requires  integral<T> T process(T) [with T = const char*]':
+```
+
+Concepts 版本**直接指出"约束未满足"和"哪个表达式有问题"**。这就是生产力差异。
+
+### 标准库预定义的 concepts
+
+`<concepts>` 头文件提供了一批：
+
+| Concept | 含义 |
+| --- | --- |
+| `std::integral<T>` | 整数类型 |
+| `std::floating_point<T>` | 浮点类型 |
+| `std::same_as<T, U>` | 同一类型 |
+| `std::convertible_to<From, To>` | 可隐式转换 |
+| `std::derived_from<D, B>` | 派生自 |
+| `std::totally_ordered<T>` | 支持 `<` `>` `<=` `>=` `==` `!=` |
+| `std::copyable<T>` | 可拷贝 |
+| `std::movable<T>` | 可移动 |
+| `std::regular<T>` | 可拷贝、可比较、可默认构造 |
+| `std::invocable<F, Args...>` | 可用给定参数调用 |
+
+### requires 表达式的四种形式
+
+```cpp
+template<typename T>
+concept MyConcept = requires(T a, T b) {
+    a + b;                                    // 1. 简单要求：表达式必须合法
+    typename T::value_type;                   // 2. 类型要求：必须有这个嵌套类型
+    { a.begin() };                            // 3. 复合要求：表达式合法
+    { a.size() } -> std::convertible_to<size_t>;  // 4. 返回类型约束
+    requires std::integral<typename T::value_type>;  // 5. 嵌套要求
+};
+```
+
+---
+
+**翻页**：[← 上一页](./templates-02) · [下一页 →](./templates-04) · [返回目录](./)

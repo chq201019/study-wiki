@@ -1,0 +1,228 @@
+---
+id: dynamic-memory
+title: 动态内存管理
+sidebar_position: 21
+description: malloc/free 的底层、realloc 的两个陷阱、柔性数组、内存池为什么快、以及内存碎片怎么诊断。
+---
+
+# 动态内存管理
+
+**本课目标**：知道 `malloc` 做了什么，什么时候不该用它。
+
+## `malloc` 到底做了什么
+
+![malloc 内存块布局：块头元数据 + 用户数据区 + 对齐填充，返回值跳过块头，所以小分配开销远大于请求](/img/diagrams/c-malloc-layout.svg)
+
+
+```c
+void *p = malloc(100);
+```
+
+:::info[它做了三件事]
+1. **在堆上找到一块足够大的空闲区域**（可能需要向内核 `brk`/`mmap` 申请）
+2. **在块头写入元数据**（大小、是否空闲）
+3. **返回数据区的指针**（不是块头的地址）
+
+**所以 `malloc(1)` 实际占用的内存远大于 1 字节**（通常 16~32 字节起）。
+:::
+
+```c
+/* 元数据就藏在返回指针的前面 */
+void *p = malloc(100);
+size_t *meta = (size_t *)p - 1;      /* ⚠️ 仅供理解，不要依赖 */
+```
+
+:::danger[`malloc(0)` 的返回值是实现定义的]
+```c
+void *p = malloc(0);
+/* 可能返回 NULL，也可能返回一个可以 free 的唯一指针 */
+```
+
+**别写 `malloc(0)`** —— 行为不确定。
+:::
+
+## `free` 之后指针还在
+
+:::danger[`free` 不会把指针置空]
+```c
+free(p);
+p = NULL;          /* ✅ 必须手动置空 */
+```
+
+**`free(p)` 之后 `p` 依然指向那块内存** —— 再访问就是 use-after-free（**未定义行为，可能看起来"正常"**）。
+
+**而 `free(NULL)` 是安全的空操作** —— 所以"用完置 NULL"能防住重复释放。
+:::
+
+## `realloc` 的两个陷阱
+
+```c
+void *newp = realloc(p, 200);
+```
+
+:::danger[① 失败时原指针依然有效，不能直接覆盖]
+```c
+p = realloc(p, 200);        /* ❌ 失败时 p 变成 NULL，原内存泄漏 */
+
+void *tmp = realloc(p, 200);
+if (tmp) {
+    p = tmp;                /* ✅ 成功才覆盖 */
+} else {
+    /* p 仍然有效，继续用它或释放 */
+}
+```
+:::
+
+:::danger[② `realloc` 可能会搬移内存]
+```c
+void *p = malloc(100);
+void *q = p;                /* q 也指向同一块 */
+p = realloc(p, 10000);      /* 可能搬到新地址 */
+/* q 现在是悬垂指针！ */
+```
+
+**任何指向旧内存的指针/链表节点，在 `realloc` 之后都可能失效。**
+:::
+
+## 柔性数组：一次分配，两部分数据
+
+```c
+struct Msg {
+    size_t len;
+    char   data[];          /* 柔性数组成员，必须是最后一个 */
+};
+
+struct Msg *m = malloc(sizeof(struct Msg) + payload_len);
+m->len = payload_len;
+memcpy(m->data, src, payload_len);
+free(m);                    /* 一次 free 搞定 */
+```
+
+:::tip[比"结构体 + 单独指针"好在哪]
+- **一次 `malloc`/`free`**（少一半分配开销）
+- **内存连续**（缓存友好，也便于一次性发送）
+- **不会忘记释放第二部分**
+
+**这是 C 里做变长消息的标准手法。**
+:::
+
+:::warning[`sizeof` 不包括柔性数组]
+```c
+sizeof(struct Msg)          /* 只有 len 部分（可能含填充） */
+```
+
+**必须自己加 `payload_len`。**
+:::
+
+## 内存池：为什么快
+
+:::danger[`malloc` 在嵌入式里的三个问题]
+1. **不确定的耗时**（可能要遍历空闲链表）
+2. **碎片**（长时间运行后分配失败）
+3. **不可重入**（多数实现有全局锁）
+
+**所以实时系统和嵌入式项目常常禁用 `malloc`。**
+:::
+
+```c
+/* 一个最简单的固定块内存池 */
+#define BLK_SZ  32
+#define BLK_CNT 64
+
+static uint8_t  pool[BLK_SZ * BLK_CNT];
+static uint8_t  used[BLK_CNT];
+static size_t   n_used;
+
+void *pool_alloc(void) {
+    if (n_used >= BLK_CNT) return NULL;
+    for (size_t i = 0; i < BLK_CNT; i++) {
+        if (!used[i]) {
+            used[i] = 1;
+            n_used++;
+            return &pool[i * BLK_SZ];
+        }
+    }
+    return NULL;
+}
+
+void pool_free(void *p) {
+    size_t i = ((uint8_t *)p - pool) / BLK_SZ;
+    if (i < BLK_CNT && used[i]) { used[i] = 0; n_used--; }
+}
+```
+
+:::tip[内存池的收益]
+- **O(1) 分配**（或接近）
+- **零碎片**（固定块）
+- **无锁**（单线程时）
+- **可预测**（最坏情况时间确定）
+
+**代价**：块大小固定，可能浪费；块数固定，用完就失败。
+:::
+
+## 碎片怎么诊断
+
+```c
+/* glibc 提供 malloc_stats() 与 mallinfo2() */
+#include <malloc.h>
+
+struct mallinfo2 mi = mallinfo2();
+printf("arena=%zu, in_use=%zu, free=%zu\n",
+       mi.arena, mi.uordblks, mi.fordblks);
+```
+
+:::danger["总空闲够多但仍分配失败" = 碎片化的典型症状]
+```text
+heap: 100KB 总量，60KB 空闲
+但最大连续块只有 200 字节
+→ malloc(1KB) 失败
+```
+
+**诊断手段**：
+
+- `malloc_stats()` 看总体
+- **valgrind --tool=massif** 看峰值
+- 自己给 `malloc` 加 hook 记录分配大小分布
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 偶发崩溃 | use-after-free | `free` 后置 NULL，开 ASan |
+| 内存泄漏 | 某条路径忘了 `free` | ASan / valgrind |
+| `realloc` 后崩溃 | 旧指针悬垂 | `realloc` 后让所有旧指针失效 |
+| `realloc` 泄漏 | 直接 `p = realloc(p,...)` | 用临时变量判空 |
+| 长时间运行后分配失败 | 碎片 | 内存池 / 减少分配频率 |
+| `sizeof(ptr)` 是 8 | 对指针取 sizeof | 用 `sizeof(*ptr)` 或数组长度 |
+| 越界写不报错 | 堆上无边界检查 | ASan |
+| `free` 两次崩溃 | 重复释放 | 置 NULL |
+
+:::danger[`sizeof` 数组与指针的经典区别]
+```c
+void f(int arr[10]) {
+    sizeof(arr);        /* ❌ 8（指针大小），不是 40 */
+}
+```
+
+**数组传参会退化成指针** —— 必须额外传长度。
+:::
+
+## 本课自检
+
+- [ ] **知道 `malloc` 有块头元数据，小分配实际开销远大于请求**
+- [ ] **知道 `malloc(0)` 行为实现定义，别这么写**
+- [ ] **知道 `free` 不会置空指针，要手动 NULL**
+- [ ] 知道 `free(NULL)` 是安全的
+- [ ] **知道 `realloc` 失败时原指针仍有效（不能直接覆盖）**
+- [ ] **知道 `realloc` 可能搬移内存，旧指针全部失效**
+- [ ] 会用柔性数组成员做变长消息
+- [ ] 知道 `sizeof` 不含柔性数组
+- [ ] **理解内存池为什么快（O(1)、零碎片、无锁）**
+- [ ] 会用 `mallinfo2` / `malloc_stats` 看堆状态
+- [ ] **知道"空闲总量够但仍失败"是碎片化**
+- [ ] 知道数组传参会退化成指针
+
+## 下一步
+
+[位操作实战](./bit-manipulation) 或 [GDB 调试实战](./gdb)。

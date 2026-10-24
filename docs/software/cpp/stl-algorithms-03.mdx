@@ -1,0 +1,271 @@
+---
+id: stl-algorithms-03
+title: "03 std::function：灵活但有代价"
+sidebar_position: 4
+description: "STL 算法与函数对象 第 3 部分：std::function：灵活但有代价"
+---
+
+# 03 std::function：灵活但有代价
+### 它能做什么
+
+`std::function<Signature>` 是一个**类型擦除**的可调用对象包装器——能存 lambda、函数指针、仿函数、`bind` 结果，只要签名匹配：
+
+```cpp
+// std_function.cpp
+#include <functional>
+#include <cstdio>
+
+int free_func(int x) { return x * 2; }
+
+struct Functor {
+    int scale;
+    int operator()(int x) const { return x * scale; }
+};
+
+int main() {
+    std::function<int(int)> f;
+
+    f = free_func;                          // 函数指针
+    std::printf("free_func  : %d\n", f(5));
+
+    f = Functor{3};                         // 仿函数
+    std::printf("functor    : %d\n", f(5));
+
+    f = [](int x){ return x + 100; };       // lambda
+    std::printf("lambda     : %d\n", f(5));
+
+    int captured = 7;
+    f = [captured](int x){ return x + captured; };   // 带捕获的 lambda
+    std::printf("capturing  : %d\n", f(5));
+
+    std::printf("sizeof(std::function<int(int)>) = %zu\n", sizeof(f));
+    std::printf("bool(f) = %d\n", (bool)f);
+    f = nullptr;
+    std::printf("after nullptr, bool(f) = %d\n", (bool)f);
+}
+```
+
+**实测输出：**
+
+```text
+free_func  : 10
+functor    : 15
+lambda     : 105
+capturing  : 12
+sizeof(std::function<int(int)>) = 32
+bool(f) = 1
+after nullptr, bool(f) = 0
+```
+
+### 代价：为什么不该到处用
+
+`std::function` 的代价有三层：
+
+1. **大小**：通常是 **32 或 64 字节**（libstdc++ 上是 32），不管你存多小的 lambda
+2. **可能堆分配**：如果捕获的对象太大放不进内嵌缓冲区（SBO），会 `new`
+3. **间接调用**：`operator()` 通常是虚调用或函数指针调用，**不可内联**
+
+**实测对比：**
+
+```cpp
+// function_cost.cpp
+#include <functional>
+#include <chrono>
+#include <cstdio>
+#include <vector>
+
+template<typename F> long long us(F&& f) {
+    auto t0 = std::chrono::high_resolution_clock::now(); f();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count();
+}
+
+int main() {
+    const int N = 100000000;
+    int sink = 0;
+
+    auto lam = [](int x){ return x * 3; };
+
+    // 直接调用 lambda（可内联）
+    long long t_direct = us([&]{
+        for (int i = 0; i < N; ++i) sink += lam(i);
+    });
+
+    // 通过 std::function
+    std::function<int(int)> fn = lam;
+    long long t_fn = us([&]{
+        for (int i = 0; i < N; ++i) sink += fn(i);
+    });
+
+    // 通过函数指针
+    int (*fp)(int) = [](int x){ return x * 3; };
+    long long t_fp = us([&]{
+        for (int i = 0; i < N; ++i) sink += fp(i);
+    });
+
+    std::printf("direct lambda    : %lld us\n", t_direct);
+    std::printf("std::function    : %lld us\n", t_fn);
+    std::printf("function pointer : %lld us\n", t_fp);
+    std::printf("(sink=%d)\n", sink);
+}
+```
+
+**实测输出（`-O2`）：**
+
+```text
+direct lambda    : 22855 us
+std::function    : 135916 us
+function pointer : 137745 us
+```
+
+:::tip[什么时候用 std::function]
+**用 `std::function` 的场景：**
+
+- 需要**存储**回调（成员变量、容器里放一堆回调）
+- 需要**运行时替换**不同的可调用对象
+- 头文件不想暴露模板细节（类型擦除的目的）
+
+**不该用的场景：**
+
+- 函数参数里只是**立即调用**一次 → **用模板参数**（`template<typename F> void f(F&& cb)`）
+- 性能敏感的内循环 → 用 auto 参数（C++20 的 `void f(auto&& cb)`）或模板
+
+```cpp
+// 推荐：模板参数，零开销，可内联
+template<typename Callback>
+void for_each_item(Callback&& cb) { for (auto& x : items_) cb(x); }
+
+// 不推荐（除非确实需要存储）：额外开销
+void for_each_item(std::function<void(Item&)> cb);
+```
+:::
+
+### 陷阱：std::function 抛异常
+
+调用空的 `std::function` 会抛 `std::bad_function_call`：
+
+```cpp
+std::function<void()> f;
+// f();   // 抛 std::bad_function_call
+if (f) f();   // 先检查
+```
+
+## 5. C++20 ranges：管道式组合
+
+ranges 解决的是"算法组合起来很难看"的问题。
+
+### 老写法 vs 新写法
+
+```cpp
+// ranges_demo.cpp
+#include <vector>
+#include <ranges>
+#include <algorithm>
+#include <cstdio>
+
+int main() {
+    std::vector<int> v{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+
+    // 老写法：从内往外读
+    std::vector<int> tmp;
+    std::copy_if(v.begin(), v.end(), std::back_inserter(tmp),
+                 [](int x){ return x % 2 == 0; });
+    std::transform(tmp.begin(), tmp.end(), tmp.begin(),
+                   [](int x){ return x * x; });
+    std::printf("old style: ");
+    for (int x : tmp) std::printf("%d ", x);
+    std::printf("\n");
+
+    // C++20 ranges：从左到右读
+    auto result = v
+        | std::views::filter([](int x){ return x % 2 == 0; })
+        | std::views::transform([](int x){ return x * x; });
+
+    std::printf("ranges   : ");
+    for (int x : result) std::printf("%d ", x);
+    std::printf("\n");
+}
+```
+
+编译（**必须 C++20**）：
+
+```bash
+g++ -std=c++20 -o ranges_demo.exe ranges_demo.cpp && ./ranges_demo.exe
+```
+
+**实测输出：**
+
+```text
+old style: 4 16 36 64 100
+ranges   : 4 16 36 64 100
+```
+
+### ranges 的三个核心优势
+
+1. **组合性**：`|` 管道，从左到右读，符合直觉
+2. **惰性求值**：不产生中间容器，边遍历边计算
+3. **能直接作用于容器**（不必写 `begin()`/`end()`）：`std::ranges::sort(v);`
+
+### 常用 view
+
+| view | 作用 |
+| --- | --- |
+| `views::filter(pred)` | 过滤 |
+| `views::transform(f)` | 变换 |
+| `views::take(n)` | 取前 n 个 |
+| `views::drop(n)` | 丢前 n 个 |
+| `views::reverse` | 反转 |
+| `views::iota(a, b)` | 生成整数序列 |
+| `views::keys` / `views::values` | 取 map 的键/值 |
+| `views::enumerate`（**C++23**） | 带索引遍历 |
+
+```cpp
+// views_demo.cpp
+#include <vector>
+#include <ranges>
+#include <map>
+#include <cstdio>
+
+int main() {
+    std::vector<int> v{5, 3, 8, 1, 9, 2};
+
+    std::printf("first 3 sorted: ");
+    for (int x : v | std::views::filter([](int n){ return n > 2; })
+                   | std::views::take(3)) std::printf("%d ", x);
+    std::printf("\n");
+
+    std::printf("iota(1,6): ");
+    for (int x : std::views::iota(1, 6)) std::printf("%d ", x);
+    std::printf("\n");
+
+    std::map<std::string, int> m{{"a", 1}, {"b", 2}};
+    std::printf("map keys: ");
+    for (const auto& k : m | std::views::keys) std::printf("%s ", k.c_str());
+    std::printf("\n");
+
+    // 惰性：不会预先计算
+    auto lazy = std::views::iota(1) | std::views::take(5);
+    std::printf("lazy size concept: ");
+    for (int x : lazy) std::printf("%d ", x);
+    std::printf("\n");
+}
+```
+
+**实测输出：**
+
+```text
+first 3 sorted: 5 3 8
+iota(1,6): 1 2 3 4 5
+map keys: a b
+lazy size concept: 1 2 3 4 5
+```
+
+:::warning[view 是惰性的，且可能要求被引用对象存活]
+和 lambda 捕获一样，**view 不拥有数据**。把一个 view 存起来，而原始容器销毁了 → 悬空。
+
+另外部分 view（如 `filter`）的 `begin()` 不是 const 的，某些场景下需要额外注意。
+:::
+
+---
+
+**翻页**：[← 上一页](./stl-algorithms-02) · [下一页 →](./stl-algorithms-04) · [返回目录](./)

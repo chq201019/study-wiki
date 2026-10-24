@@ -1,0 +1,266 @@
+---
+id: memory-deep
+title: 内存管理深入
+sidebar_position: 19
+description: RSS 与 VSZ 的区别、Page Cache 为什么不是泄漏、OOM Killer 怎么挑受害者、swap 到底该不该开、以及怎么确认真的内存泄漏。
+---
+
+# 内存管理深入
+
+**本课目标**：看懂 `free` / `top` 的内存数字，不再为"内存一直涨"恐慌。
+
+## 四个关键指标
+
+| 指标 | 含义 | 会涨是问题吗 |
+| --- | --- | --- |
+| **VSZ / VIRT** | 虚拟地址空间大小 | **❌ 不是**（含未分配的映射） |
+| **RSS / RES** | 实际驻留物理内存 | ⚠️ 可能是 |
+| **Page Cache** | 缓存的文件数据 | **❌ 不是（可回收）** |
+| **Swap** | 换出的内存 | ⚠️ 频繁换入换出才是问题 |
+
+:::danger[VSZ 大得离谱是正常的]
+```bash
+ps aux | head -3
+# java  1234 ... 20.5g  1.2g ...     ← VSZ 20.5G，RSS 1.2G
+```
+
+**JVM 会预留巨大的虚拟地址空间**（堆、元空间、直接内存、代码缓存），但**不等于真的用了那么多物理内存**。
+
+**看内存占用要看 RSS，不是 VSZ。**
+:::
+
+## Page Cache：为什么 `free` 总是很小
+
+:::info["free 内存少"通常是好现象]
+```bash
+free -h
+#               total   used   free   shared  buff/cache   available
+# Mem:           31Gi   12Gi   2.0Gi   0.5Gi        17Gi        18Gi
+```
+
+**`free` 只有 2G，但 `available` 有 18G。**
+
+**因为 `buff/cache` 里那 17G 是 Page Cache** —— 缓存了读过的文件数据，**内存紧张时会自动回收**。
+:::
+
+:::tip[Page Cache 的作用]
+读过的文件第二次访问就不需要磁盘 IO 了 —— 这是 Linux 让系统"越用越快"的机制。
+
+**主动清缓存反而会降低性能**：
+
+```bash
+sync; echo 3 > /proc/sys/vm/drop_caches     # ⚠️ 生产环境别随便执行
+```
+
+**只在排查"缓存是否影响测量"时才清，且要知道之后性能会先降一段时间。**
+:::
+
+:::warning[`used` 里也可能含不可回收的部分]
+`free` 的 `used` = total - free - buff/cache，**基本等于不可回收的匿名内存**（进程堆栈、共享内存等）。
+
+**判断内存够不够的唯一标准是看 `available`。**
+:::
+
+## 怎么确认真的内存泄漏
+
+:::danger[别只看 RSS 涨]
+**RSS 上涨有三种正常原因**：
+
+1. **程序启动时预分配/预热**（一次性上涨后稳定）
+2. **Page Cache 被算进 RSS**（文件映射页）
+3. **内存分配器不归还**（`free` 了但保留在进程池里，供下次复用）
+
+**判断泄漏的方法：看"长期趋势 + 触发点"。**
+:::
+
+```bash
+# ① 关键指标：min 值（历史最低）
+cat /sys/fs/cgroup/<...>/memory.stat
+# anon          12345678        ← 匿名内存（真正的进程内存）
+# file          98765432        ← 文件缓存
+# slab          1234567         ← 内核对象
+
+# ② 定期采样，看 anon 是否单调上升
+while true; do
+  grep anon /sys/fs/cgroup/<...>/memory.stat | awk '{print $2}'
+  sleep 60
+done
+```
+
+:::tip[三步确认泄漏]
+**① 让业务负载归零后观察**
+
+如果 RSS 在"没请求"时还持续涨 → 大概率是泄漏。
+
+**② 对比 `anon` 而非 RSS**
+
+`anon`（匿名页）才是进程真正申请的内存；`file`（文件缓存）不算。
+
+**③ 用工具定位**
+
+```bash
+# Python：tracemalloc 是标准库，直接 import 即可，不需要安装
+# 需要图形化/对象级分析再装 objgraph 或 memory_profiler
+
+# C/C++
+valgrind --leak-check=full ./prog
+# 或 AddressSanitizer 的 LeakSanitizer
+```
+:::
+
+:::warning[内存分配器"不归还"是设计而非泄漏]
+glibc 的 `malloc` 释放大块内存会 `munmap` 归还，但**小块内存通常留在进程的 arena 里复用**。
+
+**所以**：
+
+- `free()` 之后 RSS 不下降，**可能是正常的**
+- 用 `malloc_stats()` 或 `MALLOC_TRIM_THRESHOLD_` 观察
+
+**验证方法**：让进程做一次"完全相同的负载"，看第二次是否还涨。**不涨就是复用，涨才是泄漏。**
+:::
+
+## OOM Killer 怎么挑受害者
+
+:::danger[它是按 `oom_score` 挑的，不是"谁占得多杀谁"]
+```bash
+cat /proc/<pid>/oom_score          # 当前分数
+cat /proc/<pid>/oom_score_adj      # 可调偏移（-1000 到 1000）
+```
+
+**分数计算主要考虑**：
+
+- **RSS 越大，分数越高**（占得多更可能被杀）
+- `oom_score_adj` 直接加减
+- root 进程略有保护
+- 有子进程的略降（杀父不划算）
+
+**`oom_score_adj = -1000` 表示"永不杀"**（内核线程就是这样）。
+:::
+
+```bash
+# 保护关键进程
+echo -500 > /proc/<pid>/oom_score_adj
+
+# 让某个进程优先被杀（如批处理任务）
+echo 500 > /proc/<pid>/oom_score_adj
+```
+
+:::tip[查是谁被 OOM 杀了]
+```bash
+dmesg -T | grep -i 'killed process'
+# [Mon Jan  1 10:00:00 2026] Out of memory: Killed process 1234 (java)
+#   total-vm:2048000kB, anon-rss:1800000kB, file-rss:0kB
+```
+
+**`journalctl -k | grep -i oom` 也行。**
+
+**容器里被杀通常是 exit code 137**（128 + SIGKILL=9）。
+:::
+
+## swap 到底该不该开
+
+:::info[三种立场]
+| 场景 | 建议 |
+| --- | --- |
+| **桌面 / 开发机** | **开**（防止内存尖峰直接 OOM） |
+| **数据库 / 低延迟服务** | **不开或极小**（换入换出延迟不可控） |
+| **容器** | 通常**限制 swap=0**，让超限直接 OOM |
+
+**关键不是"开不开"，而是"会不会频繁换入换出"。**
+:::
+
+```bash
+# 看换入换出速率（si/so）
+vmstat 1
+# procs -----------memory---------- ---swap--
+#  r  b   swpd   free   ...    si    so
+#  1  0  10240 800000   ...     0     0     ← si/so 都为 0 = 没在换
+```
+
+:::danger[`si` / `so` 持续非 0 才是问题]
+**轻微 swap 占用（`swpd` 有值但 `si/so` 为 0）完全正常** —— 那只是以前换出去、现在没在动的冷页。
+
+**如果 `si`/`so` 持续几十到几百 KB/s，说明内存真的不够，性能会显著下降**（机械盘尤其明显）。
+:::
+
+```bash
+cat /proc/sys/vm/swappiness        # 默认 60
+# 0 = 尽量不用 swap（但 OOM 前还是会用）
+# 1 = 内核 3.5+ 的"最小换出"
+# 100 = 积极使用 swap
+```
+
+:::warning[`swappiness=0` 不等于"禁用 swap"]
+**它只是"尽量避免"，内存压力大时仍然会换出。**
+
+**真要禁用**：`swapoff -a`（或容器里设 `--memory-swap` 等于 `--memory`）。
+:::
+
+## 一个完整的排查流程
+
+```bash
+# ① 整体视图
+free -h
+vmstat 1 5                      # 看 si/so 和 wa
+
+# ② 谁占得多（按 RSS 排序）
+ps aux --sort=-rss | head -10
+
+# ③ 细分（共享内存、文件映射分别多少）
+pmap -x <pid> | tail -5
+cat /proc/<pid>/status | grep -E 'Vm(Size|RSS|Swap|Data)'
+
+# ④ 泄漏趋势
+while true; do grep -E 'VmRSS|VmData' /proc/<pid>/status; sleep 60; done
+
+# ⑤ 是否被 cgroup/容器限制
+cat /sys/fs/cgroup/<...>/memory.max
+cat /sys/fs/cgroup/<...>/memory.current
+```
+
+| 现象 | 检查项 |
+| --- | --- |
+| `free` 小但系统正常 | Page Cache（看 `available`） |
+| RSS 持续涨 | 泄漏 vs 分配器池（看趋势和触发点） |
+| 进程被杀 exit 137 | OOM Killer（`dmesg`） |
+| 系统卡顿、`si/so` 高 | 内存不足在 swap |
+| 容器里 OOM 但宿主内存充足 | cgroup `memory.max` 限制 |
+| `/proc/<pid>/status` 里 VmSwap 大 | 该进程被换出很多 |
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 以为内存泄漏 | Page Cache 占着 | 看 `available` 和 `anon` |
+| VSZ 巨大 | 虚拟预留 | 看 RSS |
+| `free()` 后 RSS 不降 | 分配器保留复用 | 看长期趋势 |
+| 容器莫名 OOM | cgroup 限制 | 查 `memory.max` |
+| 关 swap 后性能更差 | 内存尖峰直接 OOM | 保留少量 swap |
+| `swappiness=0` 还在换 | 它不是禁用 | 用 `swapoff` |
+| 打了 `drop_caches` 变慢 | 缓存被清空 | 别再打 |
+
+:::danger[不要在生产上频繁 `drop_caches`]
+**清掉 Page Cache 会让所有文件读取退回磁盘** —— 数据库和文件服务的性能会断崖式下降，且恢复需要时间。
+
+**它只适合"我要测一个干净的基线"这种一次性场景。**
+:::
+
+## 本课自检
+
+- [ ] **能区分 VSZ（虚拟）与 RSS（实际驻留）**
+- [ ] **知道 Java 等程序 VSZ 巨大是正常的**
+- [ ] **知道 Page Cache 可回收，`free` 小不等于内存不够**
+- [ ] **知道判断内存够不够要看 `available`**
+- [ ] 知道 `used` 大致等于不可回收的匿名内存
+- [ ] **知道 RSS 涨有三种正常原因（预热、文件映射、分配器池）**
+- [ ] **知道要看 `anon` 而非 RSS，并看长期趋势**
+- [ ] 会用 `pmap` / `/proc/<pid>/status` 细分内存
+- [ ] **知道 OOM Killer 按 `oom_score` 挑，可用 `oom_score_adj` 调整**
+- [ ] 知道容器 OOM 通常是 cgroup `memory.max`
+- [ ] **知道 `si`/`so` 持续非 0 才是 swap 问题**
+- [ ] **知道 `swappiness=0` 不等于禁用 swap**
+- [ ] 知道不该在生产环境频繁 `drop_caches`
+
+## 下一步
+
+[进程与信号](./process) 或 [容器与隔离](./containers)。

@@ -1,0 +1,279 @@
+---
+title: ADC 与模拟信号
+sidebar_position: 3
+description: 模拟信号世界、ADC 原理与采样、衰减档位、校准、DMA 连续采样，以及 S3 上做模拟输出的正确姿势。
+---
+
+# ADC 与模拟信号
+
+快速上手用积木读过电位器，这一章把"模拟量"讲透：世界不是只有开和关——光线有强弱、温度有高低、旋钮有中间位置。**ADC（Analog-to-Digital Converter，模数转换器）**就是把这些连续变化的电压翻译成数字的部件；反过来把数字变电压叫 **DAC（数模转换器）**。
+
+:::danger[先记住一个硬件事实：ESP32-S3 没有内置 DAC]
+经典款 ESP32 带两路 8 位 DAC（GPIO25/26），**但 S3 把它去掉了**（C3/C6/H2 也没有，S2 有）。在 S3 上要输出模拟电压，只有两条路（本章第 7 节）：用 PWM 加低通滤波凑出模拟电平，或外接 DAC 芯片（如 MCP4725）。网上大量教程写 `dacWrite` 或 `GPIO25/26`，那是老款 ESP32 的写法，S3 上无效。各型号 ADC/DAC 差异见[跨型号移植指南](../../reference/porting)。
+:::
+
+## 1. 模拟世界与数字世界：ADC 为什么存在
+
+温度、光照、声音、气压——这些物理量在真实世界里是**连续变化**的（25.0000℃ 和 25.0001℃ 之间还有无数个值）。但芯片只认数字（[L0](../l0-basics/what-is-computing)）。
+
+把连续变成离散的，要过两道关卡：
+
+1. **量（Sampling，采样）**：每隔一小段时间量一次值。"每秒量 100 次"叫采样率 100Hz
+2. **刻度化（Quantization，量化）**：把量到的电压落到有限的格子上。12 位 ADC 有 4096 格，落在哪格记哪个数
+
+两道关卡各带来一个误差：
+
+- **采样率不够** → 变化太快跟不上。经验规则（奈奎斯特采样定理）：**采样率至少是信号最高频率的 2 倍**。想还原 1kHz 的音频波形，至少每秒采 2000 次
+- **格子太粗** → 精度损失。4096 格按理论满量程 3.3V 算每格约 0.8mV；但 11dB/12dB 档实际有效量程只有 3.1V，每格约 0.76mV——大多数传感器场景够用
+
+**理解了"采样+量化"，ADC 的所有参数表都能读懂了**：分辨率（格子数）、采样率（每秒量几次）、量程（尺子多长）。
+
+### 顺便讲讲内部原理：逐次逼近 = 二分搜索
+
+S3 的 ADC 用的是**逐次逼近型（SAR，Successive Approximation Register）**结构，原理像"猜价格"游戏：
+
+```text
+量一个未知电压（介于 0～3.3V），12 次猜中它：
+
+第 1 猜：内部先产生 3.3V 的一半（1.65V），问比较器："输入比它大吗？"
+        大 → 记下这一位是 1，继续往上猜；小 → 记 0，往下猜
+第 2 猜：在剩余范围里再取中点……
+……
+第 12 猜：范围缩到 1 个格子，锁定读数
+```
+
+**二分搜索**：每猜一次排除一半可能，12 次就能从 4096 格里锁定——这就是"12 位"和"逐次逼近"名字的由来。
+
+这个原理直接解释了 ADC 的三个脾气（后面"常见故障"里会再见到）：
+
+1. **转换要花时间**——12 次猜测，每次要等内部电路稳定，所以单次采样有几十微秒开销（高频波形要换第 6 节的连续模式）
+2. **采样靠内部的小电容**——开始前它要先"充成输入电压"，**如果输入源内阻太大（比如经过一个 1MΩ 的电阻才到引脚），电容在采样窗口内充不满，读数偏低**——这就是"输入端加 0.1µF 电容"或加运放缓冲的原因
+3. **转换期间输入不能变**——猜到第 6 次输入还在跳，结果就作废（变化快的信号用连续模式，它有专门的采样保持电路）
+
+![一次 ADC 转换就是 12 次二分猜测：先取满量程一半与输入比较，每猜一次排除一半可能，12 猜锁定 4096 格中的一格；S3 的 DB_11/DB_12 有效量程上限 3100mV，每格约 0.76mV，单次转换几十微秒](/img/diagrams/esp32-adc-sample-timing.svg)
+
+## 2. 硬件事实与衰减档位
+
+| 项 | ESP32-S3 |
+| --- | --- |
+| 分辨率 | 12 bit（4096 级） |
+| ADC 单元 | 2 个（ADC1 / ADC2） |
+| 通道 | ADC1：GPIO1～10；ADC2：GPIO11～20 |
+| 输入上限 | 3.3V，**绝对不能接 5V**（会烧 ADC 甚至芯片） |
+
+换算公式：`电压 = 读数 / 4095 × 量程`。
+
+### 衰减（Attenuation）：给电压表换量程
+
+芯片内部的"尺子"直接量程只有约 1V（量得精细但范围小）。要量到 3.3V，得在前面加一个**衰减器**把信号按比例缩小——代价是每格代表的电压变大、精度变差。**像给电压表换量程档位**：
+
+| 档位（IDF 5.x） | 大致量程 | 每格约 | 适用 |
+| --- | --- | --- | --- |
+| `ADC_ATTEN_DB_0` | 0～1V | 0.25mV | 高精度小信号 |
+| `ADC_ATTEN_DB_2_5` | 0～1.3V | 0.3mV | |
+| `ADC_ATTEN_DB_6` | 0～2.2V | 0.5mV | |
+| `ADC_ATTEN_DB_11` | 0～3.1V | 0.76mV | 通用（S3 有效量程上限 3100mV） |
+
+日常项目一律先用 `ADC_ATTEN_DB_11`（5.3+ 里改叫 `ADC_ATTEN_DB_12`，旧名仍兼容），量程最大最省心；追求精度的小信号（比如量电池分压）才往下调。
+
+## 3. 校准：读数不等于电压
+
+### 为什么会不准：S 形曲线
+
+理想的 ADC 读数和电压是完美直线，但 S3 的 ADC 实际是**S 形曲线**——中段准、两端歪（低端偏低、高端偏高），直接线性换算误差能到百分之几。**别试图记住曲线形状——两条正路：**
+
+**路线一：出厂校准 API（够用）**。乐鑫给每颗芯片出厂时烧了校准数据，API 读它换算（第 4 节代码里的 `adc_cali_raw_to_voltage`），误差进到百分之一量级。
+
+**路线二：多点标定（要求高时）**。拿几个已知电压（万用表量真实值）记下对应读数，之后在点之间线性插值：
+
+```c
+// 用已知电压点标定（volt 是万用表量出的真实电压，raw 是当时 ADC 读数）
+static const struct { float volt; int raw; } cal[] = {
+    {0.1f, 128}, {0.5f, 620}, {1.0f, 1240}, {1.5f, 1860}, {2.0f, 2480}, {3.0f, 3720},
+};
+float adc_to_volt(int raw) {
+    // 找到 raw 落在哪个区间，在两点间线性插值（L0 学的 for + if 组合）
+    for (int i = 0; i < (int)(sizeof(cal)/sizeof(cal[0])) - 1; i++) {
+        if (raw >= cal[i].raw && raw <= cal[i+1].raw) {
+            float t = (float)(raw - cal[i].raw) / (cal[i+1].raw - cal[i].raw);
+            return cal[i].volt + t * (cal[i+1].volt - cal[i].volt);
+        }
+    }
+    return 0;
+}
+```
+
+**插值的思想通用性极强**：传感器（热敏电阻、光敏）几乎都有非线性特性，"标定表 + 插值"是万能解。
+
+### 读数跳动：滤波三板斧
+
+ADC 读数天然带噪声（±几格跳动），三个层次的滤波：
+
+```c
+// 1. 平均滤波（最常用）：连采 16 次取平均
+uint32_t sum = 0;
+for (int i = 0; i < 16; i++) {
+    adc_oneshot_read(unit, ADC_CHANNEL_0, &raw);
+    sum += raw;
+}
+raw = sum / 16;
+
+// 2. 滑动窗口：保留最近 N 次读数取平均（对持续变化的信号更友好，L0 数组实战）
+
+// 3. 硬件辅助：输入端加 0.1µF 电容到 GND，滤高频毛刺
+```
+
+## 4. 单次采样（IDF 5.x 新驱动）
+
+绝大多数场景用单次采样就够：问一次、答一个数。
+
+![电位器接 ADC：两端接 3.3V 与 GND 组成可调分压器，中间抽头接 GPIO1（ADC1_CH0）；读数 0～4095 与电压按「读数 ÷ 4095 × 量程」对应，DB_11/DB_12 有效量程上限 3100mV、每格约 0.76mV](/img/diagrams/esp32-wire-adc-pot.svg)
+
+```c
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+
+adc_oneshot_unit_handle_t unit;      // 一个 ADC 单元（ADC1 或 ADC2）
+adc_cali_handle_t cali;              // 校准句柄
+
+void adc_init(void) {
+    // 1. 开单元
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id = ADC_UNIT_1,       // 用 ADC1（GPIO1～10）
+    };
+    adc_oneshot_new_unit(&unit_cfg, &unit);
+
+    // 2. 配通道
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten    = ADC_ATTEN_DB_12,          // 5.3+ 的写法，等价旧名 DB_11
+        .bitwidth = ADC_BITWIDTH_DEFAULT,     // 12 位
+    };
+    adc_oneshot_config_channel(unit, ADC_CHANNEL_0, &chan_cfg);   // GPIO1
+
+    // 3. 建校准（一次即可）
+    adc_cali_curve_fitting_config_t cali_cfg = {
+        .unit_id  = ADC_UNIT_1,
+        .atten    = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    adc_cali_create_scheme_curve_fitting(&cali_cfg, &cali);
+}
+
+int adc_read_mv(void) {                  // 读出毫伏值
+    int raw = 0, mv = 0;
+    adc_oneshot_read(unit, ADC_CHANNEL_0, &raw);
+    adc_cali_raw_to_voltage(cali, raw, &mv);    // 出厂校准曲线换算
+    return mv;
+}
+```
+
+三个层次的返回值，按需选：
+
+| 拿什么 | 换算 | 用途 |
+| --- | --- | --- |
+| 原始读数 raw | 0～4095 | 只比较相对大小（"变亮了没"） |
+| 毫伏值 mv | 校准换算 | 显示真实电压 |
+| 物理量 | 自己的公式（分压/热敏方程） | 温度、照度等 |
+
+## 5. ADC2 与 WiFi 的恩怨
+
+在 ESP32 系列上，ADC2 和 WiFi 射频共享模拟电路资源，**WiFi 工作时 ADC2 的使用受限甚至直接失败**（读数恒为 0 或返回错误），多个型号包括 S3 都有此限制。工程上的统一策略：
+
+1. **模拟输入一律优先接 ADC1（GPIO1～10）**，把 ADC2 留给"不用 WiFi 时的场合"
+2. 确实要在联网状态下用 ADC2 的，实测验证，不行就换方案——外接 I2C ADC 芯片如 **ADS1115**（16 位、4 通道，精度远超内置 ADC，还能差分测量），用 I2C 读，和 WiFi 无冲突
+
+**规划引脚时就定好**：模拟输入全排 GPIO1～10，这是 L4 所有章节里反复出现的"引脚预算"思路。
+
+## 6. 连续采样 + DMA（高频波形才需要）
+
+单次采样一次有几十微秒的开销，想每秒采几万个点（比如看音频波形、振动分析）就必须用**连续模式**：配置好后 ADC 自己不停采样，数据由 **DMA**（直接内存访问——"不用惊动 CPU 的搬运工"）自动搬进内存缓冲区，你只是定期去取：
+
+```c
+#include "esp_adc/adc_continuous.h"
+
+adc_continuous_handle_t handle;
+
+void adc_cont_init(void) {
+    adc_continuous_handle_cfg_t hcfg = {
+        .max_store_buf_size = 1024,     // 内部缓冲池大小（字节）
+        .conv_frame_size    = 256,      // 每帧大小（字节）
+    };
+    adc_continuous_new_handle(&hcfg, &handle);
+
+    // 描述要采哪些通道
+    adc_digi_pattern_config_t pattern = {
+        .atten     = ADC_ATTEN_DB_12,
+        .channel   = ADC_CHANNEL_0,     // GPIO1
+        .unit      = ADC_UNIT_1,
+        .bit_width = ADC_BITWIDTH_12,
+    };
+    adc_continuous_config_t cfg = {
+        .pattern_num    = 1,
+        .adc_pattern    = &pattern,
+        .sample_freq_hz = 20 * 1000,    // 20 kHz 采样率
+        .conv_mode      = ADC_CONV_SINGLE_UNIT_1,
+        .format         = ADC_DIGI_FORMAT_12BIT,
+    };
+    adc_continuous_config(handle, &cfg);
+    adc_continuous_start(handle);       // 开始不停采样
+}
+
+void adc_cont_poll(void) {
+    uint8_t buf[256];
+    uint32_t ret_num = 0;
+    // 取一帧数据（buf 里是各采样点拼成的字节流，每样本 4 字节）
+    if (adc_continuous_read(handle, buf, sizeof(buf), &ret_num, 1000) == ESP_OK) {
+        for (uint32_t i = 0; i + 3 < ret_num; i += 4) {
+            int sample = ((buf[i+1] & 0x0F) << 8) | buf[i];   // 拆出 12 位结果
+            // 处理 sample ...
+        }
+    }
+}
+```
+
+**什么时候值得上连续模式**：需要看"波形"（随时间变化的细节）而非"平均值"的场景——音频、振动、电源纹波。只关心温度光照这类慢变量，单次采样足够。完整可编译版本以官方示例 `examples/peripherals/adc/adc_continuous` 为准。
+
+## 7. 模拟输出：S3 的两条路
+
+### 路线一：PWM + 低通滤波（推荐，零成本）
+
+PWM（[下一章](./pwm)细讲）是高速开关的方波，占空比决定"平均电压"。在输出脚上接一个 **RC 低通滤波器**（一个电阻 + 一个电容，几毛钱），把方波"抹平"成直流：
+
+```text
+引脚 ──[10kΩ]──┬── 输出
+               │
+              1µF
+               │
+              GND
+```
+
+原理：电容"存平均"——方波高时充一点、低时放一点，输出就是平滑的平均电压。**RC 的取值是个折中**：RC 越大越平滑但响应越慢。规则：滤波截止频率远低于 PWM 频率（PWM 5kHz 时 RC 取 1ms 量级）。
+
+LED 调亮度、风扇调速这类"对平滑度不敏感"的负载甚至不用滤波，直接 PWM 就行。
+
+### 路线二：外接 DAC 芯片
+
+需要真正的模拟输出（给音频放大器供信号、驱动压电陶瓷）时，接一片 **MCP4725**（几块钱，I2C 接口，12 位分辨率），用 [I2C 章节](./i2c-spi-uart)的 API 写一个寄存器就是输出电压。
+
+| 对比 | PWM+滤波 | MCP4725 |
+| --- | --- | --- |
+| 成本 | 0（两个阻容件） | 几块钱 |
+| 精度 | 中（受滤波影响） | 高（12 位） |
+| 速度 | 快 | 受 I2C 限速（约 400kHz） |
+| 场景 | 调速、调光、简易偏置 | 波形生成、精密偏置 |
+
+## 8. 常见故障
+
+| 现象 | 原因 | 对策 |
+| --- | --- | --- |
+| 读数恒为 0 | 用了 ADC2 且 WiFi 已开；或引脚没接；或信号比量程下限还低 | 换 ADC1；检查接线 |
+| 读数恒为满 | 超量程被截断；引脚悬空（没信号源） | 检查信号电平；配置上下拉 |
+| 读数跳动 | 输入源内阻太高（ADC 内部采样电容来不及充满）；没滤波 | 加 0.1µF 电容；平均滤波 16 次 |
+| 换算电压误差大 | 直接线性换算（没用校准）；衰减档位选得太大 | 用校准 API 或多点标定 |
+| 高频采样不准 | 单次模式开销大 | 换连续模式 |
+| 接 5V 信号烧板 | ADC 引脚上限 3.3V | 5V 信号先用**分压电阻**（两个电阻串联，按比例取中间抽头）降到 3.3V 以下 |
+
+## 下一步
+
+[PWM 与电机控制](./pwm)

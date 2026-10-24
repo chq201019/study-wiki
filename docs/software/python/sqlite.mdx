@@ -1,0 +1,237 @@
+---
+id: sqlite
+title: SQLite 实战
+sidebar_position: 32
+description: 为什么 SQLite 适合大多数小应用、连接与游标、事务边界、WAL 模式、并发写的真相、以及七个破坏数据完整性的写法。
+---
+
+# SQLite 实战
+
+**本课目标**：用对 SQLite，知道它的真实边界在哪。
+
+## 它适合什么
+
+| 适合 | 不适合 |
+| --- | --- |
+| 单机应用（桌面、手机、嵌入式） | **多台机器共享同一个库文件** |
+| 读多写少 | **高并发写入**（几百 TPS 以上） |
+| 数据量到几十 GB | 需要细粒度权限 |
+| 原型、测试、缓存 | 需要网络协议访问 |
+
+:::danger[最致命的误用：把库文件放网络盘让多机访问]
+**SQLite 依赖文件锁，而 NFS/SMB 的文件锁语义不可靠。**
+
+**结果**：数据库损坏。这不是"性能问题"，是**数据丢失**。
+
+**多机共享请用 PostgreSQL / MySQL。**
+:::
+
+## 基本用法
+
+```python
+import sqlite3
+
+conn = sqlite3.connect("app.db")
+cur = conn.cursor()
+
+cur.execute("CREATE TABLE IF NOT EXISTS user (id INTEGER PRIMARY KEY, name TEXT)")
+cur.execute("INSERT INTO user (name) VALUES (?)", ("张三",))
+conn.commit()
+
+for row in cur.execute("SELECT id, name FROM user"):
+    print(row)
+
+conn.close()
+```
+
+:::danger[**永远用 `?` 占位，不要拼字符串**]
+```python
+cur.execute(f"SELECT * FROM user WHERE name = '{name}'")     # ❌ SQL 注入
+cur.execute("SELECT * FROM user WHERE name = ?", (name,))      # ✅
+```
+
+**注意参数是元组** —— `(name)` 是字符串，`(name,)` 才是元组。
+:::
+
+## 事务边界
+
+:::info[Python 的 sqlite3 默认"隐式开事务"]
+```python
+cur.execute("INSERT ...")      # 事务已自动开始
+conn.commit()                  # 提交
+conn.rollback()                # 回滚
+```
+
+**不 commit 就 close，改动会丢失。**
+:::
+
+```python
+# Python 3.12+ 支持 autocommit 参数
+conn = sqlite3.connect("app.db", autocommit=False)
+
+# 或者用上下文管理器（注意：只提交，不回滚！）
+with conn:
+    conn.execute("INSERT ...")
+    # 异常时会 rollback
+```
+
+:::warning[`with conn` 不关闭连接]
+```python
+with sqlite3.connect("app.db") as conn:
+    ...
+# 退出了，但 conn 没关！
+```
+
+**上下文管理器只管事务，不管连接生命周期。** 要关连接得显式 `conn.close()`。
+:::
+
+## 批量插入要慢得多
+
+```python
+# ❌ 每条一次事务（每条都要 fsync）
+for name in names:
+    conn.execute("INSERT INTO user (name) VALUES (?)", (name,))
+    conn.commit()
+```
+
+:::tip[三种提速手段（差距可达 100 倍）]
+```python
+# ① 一次事务包住所有插入
+with conn:
+    for name in names:
+        conn.execute("INSERT INTO user (name) VALUES (?)", (name,))
+
+# ② executemany
+conn.executemany("INSERT INTO user (name) VALUES (?)", [(n,) for n in names])
+
+# ③ 调 PRAGMA（见下）
+```
+
+**每一次 commit 都意味着一次 fsync** —— 机械盘上几毫秒，一万条就是几十秒。
+:::
+
+## 七个必调的 PRAGMA
+
+```python
+conn.execute("PRAGMA journal_mode = WAL")       # 关键：读写不互斥
+conn.execute("PRAGMA synchronous = NORMAL")     # WAL 下安全性足够
+conn.execute("PRAGMA foreign_keys = ON")        # 默认是关的！
+conn.execute("PRAGMA cache_size = -64000")      # 64MB
+conn.execute("PRAGMA busy_timeout = 5000")      # 锁等待 5 秒
+conn.execute("PRAGMA temp_store = MEMORY")
+conn.execute("PRAGMA mmap_size = 268435456")    # 256MB
+```
+
+:::danger[**`foreign_keys` 默认是关闭的**]
+```python
+/* 外键约束写了但根本没生效！ */
+CREATE TABLE post (user_id INTEGER REFERENCES user(id));
+```
+
+**每个连接都要单独 `PRAGMA foreign_keys = ON`**（它是连接级设置，不持久）。
+
+**这是 SQLite 最坑的默认值。**
+:::
+
+### WAL 模式
+
+:::info[默认的 rollback journal 让读和写互斥]
+- **默认模式**：写的时候读者被挡住
+- **WAL**：读写可以并发（写者追加到 `-wal` 文件，读者读快照）
+
+**开启后目录会多出 `app.db-wal` 和 `app.db-shm` 两个文件** —— 这是正常的，别删。
+:::
+
+:::warning[WAL 要求库文件和 `-wal` 在同一文件系统]
+**并且 WAL 不支持网络文件系统**（这也是不能多机共享的又一个理由）。
+:::
+
+## 并发写的真相
+
+:::danger[SQLite 同一时刻只允许**一个写者**]
+```text
+多个进程同时写 → SQLITE_BUSY
+```
+
+**WAL 能让"读和写"并发，但"写和写"依然互斥。**
+
+**缓解办法**：
+
+```python
+conn.execute("PRAGMA busy_timeout = 5000")    # 自动等 5 秒而不是立刻失败
+```
+
+**根本办法**：把写操作集中到一个线程/进程（用队列串行化）。
+:::
+
+```python
+# 多线程时：每个线程一个连接（连接不能跨线程共享）
+def worker():
+    conn = sqlite3.connect("app.db", check_same_thread=False)
+    ...
+```
+
+:::warning[默认 `check_same_thread=True`]
+**连接不能在创建它的线程之外使用**（默认会抛异常）。
+
+**正确做法是"每线程一个连接"**，而不是关掉检查后共享一个连接。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `table is locked` | 并发写 | `busy_timeout` + 串行化写 |
+| 外键不生效 | `foreign_keys` 默认关 | 每次连接都设 ON |
+| 批量插入极慢 | 每条一次 commit | 单事务或 `executemany` |
+| 数据库损坏 | 放在网络盘 | 改用本地磁盘 |
+| 改动丢失 | 忘了 commit | 检查事务边界 |
+| `sqlite3.ProgrammingError` | 跨线程用连接 | 每线程一个连接 |
+| 删了 `-wal` 后数据丢了 | WAL 里有未合并数据 | 别手工删 |
+| 中文排序不对 | 默认二进制比较 | 用 `COLLATE NOCASE` 或自定义 |
+
+:::danger[不要手工删除 `-wal` / `-shm` 文件]
+**WAL 文件里有尚未合并进主库的数据。**
+
+```bash
+rm app.db-wal        # ❌ 可能丢失最近的写入
+```
+
+**正确做法是正常关闭所有连接**（SQLite 会自动 checkpoint）。
+:::
+
+## 一个可用的连接模板
+
+```python
+import sqlite3
+
+def get_conn(path):
+    conn = sqlite3.connect(path, timeout=5)
+    conn.row_factory = sqlite3.Row            # 让结果可以按列名访问
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
+```
+
+**`row_factory = sqlite3.Row` 让 `row["name"]` 可用**，比记列索引方便得多。
+
+## 本课自检
+
+- [ ] 知道 SQLite 适合单机、读多写少
+- [ ] **知道把库放网络盘会导致数据损坏**
+- [ ] **知道永远用 `?` 占位，参数要元组**
+- [ ] 知道 Python 的 sqlite3 隐式开事务、要 commit
+- [ ] **知道 `with conn` 只管事务不管连接关闭**
+- [ ] **知道批量插入要单事务或 `executemany`**
+- [ ] **知道 `foreign_keys` 默认关闭，每次连接都要开**
+- [ ] 会开 WAL 并知道它让读写并发
+- [ ] **知道同一时刻只允许一个写者**
+- [ ] 会用 `busy_timeout` 缓解锁冲突
+- [ ] **知道连接不能跨线程，要每线程一个**
+- [ ] **知道不能手工删 `-wal` 文件**
+
+## 下一步
+
+[logging 模块](./logging) 或 [文件与路径处理](./files)。

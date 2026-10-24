@@ -1,0 +1,271 @@
+---
+id: 11-timer
+title: 11 定时器与中断
+sidebar_position: 11
+description: 为什么轮询不够、中断怎么写、ISR 里绝对不能做什么，以及 esp_timer 和 GPIO 中断两种用法。
+---
+
+# 11 定时器与中断
+
+**本课目标**：会写中断，知道 ISR 的红线在哪。
+
+## 为什么需要中断
+
+**轮询（polling）的问题**：
+
+```c
+while (1) {
+    if (gpio_get_level(BTN) == 0) { /* 处理 */ }
+    do_other_work();       /* 如果这步花了 100ms... */
+}
+```
+
+:::danger[轮询会漏事件]
+如果 `do_other_work()` 花了 100 ms，而按键只按了 50 ms——**这个按键就丢了**。
+
+轮询频率决定了你能响应多快的事件。
+
+**中断**解决这个问题：**事件发生时立刻打断当前代码去处理**。
+:::
+
+```mermaid
+flowchart LR
+  A["主程序运行中"] -->|硬件事件| B["CPU 暂停主程序"]
+  B --> C["执行 ISR"]
+  C --> D["返回主程序继续"]
+```
+
+## 两种常用"定时/事件"机制
+
+| 机制 | 用途 | API |
+| --- | --- | --- |
+| **`esp_timer`** | 软件定时器（周期/单次回调） | `esp_timer_create` |
+| **GPIO 中断** | 引脚电平变化触发 | `gpio_install_isr_service` |
+
+## 一、`esp_timer`：软件定时器
+
+**适合**：周期性任务（每 100ms 采样一次）、超时判断。
+
+```c
+#include "esp_timer.h"
+#include "esp_log.h"
+
+static const char *TAG = "timer";
+
+static void my_callback(void *arg)
+{
+    /* 这里在定时器任务上下文执行，可以调普通 API */
+    ESP_LOGI(TAG, "定时器触发");
+}
+
+void app_main(void)
+{
+    const esp_timer_create_args_t args = {
+        .callback = my_callback,
+        .name     = "my_timer",
+    };
+
+    esp_timer_handle_t timer;
+    ESP_ERROR_CHECK(esp_timer_create(&args, &timer));
+
+    /* 周期性触发，每 1000000 微秒 = 1 秒 */
+    ESP_ERROR_CHECK(esp_timer_start_periodic(timer, 1000000));
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+```
+
+:::warning[`esp_timer` 的时间单位是微秒]
+```c
+esp_timer_start_periodic(timer, 1000000);    /* 1 秒 */
+esp_timer_start_periodic(timer, 1000);       /* 1 毫秒 */
+```
+
+**不是毫秒！** 传错单位会得到快 1000 倍的定时器。
+:::
+
+:::info[`esp_timer` 回调运行在哪个任务]
+它跑在一个**优先级很高的系统任务**里（默认任务名 `esp_timer`）。
+
+**所以回调里不要做耗时操作**——会阻塞其他定时器，甚至触发看门狗。
+
+**规矩：回调里只置标志位/发队列，重活交给普通任务。**
+:::
+
+## 二、GPIO 中断
+
+**适合**：按键、编码器、外部脉冲计数。
+
+```c
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+
+#define BTN_GPIO  0
+
+static QueueHandle_t btn_queue;
+
+/* ISR：必须是这个签名 */
+static void IRAM_ATTR btn_isr(void *arg)
+{
+    uint32_t dummy = 1;
+    /* 从 ISR 里发队列（必须用 FromISR 版本） */
+    xQueueSendFromISR(btn_queue, &dummy, NULL);
+}
+
+void app_main(void)
+{
+    btn_queue = xQueueCreate(10, sizeof(uint32_t));
+
+    /* ① 配置引脚 */
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << BTN_GPIO),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .intr_type    = GPIO_INTR_NEGEDGE,     /* 下降沿触发 */
+    };
+    ESP_ERROR_CHECK(gpio_config(&cfg));
+
+    /* ② 安装 ISR 服务（全局只需一次） */
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+
+    /* ③ 给这个引脚挂上处理函数 */
+    ESP_ERROR_CHECK(gpio_isr_handler_add(BTN_GPIO, btn_isr, NULL));
+
+    /* ④ 主任务等队列 */
+    uint32_t val;
+    while (1) {
+        if (xQueueReceive(btn_queue, &val, portMAX_DELAY) == pdTRUE) {
+            /* 在这里做真正的事（可以打印、可以耗时） */
+            ESP_LOGI("btn", "按键中断");
+        }
+    }
+}
+```
+
+## ISR 的红线：绝对不能做的事
+
+:::danger[ISR 里的禁止清单]
+| 禁止 | 原因 |
+| --- | --- |
+| `printf` / `ESP_LOGI` | 阻塞、可能要锁 |
+| `vTaskDelay` | **ISR 里不能阻塞** |
+| `malloc` / `free` | 非中断安全 |
+| 耗时循环 | 阻塞其他中断，触发看门狗 |
+| 调非 `FromISR` 版本的 API | 会破坏内核状态 |
+| 大数组/大结构体赋值 | 占栈（ISR 栈很小） |
+
+**违反的后果**：崩溃、看门狗复位、随机死机——而且**极难排查**。
+:::
+
+:::tip[ISR 里该做什么]
+**只做最小的事，把工作推给任务**：
+
+```c
+static void IRAM_ATTR my_isr(void *arg)
+{
+    BaseType_t woken = pdFALSE;
+
+    /* ① 发队列 / 给任务发通知（二选一） */
+    xQueueSendFromISR(q, &data, &woken);
+    /* 或 */
+    vTaskNotifyGiveFromISR(task_handle, &woken);
+
+    /* ② 如果有更高优先级任务被唤醒，请求切换 */
+    if (woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+```
+
+**三步：取数据 → 通知任务 → 必要时让出 CPU。**
+:::
+
+## `IRAM_ATTR` 是什么
+
+```c
+static void IRAM_ATTR btn_isr(void *arg)
+```
+
+:::info[为什么 ISR 要放 IRAM]
+**Flash 操作时不能从 Flash 取指令**（比如写 Flash 的那一刻，读取会失败）。
+
+如果中断恰好在写 Flash 期间触发，而 ISR 代码在 Flash 里——**就会崩溃**。
+
+`IRAM_ATTR` 把函数放进 **IRAM（片内 RAM）**，保证任何时候都能执行。
+
+**规矩：所有 ISR 都加 `IRAM_ATTR`。**（即使你暂时不写 Flash，养成习惯。）
+:::
+
+## `gpio_install_isr_service` 只装一次
+
+:::danger[重复安装会失败]
+```c
+/* 在 app_main 里调一次就好 */
+gpio_install_isr_service(0);
+```
+
+**它管理全局的 GPIO 中断分发**，重复调用返回 `ESP_ERR_INVALID_STATE`。
+
+**每个引脚用 `gpio_isr_handler_add` 单独挂。**
+:::
+
+也可以用简化版（不需要 service）：
+
+```c
+gpio_isr_register(handler, arg, ESP_INTR_FLAG_IRAM, NULL);
+```
+
+**但它只支持一个全局处理函数**，多个引脚就难区分——所以通常还是用 `service` 版本。
+
+## 中断类型
+
+| 类型 | 何时触发 |
+| --- | --- |
+| `GPIO_INTR_POSEDGE` | 上升沿（0→1） |
+| `GPIO_INTR_NEGEDGE` | 下降沿（1→0） |
+| `GPIO_INTR_ANYEDGE` | 任意变化 |
+| `GPIO_INTR_LOW_LEVEL` | 低电平期间持续 |
+| `GPIO_INTR_HIGH_LEVEL` | 高电平期间持续 |
+
+:::warning[按键用哪个边沿]
+上拉接法（按键接 GND）下：
+
+- **按下瞬间**：1 → 0 → 用 `GPIO_INTR_NEGEDGE`
+- **松开瞬间**：0 → 1 → 用 `GPIO_INTR_POSEDGE`
+
+**注意：中断同样会受抖动影响**——一次按下可能触发多次中断。
+
+**所以 ISR 里也要做时间戳过滤**（比如距上次中断 < 50ms 就忽略）。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| ISR 里 `printf` | 崩溃/看门狗 | 禁止阻塞 | 发队列给任务 |
+| ISR 里 `vTaskDelay` | 崩溃 | ISR 不能阻塞 | 同上 |
+| 用非 `FromISR` API | 随机死机 | 内核状态破坏 | 换 `FromISR` 版 |
+| 忘 `IRAM_ATTR` | 写 Flash 时崩 | 代码在 Flash | 加上 |
+| 重复安装 isr service | 返回错误 | 只能装一次 | 只调一次 |
+| `esp_timer` 单位传错 | 定时快 1000 倍 | 单位是微秒 | 按微秒算 |
+| 中断没消抖 | 一次按触发多次 | 抖动 | 时间戳过滤 |
+
+## 本课自检
+
+- [ ] **理解中断比轮询快在哪**
+- [ ] 会用 `esp_timer_create` / `start_periodic`
+- [ ] **知道 `esp_timer` 单位是微秒**
+- [ ] 会用 `gpio_config` + `gpio_install_isr_service` + `gpio_isr_handler_add`
+- [ ] **知道 ISR 里不能 `printf`/`vTaskDelay`/`malloc`**
+- [ ] 会用 `xQueueSendFromISR` 把工作推给任务
+- [ ] **会给 ISR 加 `IRAM_ATTR`**
+- [ ] 知道 `gpio_install_isr_service` 只能调一次
+- [ ] 知道中断也会受抖动影响
+
+## 下一步
+
+[12 I2C 接 OLED](./12-i2c) —— 给板子加一块屏幕。

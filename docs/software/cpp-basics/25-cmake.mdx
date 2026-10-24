@@ -1,0 +1,335 @@
+---
+id: 25-cmake
+title: 25 CMake 入门
+sidebar_position: 25
+description: 为什么需要 CMake、最小可用 CMakeLists、加库与依赖、构建与安装，以及现代 CMake 的写法。
+---
+
+# 25 CMake 入门
+
+**本课目标**：会写最小可用的 `CMakeLists.txt`，能在多平台上构建项目。
+
+## 为什么需要 CMake
+
+手写编译命令的问题：
+
+```bash
+g++ -std=c++17 -Wall -Wextra -Iinclude src/main.cpp src/math.cpp src/ui.cpp -o prog
+```
+
+项目一大就变成：
+
+```bash
+g++ -std=c++17 -Wall -Wextra -Iinclude -Isrc -Ithird_party/... \
+    src/main.cpp src/math.cpp src/ui.cpp src/net.cpp ... \
+    -Llib -lfoo -lbar -pthread -o prog
+```
+
+**编译命令本身成了维护负担。**
+
+CMake 解决：
+
+- 自动找出所有源文件
+- 管理依赖和链接
+- 生成 Makefile / Ninja / Visual Studio 工程
+- **跨平台**（Windows / Linux / macOS 同一份配置）
+
+## 最小可用例子
+
+**`CMakeLists.txt`**：
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(MyApp LANGUAGES CXX)
+
+# 要求 C++17
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# 可执行文件：名字 + 源文件
+add_executable(prog
+    src/main.cpp
+    src/math.cpp
+)
+```
+
+**构建**：
+
+```bash
+cmake -B build -S .
+cmake --build build
+```
+
+产物在 `build/prog`。
+
+:::tip[`cmake -B build -S .` 是什么]
+- `-B build`：构建目录（out-of-source build，**不污染源码目录**）
+- `-S .`：源码目录
+
+**CMake 3.13 起支持这种写法**，比老式的"先进 build 目录再 cmake .."清晰。
+:::
+
+## 加头文件目录
+
+```cmake
+target_include_directories(prog PRIVATE include)
+```
+
+`PRIVATE` 表示"只有 `prog` 自己需要这个路径"。
+
+:::warning[老式写法 vs 现代写法]
+```cmake
+# ❌ 老式全局设置（污染所有 target）
+include_directories(include)
+
+# ✅ 现代：绑定到具体 target
+target_include_directories(prog PRIVATE include)
+```
+
+**现代 CMake 的原则：所有配置都绑定到 target，不设全局。**
+:::
+
+## 加编译选项
+
+```cmake
+target_compile_options(prog PRIVATE -Wall -Wextra)
+
+# 或者按编译器区分
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(prog PRIVATE -Wall -Wextra -Wpedantic)
+elseif(MSVC)
+    target_compile_options(prog PRIVATE /W4)
+endif()
+```
+
+## 创建库
+
+```cmake
+# 静态库
+add_library(mymath STATIC
+    src/math.cpp
+)
+
+target_include_directories(mymath PUBLIC include)
+
+# 可执行文件链接库
+add_executable(prog src/main.cpp)
+target_link_libraries(prog PRIVATE mymath)
+```
+
+:::tip[`PRIVATE` / `PUBLIC` / `INTERFACE` 的区别]
+| 关键字 | 含义 |
+| --- | --- |
+| `PRIVATE` | 只用在自己内部 |
+| `PUBLIC` | 自己用，**使用者也用** |
+| `INTERFACE` | 自己不用，但使用者要用 |
+
+**头文件目录一般用 `PUBLIC`**（因为使用者也要 `#include`）。
+
+**链接库一般用 `PRIVATE`**（除非库的类型出现在你的公开接口里）。
+:::
+
+## 自动收集源文件
+
+```cmake
+file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS src/*.cpp)
+add_executable(prog ${SOURCES})
+```
+
+:::danger[`file(GLOB)` 有争议]
+**优点**：加新文件不用改 CMakeLists。
+
+**缺点**：
+
+- 新增文件时 CMake **可能不会自动重新配置**（虽然 `CONFIGURE_DEPENDS` 缓解了）
+- **显式列出能让读者一眼看到项目有哪些文件**
+
+**官方建议是显式列出**，尤其库文件。个人小项目用 GLOB 也可以。
+:::
+
+## 完整示例
+
+**目录结构**：
+
+```text
+myproject/
+├── CMakeLists.txt
+├── include/
+│   └── math.h
+└── src/
+    ├── main.cpp
+    └── math.cpp
+```
+
+**`CMakeLists.txt`**：
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(MyApp LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)          # 用标准 C++，不用编译器扩展
+
+# 库
+add_library(mymath STATIC src/math.cpp)
+target_include_directories(mymath PUBLIC include)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(mymath PRIVATE -Wall -Wextra)
+endif()
+
+# 可执行文件
+add_executable(prog src/main.cpp)
+target_link_libraries(prog PRIVATE mymath)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(prog PRIVATE -Wall -Wextra)
+endif()
+```
+
+**`include/math.h`**：
+
+```cpp
+#pragma once
+
+namespace math {
+int add(int a, int b);
+int mul(int a, int b);
+}
+```
+
+**`src/math.cpp`**：
+
+```cpp
+#include "math.h"
+
+namespace math {
+int add(int a, int b) { return a + b; }
+int mul(int a, int b) { return a * b; }
+}
+```
+
+**`src/main.cpp`**：
+
+```cpp
+#include <iostream>
+#include "math.h"
+
+int main() {
+    std::cout << "2 + 3 = " << math::add(2, 3) << "\n";
+    std::cout << "2 * 3 = " << math::mul(2, 3) << "\n";
+    return 0;
+}
+```
+
+**构建**：
+
+```bash
+cmake -B build -S .
+cmake --build build
+./build/prog
+```
+
+输出：
+
+```text
+2 + 3 = 5
+2 * 3 = 6
+```
+
+## 常用构建命令
+
+```bash
+# 配置（生成构建系统）
+cmake -B build -S .
+
+# 构建
+cmake --build build
+
+# 指定构建类型
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug
+
+# 并行构建
+cmake --build build -j
+
+# 清理
+cmake --build build --target clean
+
+# 从零重来
+rm -rf build
+```
+
+:::tip[`CMAKE_BUILD_TYPE` 常用值]
+| 值 | 优化 | 调试信息 |
+| --- | --- | --- |
+| `Debug` | `-O0` | ✅ |
+| `Release` | `-O3` | ❌ |
+| `RelWithDebInfo` | `-O2` | ✅ |
+
+**开发用 `Debug`，发布用 `Release`。**
+
+（MSVC 是多配置生成器，用 `--config Release` 而不是这个变量。）
+:::
+
+## 添加第三方依赖（现代做法）
+
+```cmake
+include(FetchContent)
+
+FetchContent_Declare(
+    fmt
+    GIT_REPOSITORY https://github.com/fmtlib/fmt.git
+    GIT_TAG        10.1.1
+)
+FetchContent_MakeAvailable(fmt)
+
+target_link_libraries(prog PRIVATE fmt::fmt)
+```
+
+**CMake 自动下载并构建依赖**，不用手动装。
+
+（也可以用系统的包管理器 + `find_package`。）
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 忘记 `project()` | 配置失败 | 必须最先声明 | 加 `project(Name LANGUAGES CXX)` |
+| 用 `include_directories` | 全局污染 | 老式写法 | `target_include_directories` |
+| `PUBLIC`/`PRIVATE` 用错 | 使用者编译失败 | 依赖没传递 | 头文件目录用 `PUBLIC` |
+| 直接改 `CMAKE_CXX_FLAGS` | 全局影响 | 老式 | `target_compile_options` |
+| 在源码目录构建 | 生成物混进源码 | 没加 `-B build` | 用独立构建目录 |
+| 没设 C++ 标准 | 用了新特性报错 | 默认可能很老 | `CMAKE_CXX_STANDARD` |
+| 忘 `-DCMAKE_BUILD_TYPE` | 默认无优化 | 未指定 | 显式指定 |
+
+:::danger[不要在源码目录里构建]
+```bash
+cd myproject
+cmake .                  # ❌ 生成物全在源码目录
+```
+
+**CMake 会生成大量文件**（`CMakeCache.txt`、`CMakeFiles/`、`Makefile`），污染源码。
+
+**始终用 `cmake -B build -S .`。**
+
+并且把 `build/` 加进 `.gitignore`。
+:::
+
+## 本课自检
+
+- [ ] 知道 CMake 解决什么问题（跨平台构建配置）
+- [ ] 会写最小 `CMakeLists.txt`（`cmake_minimum_required` + `project` + `add_executable`）
+- [ ] 会用 `cmake -B build -S .` 和 `cmake --build build`
+- [ ] **知道要 out-of-source 构建（不污染源码）**
+- [ ] 会用 `target_include_directories`
+- [ ] 会创建库并 `target_link_libraries`
+- [ ] 知道 `PRIVATE` / `PUBLIC` / `INTERFACE` 的区别
+- [ ] 知道现代 CMake 要绑定到 target，不设全局
+- [ ] 会设 `CMAKE_CXX_STANDARD`
+- [ ] 知道 `Debug` / `Release` 的区别
+
+## 下一步
+
+[26 调试与常见错误](./26-debug) —— C++ 特有的崩溃与未定义行为。

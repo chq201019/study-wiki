@@ -1,0 +1,281 @@
+---
+id: 20-logs
+title: 20 日志与排错
+sidebar_position: 20
+description: journalctl 和 dmesg 怎么用、日志在哪、日志占满磁盘怎么办，以及一套通用的排错思路。
+---
+
+# 20 日志与排错
+
+**本课目标**：出了问题知道去哪看日志，有一套能复用的排错流程。
+
+## 日志在哪
+
+| 位置 | 内容 |
+| --- | --- |
+| **`journalctl`** | systemd 统一管理的日志（**首选**） |
+| `/var/log/syslog` | Debian/Ubuntu 系统日志 |
+| `/var/log/messages` | RHEL/CentOS 系统日志 |
+| `/var/log/auth.log` | 登录认证（Debian/Ubuntu；RHEL 系是 `/var/log/secure`） |
+| `/var/log/nginx/` | Nginx 自己的日志 |
+| `dmesg` | **内核日志**（硬件、驱动） |
+
+## `journalctl`：主力工具
+
+```bash
+journalctl                          # 全部日志（从旧到新，很长）
+journalctl -n 50                    # 最后 50 行
+journalctl -f                       # **实时跟踪**（最常用）
+journalctl -u nginx                 # 某个服务的日志
+journalctl -u nginx -n 50 --no-pager
+```
+
+本机实测：
+
+```bash
+journalctl -n 2 --no-pager
+```
+
+```text
+10月 18 19:40:21 debian systemd[1]: Started user@0.service - User Manager for UID 0.
+10月 18 19:40:21 debian systemd[1]: Started session-683.scope - Session 683 of User root.
+```
+
+:::tip[`--no-pager` 为什么常用]
+不加的话，`journalctl` 在终端里会调用 `less` 分页，**脚本里拿不到干净的输出**。
+
+**管道/重定向/脚本里一律加 `--no-pager`** —— 输出不是终端时 systemd 本来就会禁用分页，显式加只是让行为更确定。
+:::
+
+### 按时间筛
+
+```bash
+journalctl --since "2024-01-01 10:00:00"
+journalctl --since "1 hour ago"
+journalctl --since today
+journalctl --since "10 min ago" -u myapp
+journalctl -b                       # 本次开机以来
+journalctl -b -1                    # 上次开机（排查重启原因很有用）
+```
+
+:::tip[`-b -1` 是排查"机器重启了"的关键]
+```bash
+journalctl -b -1 -n 100             # 看上一次启动的最后 100 行
+```
+
+**如果系统意外重启，上一次的日志末尾就是崩溃现场。**
+:::
+
+### 按优先级筛
+
+```bash
+journalctl -p err                   # 只看 error 及以上
+journalctl -p warning -u nginx
+```
+
+| 级别 | 含义 |
+| --- | --- |
+| `emerg` | 系统不可用 |
+| `alert` | 必须立即处理 |
+| `crit` | 严重 |
+| `err` | **错误** |
+| `warning` | 警告 |
+| `info` | 普通信息 |
+| `debug` | 调试 |
+
+### 按内容筛
+
+```bash
+journalctl -u nginx | grep -i error
+journalctl --grep="Out of memory"
+```
+
+### 清理
+
+```bash
+journalctl --disk-usage                 # 占了多少
+sudo journalctl --vacuum-time=7d        # 只保留 7 天
+sudo journalctl --vacuum-size=500M      # 只保留 500M
+```
+
+:::danger[日志能把磁盘占满]
+[第 13 课](./13-disk)实测本站 `/var/log` 占了 286M。
+
+**长期运行的服务器，journal 可能涨到几 GB。**
+
+**持久化限制**：编辑 `/etc/systemd/journald.conf`：
+
+```ini
+SystemMaxUse=500M
+SystemMaxFileSize=50M
+```
+
+改完 `sudo systemctl restart systemd-journald`。
+:::
+
+## `dmesg`：内核日志
+
+```bash
+dmesg                       # 全部内核消息
+dmesg | tail -20            # 最近 20 条
+dmesg -T                    # 显示人类可读时间
+dmesg -w                    # 实时跟踪（插拔 USB 时看）
+dmesg | grep -i error
+```
+
+本机实测 `dmesg` 在 `/usr/bin/dmesg`。
+
+:::tip[`dmesg` 能看什么]
+- **硬件识别**（硬盘、网卡、USB 插拔）
+- **驱动加载错误**
+- **内核 panic / OOM**
+- 内存、CPU 检测信息
+
+**插上设备没反应时**：
+
+```bash
+dmesg -w                    # 然后插设备，看有没有新消息
+```
+
+**有消息 = 硬件认到了（驱动问题）；没消息 = 硬件没认到（线/供电问题）。**
+:::
+
+:::warning[`dmesg` 的时间戳不好读]
+```bash
+dmesg                       # [  12.345678] ... 内核启动后秒数
+dmesg -T                    # [Fri Oct 18 19:40:21 2024] ... 人类可读
+```
+
+**用 `-T` 更好读。**
+:::
+
+## 通用排错流程
+
+:::tip[五步法：从现象到根因]
+```
+① 确认现象（能不能复现、影响范围）
+      ↓
+② 看日志（journalctl -u 服务 / dmesg）
+      ↓
+③ 看资源（df 磁盘 / free 内存 / top CPU / ss 端口）
+      ↓
+④ 手动复现（绕过服务，直接跑命令看真实报错）
+      ↓
+⑤ 定位后修改 → 验证 → 记录
+```
+:::
+
+### 具体命令清单
+
+```bash
+# ① 服务状态
+systemctl status myapp
+systemctl --failed
+
+# ② 服务日志
+journalctl -u myapp -n 100 --no-pager
+journalctl -u myapp -p err -b
+
+# ③ 内核/硬件
+dmesg -T | tail -30
+
+# ④ 资源
+df -h                   # 磁盘
+df -i                   # inode
+free -h                 # 内存
+top -bn1 | head -15     # CPU 和进程
+ss -tlnp                # 端口
+
+# ⑤ 网络
+ip -brief addr
+ping -c 2 8.8.8.8
+curl -sI http://localhost
+
+# ⑥ 手动跑（关键）
+sudo -u www-data /opt/myapp/app --port 8080
+```
+
+## 常见故障对照表
+
+| 现象 | 先查什么 | 命令 |
+| --- | --- | --- |
+| 服务起不来 | 服务日志 | `journalctl -u 服务 -n 50` |
+| 服务突然挂了 | 是否 OOM | `journalctl -k \| grep -i oom` |
+| 网站打不开 | 端口/监听 | `ss -tlnp`、`curl -I localhost` |
+| 磁盘满了 | 谁占的 | `df -h` → `du -h --max-depth=1` |
+| 内存不足 | 谁吃的 | `free -h`、`ps aux --sort=-%mem \| head` |
+| 系统变慢 | 负载/IO | `top`、`iostat` |
+| 机器意外重启 | 上次日志 | `journalctl -b -1 -n 100` |
+| 硬件没反应 | 是否识别 | `dmesg -w` 然后插设备 |
+| 登录不上 | 认证失败 | `journalctl -u ssh`、`/var/log/auth.log` |
+| 时钟不对 | 时间同步 | `timedatectl` |
+
+## 实战：排查一个起不来的服务
+
+```bash
+# ① 现象：服务是 failed
+systemctl status myapp
+# Active: failed (Result: exit-code)
+
+# ② 看完整日志找错误
+journalctl -u myapp -n 50 --no-pager
+# 假设看到：Error: cannot bind to port 8080
+
+# ③ 谁占了 8080
+ss -tlnp | grep :8080
+# LISTEN 0 128 0.0.0.0:8080 users:(("oldapp",pid=999,...))
+
+# ④ 确认旧进程
+ps -p 999
+
+# ⑤ 停掉旧的
+systemctl stop oldapp        # 或 kill 999
+
+# ⑥ 重试
+systemctl start myapp
+systemctl status myapp
+
+# ⑦ 验证
+curl -sI http://localhost:8080
+```
+
+:::tip[这个流程的通用性]
+**"看状态 → 看日志 → 找原因 → 改 → 验证"** 适用于几乎所有 Linux 故障。
+
+**90% 的问题，`journalctl -u 服务名 -n 50` 里就有答案。**
+:::
+
+## 其他有用的排错工具
+
+```bash
+strace -p 1234              # 跟踪进程的系统调用（卡在哪一步）
+lsof -p 1234                # 进程打开了哪些文件
+tcpdump -i any port 80      # 抓包
+vmstat 1 5                  # 系统整体统计
+iostat -x 1 3               # 磁盘 IO
+```
+
+:::warning[别一上来就用 strace]
+`strace` 输出的信息量极大，**新手很难看懂**。
+
+**先看日志**，日志解决不了再上 `strace`。
+:::
+
+## 本课自检
+
+- [ ] 知道日志主要在 `journalctl` 里
+- [ ] 会用 `journalctl -f` 实时跟踪
+- [ ] 会用 `-u 服务名` 看单个服务
+- [ ] **知道脚本/管道里要加 `--no-pager`**
+- [ ] 会用 `--since` 按时间筛
+- [ ] **知道 `-b -1` 看上次开机的日志（排查意外重启）**
+- [ ] 会用 `-p err` 按级别筛
+- [ ] 会用 `--vacuum-time` 清理日志
+- [ ] 会用 `dmesg -T` 看内核日志
+- [ ] **知道插设备用 `dmesg -w` 判断硬件是否识别**
+- [ ] 掌握"状态→日志→资源→手动复现→验证"的排错流程
+- [ ] 知道别一上来就用 strace
+
+## 下一步
+
+[21 下一步](./21-next) —— 服务器运维还是嵌入式 Linux。

@@ -1,0 +1,342 @@
+---
+id: bootloader
+title: "10 Bootloader 与 IAP 升级"
+sidebar_position: 10
+description: 一份固件怎么分成 Bootloader 和应用两块、跳转时到底要做哪几步、向量表重定位、升级失败后的自恢复设计。
+---
+
+# 10 Bootloader 与 IAP 升级
+
+**本课目标**：能自己实现一个串口升级的 Bootloader。
+
+## 为什么需要 Bootloader
+
+:::info[三种烧写方式]
+| 方式 | 需要什么 | 适合 |
+| --- | --- | --- |
+| **ST-Link / SWD** | 调试器 + 拆机 | 开发阶段 |
+| **系统存储器串口下载** | BOOT0 跳线 | 救砖 |
+| **Bootloader（IAP）** | 只要通信口（串口/CAN/无线） | **产品现场升级** |
+
+**IAP = In-Application Programming**：程序自己改写自己所在的 Flash。
+:::
+
+## 内存怎么分
+
+```text
+0x08000000  ┌────────────────────────┐
+            │  Bootloader（16~32 KB）  │  ← 出厂烧一次，永不改变
+0x08004000  ├────────────────────────┤
+            │  应用 App（剩余空间）      │  ← 可以升级
+            │                        │
+0x08010000  ├────────────────────────┤
+            │  （可选）备份区          │  ← 存新固件，支持回滚
+            └────────────────────────┘
+```
+
+:::danger[Bootloader 占多少要提前定死]
+**这个起始地址一旦发布就不能改了**——已经出货的设备里 Bootloader 就在那个位置。
+
+**新版本 Bootloader 变大后，如果起始地址往后挪，老设备就再也升级不了了**（除非先升级 Bootloader，而它自己不能被升级）。
+
+**保守做法：Bootloader 预留比实际需要大很多**（比如实际用 12KB，就预留 16KB 或 32KB）。
+:::
+
+## 应用工程要怎么改
+
+:::warning[应用工程必须改两处，否则跳过来就跑飞]
+**① 链接脚本把 Flash 起始地址后移**
+
+```ld
+MEMORY
+{
+  /* 原来：ORIGIN = 0x08000000, LENGTH = 64K */
+  FLASH (rx)  : ORIGIN = 0x08004000, LENGTH = 48K     /* 让出前 16KB */
+  RAM   (xrw) : ORIGIN = 0x20000000, LENGTH = 20K
+}
+```
+
+**② 代码里重定位向量表**（在 `main` 最开头，任何中断使能之前）
+
+```c
+/* 必须最先做 */
+SCB->VTOR = 0x08004000;      /* 或直接写 FLASH_BASE + 0x4000 */
+```
+
+**CubeMX 工程可以改成**：
+
+```c
+#define VECT_TAB_OFFSET  0x4000U
+/* system_stm32f1xx.c 里 SystemInit() 会用这个宏 */
+```
+:::
+
+:::danger[忘了改 VTOR 会怎样]
+应用里的 `SYSTICK_IRQHandler` 会跳进 **Bootloader 的向量表**，执行 Bootloader 里的同名函数（或落到 Default_Handler 死循环）。
+
+**表现**：程序跳过去后看起来"卡住"或随机 HardFault。
+
+**这是跳转失败的第一大原因。**
+:::
+
+## Bootloader 的跳转流程
+
+```c
+#define APP_ADDR  0x08004000U
+#define APP_END   0x08010000U
+
+typedef void (*pFunction)(void);
+
+void jump_to_app(void)
+{
+    uint32_t app_stack = *(volatile uint32_t *)APP_ADDR;
+    uint32_t app_entry = *(volatile uint32_t *)(APP_ADDR + 4);
+
+    /* ① 检查栈顶值是否合理（在 RAM 范围内） */
+    if (app_stack < 0x20000000U || app_stack > 0x20005000U) {
+        /* 应用不存在或损坏，停在 Bootloader */
+        return;
+    }
+
+    /* ② 关中断 + 关外设（顺序重要） */
+    __disable_irq();
+    SysTick->CTRL = 0;
+    SysTick->LOAD = 0;
+    SysTick->VAL  = 0;
+    for (int i = 0; i < 8; i++) {
+        NVIC->ICER[i] = 0xFFFFFFFF;     /* 关所有中断使能 */
+        NVIC->ICPR[i] = 0xFFFFFFFF;     /* 清所有挂起 */
+    }
+
+    /* ③ 复位已用外设（串口、定时器等），避免状态残留 */
+    HAL_DeInit();
+    __HAL_RCC_GPIOA_CLK_DISABLE();
+    /* ... 按需关掉用过的外设时钟 */
+
+    /* ④ 重定位向量表 */
+    SCB->VTOR = APP_ADDR;
+
+    /* ⑤ 设置栈指针 */
+    __set_MSP(app_stack);
+
+    /* ⑥ 跳过去 */
+    pFunction jump = (pFunction)app_entry;
+    jump();
+
+    /* 不会返回到这里 */
+}
+```
+
+:::danger[六个步骤的顺序不能乱]
+| 顺序 | 步骤 | 为什么 |
+| --- | --- | --- |
+| 1 | 检查栈顶值 | 应用可能不存在（空 Flash = 0xFFFFFFFF） |
+| 2 | **关中断** | 跳转过程中任何中断都会用旧向量表 → 跑飞 |
+| 3 | 复位外设 | 否则应用的 `HAL_Init` 里外设状态是脏的 |
+| 4 | **改 VTOR** | 应用的中断才能进它自己的向量表 |
+| 5 | **设 MSP** | 用应用的栈，而不是 Bootloader 的 |
+| 6 | 跳转 | — |
+
+**`__disable_irq()` 必须在最前面，因为后面任何一步都可能被中断打断。**
+:::
+
+:::warning[为什么不返回：`jump()` 之后的代码是死代码]
+应用一旦跑起来就再也不回来了（除非它主动软复位）。
+
+**但如果应用在启动时就崩了，`jump()` 也不会返回** —— 它会 HardFault 然后卡在错误处理里。
+
+**所以下面这段"跳转后兜底"其实没用**：
+
+```c
+jump();                  /* 不是函数调用，是切换执行流 */
+/* 这行永远不会执行，除非应用自己跳回来 */
+```
+
+**要处理"应用启动崩溃"，只能靠看门狗。**
+:::
+
+## 应用怎么写才配合
+
+:::tip[应用侧要做三件事]
+```c
+int main(void)
+{
+    /* ① 向量表重定位（CubeMX 工程可用 VECT_TAB_OFFSET） */
+    SCB->VTOR = 0x08004000U;
+
+    HAL_Init();
+    SystemClock_Config();
+    /* ... */
+
+    /* ② 告诉 Bootloader "我启动成功了" */
+    mark_app_valid();
+
+    while (1) { /* ... */ }
+}
+```
+
+**③ 提供"回到 Bootloader"的通道**
+
+```c
+/* 收到升级命令 → 写标志 → 软复位 */
+void enter_bootloader(void)
+{
+    *(uint32_t *)BOOT_FLAG_ADDR = 0x5AA5C33C;    /* 或写备份寄存器 */
+    HAL_NVIC_SystemReset();
+}
+```
+:::
+
+### 标志位放哪
+
+| 位置 | 掉电保持 | 寿命 | 适合 |
+| --- | --- | --- | --- |
+| **备份寄存器（BKP）** | 需 VBAT | 无限 | ✅ **推荐** |
+| RAM（`.noinit` 段） | ❌ | 无限 | 软复位够用 |
+| Flash | ✅ | 1 万次 | 需要跨掉电保存 |
+
+```c
+/* 用 BKP 存升级请求 */
+if (HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR1) == 0x5AA5) {
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR1, 0);      /* 清掉，避免反复进 */
+    run_bootloader_upgrade();
+}
+```
+
+:::danger[RAM 标志位在软复位后会清零吗]
+**不一定**——很多芯片软复位不清 SRAM。
+
+**但这不可依赖**：上电复位一定会清，低功耗唤醒可能清。**要跨复位可靠传值，用 BKP 或 Flash。**
+:::
+
+## 固件完整性校验
+
+:::warning[中断的升级会留下半截固件]
+如果升级到 60% 断电，Flash 里就是半个程序。**直接跳过去会跑飞。**
+
+**所以升级流程必须是**：
+
+```text
+1. 接收数据 → 写进备份区（不是应用区！）
+2. 全部收完 → 校验 CRC/哈希
+3. 校验通过 → 擦除应用区 → 把备份区拷过去
+4. 再校验一次 → 置"升级成功"标志 → 复位
+```
+
+**任何一步失败 → 不切换，继续用老固件。**
+:::
+
+```c
+/* 简单 CRC32 校验（用 STM32 的硬件 CRC 单元更快） */
+uint32_t calc_crc32(uint32_t addr, uint32_t len)
+{
+    __HAL_RCC_CRC_CLK_ENABLE();
+    CRC->CR = CRC_CR_RESET;
+
+    for (uint32_t i = 0; i < len / 4; i++) {
+        CRC->DR = *(volatile uint32_t *)(addr + i * 4);
+    }
+    return CRC->DR;
+}
+
+/* 校验应用区 */
+if (calc_crc32(APP_ADDR, app_len) != expected_crc) {
+    /* 固件损坏，不要跳转 */
+    stay_in_bootloader();
+}
+```
+
+:::tip[F103 有硬件 CRC32 单元]
+```c
+__HAL_RCC_CRC_CLK_ENABLE();
+CRC->CR = CRC_CR_RESET;
+CRC->DR = word;         /* 写一个 32 位字，硬件自动累加 */
+uint32_t result = CRC->DR;
+```
+
+**比软件查表快几十倍**，几 KB 固件毫秒级算完。
+
+**注意**：STM32 的硬件 CRC 用的是 CRC-32/MPEG-2 多项式（`0x04C11DB7`，不反射，初值 0xFFFFFFFF），**和 zlib 的 CRC32 结果不同**。要和 PC 端工具对上，得用同样的参数。
+:::
+
+## 一个最小可用的串口升级协议
+
+:::info[协议只要四件事]
+| 步骤 | 命令 | 说明 |
+| --- | --- | --- |
+| 1 | 握手 | 上位机发 `0x7F`，Bootloader 回版本和芯片 ID |
+| 2 | 擦除 | 上位机发起始地址 + 长度，Bootloader 擦除对应页 |
+| 3 | 写数据 | 分包（每包 ≤ 256 字节 + 校验） |
+| 4 | 完成 | 上位机发期望 CRC，Bootloader 校验后置标志 |
+:::
+
+```c
+/* 写一包的关键代码 */
+HAL_FLASH_Unlock();
+__HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_PGERR | FLASH_FLAG_WRPRTERR);
+
+for (uint32_t i = 0; i < len; i += 2) {              /* F103 按半字写 */
+    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD,
+                          write_addr + i,
+                          data[i] | (data[i + 1] << 8)) != HAL_OK) {
+        HAL_FLASH_Lock();
+        return -1;
+    }
+}
+HAL_FLASH_Lock();
+```
+
+:::danger[F103 的 Flash 编程粒度是"半字"（16 位）]
+```c
+HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, addr, value);
+```
+
+**不能按字节写**。所以：
+
+- 数据长度必须是**偶数**
+- 最后一包不足偶数要补齐（用 `0xFF`）
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 跳过去就 HardFault | 没改 `SCB->VTOR` | 应用里重定位向量表 |
+| **中断进不去/乱跳** | VTOR 指向旧表 | 同上 |
+| 跳过去卡在默认处理 | 应用没烧或烧错地址 | 检查 `APP_ADDR` |
+| 偶尔跳转失败 | 跳转前没关中断 | `__disable_irq()` 放最前 |
+| 应用里外设不工作 | Bootloader 留下的外设状态 | 调 `HAL_DeInit()` |
+| 升级后一半功能正常 | 擦除不完整 | 按页擦，别漏页 |
+| 写 Flash 返回错误 | 忘了 Unlock | `HAL_FLASH_Unlock()` |
+| 写 Flash 返回错误（已 Unlock） | 目标页没擦 | 必须先擦再写 |
+| PC 端算的 CRC 对不上 | STM32 CRC 多项式不同 | 两端用同一套参数 |
+
+:::danger[Flash 写之前必须擦，而且是整页擦]
+```text
+Flash 只能把 1 写成 0，不能把 0 写回 1
+  → 想改内容必须先"擦除"（整页恢复成 0xFF）
+```
+
+**F103 中容量型号页大小 1KB，大容量型号 2KB。**
+
+**擦除时间是毫秒级的**（每页约 20~40ms），升级过程中要留足超时。
+:::
+
+## 本课自检
+
+- [ ] 能说出三种烧写方式的取舍
+- [ ] **知道 Bootloader 起始地址一旦发布不能改**
+- [ ] 知道要给 Bootloader 预留余量
+- [ ] **知道应用工程必须改链接脚本起始地址**
+- [ ] **知道应用必须重定位 `SCB->VTOR`**
+- [ ] 能背出跳转六步的顺序（检查→关中断→复位外设→改VTOR→设MSP→跳）
+- [ ] **理解 `__disable_irq()` 必须最前面**
+- [ ] 知道标志位用 BKP 比 RAM 可靠
+- [ ] **理解升级要写备份区 + 校验后才切换**
+- [ ] 知道 F103 有硬件 CRC32，但多项式与 zlib 不同
+- [ ] **知道 F103 Flash 按半字编程，长度必须偶数**
+- [ ] 知道写 Flash 前必须整页擦除
+
+## 下一步
+
+[11 Flash 读写与 EEPROM 模拟](./flash-eeprom) —— 怎么在 Flash 里存参数。

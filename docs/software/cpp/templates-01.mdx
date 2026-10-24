@@ -1,0 +1,225 @@
+---
+id: templates-01
+title: "01 模板"
+sidebar_position: 2
+description: "模板 第 1 部分：模板"
+---
+
+# 01 模板
+**这里解决一个问题：怎么写"对任意类型都成立"的代码，同时不牺牲类型安全和性能。**
+
+模板是 C++ 的**编译期**泛型机制。它不是"运行时多态"，也不是"类型擦除"——**每一个不同的类型参数都会生成一份独立的代码**。理解这一点，就理解了模板的全部优点和全部缺点。
+
+## 本页学什么
+
+- 函数模板与类模板：实例化到底发生了什么
+- 模板特化（全特化 / 偏特化）
+- 可变参数模板与折叠表达式（C++17）
+- SFINAE：为什么它能工作，以及它的可读性代价
+- **C++20 Concepts**：SFINAE 的替代者
+- CRTP：编译期多态，零开销替代虚函数
+
+## 1. 函数模板：实例化机制
+
+![模板实例化：max 模板是图纸，编译器为 int / double / char 各生成一份独立机器码](/img/diagrams/cpp-template-instantiation.svg)
+
+
+### 最小例子与"模板不是函数"
+
+```cpp
+// tpl_basic.cpp
+#include <cstdio>
+#include <string>
+#include <typeinfo>
+
+template<typename T>
+T max_of(T a, T b) {
+    return a > b ? a : b;
+}
+
+int main() {
+    std::printf("max_of(3, 5)     = %d\n", max_of(3, 5));
+    std::printf("max_of(3.5, 2.1) = %.2f\n", max_of(3.5, 2.1));
+    std::printf("max_of('a','z')  = %c\n", max_of('a', 'z'));
+    std::printf("max_of(str)      = %s\n",
+                max_of(std::string("abc"), std::string("xyz")).c_str());
+}
+```
+
+**实测输出：**
+
+```text
+max_of(3, 5)     = 5
+max_of(3.5, 2.1) = 3.50
+max_of('a','z')  = z
+max_of(str)      = xyz
+```
+
+关键点：**模板本身不生成任何代码**。只有当你调用 `max_of<int>(3,5)` 时，编译器才用 `T = int` **实例化**出一个真正的函数：
+
+```cpp
+int max_of_int(int a, int b) { return a > b ? a : b; }   // 编译器生成的
+```
+
+### 实测：模板实例化了多少份代码
+
+```bash
+# 编译并查看生成了哪些符号
+g++ -std=c++17 -O0 -c tpl_basic.cpp -o tpl_basic.o
+nm -C tpl_basic.o | grep max_of
+```
+
+**真实输出：**
+
+```text
+0000000000000000 T char max_of<char>(char, char)
+0000000000000000 T double max_of<double>(double, double)
+0000000000000000 T int max_of<int>(int, int)
+0000000000000000 T std::__cxx11::basic_string<char, std::char_traits<char>,
+                    std::allocator<char> > max_of<std::__cxx11::basic_string<...> >(...)
+```
+
+每一个被用到的类型都生成了一份独立函数。**这就是"代码膨胀"（code bloat）的来源**——也是模板零开销的原因（没有间接调用，每份都是专门为该类型生成的、可被完全优化的代码）。
+
+### 类型推导规则
+
+`template<typename T> void f(T param)` 的推导：
+
+| 实参类型 | `T` 推导为 | 说明 |
+| --- | --- | --- |
+| `int`（左值） | `int` | 顶层 const/引用被忽略 |
+| `const int`（左值） | `int` | 顶层 const 被忽略 |
+| `const int&` | `int` | 引用被忽略 |
+| `int[5]`（数组） | `int*` | **数组退化为指针** |
+| 函数名 | 函数指针 | 函数退化为指针 |
+| `{1,2,3}`（初始化列表） | **推导失败** | 需要用 `std::initializer_list<T>` |
+
+数组不退化的写法：
+
+```cpp
+template<typename T, size_t N>
+void f(T (&arr)[N]) {    // 引用一个数组，保留大小
+    std::printf("N = %zu\n", N);
+}
+```
+
+### 两种模板参数：类型与非类型
+
+```cpp
+// nontype.cpp
+#include <cstdio>
+
+// 非类型模板参数（NTTP）：编译期常量
+template<typename T, int Size>
+struct FixedBuffer {
+    T data[Size];
+    constexpr int size() const { return Size; }
+};
+
+// C++17 起可以用 auto 推导非类型参数
+template<auto Value>
+struct Constant {
+    static constexpr auto value = Value;
+};
+
+int main() {
+    FixedBuffer<int, 8> b;
+    std::printf("sizeof(b) = %zu, size=%d\n", sizeof(b), b.size());
+
+    Constant<42> c1;
+    Constant<'x'> c2;
+    std::printf("c1=%d c2=%c\n", (int)c1.value, (char)c2.value);
+}
+```
+
+**实测输出：**
+
+```text
+sizeof(b) = 32, size=8
+c1=42 c2=x
+```
+
+**非类型模板参数让"大小"进入类型系统**——`FixedBuffer<int,8>` 和 `FixedBuffer<int,16>` 是**不同的类型**，编译器知道确切大小，可以完全展开循环、放到栈上。**这在嵌入式里极其有用**（见 [嵌入式 C++](./embedded-cpp)）。
+
+## 2. 类模板
+
+```cpp
+// class_tpl.cpp
+#include <cstdio>
+#include <cstring>
+
+template<typename T, size_t N>
+class Ring {
+    T     buf_[N];
+    size_t head_ = 0, count_ = 0;
+public:
+    void push(const T& v) {
+        buf_[head_] = v;
+        head_ = (head_ + 1) % N;
+        if (count_ < N) ++count_;
+    }
+    size_t size()  const { return count_; }
+    bool   empty() const { return count_ == 0; }
+    T      pop()   { size_t i = (head_ + N - count_) % N; --count_; return buf_[i]; }
+};
+
+int main() {
+    Ring<int, 4> r;
+    std::printf("sizeof(Ring<int,4>) = %zu\n", sizeof(r));
+    for (int i = 1; i <= 6; ++i) r.push(i * 10);
+    std::printf("size=%zu (满了，旧的被覆盖)\n", r.size());
+    while (!r.empty()) std::printf("  pop %d\n", r.pop());
+}
+```
+
+**实测输出：**
+
+```text
+sizeof(Ring<int,4>) = 32
+size=4 (满了，旧的被覆盖)
+  pop 30
+  pop 40
+  pop 50
+  pop 60
+```
+
+注意 `sizeof` 是 **16 + 16 = 32**：`4 个 int` (16) + `两个 size_t` (16)。**没有任何额外开销**——这个类和一个手写的 C 环形缓冲区布局完全一样。
+
+### 类模板的成员定义
+
+类外定义时要把模板头写全：
+
+```cpp
+template<typename T, size_t N>
+void Ring<T, N>::clear() { head_ = 0; count_ = 0; }
+```
+
+### C++17 CTAD：类模板参数推导
+
+```cpp
+// ctad.cpp
+#include <vector>
+#include <utility>
+#include <cstdio>
+
+int main() {
+    std::pair p1(1, 2.5);              // C++17：推导为 pair<int,double>
+    std::vector v{1, 2, 3};            // 推导为 vector<int>
+    // 老写法
+    std::pair<int, double> p2(1, 2.5);
+    std::vector<int> v2{1, 2, 3};
+    std::printf("p1.first=%d p1.second=%.1f\n", p1.first, p1.second);
+    std::printf("v.size=%zu\n", v.size());
+}
+```
+
+**实测输出：**
+
+```text
+p1.first=1 p1.second=2.5
+v.size=3
+```
+
+---
+
+**翻页**：[下一页 →](./templates-02) · [返回目录](./)

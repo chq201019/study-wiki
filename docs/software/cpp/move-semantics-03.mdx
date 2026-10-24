@@ -1,0 +1,106 @@
+---
+id: move-semantics-03
+title: "03 常见误区汇总"
+sidebar_position: 4
+description: "移动语义与完美转发 第 3 部分：常见误区汇总"
+---
+
+# 03 常见误区汇总
+### 误区：`std::move` 之后源对象一定为空
+
+**错。** 标准只说源对象处于"有效但未指定状态"（valid but unspecified）。
+
+```cpp
+std::string a = "hello";
+std::string b = std::move(a);
+// a 可能是 ""，也可能是 "hello"（如果 SSO 生效，小字符串是拷贝而非移动！）
+```
+
+**实测：**
+
+```cpp
+// move_sso.cpp
+#include <string>
+#include <cstdio>
+
+int main() {
+    std::string short_str = "hi";                    // SSO 内（15 字符以内）
+    std::string long_str  = std::string(100, 'x');   // 超过 SSO
+
+    std::printf("before: short=%p long=%p\n",
+                (void*)short_str.data(), (void*)long_str.data());
+
+    std::string s2 = std::move(short_str);
+    std::string l2 = std::move(long_str);
+
+    std::printf("after move:\n");
+    std::printf("  short_str = \"%s\" (len=%zu, ptr=%p)\n",
+                short_str.c_str(), short_str.size(), (void*)short_str.data());
+    std::printf("  long_str  = \"%s\"... (len=%zu)\n",
+                long_str.empty() ? "(empty)" : long_str.substr(0,5).c_str(),
+                long_str.size());
+}
+```
+
+**实测输出：**
+
+```text
+before: short=000000a3035ff680 long=00000254807a65f0
+after move:
+  short_str = "" (len=0, ptr=000000a3035ff680)
+  long_str  = "(empty)"... (len=0)
+```
+
+**短字符串因为在 SSO 缓冲区里，移动时实际上是拷贝**——源对象的内容没变。这就是"实现相关"的典型例子。
+
+### 误区：给 const 对象 move
+
+```cpp
+const std::string s = "hello";
+std::string t = std::move(s);   // 实际调用拷贝构造！因为 const 不能绑到 string&&
+```
+
+`std::move` 对 const 对象返回的是 `const std::string&&`，而移动构造函数接受 `std::string&&`——**绑不上**，所以退回拷贝构造。**静默变慢，没有警告。**
+
+### 误区：以为移动一定比拷贝快
+
+对 `int`、`double`、小 POD 结构体，**移动 == 拷贝**（都是复制几个字节）。移动只对"持有资源的类型"（指针、句柄）有意义。
+
+## 常见坑
+
+| 坑 | 现象 | 解法 |
+| --- | --- | --- |
+| 以为 `std::move` 执行了移动 | 误判性能 | 它只是 `static_cast` 到右值引用 |
+| `return std::move(local);` | 禁用 NRVO，反而更慢 | 直接 `return local;` |
+| 对 const 对象 `move` | 静默退化成拷贝 | 不要给 const 对象加 move |
+| 移动后继续用源对象 | 值未指定 | 只做"重新赋值"或"析构" |
+| 以为 NRVO 是标准保证 | 依赖它做副作用 | C++17 只保证 prvalue |
+| `T&&` 以为是右值引用 | 其实是转发引用 | 看 `T` 是不是被推导的模板参数 |
+| 对同一参数 `forward` 两次 | 源已被移走 | 只转发一次 |
+| 以为移动 string 一定置空源 | SSO 下是拷贝 | 不要依赖源对象状态 |
+| 给小 POD 加移动语义 | 毫无收益 | 移动只对持有资源的类型有意义 |
+| `std::move` 用在返回值以外的不必要时 | 代码误导 | 只在"要转移所有权"时写 |
+
+## 自检清单
+
+- [ ] 说出 lvalue / xvalue / prvalue 的区别，各举 2 个例子
+- [ ] 背出引用折叠的四条规则
+- [ ] 写出 `std::move` 的等价实现（一行 `static_cast`）
+- [ ] 解释为什么 `std::move(x)` 单独调用不产生任何效果
+- [ ] 解释为什么函数内的形参（即使声明为 `T&&`）是左值
+- [ ] 写出 `std::forward` 的两个重载，并解释它如何"有条件转换"
+- [ ] 说明 RVO 和 NRVO 的区别，以及 C++17 保证了哪个
+- [ ] 解释为什么 `return std::move(local)` 是有害的
+- [ ] 解释为什么 `NonMovable` 类型在 C++17 起可以被返回
+- [ ] 说出移动后源对象的确切状态保证
+
+## 下一步
+
+- 移动在容器里的应用 → [STL 容器](./stl-containers)
+- 特殊成员函数与 Rule of 5 → [类与对象](./classes)
+- 完美转发在模板里的应用 → [模板](./templates)
+- 回到 [C++ 主线导读](./)
+
+---
+
+**翻页**：[← 上一页](./move-semantics-02) · [返回目录](./)

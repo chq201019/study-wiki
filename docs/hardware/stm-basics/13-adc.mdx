@@ -1,0 +1,284 @@
+---
+id: 13-adc
+title: 13 ADC 采集
+sidebar_position: 13
+description: STM32 的 ADC 为什么比 ESP32 强、12 位怎么换算、CubeMX 配置、轮询与 DMA 两种读法，以及采样时间怎么选。
+---
+
+# 13 ADC 采集
+
+**本课目标**：读电位器、光敏电阻、电池电压这些模拟量。
+
+## STM32 的 ADC 比 ESP32 好在哪
+
+| | ESP32 | **STM32F103** |
+| --- | --- | --- |
+| 分辨率 | 12 位 | 12 位 |
+| **线性度** | 差（±6% 误差，需校准） | **好（±1 LSB）** |
+| 采样率 | 一般 | **1 MSPS**（最高） |
+| 通道数 | 18 | **16~18** |
+| 独立 ADC 单元 | 2（ADC2 与 WiFi 冲突） | **2~3 个（可同时采样）** |
+
+:::tip[这是 STM32 的核心优势之一]
+ESP32 的 ADC 是出了名的"能读但不准"（[ESP32 第 10 课](../esp-basics/10-adc)）。
+
+**STM32 的 ADC 精度高、线性好，适合真正需要测量的场合**（电子秤、传感器、电池监测）。
+:::
+
+## 12 位怎么换算
+
+```text
+参考电压 VREF = 3.3V
+分辨率 12 位 → 0 ~ 4095
+
+电压 = ADC值 × 3.3 / 4095
+```
+
+| ADC 值 | 电压 |
+| --- | --- |
+| 0 | 0.00 V |
+| 1024 | 0.83 V |
+| 2048 | 1.65 V |
+| 4095 | 3.30 V |
+
+## CubeMX 配置
+
+以 **PA1（ADC1_IN1）读电位器** 为例：
+
+1. 引脚图上点 **PA1** → 选 **ADC1_IN1**
+2. 左侧 **Analog → ADC1**：
+   - 勾选 **IN1**
+3. 下方 **Parameter Settings**：
+
+| 参数 | 推荐值 | 说明 |
+| --- | --- | --- |
+| **Clock Prescaler** | **PCLK2 divided by 6** | ADC 时钟不能超过 14MHz |
+| Resolution | 12 bits | |
+| Scan Conversion Mode | Disabled | 单通道关闭扫描 |
+| Continuous Conversion Mode | Disabled | 用轮询就关，用连续就开 |
+| Discontinuos Conversion Mode | Disabled | |
+| **Sampling Time** | **71.5 Cycles** | 见下 |
+
+:::danger[ADC 时钟不能超过 14 MHz]
+STM32F103 的 ADC 时钟上限是 **14 MHz**（APB2 是 72MHz）。
+
+**所以分频至少要 /6（72/6 = 12 MHz）。**
+
+**超过 14MHz 会导致转换结果不准或乱跳。**
+
+CubeMX 会自动限制，但你手动改时要留意。
+:::
+
+## 采样时间怎么选
+
+```text
+采样时间越长 → 越准，但越慢
+```
+
+| 采样时间 | 总转换时间（@12MHz） | 适合 |
+| --- | --- | --- |
+| 1.5 cycles | 约 1.17 µs | 低阻抗源（运放输出） |
+| 7.5 cycles | 约 1.67 µs | 一般 |
+| **71.5 cycles** | **约 7.1 µs** | **高阻抗源（电位器、光敏电阻）** |
+| 239.5 cycles | 约 21.7 µs | 很高阻抗 |
+
+:::warning[阻抗高的信号源要长采样时间]
+**电位器（10kΩ）、光敏电阻**这类信号源内阻大，ADC 内部的采样电容**充不满**。
+
+**结果**：读数偏低、不稳定。
+
+**规矩：不确定就用 71.5 或 239.5 cycles**——慢一点无所谓，准更重要。
+:::
+
+## 方式一：轮询读取（最简单）
+
+```c
+#include "adc.h"
+
+uint32_t read_adc(void)
+{
+    HAL_ADC_Start(&hadc1);                          /* ① 启动转换 */
+    HAL_ADC_PollForConversion(&hadc1, 10);          /* ② 等转换完成，最多 10ms */
+    uint32_t value = HAL_ADC_GetValue(&hadc1);      /* ③ 读数 */
+    HAL_ADC_Stop(&hadc1);                           /* ④ 停止（可选） */
+    return value;
+}
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_ADC1_Init();
+    MX_USART1_UART_Init();
+
+    /* ADC 校准（第一次用建议做） */
+    HAL_ADCEx_Calibration_Start(&hadc1);
+
+    while (1)
+    {
+        uint32_t raw = read_adc();
+        float voltage = raw * 3.3f / 4095.0f;
+
+        printf("ADC=%4lu  电压=%.3f V\r\n", raw, voltage);
+        HAL_Delay(500);
+    }
+}
+```
+
+:::danger[忘了 `HAL_ADC_Start` 就读]
+```c
+uint32_t v = HAL_ADC_GetValue(&hadc1);      /* ❌ 读到的是旧值或 0 */
+```
+
+**必须 `Start` → `PollForConversion` → `GetValue` 三步。**
+
+**读到的值一直不变（或一直是 0），先怀疑漏了 `Start`。**
+:::
+
+:::tip[为什么要 `HAL_ADCEx_Calibration_Start`]
+**ADC 内部有电容失配和偏移**，上电后校准一次能显著改善精度。
+
+**只需在上电初始化时调一次**，不用每次读都校准。
+
+（ESP32 要用曲线拟合校准，STM32 只需这一行。）
+:::
+
+## 方式二：DMA 连续采集（推荐）
+
+要**高速连续采样**（比如测音频、振动），用 DMA 让 ADC 自动把数据搬到内存。
+
+CubeMX 配置：
+
+1. ADC1 的 **Continuous Conversion Mode** → **Enabled**
+2. **DMA Settings** 标签 → **Add** → 选 `ADC1`
+3. Mode 选 **Circular**（循环）
+
+```c
+#define BUF_SIZE  64
+uint16_t adc_buf[BUF_SIZE];
+
+/* 启动一次，之后自动循环填充 */
+HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buf, BUF_SIZE);
+
+while (1) {
+    /* adc_buf 里始终是最新的 64 个采样值 */
+    uint32_t sum = 0;
+    for (int i = 0; i < BUF_SIZE; i++) sum += adc_buf[i];
+
+    float avg = (float)sum / BUF_SIZE;
+    float volt = avg * 3.3f / 4095.0f;
+
+    printf("平均 %.3f V\r\n", volt);
+    HAL_Delay(200);
+}
+```
+
+:::tip[DMA 方式的好处]
+| | 轮询 | DMA |
+| --- | --- | --- |
+| CPU 占用 | 每次都要等 | **几乎为零** |
+| 采样率 | 低（受限于调用频率） | **高（可达 1 MSPS）** |
+| 适合 | 偶尔读一次 | 连续高速采样 |
+
+**DMA 是 STM32 的精髓之一**（[第 17 课](./17-dma)细讲）。
+:::
+
+## 完整示例：电位器调 LED 亮度
+
+```c
+uint16_t duty = 0;
+int8_t   step = 2;
+
+while (1)
+{
+    /* ① 读电位器 */
+    uint32_t raw = read_adc();
+
+    /* ② 映射到 PWM 占空比（0~99） */
+    duty = (raw * 99) / 4095;
+
+    /* ③ 设置 PWM */
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, duty);
+
+    printf("ADC=%4lu  duty=%2u\r\n", raw, duty);
+    HAL_Delay(50);
+}
+```
+
+:::tip[这个例子串起了三课]
+**ADC 输入 → 计算 → PWM 输出**。
+
+**旋钮一转，灯就变亮变暗**——这是最直观的"模拟量闭环"演示。
+
+**同样的思路能做**：电位器调电机转速、光敏电阻调灯亮度。
+:::
+
+## 测超过 3.3V 的电压
+
+:::danger[ADC 引脚绝不能超过 3.3V]
+**会烧引脚**（即使有些引脚标 5V 容忍，ADC 输入也不容忍超过 VDDA）。
+
+**测 12V 电池要分压**：
+
+```text
+12V ──[R1 100k]──┬──[R2 10k]── GND
+                 │
+              PA1 (ADC)
+
+ADC 电压 = 12 × 10/(100+10) = 1.09 V
+实际电压 = ADC 电压 × (R1+R2)/R2 = ×11
+```
+
+**分压电阻要用精度 1% 的**，否则测量误差大。
+:::
+
+:::tip[加个滤波电容更稳]
+```text
+ADC 引脚 ──┬── 0.1µF ── GND
+```
+
+**滤掉高频干扰，读数更稳定。**
+
+（代价：响应变慢，不适合快速变化的信号。）
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 忘 `HAL_ADC_Start` | 读到 0 或旧值 | 没启动转换 | 补上 |
+| ADC 时钟超 14MHz | 读数乱跳 | 分频不够 | /6 或 /8 |
+| 采样时间太短 | 读数偏低 | 高阻源充不满 | 71.5 cycles |
+| 超 3.3V | 烧引脚 | 超量程 | 先分压 |
+| 不校准 | 精度差 | 电容失配 | `HAL_ADCEx_Calibration_Start` |
+| 单次读数就用 | 数值跳动 | 噪声 | 多次平均 |
+| DMA 缓冲区越界 | 数据错乱 | 长度参数错 | 检查 `BUF_SIZE` |
+
+:::warning[ADC 读数跳动是正常的]
+即使输入电压不变，读数也会有小幅波动（±2~5 LSB）——**这是噪声，不是坏了**。
+
+**降噪手段**：
+
+1. 多值平均（最有效）
+2. 加大采样时间
+3. 加滤波电容
+4. 远离数字信号走线
+:::
+
+## 本课自检
+
+- [ ] 知道 STM32 的 ADC 精度和线性度都比 ESP32 好
+- [ ] 会用 `电压 = ADC值 × 3.3 / 4095` 换算
+- [ ] **知道 ADC 时钟不能超过 14MHz（要 /6 分频）**
+- [ ] **知道高阻抗信号源要用长采样时间（71.5 cycles）**
+- [ ] **会用轮询三步：Start → PollForConversion → GetValue**
+- [ ] 会在上电时调一次 `HAL_ADCEx_Calibration_Start`
+- [ ] 会用 DMA 做连续高速采集
+- [ ] **知道测超过 3.3V 必须先分压**
+- [ ] 知道读数小幅跳动是正常噪声
+- [ ] 能做出"电位器调 LED 亮度"
+
+## 下一步
+
+[14 中断与 NVIC](./14-interrupt) —— 让外部事件立刻得到响应。

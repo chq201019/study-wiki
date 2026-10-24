@@ -1,0 +1,315 @@
+---
+id: 25-ota
+title: 25 OTA 升级
+sidebar_position: 25
+description: OTA 为什么需要双分区、固件怎么下发、回滚怎么做，以及升级失败变砖怎么救。
+---
+
+# 25 OTA 升级
+
+**本课目标**：让设备能远程更新固件，不用拆机接线。
+
+## 为什么需要 OTA
+
+:::danger[没有 OTA 的产品会很难受]
+发现一个 bug → 要把所有设备收回来、或派人上门、或让用户自己刷……
+
+**有 OTA**：推一个固件，设备自己升级完。
+
+**这是产品级设备的必备能力。**
+:::
+
+## 核心机制：双分区（A/B 分区）
+
+![ESP32 OTA 双分区三阶段：正常运行 ota_0、下载写入 ota_1、改 otadata 指向 ota_1 后重启，失败可回滚](/img/diagrams/esp32-ota-partition.svg)
+
+
+```text
+┌──────────────────────────────────────────┐
+│ Bootloader                               │
+├──────────────────────────────────────────┤
+│ OTA data（记录"该启动哪个分区"）          │
+├──────────────────────────────────────────┤
+│ ota_0（应用固件 A）  ← 正在运行            │
+├──────────────────────────────────────────┤
+│ ota_1（应用固件 B）  ← 新固件写这里        │
+└──────────────────────────────────────────┘
+```
+
+:::tip[为什么必须两个分区]
+**正在运行的固件不能覆盖自己**（会把自己写坏）。
+
+**流程**：
+
+1. 当前跑 `ota_0`
+2. 新固件下载到 `ota_1`
+3. 校验通过 → 改 OTA data 指向 `ota_1`
+4. 重启 → 从 `ota_1` 启动
+5. 如果新固件启动失败 → Bootloader **自动回滚**到 `ota_0`
+:::
+
+## 分区表要改成 OTA 布局
+
+默认的 `partitions_singleapp.csv` **只有一个 app 分区**，不能 OTA。
+
+用官方提供的 OTA 分区表：
+
+```text
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x4000
+otadata,  data, ota,     0xd000,   0x2000
+phy_init, data, phy,     0xf000,   0x1000
+ota_0,    app,  ota_0,   0x10000,  0x180000
+ota_1,    app,  ota_1,   0x190000, 0x180000
+```
+
+| 行 | 说明 |
+| --- | --- |
+| `otadata` | **记录当前该启动哪个分区** |
+| `ota_0` / `ota_1` | 两块同样大小的固件空间 |
+
+:::danger[OTA 分区表要占一倍 Flash]
+两个 app 分区各 1.5 MB = **3 MB**，加上其他 → 至少需要 4 MB Flash。
+
+**4 MB 的板子做 OTA 会很紧张**（app 分区只能各 1.5 MB 左右）。
+
+**建议 8 MB 以上**，16 MB 最舒服。
+:::
+
+## 最简单的 OTA：本地服务器升级
+
+```c
+#include "esp_ota_ops.h"
+#include "esp_http_client.h"
+#include "esp_log.h"
+
+#define OTA_URL "http://192.168.1.100:8000/myapp.bin"
+
+void do_ota(void)
+{
+    ESP_LOGI(TAG, "开始 OTA");
+
+    /* ① 拿到"下一个"分区 */
+    const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
+    if (!update) {
+        ESP_LOGE(TAG, "没有可用的 OTA 分区（分区表不对）");
+        return;
+    }
+
+    esp_ota_handle_t handle;
+    esp_err_t err = esp_ota_begin(update, OTA_SIZE_UNKNOWN, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ota_begin 失败: %s", esp_err_to_name(err));
+        return;
+    }
+
+    /* ② 下载并写入 */
+    esp_http_client_config_t cfg = { .url = OTA_URL, .timeout_ms = 20000 };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    esp_http_client_open(c, 0);
+
+    int content_len = esp_http_client_fetch_headers(c);
+    ESP_LOGI(TAG, "固件大小 %d 字节", content_len);
+
+    uint8_t buf[1024];
+    int total = 0;
+    while (1) {
+        int n = esp_http_client_read(c, (char *)buf, sizeof(buf));
+        if (n == 0) break;                       /* 读完了 */
+        if (n < 0) {                             /* 出错 */
+            ESP_LOGE(TAG, "下载出错");
+            esp_ota_abort(handle);
+            esp_http_client_close(c);
+            esp_http_client_cleanup(c);
+            return;
+        }
+        err = esp_ota_write(handle, buf, n);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "写入失败");
+            esp_ota_abort(handle);
+            esp_http_client_close(c);
+            esp_http_client_cleanup(c);
+            return;
+        }
+        total += n;
+    }
+
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+
+    /* ③ 收尾 */
+    err = esp_ota_end(handle);                   /* 校验固件 */
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "固件校验失败（可能下载不完整）");
+        return;
+    }
+
+    err = esp_ota_set_boot_partition(update);    /* 下次从这里启动 */
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "设置启动分区失败");
+        return;
+    }
+
+    /* ④ 重启生效 */
+    ESP_LOGI(TAG, "升级完成，共 %d 字节，重启中...", total);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+}
+```
+
+:::danger[`esp_ota_end` 一定要调]
+```c
+esp_ota_write(...);        /* 写完 */
+esp_ota_set_boot_partition(...);   /* ❌ 少了 end → 没有校验 → 可能启动坏固件 */
+```
+
+**`esp_ota_end` 负责校验镜像完整性**（头、校验和）。
+
+**漏了它，一个下载不完整的固件就会被当成好的。**
+:::
+
+:::warning[必须先确认分区表支持 OTA]
+```c
+const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
+if (!update) { /* 分区表没有 ota_0/ota_1 → 无法 OTA */ }
+```
+
+**默认 `singleapp` 分区表没有 OTA 分区**，运行时会拿到 NULL。
+
+**这是"OTA 代码跑不通"最常见的原因。**
+:::
+
+## 怎么让设备知道"有新固件"
+
+真实产品不会硬编码 URL，通常：
+
+| 方式 | 做法 |
+| --- | --- |
+| **版本检查接口** | 请求 `GET /api/firmware/latest?dev=X&ver=1.0.2` → 返回新版本 URL |
+| **MQTT 通知** | 服务器推 `device/xxx/ota` = `{"url":"...","ver":"1.1.0"}` |
+| **定时轮询** | 每天检查一次 |
+
+:::tip[必须做版本比较]
+```c
+const esp_app_desc_t *app = esp_app_get_description();
+ESP_LOGI(TAG, "当前版本 %s", app->version);
+```
+
+`app->version` 来自 `CMakeLists.txt` 里的 `project(... VERSION 1.0.2)`。
+
+**没有版本比较，设备会反复刷同一个固件——把 Flash 写坏。**
+:::
+
+## 回滚：防止变砖
+
+:::danger[新固件启动失败怎么办]
+如果新固件有 bug（比如开机就崩），**设备会一直重启**。
+
+**ESP-IDF 提供"首次启动确认"机制**：
+
+```c
+void app_main(void)
+{
+    /* ① 检查是不是"刚升级完的第一次启动" */
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+
+    if (esp_ota_get_state_partition(running, &state) == ESP_OK) {
+        if (state == ESP_OTA_IMG_PENDING_VERIFY) {
+            ESP_LOGW(TAG, "新固件首次启动，开始自检");
+
+            /* ② 做自检：连得上 WiFi 吗？传感器正常吗？ */
+            if (selftest_ok()) {
+                esp_ota_mark_app_valid_cancel_rollback();   /* ✅ 确认可用 */
+                ESP_LOGI(TAG, "自检通过，固件已确认");
+            } else {
+                ESP_LOGE(TAG, "自检失败，回滚");
+                esp_ota_mark_app_invalid_rollback_and_reboot();
+            }
+        }
+    }
+
+    /* 正常业务 */
+}
+```
+
+**这是产品 OTA 必须实现的部分。**
+:::
+
+## 更省事的方案：`esp_https_ota`
+
+ESP-IDF 有封装好的组件，**不用自己写下载循环**：
+
+```c
+#include "esp_https_ota.h"
+
+esp_http_client_config_t cfg = {
+    .url = "https://example.com/fw.bin",
+    .crt_bundle_attach = esp_crt_bundle_attach,
+};
+
+esp_https_ota_config_t ota_cfg = { .http_config = &cfg };
+
+esp_err_t ret = esp_https_ota(&ota_cfg);
+if (ret == ESP_OK) {
+    esp_restart();
+}
+```
+
+:::tip[先用 `esp_https_ota`，别从零写]
+它内部处理了：下载、写入、校验、重试、进度回调。
+
+**只有在需要特殊逻辑（断点续传、自定义协议）时才自己写循环。**
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 分区表没 ota 分区 | `update` 为 NULL | 用了 singleapp | 改 OTA 分区表 |
+| 漏 `esp_ota_end` | 启动坏固件 | 没校验 | 必须调 |
+| 不比较版本 | 反复刷同一固件 | 逻辑缺失 | 比较 `app->version` |
+| 不做回滚确认 | 坏固件变砖 | 没自检 | `mark_app_valid` |
+| 升级时断电 | 可能变砖 | 写了一半 | 有 A/B 分区可回滚 |
+| Flash 太小 | 编译/OTA 失败 | 两个 app 分区放不下 | 用 8MB+ |
+| OTA 时不喂看门狗 | 中途复位 | 下载耗时超过 WDT | 长任务里 `esp_task_wdt_reset()` |
+
+:::danger[升级过程中断电会怎样]
+**有 A/B 分区时**：OTA data 还没切换，重启后还是跑旧固件——**安全**。
+
+**如果已经切换了但新固件没写完**：Bootloader 校验失败 → 回滚到旧固件——**也安全**。
+
+**所以关键是：一定要用带 A/B 的分区表。** 单分区覆盖式升级断电就是真变砖。
+:::
+
+## 本课自检
+
+- [ ] **理解 A/B 双分区为什么必须**
+- [ ] 知道 OTA 分区表要有 `otadata` + `ota_0` + `ota_1`
+- [ ] **知道 OTA 分区表要占一倍 Flash，建议 8MB+**
+- [ ] 会用 `esp_ota_get_next_update_partition`
+- [ ] 会 `esp_ota_begin` / `write` / `end` / `set_boot_partition`
+- [ ] **知道 `esp_ota_end` 负责校验，不能漏**
+- [ ] 知道要用 `esp_app_get_description()->version` 比较版本
+- [ ] **会用 `esp_ota_mark_app_valid_cancel_rollback` 做自检确认**
+- [ ] 知道 `esp_https_ota` 是更省事的封装
+- [ ] **知道升级期间要喂看门狗**
+
+## 第四阶段小结
+
+你现在掌握了 ESP32 的系统能力：
+
+| 能力 | 用什么 |
+| --- | --- |
+| 多任务 | FreeRTOS 任务 |
+| 任务间同步 | 队列 / 信号量 / 互斥锁 |
+| 断电保存配置 | NVS |
+| 省电 | 深度睡眠 |
+| 存文件 | LittleFS |
+| 远程升级 | OTA |
+
+**这些是"能做成产品"和"只能做实验"的分界线。**
+
+## 下一步
+
+[26 项目：温湿度上云](./26-project-sensor) —— 把前面所有东西串起来。

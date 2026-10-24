@@ -1,0 +1,237 @@
+---
+id: transition-03
+title: "03 范围 for"
+sidebar_position: 4
+description: "从 C 到 C++ 第 3 部分：范围 for"
+---
+
+# 03 范围 for
+### 语法与等价展开
+
+```cpp
+for (const auto& x : container) { /* ... */ }
+```
+
+编译器大致展开成：
+
+```cpp
+{
+    auto&& __range = container;
+    auto   __begin = begin(__range);
+    auto   __end   = end(__range);
+    for (; __begin != __end; ++__begin) {
+        const auto& x = *__begin;
+        /* ... */
+    }
+}
+```
+
+注意 `__range` 用的是 `auto&&`——所以**范围 for 能接临时对象**。
+
+### 实测：三种写法的代价差多少
+
+```cpp
+// rangefor.cpp
+#include <vector>
+#include <string>
+#include <cstdio>
+#include <chrono>
+
+int main() {
+    std::vector<std::string> v;
+    for (int i = 0; i < 100000; ++i) v.push_back("a fairly long string here");
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    long long n1 = 0;
+    for (auto x : v) n1 += x.size();          // 拷贝！
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    long long n2 = 0;
+    for (const auto& x : v) n2 += x.size();   // 引用
+    auto t2 = std::chrono::high_resolution_clock::now();
+
+    std::printf("by value : %lld us\n",
+        (long long)std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count());
+    std::printf("by ref   : %lld us\n",
+        (long long)std::chrono::duration_cast<std::chrono::microseconds>(t2-t1).count());
+    std::printf("n1=%lld n2=%lld\n", n1, n2);
+}
+```
+
+编译运行（`-O2`）：
+
+```bash
+g++ -std=c++17 -O2 -o rangefor.exe rangefor.cpp && ./rangefor.exe
+```
+
+**实测输出：**
+
+```text
+by value : 4172 us
+by ref   : 94 us
+n1=2500000 n2=2500000
+```
+
+**差了 44 倍。** 因为 `auto x` 给每个元素拷贝了一次 `std::string`（10 万次堆分配）。
+
+:::danger[这是真实项目里最常见的性能 bug 之一]
+写 `for (auto x : v)` 而不是 `for (const auto& x : v)`，在元素是 `int` 时无害，在元素是 `std::string`/`std::vector`/结构体时是灾难。
+
+**默认写 `const auto&`，需要修改时才写 `auto&`，只有元素是 int/指针这类标量时才偷懒写 `auto`。**
+:::
+
+### 范围 for 的坑：不能修改容器结构
+
+```cpp
+// 危险：遍历时增删元素
+for (auto& x : v) {
+    if (x == 3) v.push_back(4);   // 迭代器失效，UB
+}
+```
+
+详见 [STL 容器](./stl-containers) 的"迭代器失效"一节。
+
+## 7. nullptr：为什么不能用 NULL
+
+### NULL 在 GCC 里到底是什么
+
+先实测，不要猜。用 `-E -dM` 看宏的真实定义：
+
+```bash
+echo '#include <cstddef>' > p.cpp
+g++ -std=c++17 -E -dM p.cpp | grep 'define NULL'
+```
+
+**实测输出（MinGW-w64 GCC 16.2.0）：**
+
+```text
+#define NULL __null
+```
+
+`__null` 是 **GCC 的扩展**，它是一个"空指针常量"，但同时也能当整数用——**它不是 `0`，也不是 `nullptr`**。用 `typeid` 验证：
+
+```cpp
+// probe_null.cpp
+#include <cstdio>
+#include <cstddef>
+#include <typeinfo>
+
+int main() {
+    std::printf("sizeof(NULL)       = %zu\n", sizeof(NULL));
+    std::printf("typeid(NULL).name()     = %s\n", typeid(NULL).name());
+    std::printf("typeid(nullptr).name()  = %s\n", typeid(nullptr).name());
+    std::printf("same type? %d\n", (int)(typeid(NULL) == typeid(nullptr)));
+}
+```
+
+**实测输出：**
+
+```text
+sizeof(NULL)       = 8
+typeid(NULL).name()     = x      (long，GCC 把 __null 当整型)
+typeid(nullptr).name()  = Dn     (std::nullptr_t)
+same type? 0
+```
+
+### 重载时的后果：不是"选错"，而是"歧义"
+
+```cpp
+// null_v2.cpp
+#include <cstdio>
+#include <cstddef>
+
+void f(int)    { std::printf("  f(int)\n"); }
+void f(char*)  { std::printf("  f(char*)\n"); }
+void g(long)   { std::printf("  g(long)\n"); }
+void g(char*)  { std::printf("  g(char*)\n"); }
+
+int main() {
+    f(0);
+    f(nullptr);
+    f(NULL);      // ← 这一行
+    g(NULL);      // ← 换成 long 也一样
+}
+```
+
+**真实编译错误：**
+
+```text
+null_v2.cpp:10:36: error: call of overloaded 'f(NULL)' is ambiguous
+null_v2.cpp:11:36: error: call of overloaded 'g(NULL)' is ambiguous
+```
+
+**`f(NULL)` 是编译错误（歧义），不是静默选错。**
+
+:::warning[这一点在不同编译器上表现不同]
+`NULL` 的定义是**实现相关**的：
+
+- **GCC / MinGW**：`__null`（GCC 扩展，能匹配整型也能匹配指针 → **歧义**）
+- **MSVC**：`0`（能匹配 `int` → **静默调用 `f(int)`**）
+- **Clang/libc++**：通常是 `__null` 或 `0`，行为不一
+
+**所以"`f(NULL)` 会静默调用 `f(int)`"这个广为流传的说法，在 GCC 上不成立，但在 MSVC 上成立。** 这正是不能依赖它的理由——**行为随编译器变，还都很难发现。**
+:::
+
+去掉有歧义的那行，看 `nullptr` 的正确行为：
+
+```cpp
+// null_clean.cpp
+#include <cstdio>
+#include <cstddef>
+
+void f(int)    { std::printf("  f(int)\n"); }
+void f(char*)  { std::printf("  f(char*)\n"); }
+
+int main() {
+    std::printf("f(0):\n");        f(0);
+    std::printf("f(nullptr):\n");  f(nullptr);
+
+    int* p1 = NULL;
+    int* p2 = nullptr;
+    std::printf("p1=%p p2=%p\n", (void*)p1, (void*)p2);
+    std::printf("sizeof(nullptr)=%zu  sizeof(void*)=%zu\n",
+                sizeof(nullptr), sizeof(void*));
+}
+```
+
+**实测输出：**
+
+```text
+f(0):
+  f(int)
+f(nullptr):
+  f(char*)
+p1=0000000000000000 p2=0000000000000000
+sizeof(nullptr)=8  sizeof(void*)=8
+```
+
+**`nullptr` 的行为在所有编译器上都是确定的**：它只匹配指针版本。
+
+### nullptr 的类型
+
+`nullptr` 的类型是 `std::nullptr_t`（定义在 `<cstddef>`），它能**隐式转换成任意指针类型**，但不能转换成整数：
+
+```cpp
+int*  p = nullptr;   // OK
+char* c = nullptr;   // OK
+// int i = nullptr;  // 编译错误
+```
+
+**真实编译错误：**
+
+```text
+nullptr_demo.cpp: In function 'int main()':
+nullptr_demo.cpp:19:13: error: cannot convert 'std::nullptr_t' to 'int' in initialization
+   19 |     int i = nullptr;
+      |             ^~~~~~~
+```
+
+:::tip[规则]
+**C++11 起，所有空指针一律写 `nullptr`。** 把 `NULL` 从你的词汇表里删掉。老代码里的 `NULL` 见到就改。
+
+`sizeof(nullptr)` 等于 `sizeof(void*)`（实测 8），这是标准允许的但**不是强制要求**——标准只保证 `nullptr_t` 能转成任何指针类型。
+:::
+
+---
+
+**翻页**：[← 上一页](./transition-02) · [下一页 →](./transition-04) · [返回目录](./)

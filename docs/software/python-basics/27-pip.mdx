@@ -1,0 +1,398 @@
+---
+id: 27-pip
+title: 27 第三方库与 pip
+sidebar_position: 27
+description: pip 常用命令、虚拟环境为什么必须有、requirements.txt、国内镜像源，以及几个值得学的库。
+---
+
+# 27 第三方库与 pip
+
+**本课目标**：会安装第三方库，并且**养成用虚拟环境的习惯**（这是专业与业余的分水岭）。
+
+## pip 是什么
+
+Python 自带标准库，但真正强大的生态在**第三方库**：requests（网络）、pandas（数据分析）、Pillow（图片）……
+
+`pip` 就是安装它们的工具。
+
+## 基本命令
+
+```bash
+# 安装
+python -m pip install requests
+
+# 安装指定版本
+python -m pip install requests==2.31.0
+
+# 升级
+python -m pip install --upgrade requests
+
+# 卸载
+python -m pip uninstall requests
+
+# 查看已安装
+python -m pip list
+
+# 查看某个包的信息
+python -m pip show requests
+
+# 搜索（注意：官方已弃用 search，通常直接去 pypi.org 搜）
+```
+
+:::tip[为什么写 `python -m pip` 而不是 `pip`]
+电脑上可能装了多个 Python（系统一个、你自己装一个、conda 一个）。
+
+直接敲 `pip` 时，不确定用的是哪个 Python 的 pip，**可能装到了错误的地方**——表现为「明明装了却 import 不到」。
+
+`python -m pip` 明确表示「用**当前这个** python 执行它自带的 pip」，绝不会装错。
+
+**养成习惯：一直写 `python -m pip`。**
+:::
+
+## 虚拟环境：为什么必须有
+
+:::danger[全局安装的问题]
+假设你在系统 Python 里装了 `requests 2.20`。
+
+后来另一个项目需要 `requests 2.31`，你升级了。**前一个项目可能就跑不起来了**——因为新版可能改了 API。
+
+更糟的情况：两个库依赖同一个包的**不同版本**，在全局环境下无法共存。
+:::
+
+**虚拟环境（venv）** 就是给每个项目一个独立的包目录：
+
+```text
+项目A/.venv/    → 装 requests 2.20
+项目B/.venv/    → 装 requests 2.31
+系统 Python     → 干净，不装任何项目依赖
+```
+
+互不干扰。
+
+### 创建与使用
+
+```bash
+# ① 在项目目录下创建（.venv 是习惯名字）
+python -m venv .venv
+
+# ② 激活
+# Windows (cmd)
+.venv\Scripts\activate
+# Windows (PowerShell)
+.venv\Scripts\Activate.ps1
+# macOS / Linux
+source .venv/bin/activate
+```
+
+激活成功后，命令行前面会出现 `(.venv)`：
+
+```text
+(.venv) C:\code\myproject>
+```
+
+**看到这个前缀就说明在虚拟环境里**，此时 `python` 和 `pip` 都指向这个环境。
+
+### 退出
+
+```bash
+deactivate
+```
+
+### 完整流程
+
+```bash
+cd myproject
+python -m venv .venv
+.venv\Scripts\activate
+
+python -m pip install requests
+python main.py
+
+deactivate
+```
+
+:::warning[别忘了把 .venv 加进 .gitignore]
+虚拟环境目录里有几百 MB 的包文件，**绝对不要提交到 git**。
+
+`.gitignore` 里加一行：
+
+```text
+.venv/
+```
+
+别人克隆项目后自己运行 `python -m venv .venv` 重建即可（依赖列表在 `requirements.txt` 里）。
+:::
+
+## 国内镜像源：解决下载慢
+
+默认从 PyPI 官方源下载，国内可能很慢甚至超时。
+
+### 临时使用
+
+```bash
+python -m pip install requests -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+### 永久配置
+
+```bash
+python -m pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+配置后查看：
+
+```bash
+python -m pip config list
+```
+
+:::tip[常用镜像源]
+| 源 | 地址 |
+| --- | --- |
+| 清华（推荐） | `https://pypi.tuna.tsinghua.edu.cn/simple` |
+| 阿里云 | `https://mirrors.aliyun.com/pypi/simple/` |
+| 中科大 | `https://pypi.mirrors.ustc.edu.cn/simple/` |
+
+如果某个包在镜像上找不到（少见），临时加 `-i https://pypi.org/simple` 用官方源。
+:::
+
+## requirements.txt：记录依赖
+
+项目要交给别人（或部署到服务器）时，需要告诉对方装哪些包、什么版本。
+
+### 导出
+
+```bash
+python -m pip freeze > requirements.txt
+```
+
+生成的文件长这样：
+
+```text
+requests==2.31.0
+urllib3==2.0.7
+certifi==2023.7.22
+```
+
+### 安装
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+:::warning[`pip freeze` 会导出环境里所有包]
+如果你在**没有虚拟环境**的情况下 freeze，会把系统里几百个包全导出来——`requirements.txt` 变成一份无用的长清单。
+
+**正确做法**：在干净的虚拟环境里，只装项目需要的包，再 freeze。
+:::
+
+### 手动维护（更推荐）
+
+`pip freeze` 导出的是「精确版本」，包括间接依赖。更好的做法是**手写直接依赖**：
+
+```text
+# requirements.txt
+requests>=2.31,<3.0
+click>=8.0
+```
+
+这样间接依赖的版本可以灵活升级，不会被锁死。
+
+## 常用库推荐
+
+按用途分类，都是各自领域的主流选择。
+
+### 网络请求
+
+```bash
+python -m pip install requests
+```
+
+```python
+import requests
+
+resp = requests.get("https://example.com", timeout=10)
+print(resp.status_code)
+print(resp.text[:100])
+```
+
+比标准库的 `urllib` 好用太多，是事实标准。
+
+### 数据处理
+
+```bash
+python -m pip install pandas
+```
+
+```python
+import pandas as pd
+
+df = pd.read_csv("data.csv")
+print(df.head())
+print(df["price"].mean())
+```
+
+表格数据处理神器，几行代码完成 Excel 里要拖半天的操作。
+
+### 图片处理
+
+```bash
+python -m pip install Pillow
+```
+
+```python
+from PIL import Image
+
+img = Image.open("photo.jpg")
+img = img.resize((200, 200))
+img.save("thumb.jpg")
+```
+
+### 更好看的终端输出
+
+```bash
+python -m pip install rich
+```
+
+```python
+from rich import print
+from rich.table import Table
+
+table = Table(title="成绩表")
+table.add_column("姓名")
+table.add_column("分数", justify="right")
+table.add_row("小明", "95")
+table.add_row("小红", "92")
+
+print(table)
+```
+
+会输出带颜色和边框的表格。
+
+### 命令行工具
+
+```bash
+python -m pip install click
+```
+
+```python
+import click
+
+@click.command()
+@click.option("--name", default="世界", help="要问候的对象")
+def hello(name):
+    click.echo(f"你好，{name}！")
+
+if __name__ == "__main__":
+    hello()
+```
+
+运行 `python hello.py --name 小明`，自动获得 `--help`、参数校验等。
+
+## 虚拟环境工具对比
+
+venv 是标准库自带的，够用。但还有更方便的选择：
+
+| 工具 | 特点 |
+| --- | --- |
+| **venv** | 标准库自带，无需安装，够用 |
+| **uv** | 极快（Rust 写的），近年流行 |
+| **conda** | 科学计算常用，能管非 Python 依赖 |
+| **poetry** | 依赖解析 + 打包，适合做库 |
+
+:::tip[新手建议先用 venv]
+`venv` 不需要额外安装，命令简单，理解了它再用别的工具会很快。
+
+`uv` 值得关注——安装依赖快几十倍，但属于进阶选择。
+:::
+
+## 常见问题
+
+### 装好了但 import 不到
+
+:::danger[99% 是这两个原因]
+**① 装到了别的 Python 环境**
+
+```bash
+python -c "import sys; print(sys.prefix)"   # 看当前用的是哪个环境
+python -m pip show requests                  # 看这个包装在哪
+```
+
+两个路径对不上，就说明装错了地方。
+
+**② 编辑器选错了解释器**
+
+VS Code 右下角看显示的是哪个 Python（[第 4 课](./04-editor)提过）。点它可以切换。
+
+**排查顺序**：先确认终端里 `python -m pip install` 成功，再确认编辑器用的同一个解释器。
+:::
+
+### 权限错误
+
+```text
+ERROR: Could not install packages due to an OSError: [Errno 13] Permission denied
+```
+
+**不要在系统 Python 里用 `--user` 或 sudo 硬装**，正确做法是**建虚拟环境**。
+
+### 编译错误（缺 C 编译器）
+
+某些包需要编译（如 `numpy` 老版本）：
+
+```text
+error: Microsoft Visual C++ 14.0 or greater is required
+```
+
+**解法**：
+
+1. 先用预编译包：`python -m pip install --only-binary :all: 包名`
+2. 或安装 Microsoft C++ Build Tools
+3. 现代版本的 numpy/pandas 通常都有预编译包，很少遇到
+
+### 依赖冲突
+
+```text
+ERROR: pip's dependency resolver does not currently take into account all the packages...
+```
+
+通常是两个包要求同一个库的不同版本。**解法**：
+
+```bash
+# 看谁依赖了什么
+python -m pip show 包名
+```
+
+实在解决不了就**新建一个干净的虚拟环境重装**——这比重度排查快。
+
+## 常见命令速查
+
+| 目的 | 命令 |
+| --- | --- |
+| 装包 | `python -m pip install 包名` |
+| 装指定版本 | `python -m pip install 包名==1.2.3` |
+| 升级包 | `python -m pip install -U 包名` |
+| 卸载 | `python -m pip uninstall 包名` |
+| 列出已装 | `python -m pip list` |
+| 查看详情 | `python -m pip show 包名` |
+| 导出依赖 | `python -m pip freeze > requirements.txt` |
+| 按清单安装 | `python -m pip install -r requirements.txt` |
+| 建虚拟环境 | `python -m venv .venv` |
+| 激活（Win） | `.venv\Scripts\activate` |
+| 激活（mac/Linux） | `source .venv/bin/activate` |
+| 退出 | `deactivate` |
+
+## 本课自检
+
+- [ ] 会用 `python -m pip install` 装包
+- [ ] 知道为什么写 `python -m pip` 而不是 `pip`
+- [ ] **能说出全局安装的两个问题**
+- [ ] 会创建和激活虚拟环境
+- [ ] 知道激活后命令行有 `(.venv)` 前缀
+- [ ] 会把 `.venv/` 加进 `.gitignore`
+- [ ] 会配置国内镜像源
+- [ ] 会用 `requirements.txt` 导出和安装
+- [ ] 知道「装了但 import 不到」怎么排查
+- [ ] 知道至少 3 个常用库的用途
+
+## 下一步
+
+[28 调试技巧与读懂报错](./28-debug) —— 这是最实用的一课：出错时不再靠猜。

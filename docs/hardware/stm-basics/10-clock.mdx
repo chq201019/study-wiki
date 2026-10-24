@@ -1,0 +1,292 @@
+---
+id: 10-clock
+title: 10 时钟树与时基
+sidebar_position: 10
+description: 时钟树怎么走、HSE/PLL/分频的关系、APB1 为什么只能 36MHz、HAL_Delay 的精度从哪来，以及时钟配错会怎样。
+---
+
+# 10 时钟树与时基
+
+**本课目标**：搞懂 STM32 的时钟从哪来、怎么配、配错会有什么后果。
+
+## 为什么需要"时钟树"
+
+![STM32F103 时钟树：8MHz 外部晶振经 PLL 倍频到 72MHz，再分频给 AHB/APB1/APB2 及各外设](/img/diagrams/stm32-clock-tree.svg)
+
+
+:::info[单片机的每个部件都在"跟着节拍走"]
+CPU 执行指令要时钟，定时器计数要时钟，串口波特率要时钟，ADC 采样要时钟。
+
+**STM32 的时钟不是"一个频率给所有部件"，而是一棵有分频/倍频的树。**
+:::
+
+```text
+        8 MHz HSE（外部晶振）
+              ↓
+        ┌─────────────┐
+        │  PLL ×9     │  ← 锁相环倍频
+        └─────────────┘
+              ↓ 72 MHz
+          SYSCLK（系统时钟）
+              ↓
+      ┌───────┼───────┐
+      ↓       ↓       ↓
+    AHB/1   AHB/1   AHB/1
+     72MHz   72MHz   72MHz
+      ↓
+  ┌───┴────┐
+  ↓        ↓
+APB1/2   APB2/1
+ 36MHz   72MHz
+  ↓        ↓
+定时器2-7  定时器1, USART1, SPI1, ADC
+USART2/3
+I2C1/2
+SPI2
+```
+
+## 四个关键时钟源
+
+| 时钟源 | 频率（F103） | 是什么 |
+| --- | --- | --- |
+| **HSI** | 8 MHz | 内部 RC 振荡器（**上电默认**） |
+| **HSE** | 8 MHz | 外部晶振（板子上那颗银色的） |
+| **LSI** | 约 40 kHz | 内部低速（看门狗、RTC） |
+| **LSE** | 32.768 kHz | 外部低速晶振（RTC 精确走时） |
+
+:::danger[上电默认跑在 HSI 8MHz]
+**HAL 库初始化后，如果你不配时钟，CPU 只跑 8 MHz。**
+
+后果：
+
+- 程序慢 9 倍
+- `HAL_Delay(1000)` 实际约 9 秒
+- 串口波特率全部错（算出来的分频系数不对）
+- 定时器周期全错
+
+**所以时钟是 STM32 必须配的第一步。**
+:::
+
+:::tip[HSI vs HSE 的精度]
+| | HSI（内部） | HSE（外部晶振） |
+| --- | --- | --- |
+| 精度 | **±1%** | **±20 ppm（0.002%）** |
+| 启动速度 | 快（微秒级） | 慢（毫秒级） |
+| 成本 | 免费（芯片内） | 要焊晶振 |
+| 适合 | 对时序要求不高的场合 | **串口/CAN/USB 必须用** |
+
+**115200 波特率下，1% 误差已经接近误码极限。**
+
+**所以做串口通信一定要用 HSE。**
+:::
+
+## 配时钟：CubeMX 自动求解
+
+打开 **Clock Configuration** 标签页，在 **HCLK (MHz)** 输入 `72`，回车。
+
+CubeMX 会自动算出：
+
+```text
+HSE:              8 MHz
+PLL Source:       HSE
+PLLMul:           ×9        → 72 MHz
+SYSCLK:           72 MHz
+AHB Prescaler:    /1        → HCLK = 72 MHz
+APB1 Prescaler:   /2        → PCLK1 = 36 MHz
+APB2 Prescaler:   /1        → PCLK2 = 72 MHz
+```
+
+:::warning[APB1 最高只能 36 MHz]
+**硬性限制**：STM32F103 的 APB1 总线频率上限是 36 MHz（APB2 是 72 MHz）。
+
+如果手动把 APB1 设成 /1（72MHz）：
+
+- CubeMX 会**红色警告**
+- 强行用会导致外设行为异常（甚至不工作）
+
+**规矩：用自动求解，别手动改分频。**
+:::
+
+:::danger[APB1 上的定时器有个"隐藏倍频"]
+如果 APB1 分频系数 ≠ 1，**挂在 APB1 上的定时器时钟会自动 ×2**。
+
+```text
+APB1 = 36 MHz  →  定时器 2~7 的时钟 = 72 MHz
+```
+
+**这很容易算错定时器周期！**
+
+（CubeMX 里显示的"定时器时钟"已经是 ×2 之后的值，看那个为准。）
+:::
+
+## `HAL_Delay` 为什么准（或者不准）
+
+:::tip[链条是这样的]
+```text
+SYSCLK 72MHz
+   ↓ 分频到 1MHz（每 1 微秒一个计数）
+SysTick 定时器
+   ↓ 每 1000 个计数 = 1ms
+SysTick 中断
+   ↓
+uwTick 变量每 ms 加 1
+   ↓
+HAL_Delay(ms) 就是"等到 uwTick 增加 ms"
+```
+:::
+
+:::danger[时钟配错 → 全链路都错]
+如果实际跑 8MHz 但代码以为 72MHz：
+
+```text
+SysTick 实际慢 9 倍
+  → "1ms" 实际是 9ms
+    → HAL_Delay(1000) 实际等 9 秒
+```
+
+**验证方法**：
+
+```c
+uint32_t t0 = HAL_GetTick();
+HAL_Delay(1000);
+printf("实际耗时 %lu ms\r\n", HAL_GetTick() - t0);
+```
+
+**应该输出约 1000。差很多就说明时钟有问题。**
+:::
+
+## 检查时钟配好了没
+
+```c
+printf("SystemCoreClock = %lu Hz\r\n", SystemCoreClock);
+```
+
+:::warning[`SystemCoreClock` 变量是 HAL 算出来的]
+它是 `SystemClock_Config()` 根据你的配置算出来的值。
+
+**如果输出 `72000000` 说明配置生效了**（但只代表"配置对了"，不代表晶振真的起振了）。
+
+**更可靠的验证**：用串口打印 + 秒表对照。
+
+```c
+while (1) {
+    HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+    HAL_Delay(500);
+}
+```
+
+**用秒表数 10 次闪烁，应该正好 10 秒**（20 次翻转 ×0.5s）。偏差大就是时钟问题。
+:::
+
+## 时钟树的各段含义
+
+| 段 | 含义 | F103 常见值 |
+| --- | --- | --- |
+| **HSE** | 外部晶振频率 | 8 MHz |
+| PLL Mul | 倍频系数 | ×9 |
+| **SYSCLK** | 系统时钟（CPU 主频） | 72 MHz |
+| **AHB** | 高速总线（内存、DMA） | 72 MHz |
+| **APB1** | 低速外设总线 | **36 MHz** |
+| **APB2** | 高速外设总线 | 72 MHz |
+
+### 各外设挂在哪条总线上
+
+| 总线 | 外设 |
+| --- | --- |
+| **APB1**（36MHz） | TIM2~TIM7、USART2/3、I2C1/2、SPI2、CAN |
+| **APB2**（72MHz） | TIM1、USART1、SPI1、ADC1/2、GPIO |
+
+:::tip[为什么 USART1 比 USART2 快]
+**USART1 在 APB2（72MHz），USART2/3 在 APB1（36MHz）。**
+
+所以 USART1 理论上能跑到更高波特率（4.5 Mbps vs 2.25 Mbps）。
+
+**做高速串口要用 USART1。**
+:::
+
+## 完整配置代码（CubeMX 生成的）
+
+```c
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /* ① 振荡器配置：HSE 开，PLL 用 HSE ×9 */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();        /* ← HSE 起振失败会进这里 */
+  }
+
+  /* ② 总线时钟配置：切 SYSCLK 到 PLL，配各分频 */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                              | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+```
+
+:::danger[`FLASH_LATENCY_2` 是什么]
+**72 MHz 下，Flash 读取速度跟不上 CPU**，需要插入等待周期。
+
+| CPU 频率 | Flash 等待周期 |
+| --- | --- |
+| ≤ 24 MHz | 0 |
+| 24~48 MHz | 1 |
+| **48~72 MHz** | **2** |
+
+**这个值配错了会跑飞**（读到错误的指令）。
+
+**CubeMX 会自动算对，别手动改。**
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 没配时钟 | 程序慢 9 倍 | 跑在 HSI 8MHz | Clock Configuration 配 72 |
+| 停不进 `main` | 卡在 `Error_Handler` | HSE 起振失败 | 检查晶振/改用 HSI |
+| 串口乱码 | 波特率偏 | HSI 精度不够 | 用 HSE |
+| APB1 设 /1 | 外设异常 | 超 36MHz 上限 | 用自动求解 |
+| 定时器周期差一倍 | 少算了隐藏倍频 | APB1 分频≠1 时定时器 ×2 | 看 CubeMX 显示的定时器时钟 |
+| `FLASH_LATENCY` 错 | 程序跑飞 | 等待周期不匹配 | 让 CubeMX 生成 |
+
+:::warning[蓝板没有晶振的情况]
+极少数超便宜的板子省掉了 8MHz 晶振。
+
+**这时 HSE 起振会失败** → 卡在 `Error_Handler`。
+
+**应急办法**：CubeMX 里把时钟源改成 **HSI**，PLL 源选 HSI/2 ×16 = 64MHz（到不了 72）。
+
+**但这会导致串口波特率不准**——所以还是建议买带晶振的板子。
+:::
+
+## 本课自检
+
+- [ ] 知道时钟树是"倍频 + 分频"的树形结构
+- [ ] **知道上电默认跑 HSI 8MHz，不配时钟就只有 8MHz**
+- [ ] 能说出 HSI / HSE / LSI / LSE 各自的用途
+- [ ] **知道 HSE 是外部晶振，精度远高于 HSI**
+- [ ] **知道 APB1 最高 36MHz，APB2 是 72MHz**
+- [ ] **知道 APB1 分频 ≠1 时，定时器时钟会 ×2**
+- [ ] 理解 `HAL_Delay` 依赖 SysTick，而 SysTick 依赖时钟
+- [ ] 知道 `FLASH_LATENCY_2` 的含义
+- [ ] 会用 `SystemCoreClock` 和秒表验证时钟
+- [ ] 知道 HSE 起振失败会卡在 `Error_Handler`
+
+## 下一步
+
+[11 GPIO 输入与按键](./11-gpio-input) —— 让板子听懂你按了按键。

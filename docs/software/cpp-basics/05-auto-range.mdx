@@ -1,0 +1,337 @@
+---
+id: 05-auto-range
+title: 05 auto 与范围 for
+sidebar_position: 5
+description: auto 怎么推导类型、什么时候会丢引用和 const、范围 for 的三种写法，以及结构化绑定。
+---
+
+# 05 auto 与范围 for
+
+**本课目标**：会用 `auto` 少写类型，会用范围 for 遍历，知道它们的陷阱。
+
+## auto：让编译器推导类型
+
+```cpp
+auto a = 42;                    /* int */
+auto b = 3.14;                  /* double */
+auto c = "hi";                  /* const char* —— 注意！ */
+auto d = std::string("hi");     /* std::string */
+
+auto v = std::vector<int>{1, 2, 3};      /* std::vector<int> */
+```
+
+本机实测 `sizeof`：
+
+```text
+4 8 8 24
+```
+
+（`int`=4，`double`=8，`const char*`=8，`std::string`=24。）
+
+## auto 最实用的场景
+
+### ① 迭代器（类型名很长）
+
+```cpp
+/* 不用 auto */
+std::map<std::string, std::vector<int>>::iterator it = m.begin();
+
+/* 用 auto */
+auto it = m.begin();
+```
+
+**这是 `auto` 最大的价值**——那些类型名长得没法看。
+
+### ② 冗长的模板类型
+
+```cpp
+auto result = compute_values(42, 3.14);      /* 不用手写返回类型 */
+```
+
+### ③ lambda 表达式
+
+```cpp
+auto add = [](int a, int b) { return a + b; };   /* lambda 类型无法手写 */
+```
+
+## auto 的陷阱：会丢引用和 const
+
+:::danger[这是 auto 最容易出错的地方]
+```cpp
+int n = 5;
+int &r = n;
+
+auto x = r;              /* x 是 int，不是 int& —— 引用被丢掉！ */
+x = 100;                 /* 改的是副本，n 还是 5 */
+```
+
+本机实测：
+
+```text
+n=5 x=100 (x 是副本)
+```
+
+**`auto` 默认会丢掉引用和顶层 `const`**——因为 `auto` 的推导规则等同于按值传参。
+:::
+
+### 想保留引用和 const，要显式写
+
+```cpp
+int n = 5;
+int &r = n;
+
+auto &y = r;             /* int& —— 保留引用 */
+const auto &z = n;       /* const int& */
+```
+
+| 写法 | 推导结果 |
+| --- | --- |
+| `auto x = r;` | `int`（丢引用） |
+| `auto &x = r;` | `int&` |
+| `const auto x = r;` | `const int` |
+| `auto &&x = ...` | 转发引用（后续课讲） |
+
+## 范围 for：更简洁的遍历
+
+```cpp
+std::vector<int> v = {1, 2, 3};
+
+/* 传统写法 */
+for (size_t i = 0; i < v.size(); i++) {
+    std::cout << v[i] << " ";
+}
+
+/* 范围 for */
+for (int x : v) {
+    std::cout << x << " ";
+}
+```
+
+**读作「对于 v 里的每个 x」**，不用管下标、不用管长度。
+
+## 三种写法，用途完全不同
+
+### ① 按值 `for (int x : v)` —— 只读，复制
+
+```cpp
+for (int x : v) {
+    x *= 2;              /* 改的是副本，v 不变 */
+}
+```
+
+本机实测：
+
+```text
+值遍历后: 1 2 3        ← 没变
+```
+
+:::warning[编译器会警告"改了但没用"]
+```text
+warning: variable 'e' set but not used [-Wunused-but-set-variable]
+```
+
+**看到这个警告就说明你改的是副本。** 想真改就用引用。
+:::
+
+### ② 引用 `for (int &x : v)` —— 可修改
+
+```cpp
+for (int &x : v) {
+    x *= 2;              /* 直接改 v 里的元素 */
+}
+```
+
+本机实测：
+
+```text
+引用遍历后: 2 4 6      ← 真的改了
+```
+
+### ③ const 引用 `for (const auto &x : v)` —— 只读，不复制（**最常用**）
+
+```cpp
+for (const auto &x : v) {
+    std::cout << x << " ";       /* 只读，且不复制 */
+}
+```
+
+:::tip[三种写法怎么选]
+| 目的 | 写法 |
+| --- | --- |
+| **只读，元素小**（int、double） | `for (int x : v)` |
+| **只读，元素大**（string、结构体） | `for (const auto &x : v)` |
+| **要修改元素** | `for (auto &x : v)` |
+
+**日常最多用的是第三种 `const auto &`**——只读且避免复制。
+:::
+
+## 结构化绑定（C++17）
+
+遍历 `map` 时特别好用：
+
+```cpp
+std::map<std::string, int> m = {{"a", 1}, {"b", 2}};
+
+/* C++17 之前 */
+for (const auto &kv : m) {
+    std::cout << kv.first << "=" << kv.second << " ";
+}
+
+/* C++17 结构化绑定 */
+for (const auto &[key, value] : m) {
+    std::cout << key << "=" << value << " ";
+}
+```
+
+本机实测：
+
+```text
+a=1 b=2
+```
+
+**`[key, value]` 把 pair 直接拆成两个名字**，可读性高得多。
+
+也适用于：
+
+```cpp
+auto [quot, rem] = divmod(17, 5);        /* 拆函数返回的结构体/元组 */
+std::pair<int, std::string> p = {1, "a"};
+auto [num, str] = p;
+```
+
+## 完整示例
+
+```cpp
+#include <iostream>
+#include <string>
+#include <vector>
+#include <map>
+
+struct Student {
+    std::string name;
+    int score;
+};
+
+int main() {
+    /* ① auto 简化迭代器 */
+    std::map<std::string, int> scores = {
+        {"Alice", 88},
+        {"Bob", 92},
+    };
+
+    /* ② const auto& 只读不复制 */
+    std::cout << "成绩表：\n";
+    for (const auto &[name, sc] : scores) {
+        std::cout << "  " << name << ": " << sc << "\n";
+    }
+
+    /* ③ auto& 修改元素 */
+    std::vector<Student> list = {
+        {"Alice", 88},
+        {"Bob", 92},
+    };
+
+    for (auto &s : list) {
+        s.score += 5;            /* 加分 */
+    }
+
+    /* ④ const auto& 遍历结构体（避免复制字符串） */
+    std::cout << "加分后：\n";
+    for (const auto &s : list) {
+        std::cout << "  " << s.name << ": " << s.score << "\n";
+    }
+
+    /* ⑤ auto 接返回值 */
+    auto total = 0;
+    for (const auto &s : list) total += s.score;
+    std::cout << "总分：" << total << "\n";
+
+    return 0;
+}
+```
+
+输出：
+
+```text
+成绩表：
+  Alice: 88
+  Bob: 92
+加分后：
+  Alice: 93
+  Bob: 97
+总分：190
+```
+
+## auto 该不该滥用
+
+:::warning[别让代码失去可读性]
+```cpp
+/* ❌ 看不出是什么类型 */
+auto x = get_data();
+auto y = x[0];
+
+/* ✅ 关键位置写清楚类型 */
+std::vector<int> x = get_data();
+int y = x[0];
+```
+
+**建议**：
+
+| 场景 | 用 auto 吗 |
+| --- | --- |
+| 迭代器 | ✅ 强烈推荐 |
+| lambda | ✅ 必须 |
+| 模板返回值 | ✅ 推荐 |
+| 简单变量（`int`、`double`） | ⚠️ 写明类型更清晰 |
+| 想强调类型时 | ❌ 写清楚 |
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `auto x = 引用` 想改原值 | 改的是副本 | auto 丢引用 | `auto &x = ...` |
+| `auto x = const值` 想保持 const | const 丢了 | auto 丢顶层 const | `const auto x` |
+| `for (int x : v)` 改元素 | 无效 | 改副本 | `for (int &x : v)` |
+| `auto c = "hi"` 当 string 用 | 类型是 `const char*` | 字面量是指针 | `std::string("hi")` |
+| 范围 for 里删除元素 | 崩溃 | 迭代器失效 | 用迭代器或 `erase_if` |
+
+:::danger[范围 for 里不要修改容器大小]
+```cpp
+for (auto &x : v) {
+    if (x < 0) v.push_back(0);      /* ❌ 未定义行为 */
+}
+```
+
+`push_back` 可能导致重新分配，让遍历用的迭代器失效。
+
+**要增删元素，用普通循环或算法**（`std::remove_if`、`erase_if`）。
+:::
+
+## 本课自检
+
+- [ ] 会用 `auto` 声明变量
+- [ ] **知道 `auto` 会丢引用和顶层 const**
+- [ ] 知道 `auto &` / `const auto &` 的区别
+- [ ] 会用范围 for 三种写法
+- [ ] **知道改元素要用 `for (auto &x : v)`**
+- [ ] 知道 `const auto &` 是只读大对象的最佳选择
+- [ ] 会用结构化绑定 `auto [k, v]`
+- [ ] 知道 `auto c = "hi"` 是 `const char*` 不是 string
+- [ ] 知道范围 for 里不能增删元素
+- [ ] 知道何时该写明确类型而非 auto
+
+## 第一阶段小结
+
+你已经掌握了 C++ 的基础语法差异：
+
+- `iostream` 输入输出
+- **引用**（C++ 最重要的基础）
+- 函数重载与默认参数
+- `auto` 与范围 for
+
+**这些让 C++ 代码比 C 简洁得多。** 接下来进入 C++ 真正的核心：**类**。
+
+## 下一步
+
+[06 类与对象入门](./06-class) —— 开始面向对象。

@@ -1,0 +1,244 @@
+---
+id: 24-filesystem
+title: 24 文件系统
+sidebar_position: 24
+description: SPIFFS 与 LittleFS 的选择、分区表怎么加数据分区、怎么读写文件，以及文件系统为什么不适合频繁写。
+---
+
+# 24 文件系统
+
+**本课目标**：在 Flash 上存文件（网页、配置、日志、字库）。
+
+## 什么时候需要文件系统
+
+| 需求 | 用 NVS | 用文件系统 |
+| --- | --- | --- |
+| 存几个配置项 | ✅ | ⚠️ 杀鸡用牛刀 |
+| 存网页文件（HTML/CSS/JS） | ❌ | ✅ |
+| 存字库、图片 | ❌ | ✅ |
+| 存日志 | ❌ | ✅ |
+| 存超过 4 KB 的数据 | ❌ | ✅ |
+
+:::tip[典型用途：把网页放进 Flash]
+做 Web 服务器时（[第 19 课](./19-webserver)），网页写在 C 字符串里很难维护。
+
+**放进文件系统就清爽了**：
+
+```text
+/index.html
+/style.css
+/app.js
+```
+
+**改网页不用重新编译固件**（只要重新烧文件系统）。
+:::
+
+## SPIFFS vs LittleFS
+
+| | SPIFFS | **LittleFS** |
+| --- | --- | --- |
+| 断电安全 | 较弱 | **强** |
+| 磨损均衡 | 有 | **更好** |
+| 目录支持 | ❌ 扁平 | ✅ 支持 |
+| 官方态度 | **已弃用**（deprecated） | **推荐** |
+
+:::danger[SPIFFS 已被 ESP-IDF 标记为弃用]
+新版 ESP-IDF 推荐 **LittleFS**（或 FAT）。
+
+**新项目一律用 LittleFS。**
+
+（老教程大量使用 SPIFFS，看到时知道它已被取代即可。）
+:::
+
+## 第一步：加数据分区
+
+**默认分区表里没有文件系统分区**，要自己加。
+
+### 建自定义分区表
+
+新建 `partitions.csv`：
+
+```text
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x6000
+phy_init, data, phy,     0xf000,   0x1000
+factory,  app,  factory, 0x10000,  0x180000
+storage,  data, spiffs,  ,         0x100000
+```
+
+| 行 | 说明 |
+| --- | --- |
+| `nvs` | 配置存储（24 KB） |
+| `phy_init` | 射频校准（4 KB） |
+| `factory` | 应用固件（1.5 MB） |
+| **`storage`** | **文件系统（1 MB）** |
+
+:::warning[`SubType` 写 `spiffs` 也能给 LittleFS 用]
+```text
+storage,  data, spiffs,  ,  0x100000
+```
+
+**`spiffs` 只是个分区类型标识**，LittleFS 也能挂在这个分区上。
+
+（也可以写 `littlefs`，但需要工具链支持。）
+:::
+
+### 让工程用这个分区表
+
+在顶层 `CMakeLists.txt` 里指定：
+
+```cmake
+set(EXTRA_COMPONENT_DIRS ...)
+
+# 使用自定义分区表
+set(PARTITION_TABLE_CUSTOM y)
+set(PARTITION_TABLE_CUSTOM_FILENAME "partitions.csv")
+```
+
+或者用 `idf.py menuconfig`：
+
+```text
+Partition Table → Custom partition table CSV
+```
+
+:::danger[分区大小算错会导致编译失败]
+```text
+Error: app partition is too small for binary
+```
+
+**`factory` 分区要比固件实际大小大**（留 20% 余量）。
+
+**所有分区加起来不能超过 Flash 总容量**（16 MB 的板子别写 20 MB 的分区表）。
+:::
+
+## 读写文件（用标准 C 文件 API）
+
+挂载 LittleFS 后，**可以用 `fopen`/`fread`/`fwrite` 像普通文件一样操作**：
+
+```c
+#include <stdio.h>
+#include "esp_littlefs.h"
+
+void fs_demo(void)
+{
+    /* ① 挂载 */
+    esp_vfs_littlefs_conf_t conf = {
+        .base_path = "/littlefs",
+        .partition_label = "storage",
+        .format_if_mount_failed = true,     /* 首次自动格式化 */
+    };
+    esp_err_t ret = esp_vfs_littlefs_register(&conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "挂载失败: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    /* ② 写文件 */
+    FILE *f = fopen("/littlefs/hello.txt", "w");
+    if (f) {
+        fprintf(f, "Hello, LittleFS!\n");
+        fclose(f);
+    }
+
+    /* ③ 读文件 */
+    f = fopen("/littlefs/hello.txt", "r");
+    if (f) {
+        char buf[64];
+        while (fgets(buf, sizeof(buf), f)) {
+            ESP_LOGI(TAG, "读到: %s", buf);
+        }
+        fclose(f);
+    }
+
+    /* ④ 查剩余空间 */
+    size_t total = 0, used = 0;
+    esp_littlefs_info("storage", &total, &used);
+    ESP_LOGI(TAG, "总 %u KB，已用 %u KB", total / 1024, used / 1024);
+}
+```
+
+:::warning[LittleFS 不是核心组件]
+`esp_littlefs` 是**托管组件**，要单独加：
+
+```bash
+idf.py add-dependency "joltwallet/littlefs"
+```
+
+或者用组件管理器手动加进 `idf_component.yml`。
+:::
+
+## 读固件里的只读资源
+
+如果只是要**打包网页文件进固件**（不需要运行时修改），可以用更简单的办法：
+
+```cmake
+# main/CMakeLists.txt
+idf_component_register(SRCS "main.c"
+                       INCLUDE_DIRS ""
+                       EMBED_FILES "index.html" "style.css")
+```
+
+用 `EMBED_FILES` 把文件**直接嵌入固件**（变成符号）：
+
+```c
+extern const char index_html_start[] asm("_binary_index_html_start");
+extern const char index_html_end[]   asm("_binary_index_html_end");
+
+size_t len = index_html_end - index_html_start;
+httpd_resp_send(req, index_html_start, len);
+```
+
+:::tip[`EMBED_FILES` 和文件系统怎么选]
+| 场景 | 用哪个 |
+| --- | --- |
+| 网页、图标等**只读**资源 | **`EMBED_FILES`**（简单、无分区） |
+| 需要**运行时写**（日志、用户数据） | **文件系统** |
+| 资源很大（几 MB 字库） | **文件系统**（不占固件大小） |
+:::
+
+## Flash 寿命：这是最大的限制
+
+:::danger[Flash 擦写寿命约 10 万次]
+| 存储方式 | 寿命影响 |
+| --- | --- |
+| NVS | 磨损均衡，可接受 |
+| **文件系统频繁写** | **很快写坏** |
+| 每分钟写一次日志 | 约 2 个月就到寿命 |
+
+**计算**：10 万次 ÷ (60×24×30 次/月) ≈ **2.3 个月**。
+:::
+
+| 做法 | 是否推荐 |
+| --- | --- |
+| 每秒写日志到 Flash | ❌ 绝对不要 |
+| 每分钟写一次状态 | ⚠️ 很短命 |
+| 攒够 100 条批量写 | ✅ 可接受 |
+| 只在关机/关键事件写 | ✅ 推荐 |
+| 用 RAM 缓冲 + 定期落盘 | ✅ 推荐 |
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 分区表里没数据分区 | 挂载失败 | 没有 storage 分区 | 加 `partitions.csv` |
+| 分区类型不是 `data` | 挂载失败 | 类型错 | `data, spiffs` |
+| 挂载路径写错 | `fopen` 失败 | base_path 不匹配 | 检查前缀 |
+| 频繁写文件 | Flash 写坏 | 寿命有限 | 缓冲后批量写 |
+| 用 SPIFFS | 弃用警告 | 官方已弃用 | 改 LittleFS |
+| 忘卸载就重启 | 数据可能丢 | 没 flush | `esp_vfs_littlefs_unregister` |
+
+## 本课自检
+
+- [ ] 知道什么该用 NVS、什么该用文件系统
+- [ ] **知道 SPIFFS 已弃用，新项目用 LittleFS**
+- [ ] 会写 `partitions.csv` 加数据分区
+- [ ] 会算分区大小（不能超 Flash 总量）
+- [ ] 会用 `esp_vfs_littlefs_register` 挂载
+- [ ] 会用标准 `fopen`/`fprintf`/`fgets` 读写
+- [ ] 知道 `format_if_mount_failed` 的作用
+- [ ] **知道 `EMBED_FILES` 是打包只读资源的更简单方式**
+- [ ] **知道 Flash 擦写寿命约 10 万次，不能频繁写**
+
+## 下一步
+
+[25 OTA 升级](./25-ota) —— 不拆机、不接线，远程更新固件。

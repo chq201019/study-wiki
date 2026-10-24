@@ -1,0 +1,316 @@
+---
+id: 18-ntp
+title: 18 NTP 对时
+sidebar_position: 18
+description: 为什么设备需要准确时间、SNTP 怎么对时、时区怎么处理，以及时间戳在数据上报里的价值。
+---
+
+# 18 NTP 对时
+
+**本课目标**：让设备拿到准确的网络时间。
+
+## 为什么设备需要准确时间
+
+| 场景 | 为什么需要 |
+| --- | --- |
+| **数据上报** | 服务器要知道"这条数据是什么时候的" |
+| **定时任务** | 早上 7 点开窗帘 |
+| **日志** | 出问题要能对上时间 |
+| **证书校验** | HTTPS 证书有效期检查 |
+| **定时器/闹钟** | 断电重启后要知道现在是几点 |
+
+:::danger[ESP32 上电默认时间是什么]
+**1970 年 1 月 1 日 00:00:00 UTC**（Unix 纪元起点）。
+
+**没有任何电池备份 RTC**（除非你外接模块）。
+
+**所以每次上电都要重新对时。**
+:::
+
+## SNTP 是什么
+
+**NTP = Network Time Protocol**（网络时间协议）
+**SNTP = 简化版 NTP**（够用、省资源）
+
+```text
+ESP32 ──→ ntp.aliyun.com ──→ 标准时间
+      ←──  "现在是 X"
+```
+
+原理：向时间服务器发请求，拿回时间戳，同时**测量往返延迟做修正**。
+
+:::tip[ESP32 只做客户端，不做服务器]
+ESP-IDF 内置 SNTP **客户端**（`esp_sntp`），只负责"去问时间"。
+
+**精度**：局域网内约 1~10 ms，跨互联网约 10~100 ms。
+
+**够日常用，但做不了高精度同步**（那要用 GPS 或 PTP）。
+:::
+
+## 最简单的用法
+
+```c
+#include <time.h>
+#include <sys/time.h>
+#include "esp_sntp.h"
+#include "esp_log.h"
+
+static const char *TAG = "ntp";
+
+void time_sync_start(void)
+{
+    /* ① 设置服务器 */
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "ntp.aliyun.com");
+    esp_sntp_setservername(1, "cn.pool.ntp.org");   /* 备用 */
+    esp_sntp_init();
+
+    /* ② 等同步完成（最多 10 秒） */
+    time_t now = 0;
+    struct tm t = {0};
+    int retry = 0;
+
+    while (t.tm_year < (2020 - 1900) && ++retry < 20) {
+        ESP_LOGI(TAG, "等待时间同步... (%d)", retry);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        time(&now);
+        localtime_r(&now, &t);
+    }
+
+    if (t.tm_year >= (2020 - 1900)) {
+        char buf[64];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
+        ESP_LOGI(TAG, "同步成功: %s", buf);
+    } else {
+        ESP_LOGE(TAG, "同步失败");
+    }
+}
+```
+
+:::danger[为什么判断条件是 `tm_year < 2020-1900`]
+未同步时 `time()` 返回 0（1970 年）。
+
+**所以"年份小于 2020"就说明还没对上时间。**
+
+**注意 `tm_year` 是"从 1900 年起的偏移量"**——所以 2020 年对应 `tm_year = 120`。
+
+这个判断方式是 ESP-IDF 官方示例的做法。
+:::
+
+:::warning[`tm_year` 和 `tm_mon` 都从 0 开始]
+| 字段 | 含义 | 注意 |
+| --- | --- | --- |
+| `tm_year` | 年份 | **要 +1900 才是真实年份** |
+| `tm_mon` | 月份 | **0 = 一月**，要 +1 |
+| `tm_mday` | 日 | 1~31（正常） |
+| `tm_hour` | 时 | 0~23（正常） |
+| `tm_wday` | 星期 | **0 = 周日** |
+
+```c
+printf("现在是 %d 年 %d 月\n", t.tm_year + 1900, t.tm_mon + 1);
+```
+
+**忘了 +1900 会显示"1900 年"，这是 C 语言的老坑。**
+:::
+
+## 时区：为什么时间差了 8 小时
+
+:::danger[SNTP 给的是 UTC，不是北京时间]
+```text
+同步成功: 1970-01-01 14:23:05       ← 看起来对，其实是 UTC
+```
+
+**UTC 比北京时间晚 8 小时。** 不做时区转换，你的"早上 7 点"会变成下午 3 点。
+:::
+
+**设置时区**：
+
+```c
+#include <time.h>
+
+/* 中国标准时间（无夏令时） */
+setenv("TZ", "CST-8", 1);
+tzset();
+```
+
+:::tip[时区字符串格式]
+`CST-8` 的意思是"比 UTC 快 8 小时"。
+
+**注意符号是反的**：`-8` 表示 UTC+8。
+
+其他常用：
+
+| 地区 | 字符串 |
+| --- | --- |
+| 中国 | `CST-8` |
+| 日本 | `JST-9` |
+| UTC | `UTC0` |
+| 纽约（含夏令时） | `EST5EDT,M3.2.0,M11.1.0` |
+
+**国际产品要处理夏令时就用完整格式，简单产品用 `CST-8` 足够。**
+:::
+
+## `strftime`：格式化时间
+
+```c
+char buf[64];
+strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
+ESP_LOGI(TAG, "%s", buf);
+/* 输出：2024-10-18 14:23:05 */
+```
+
+| 格式符 | 含义 | 例子 |
+| --- | --- | --- |
+| `%Y` | 四位年 | 2024 |
+| `%m` | 月（01-12） | 10 |
+| `%d` | 日（01-31） | 18 |
+| `%H` | 时（00-23） | 14 |
+| `%M` | 分 | 23 |
+| `%S` | 秒 | 05 |
+| `%A` | 星期几（英文） | Friday |
+| `%s` | Unix 时间戳 | 1729232585 |
+
+## 用 Unix 时间戳上报数据
+
+:::tip[上报数据优先用时间戳]
+```c
+time_t now;
+time(&now);
+ESP_LOGI(TAG, "{\"ts\":%lld,\"temp\":22.5}", (long long)now);
+/* {"ts":1729232585,"temp":22.5} */
+```
+
+**好处**：
+
+1. **省字节**（10 位数字 vs 19 字符的日期字符串）
+2. **服务器端好处理**（能直接比较、排序）
+3. **不受时区影响**
+
+**显示给人看时才转成日期字符串。**
+:::
+
+## 完整示例
+
+```c
+#include <stdio.h>
+#include <time.h>
+#include <sys/time.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_sntp.h"
+#include "esp_log.h"
+
+static const char *TAG = "ntp";
+static bool s_synced = false;
+
+/* 同步回调 */
+static void on_sync(struct timeval *tv)
+{
+    s_synced = true;
+    ESP_LOGI(TAG, "同步完成，时间戳 %lld", (long long)tv->tv_sec);
+}
+
+void app_main(void)
+{
+    /* 时区先设好（对时前设也行） */
+    setenv("TZ", "CST-8", 1);
+    tzset();
+
+    /* 配置 SNTP */
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "ntp.aliyun.com");
+    esp_sntp_setservername(1, "cn.pool.ntp.org");
+    sntp_set_time_sync_notification_cb(on_sync);
+    esp_sntp_init();
+
+    /* 等同步 */
+    int retry = 0;
+    while (!s_synced && retry++ < 20) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    if (!s_synced) {
+        ESP_LOGE(TAG, "对时失败，检查网络");
+        return;
+    }
+
+    /* 每秒打印时间 */
+    while (1) {
+        time_t now;
+        struct tm t;
+        time(&now);
+        localtime_r(&now, &t);
+
+        char buf[64];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
+        ESP_LOGI(TAG, "%s  (ts=%lld)", buf, (long long)now);
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+```
+
+:::info[为什么用回调而不是轮询]
+```c
+sntp_set_time_sync_notification_cb(on_sync);
+```
+
+**同步完成才置标志位**，比反复比较年份更干净。
+
+**两种方式都行**——官方示例两种都有。
+:::
+
+## 没有网络怎么办
+
+:::warning[离线设备怎么知道时间]
+没有 WiFi 就拿不到网络时间。可选方案：
+
+| 方案 | 成本 | 精度 |
+| --- | --- | --- |
+| **外接 RTC 模块**（DS3231） | 几元 | 秒级，带电池能走几年 |
+| GPS 模块 | 几十元 | **纳秒级** |
+| 手动设置 | 免费 | 看用户输入 |
+| 只做相对计时 | 免费 | 用 `esp_timer` 算间隔 |
+
+**做闹钟类产品，DS3231 是最划算的选择**（几元钱，断电走时）。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 不设时区 | 差 8 小时 | SNTP 给 UTC | `setenv("TZ","CST-8",1)` |
+| 忘 `tzset()` | 设了 TZ 没生效 | 没重新加载 | 加 `tzset()` |
+| `tm_year` 不 +1900 | 显示 1900 年 | 从 1900 起算 | `+ 1900` |
+| `tm_mon` 不 +1 | 月份少 1 | 0 起始 | `+ 1` |
+| 不等同步就用时间 | 拿到 1970 年 | 还没对上 | 等回调/判年份 |
+| 服务器写错 | 同步失败 | 域名不可达 | 换 `ntp.aliyun.com` |
+| 对时前没联网 | 一直失败 | 没网 | 先等 WiFi GOT_IP |
+
+:::danger[必须在对时前确认 WiFi 已连]
+```c
+esp_sntp_init();          /* 此时还没 IP → 请求发不出去 → 静默失败 */
+```
+
+**顺序**：WiFi 拿到 IP → 再启动 SNTP。
+
+（[第 14 课](./14-wifi)讲了怎么等 `IP_EVENT_STA_GOT_IP`。）
+:::
+
+## 本课自检
+
+- [ ] 知道 ESP32 上电默认是 1970 年
+- [ ] 知道 SNTP 是 NTP 的简化版，ESP32 只做客户端
+- [ ] 会用 `esp_sntp_setoperatingmode` / `setservername` / `init`
+- [ ] **知道要用"年份 < 2020"判断是否已同步**
+- [ ] **知道 `tm_year` 要 +1900、`tm_mon` 要 +1**
+- [ ] **知道 SNTP 给的是 UTC，要设时区**
+- [ ] 会用 `setenv("TZ","CST-8",1)` + `tzset()`
+- [ ] 会用 `strftime` 格式化
+- [ ] **知道上报数据优先用 Unix 时间戳**
+- [ ] 知道必须先联网再对时
+- [ ] 知道离线方案（DS3231 / GPS）
+
+## 下一步
+
+[19 Web 服务器控制灯](./19-webserver) —— 用浏览器直接控制设备。

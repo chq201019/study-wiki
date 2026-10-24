@@ -1,0 +1,100 @@
+---
+id: api-map
+title: Arduino ↔ IDF API 对照
+sidebar_position: 3
+description: 迁移时需要的 API 逐条对照，含调用顺序差异。
+---
+
+# Arduino ↔ IDF API 对照
+
+## 1. 程序结构
+
+| Arduino | ESP-IDF |
+| --- | --- |
+| `setup()` + `loop()` | `app_main()`（只执行一次，用任务代替 loop） |
+| `delay(ms)` | `vTaskDelay(pdMS_TO_TICKS(ms))` |
+| `delayMicroseconds(us)` | `esp_rom_delay_us(us)` 或 `ets_delay_us(us)` |
+| `millis()` | `esp_timer_get_time() / 1000` |
+| `micros()` | `esp_timer_get_time()` |
+| `yield()` | `taskYIELD()` |
+| `#include <Arduino.h>` | `#include "freertos/FreeRTOS.h"` 等 |
+
+## 2. GPIO
+
+| Arduino | ESP-IDF |
+| --- | --- |
+| `pinMode(p, OUTPUT)` | `gpio_config()` |
+| `pinMode(p, INPUT_PULLUP)` | `gpio_config()` + `GPIO_MODE_INPUT` + `GPIO_PULLUP_ENABLE` |
+| `digitalWrite(p, HIGH)` | `gpio_set_level(GPIO_NUM_x, 1)` |
+| `digitalRead(p)` | `gpio_get_level(GPIO_NUM_x)` |
+| `attachInterrupt(d, fn, mode)` | `gpio_install_isr_service()` + `gpio_isr_handler_add()` |
+| `detachInterrupt(d)` | `gpio_isr_handler_remove()` |
+
+## 3. 模拟量
+
+| Arduino | ESP-IDF |
+| --- | --- |
+| `analogRead(p)` | `adc_oneshot_read(unit, chan, &raw)` |
+| `analogReadResolution(12)` | `.bitwidth = ADC_BITWIDTH_12`（默认就是 12） |
+| `analogSetPinAttenuation(p, A)` | `.atten = ADC_ATTEN_DB_11` |
+| `analogWrite(p, v)` | `ledc_set_duty()` + `ledc_update_duty()` |
+| `dacWrite(p, v)` | `dac_oneshot_output_voltage()` |
+
+## 4. 总线
+
+| Arduino | ESP-IDF |
+| --- | --- |
+| `Wire.begin()` | `i2c_new_master_bus()` |
+| `Wire.beginTransmission(a)` / `Wire.write()` | `i2c_master_transmit(dev, buf, len, timeout)` |
+| `Wire.requestFrom(a, n)` | `i2c_master_transmit_receive()` |
+| `SPI.begin(sck, miso, mosi, ss)` | `spi_bus_initialize()` + `spi_bus_add_device()` |
+| `SPI.transfer(b)` | `spi_device_polling_transmit()` |
+| `Serial2.begin(baud, cfg, rx, tx)` | `uart_driver_install()` + `uart_param_config()` + `uart_set_pin()` |
+
+## 5. 网络
+
+| Arduino | ESP-IDF |
+| --- | --- |
+| `WiFi.begin(ssid, pwd)` | `esp_wifi_init/start/connect` + 事件回调 |
+| `WiFi.localIP()` | 从 `IP_EVENT_STA_GOT_IP` 事件取 |
+| `WiFi.scanNetworks()` | `esp_wifi_scan_start()` + `WIFI_EVENT_STA_SCAN_DONE` |
+| `WiFi.softAP(ssid)` | `esp_wifi_set_mode(WIFI_MODE_AP)` + `esp_wifi_start()` |
+| `client.publish(t, m)` | `esp_mqtt_client_publish()` |
+| `client.loop()` | **不需要**，MQTT 有独立任务 |
+
+## 6. 存储
+
+| Arduino | ESP-IDF |
+| --- | --- |
+| `EEPROM.read/write` | NVS API |
+| `LittleFS.begin()` | `esp_vfs_littlefs_register()` |
+| `SD.begin(ss, spi)` | `esp_vfs_fat_sdmmc_mount()` |
+| `ESP.getFreeHeap()` | `heap_caps_get_free_size(MALLOC_CAP_INTERNAL)` |
+
+## 7. 系统
+
+| Arduino | ESP-IDF |
+| --- | --- |
+| `ESP.restart()` | `esp_restart()` |
+| `ESP.getPsramSize()` | `esp_psram_get_size()` |
+| `pinMode(BUILTIN_LED, ...)` | `gpio_config(GPIO_NUM_38)`（具体引脚看板子） |
+| `WiFi.setSleep(false)` | `esp_wifi_set_ps(WIFI_PS_NONE)` |
+| `Serial.begin()` | 见 UART 对照 |
+
+## 8. 关键行为差异（迁移时最容易出事的地方）
+
+| 项 | Arduino | ESP-IDF | 后果 |
+| --- | --- | --- | --- |
+| 错误检查 | 基本不检查 | 每层返回 `esp_err_t` | 忘检查就是静默失败 |
+| 内存分配 | `malloc` 大块自动进 PSRAM | 默认不进 PSRAM | 大数组分配失败 |
+| 初始化顺序 | 无所谓 | 有严格依赖顺序 | 顺序错直接失败 |
+| 时间单位 | 毫秒 | tick / 微秒混用 | `vTaskDelay(1000)` 实际是几十毫秒 |
+| 任务栈 | 一个默认栈 | 每个任务要指定 | 栈小 → 随机崩溃 |
+
+## 9. 迁移时的三个必做改动
+
+1. **`delay` → `vTaskDelay(pdMS_TO_TICKS(...))`**
+2. **`app_main` 里创建任务**，不要写 `while(1)`
+3. **每个 `esp_err_t` 都检查**
+
+完整说明见 [L2 编程模型](../course/l2-programming-model/)。

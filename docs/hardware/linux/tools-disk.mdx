@@ -1,0 +1,292 @@
+---
+id: tools-disk
+title: 磁盘与挂载工具
+sidebar_position: 27
+description: lsblk/blkid/fdisk 的分工、df 与 du 差异、挂载与 fstab 的 nofail、LVM 与 RAID 的入门判断、以及分区表类型的影响。
+---
+
+# 磁盘与挂载工具
+
+**本课目标**：能看清一块盘的结构，会安全地挂载与扩容。
+
+## 从"有哪些盘"开始
+
+```bash
+lsblk                    # 树形列出所有块设备（最直观）
+lsblk -f                 # 带文件系统类型、UUID、挂载点
+lsblk -d -o NAME,SIZE,ROTA,MODEL     # 只看物理盘（ROTA=1 是机械盘）
+blkid                    # 各分区的 UUID 与类型
+fdisk -l                 # 分区表细节（需要 root）
+parted -l                # 同上前者，但支持 GPT
+```
+
+:::tip[`lsblk -f` 是最有用的一条]
+```bash
+$ lsblk -f
+NAME   FSTYPE FSVER LABEL UUID                                 MOUNTPOINTS
+sda
+├─sda1 vfat   FAT32       1A2B-3C4D                            /boot/efi
+├─sda2 ext4   1.0         8f3c...                              /
+└─sda3 swap   1           9a1b...                              [SWAP]
+```
+
+**一次看到：设备树、文件系统类型、UUID、挂载点。**
+:::
+
+:::warning[设备名 `/dev/sda` 不保证稳定]
+**插拔顺序、控制器变化都可能让 `sda` 变成 `sdb`。**
+
+**所以 `fstab` 里必须用 UUID 或 LABEL，不能写 `/dev/sda1`** —— 否则某次重启后挂错盘甚至起不来。
+:::
+
+## `df` 与 `du` 的分工
+
+```bash
+df -h                       # 按文件系统看容量（从超级块读，快）
+df -i                       # inode 使用情况
+du -sh /var/log             # 按目录统计实际占用（遍历文件，慢）
+du -h --max-depth=1 /       # 只看一层
+```
+
+:::danger[两者结果不一致是正常的]
+| 工具 | 数据来源 | 差异原因 |
+| --- | --- | --- |
+| `df` | 文件系统超级块 | 包含已删除但被进程打开的文件、元数据、保留块 |
+| `du` | 遍历目录下的文件 | 看不到"已删除但被打开"的文件 |
+
+**`df` 说满了但 `du` 找不到 → `lsof +L1` 找被删但仍打开的文件。**
+:::
+
+:::tip[`df -h` 的 `Size` 为什么比标称小]
+```bash
+df -h /
+# Filesystem  Size  Used Avail Use% Mounted on
+# /dev/sda2    56G   21G   33G  39% /
+```
+
+**ext4 默认给 root 保留 5%**，所以 `Size - Used` 不等于 `Avail`。
+
+```bash
+# 看保留块
+tune2fs -l /dev/sda2 | grep -i reserved
+```
+
+**数据盘可以把保留比例调低**：`tune2fs -m 1 /dev/sdb1`。
+:::
+
+## 挂载
+
+```bash
+mount /dev/sdb1 /mnt/data                # 临时挂载
+mount -t ext4 /dev/sdb1 /mnt/data        # 指定类型（一般自动识别）
+mount -o ro /dev/sdb1 /mnt               # 只读
+mount -o remount,rw /                    # 重挂为可写（救援常用）
+umount /mnt/data                         # 卸载
+umount -l /mnt/data                      # lazy（不推荐，容易产生幽灵挂载）
+fuser -vm /mnt/data                      # 看谁在用（卸载失败时）
+```
+
+:::danger[卸载失败：`target is busy`]
+```bash
+umount /mnt/data
+# umount: /mnt/data: target is busy.
+```
+
+**先找出谁在用**：
+
+```bash
+lsof +D /mnt/data           # 打开该目录下文件的进程
+fuser -vm /mnt/data         # 同上，更简洁
+```
+
+**常见占用者**：shell 的当前目录就在里面、后台任务在写、`NFS` 客户端没断。
+
+**不要在找不到原因时用 `umount -l`** —— 它只是从命名空间摘掉，占用仍在，后续会出更诡异的问题。
+:::
+
+## `fstab` 的正确写法
+
+```text
+# <设备>        <挂载点>   <类型>  <选项>                     <dump> <pass>
+UUID=8f3c...    /          ext4    defaults,noatime           0      1
+UUID=1A2B-3C4D  /boot/efi  vfat    umask=0077                 0      1
+UUID=9a1b...    none       swap    sw                         0      0
+UUID=abcd...    /data      ext4    defaults,nofail            0      2
+```
+
+:::danger[数据盘一定要加 `nofail`]
+**没有 `nofail` 时，这块盘挂了/拔了 → 系统启动卡在 emergency mode。**
+
+**`nofail` 的含义**：挂不上也继续启动。
+
+**外接盘、网络盘、可插拔盘都必须加。**
+:::
+
+| 选项 | 作用 |
+| --- | --- |
+| `defaults` | `rw,suid,dev,exec,auto,nouser,async` |
+| **`noatime`** | **不更新访问时间（减少写，SSD 友好）** |
+| `nofail` | 挂不上不阻塞启动 |
+| `ro` | 只读 |
+| `x-systemd.automount` | 按需挂载（访问时才挂） |
+| `nofail,x-systemd.device-timeout=10s` | 限制等待时间 |
+
+:::warning[`fstab` 写错会导致起不来]
+**改完先验证**：
+
+```bash
+mount -a                # 挂载所有 fstab 条目；报错就是配置有问题
+systemctl daemon-reload
+```
+
+**`mount -a` 不报错再重启。**
+:::
+
+## 分区表：MBR 与 GPT
+
+![MBR 与 GPT 分区表布局对比：MBR 上限 2TiB 最多 4 主分区，GPT 有备份表与 CRC 且支持 128 分区](/img/diagrams/linux-partition-tables.svg)
+
+
+| | MBR | GPT |
+| --- | --- | --- |
+| 最大磁盘 | **2 TiB** | 极大（ZB 级） |
+| 分区数 | 4 主分区（或 3 主 + 扩展） | 128（默认） |
+| 启动 | BIOS | **UEFI** |
+| 冗余 | 无备份分区表 | 有备份与 CRC |
+
+:::danger[超过 2TB 的盘必须用 GPT]
+**MBR 的 32 位 LBA 决定了 2TiB 上限** —— 4TB 盘用 MBR 分区只能用到 2TB（或需要特殊处理）。
+:::
+
+```bash
+parted -l                             # 看分区表类型
+parted /dev/sdb mklabel gpt           # ⚠️ 会清空整个盘
+fdisk /dev/sdb                        # 交互式分区（gdisk 用于 GPT）
+```
+
+:::warning[`parted` / `fdisk` 的写操作立即生效]
+**没有"撤销"** —— 分区表一改，原有数据可能就找不到了。
+
+**动手前**：确认设备名（`lsblk` 再核一遍）、确认没有挂载、重要数据有备份。
+:::
+
+## 文件系统操作
+
+```bash
+mkfs.ext4 /dev/sdb1                        # 格式化（⚠️ 清空）
+mkfs.xfs -f /dev/sdb1
+tune2fs -L mydata /dev/sdb1                # 设卷标
+e2fsck -f /dev/sdb1                        # 检查（必须先卸载）
+resize2fs /dev/sdb1                        # 扩展到分区大小（LVM 扩容后常用）
+```
+
+:::danger[`mkfs` 打错设备名就没了]
+```bash
+mkfs.ext4 /dev/sda1        # 如果 sda1 是 /boot，系统就废了
+```
+
+**习惯**：
+
+- 动手前 `lsblk` 确认
+- 目标分区**必须未挂载**
+- 心里默念一遍设备名再按回车
+:::
+
+## 扩容的两种常见路径
+
+:::tip[路径一：同一块盘扩分区]
+```bash
+# ① 先扩分区（fdisk/parted 删了重建，起点保持不变）
+parted /dev/sdb resizepart 1 100%
+
+# ② 再扩文件系统（在线可做）
+resize2fs /dev/sdb1
+```
+:::
+
+:::tip[路径二：LVM（推荐给需要灵活扩容的场景）]
+```bash
+# 层级：PV（物理卷）→ VG（卷组）→ LV（逻辑卷）→ 文件系统
+pvs ; vgs ; lvs                # 看三层状态
+
+# 扩容：先把新盘加进 VG，再扩 LV，最后扩文件系统
+vgextend vg0 /dev/sdc
+lvextend -l +100%FREE /dev/vg0/lv_data
+resize2fs /dev/vg0/lv_data     # ext4；xfs 用 xfs_growfs
+```
+
+**LVM 的好处**：跨盘、在线扩缩、快照。**代价**：多一层抽象，救援时更麻烦。
+:::
+
+:::warning[ext4 只能扩不能缩（在线）]
+**ext4 缩小需要卸载并 `resize2fs` + `e2fsck`，风险较高。**
+
+**XFS 完全不能缩小**（只能扩）。
+
+**要缩容，选 LVM 并规划好上层文件系统**。
+:::
+
+## SSD 相关
+
+```bash
+lsblk -d -o NAME,ROTA,DISC-MAX          # ROTA=0 → SSD
+cat /sys/block/sda/queue/rotational     # 0 = SSD
+fstrim -av                              # 手动 TRIM（多数发行版有定时器）
+systemctl status fstrim.timer
+```
+
+:::tip[SSD 的两个建议]
+**① 挂载加 `noatime`** —— 减少不必要的写。
+
+**② 确保 `fstrim.timer` 开着**（或挂载加 `discard`，但定时 trim 更稳）。
+
+**别做碎片整理**（`e4defrag` 对 SSD 有害无益）。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `umount: target is busy` | 有进程在用 | `lsof +D` / `fuser -vm` |
+| 重启后盘挂错/起不来 | fstab 用了 `/dev/sdX` | 改 UUID + `nofail` |
+| 4TB 盘只认 2TB | MBR 分区表 | 改 GPT |
+| `df` 满 `du` 找不到 | 已删但被打开 | `lsof +L1` |
+| `df` 的 Avail 比预期少 | ext4 保留 5% | `tune2fs -m 1` |
+| 扩容后 `df` 没变 | 只扩了分区没扩文件系统 | `resize2fs` |
+| XFS 缩不了 | XFS 不支持缩 | 用 LVM 规划 |
+| 挂载后看不到原内容 | 挂载点覆盖 | 正常行为 |
+| `mkfs` 格式化错盘 | 设备名搞错 | 动手前 `lsblk` |
+
+:::danger[一个真实的高危操作顺序]
+```bash
+umount /data          # 忘了会失败
+mkfs.ext4 /dev/sdb1   # ❌ 如果是重装，这一步会清空
+```
+
+**格式化前问三个问题**：
+
+1. 设备名对不对？
+2. 有没有挂载（`lsblk` 看 MOUNTPOINTS）？
+3. 数据有备份吗？
+:::
+
+## 本课自检
+
+- [ ] 会用 `lsblk -f` 一次看清设备树/类型/UUID/挂载点
+- [ ] **知道 `/dev/sdX` 不保证稳定，fstab 必须用 UUID**
+- [ ] **知道 `df` 与 `du` 数据来源不同，不一致是正常的**
+- [ ] **知道 ext4 默认保留 5% 给 root**
+- [ ] 会用 `mount -o remount,rw` 救援
+- [ ] **知道 `umount` 失败要 `lsof +D` / `fuser -vm` 查占用**
+- [ ] **知道不该随手 `umount -l`**
+- [ ] **知道数据盘 fstab 必须加 `nofail`**
+- [ ] 知道改 fstab 后要先 `mount -a` 验证
+- [ ] **知道 MBR 上限 2TiB，大盘必须 GPT**
+- [ ] 知道 `mkfs` / `parted` 无撤销
+- [ ] 会走两条扩容路径（扩分区 / LVM）
+- [ ] **知道 ext4 在线不能缩、XFS 完全不能缩**
+- [ ] 知道 SSD 该用 `noatime` 并确保 `fstrim.timer` 开着
+
+## 下一步
+
+[find 与 xargs](./tools-find) 或 [系统故障排查](./troubleshoot)。

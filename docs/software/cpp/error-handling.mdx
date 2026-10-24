@@ -1,0 +1,312 @@
+---
+id: error-handling
+title: C++ 错误处理与 std::expected
+sidebar_position: 16
+description: 四种错误传递方式的取舍、异常的开销与禁用场景、std::expected 的用法（实测）、以及嵌入式环境下的错误码设计。
+---
+
+# C++ 错误处理与 std::expected
+
+**本课目标**：能为一个项目选对错误传递方式，不混用。
+
+## 四种方式
+
+| 方式 | 优点 | 缺点 |
+| --- | --- | --- |
+| **返回码** | 零开销、可预测 | 容易被忽略；无法携带信息 |
+| **异常** | 不污染正常路径；能跨层传播 | 有开销；嵌入式常禁用 |
+| **`std::optional`** | 表达"可能没有" | **不能说明为什么没有** |
+| **`std::expected<T,E>`** | 二选一（值或错误）+ 零异常 | C++23；写法略啰嗦 |
+
+:::danger[最糟糕的是"混用"]
+```cpp
+int f();                        // 返回码
+int g() noexcept;               // 承诺不抛
+int h();                        // 可能抛异常
+```
+
+**一个项目里三种风格并存时，调用方永远不知道该检查什么。**
+
+**规矩：一个模块内统一一种风格，边界处显式转换。**
+:::
+
+## 异常：开销在哪
+
+:::info[异常的三大成本]
+| 成本 | 说明 |
+| --- | --- |
+| **代码体积** | 每个 `try` 区域要生成 unwind 表（即使不抛） |
+| **抛出时** | 栈展开（unwind）很慢，通常微秒级 |
+| **禁止 `noexcept` 移动** | 影响 `vector` 扩容选择拷贝还是移动 |
+
+**"零成本异常"指的是"不抛时几乎无开销"** —— 但二进制会变大。
+:::
+
+:::danger[嵌入式通常禁用异常]
+```cpp
+g++ -fno-exceptions -fno-rtti main.cpp
+```
+
+**原因**：
+
+- 代码体积增加（Flash 紧张）
+- 栈展开需要额外的运行时支持
+- 抛异常时的延迟不可预测（硬实时不允许）
+
+**禁用后**：`throw` 编译不过；`new` 失败会直接 `abort`（要用 `nothrow` 版本）。
+:::
+
+:::warning[`noexcept` 不只是"文档"]
+```cpp
+void f() noexcept;      // 如果真抛了 → std::terminate
+```
+
+**但它也是优化提示**：
+
+```cpp
+std::vector<BigObj> v;
+v.push_back(obj);       // 如果 BigObj 的移动构造是 noexcept → 用移动
+                        // 否则 → 用拷贝（保证强异常安全）
+```
+
+**移动构造忘了标 `noexcept`，性能会明显下降**（[移动语义](./move-semantics)讲过）。
+:::
+
+## `std::optional`：只能表达"没有"
+
+```cpp
+#include <optional>
+
+std::optional<int> find_index(const std::vector<int>& v, int target)
+{
+    for (size_t i = 0; i < v.size(); ++i)
+        if (v[i] == target) return (int)i;
+    return std::nullopt;                    // 找不到
+}
+
+if (auto idx = find_index(v, 42)) {
+    use(*idx);
+}
+```
+
+:::danger[`optional` 不告诉你为什么没有]
+`find_index` 返回 `nullopt` 时，调用方无法区分：
+
+- 没找到
+- 输入不是有序的（前置条件不满足）
+- 内部出错了
+
+**需要区分时用 `expected`，或者干脆用异常。**
+:::
+
+:::warning[`optional<T>` 有额外空间开销]
+```cpp
+sizeof(std::optional<int>)      // 通常 8 字节（int 4 + 对齐/标志）
+sizeof(std::optional<char>)     // 通常 2 字节
+```
+
+**对于小类型，`optional` 可能比 `T` 大一倍**。作为返回值没问题，但别大量存进容器。
+:::
+
+## `std::expected`：值或错误（C++23）
+
+:::tip[本机实测（clang 23.1.1，`-std=c++23`）]
+```cpp
+std::expected<int, std::string> parse_int(const std::string& s)
+{
+    int v{};
+    auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (ec != std::errc{}) return std::unexpected("不是合法整数: " + s);
+    return v;
+}
+```
+
+运行结果：
+
+```text
+ok  42
+err 不是合法整数: abc
+and_then: 42
+```
+:::
+
+**三种访问方式**：
+
+```cpp
+auto r = parse_int("42");
+
+// ① 布尔判断
+if (r) use(*r);
+
+// ② 带默认值
+int v = r.value_or(0);
+
+// ③ 显式异常（会抛，慎用）
+int v2 = r.value();          // 没有值时抛 std::bad_expected_access
+
+// 错误分支
+if (!r) log(r.error());
+```
+
+**单子操作（monadic）**：
+
+```cpp
+auto r = parse_int("21")
+       .and_then([](int v) -> std::expected<int, std::string> {
+           return v * 2;
+       })
+       .transform([](int v) { return v + 1; });
+```
+
+| 操作 | 何时执行 |
+| --- | --- |
+| `and_then(f)` | 有值时执行 `f`，`f` **返回另一个 `expected`** |
+| `transform(f)` | 有值时执行 `f`，`f` **返回普通值** |
+| `or_else(f)` | 无值时执行 `f`（用于补充/转换错误） |
+
+:::warning[`.and_then` 里的 lambda 必须返回 `expected`]
+```cpp
+.and_then([](int v){ return v * 2; })          // ❌ 返回 int，编不过
+.and_then([](int v){ return std::expected<int,std::string>(v*2); })   // ✅
+```
+
+**如果只是想变换值，用 `transform`。**
+:::
+
+:::danger[`std::expected` 不能装引用，也不能是 void]
+```cpp
+std::expected<int&, Err>       // ❌ 不允许引用
+std::expected<void, Err>       // ✅ 允许（表示"只可能出错，没有返回值"）
+```
+
+**`expected<void,E>` 是"可能失败的操作"的干净表达**。
+:::
+
+## 嵌入式：错误码设计
+
+:::tip[三层错误码比"全用 -1"强得多]
+```c
+typedef enum {
+    ERR_OK          = 0,
+    /* 参数类 1xx */
+    ERR_PARAM_NULL  = 101,
+    ERR_PARAM_RANGE = 102,
+    /* 硬件类 2xx */
+    ERR_HW_TIMEOUT  = 201,
+    ERR_HW_BUSY     = 202,
+    /* 状态类 3xx */
+    ERR_STATE_INVALID = 301,
+} err_t;
+```
+
+**分段的好处**：日志里 `ERR_HW_*` 一眼看出是硬件层，不用查表。
+:::
+
+:::danger[返回值 + 输出参数是 C 的惯用法]
+```c
+err_t i2c_read(uint8_t addr, uint8_t reg, uint8_t *out);
+```
+
+**调用方必须先检查返回码再用 `out`** —— 忘记检查就会读到垃圾。
+
+**缓解办法**：
+
+```c
+#define TRY(x) do { err_t __e = (x); if (__e != ERR_OK) return __e; } while (0)
+
+err_t read_sensor(float *v) {
+    uint8_t raw[2];
+    TRY(i2c_read(0x68, 0x00, raw));
+    TRY(convert(raw, v));
+    return ERR_OK;
+}
+```
+
+**这个宏让错误传播变成一行**，比到处 `if (...) return ...` 清晰得多。
+:::
+
+:::warning[`[[nodiscard]]` 能强制检查返回值]
+```cpp
+[[nodiscard]] err_t i2c_read(...);
+```
+
+```c
+// C23 也可以
+[[nodiscard]] err_t i2c_read(...);
+```
+
+**忽略返回值时编译器会警告**。**这是让"必须检查返回码"从约定变成编译期约束的最省事手段。**
+:::
+
+## 怎么选
+
+:::tip[决策表]
+| 场景 | 选择 |
+| --- | --- |
+| **纯 C 项目 / 嵌入式** | 错误码 + `[[nodiscard]]` + `TRY` 宏 |
+| C++ 桌面/服务器，允许异常 | **异常**（RAII 天然配合） |
+| **C++ 嵌入式（禁用异常）** | `expected`（C++23）或错误码 |
+| "查不到"这类非错误情况 | `optional` |
+| 需要携带详细错误上下文 | `expected<T, ErrorStruct>` |
+| 构造失败（没有返回值可给） | **只能异常**，或工厂函数返回 `expected` |
+:::
+
+:::danger[构造函数里出错是异常的专属场景]
+```cpp
+class Conn {
+public:
+    Conn(const std::string& host);      // 失败了怎么报告？
+};
+```
+
+**构造函数没有返回值**，所以：
+
+- 用异常（最简单）
+- 或改用静态工厂：`static std::expected<Conn, Err> create(...)`
+- 或两段式构造（`init()` 返回错误码）—— **但容易忘记调用 `init()`**
+
+**禁用异常的项目里，推荐静态工厂。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 忽略返回值没警告 | 没标 `[[nodiscard]]` | 加上 |
+| `noexcept` 移动后性能没提升 | 移动构造没标 `noexcept` | 标上 |
+| 异常导致二进制暴涨 | unwind 表 | 考虑 `-fno-exceptions` + 错误码 |
+| `optional` 分不清原因 | 它只能表达"没有" | 用 `expected` |
+| `expected` 编不过 | 用了 C++20 | 需要 `-std=c++23` |
+| `and_then` 编不过 | lambda 返回了普通值 | 用 `transform` |
+| 错误码全是 -1 | 没有分类 | 分层设计错误码 |
+| 混用异常和错误码 | 没有约定 | 模块内统一 |
+
+:::warning[`std::expected` 需要 C++23 标准库支持]
+```bash
+g++ -std=c++23 main.cpp          # 实测 clang 23.1.1 可用
+```
+
+**老编译器可能没有**（GCC 13+ / Clang 16+ 才有）。**降级方案**：用 `tl::expected`（单头文件库）或自己写。
+:::
+
+## 本课自检
+
+- [ ] 能说出四种错误传递方式的取舍
+- [ ] **知道混用是最糟的，模块内要统一**
+- [ ] 知道异常的三大成本（体积、unwind、影响移动）
+- [ ] **知道 `-fno-exceptions` 后构造函数无法报错，要用静态工厂**
+- [ ] **知道 `noexcept` 移动构造影响 `vector` 扩容选择**
+- [ ] 知道 `optional` 只能表达"没有"，不能说明原因
+- [ ] 知道 `optional<int>` 通常占 8 字节（有额外开销）
+- [ ] 会写 `std::expected<T,E>`，知道 `value_or` / `error` / `value`
+- [ ] **知道 `and_then` 的 lambda 必须返回 `expected`，变换值要用 `transform`**
+- [ ] 知道 `expected<void,E>` 表示"只可能出错"
+- [ ] **知道 `expected` 不能装引用**
+- [ ] 会在嵌入式里分层设计错误码
+- [ ] **知道 `[[nodiscard]]` 和 `TRY` 宏能大幅减少漏检查**
+- [ ] 知道 `expected` 需要 C++23，降级用 `tl::expected`
+
+## 下一步
+
+[移动语义与完美转发](./move-semantics) 讲了为什么 `noexcept` 移动很重要；
+或者看 [模板与泛型编程](./templates)。

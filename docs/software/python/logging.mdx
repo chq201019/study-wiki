@@ -1,0 +1,324 @@
+---
+id: logging
+title: logging 模块
+sidebar_position: 24
+description: 为什么不该用 print、logger 层级与传播、handler/formatter 的组合、生产环境的配置模板、以及多进程与多线程下的坑。
+---
+
+# logging 模块
+
+**本课目标**：用一套配置同时满足开发时看屏幕、生产时写文件、出错时发告警。
+
+## 别用 `print`
+
+:::danger[`print` 的五个短板]
+| 问题 | `print` | `logging` |
+| --- | --- | --- |
+| 级别 | ❌ 没有 | ✅ DEBUG/INFO/WARNING/ERROR |
+| 时间戳 | ❌ 要手写 | ✅ 自动 |
+| 输出目标 | 只能 stdout | ✅ 文件/网络/syslog 同时多路 |
+| 开关 | 要删代码或注释 | ✅ 改配置即可 |
+| 多线程 | 可能交错 | ✅ 有锁 |
+:::
+
+```python
+import logging
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+logging.info("服务启动")
+logging.warning("配置项缺失，使用默认值")
+```
+
+## logger 层级与传播
+
+:::info[`getLogger("a.b.c")` 形成树]
+```python
+logging.getLogger("app")          # 根
+logging.getLogger("app.db")       # app 的子
+logging.getLogger("app.db.pool")  # app.db 的子
+```
+
+**`app.db.pool` 的日志默认会向上传播到 `app.db` → `app` → root**，每层都可能处理（写文件/打印）。
+:::
+
+:::danger[传播导致"同一条日志打印两次"]
+```python
+logger = logging.getLogger("app")
+logger.addHandler(logging.StreamHandler())    # 自己加了一个
+
+logging.basicConfig()                          # root 也有一个
+logger.info("x")        # ❌ 打印两次（自己一次 + 传播到 root 一次）
+```
+
+**解法二选一**：
+
+```python
+logger.propagate = False        # 不向上传播
+# 或者：不给 root 加 handler，全部配在子 logger 上
+```
+:::
+
+:::tip[库代码的规矩：只取 logger，不加 handler]
+```python
+# 你的库
+logger = logging.getLogger(__name__)      # ✅ 就这一行
+
+def do_work():
+    logger.debug("...")                    # 由使用者决定要不要显示
+```
+
+**库绝不能调 `basicConfig()` 或 `addHandler()`** —— 那会污染使用者的日志配置。
+
+**这是 `logging` 最重要的约定。**
+:::
+
+## 级别
+
+| 级别 | 数值 | 用途 |
+| --- | --- | --- |
+| `DEBUG` | 10 | 调试细节（生产关掉） |
+| `INFO` | 20 | 正常运行信息 |
+| `WARNING` | 30 | **默认级别**，有异常但还能跑 |
+| `ERROR` | 40 | 功能失败 |
+| `CRITICAL` | 50 | 服务不可用 |
+
+```python
+logging.getLogger("noisy.lib").setLevel(logging.WARNING)   # 单独调低某模块的噪音
+```
+
+:::warning[`basicConfig` 在已经配置过之后是"空操作"]
+```python
+logging.basicConfig(level=logging.DEBUG)     # 第一次有效
+logging.basicConfig(level=logging.INFO)      # ❌ 静默忽略！
+```
+
+**`basicConfig` 只在 root 没有 handler 时生效。**
+
+**要强制重配**：`force=True`（Python 3.8+）
+
+```python
+logging.basicConfig(level=logging.INFO, force=True)
+```
+:::
+
+## Handler / Formatter / Filter
+
+```python
+import logging, sys
+from logging.handlers import RotatingFileHandler
+
+logger = logging.getLogger("app")
+logger.setLevel(logging.DEBUG)
+
+# ① 屏幕：INFO 以上，简洁格式
+console = logging.StreamHandler(sys.stdout)
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+
+# ② 文件：DEBUG 以上，详细格式，自动轮转
+fhandler = RotatingFileHandler("app.log", maxBytes=10*1024*1024, backupCount=5,
+                               encoding="utf-8")
+fhandler.setLevel(logging.DEBUG)
+fhandler.setFormatter(logging.Formatter(
+    "%(asctime)s %(levelname)-8s [%(name)s:%(lineno)d] %(message)s"))
+
+logger.addHandler(console)
+logger.addHandler(fhandler)
+```
+
+:::tip[一个 logger 多个 handler 是最有用的模式]
+- **屏幕看 INFO**（不想被 DEBUG 刷屏）
+- **文件写 DEBUG**（出问题时能翻）
+- **ERROR 单独发告警**（加一个 level=ERROR 的 handler 发到 Slack/邮件）
+:::
+
+**常用 Handler**：
+
+| Handler | 用途 |
+| --- | --- |
+| `StreamHandler` | 屏幕/管道 |
+| `FileHandler` | 文件 |
+| **`RotatingFileHandler`** | **按大小轮转** |
+| **`TimedRotatingFileHandler`** | **按时间轮转** |
+| `SysLogHandler` | syslog |
+| `QueueHandler` / `QueueListener` | 异步（避免阻塞主线程） |
+
+:::danger[别用 `FileHandler` 配外部轮转工具]
+**`FileHandler` 一直持有同一个文件句柄** —— 外部 `logrotate` 改名后，它还在往旧 inode 写（日志"消失"了）。
+
+**要么用 `TimedRotatingFileHandler`（Python 自己轮转），要么让 logrotate 用 `copytruncate`。**
+:::
+
+## 格式化字段
+
+```python
+"%(asctime)s %(levelname)s [%(name)s:%(lineno)d] %(message)s"
+```
+
+| 字段 | 内容 |
+| --- | --- |
+| `%(asctime)s` | 时间（可配 `datefmt`） |
+| `%(levelname)s` | 级别名 |
+| `%(name)s` | **logger 名（通常是 `__name__` = 模块路径）** |
+| `%(lineno)d` | 行号 |
+| `%(funcName)s` | 函数名 |
+| `%(process)d` / `%(thread)d` | 进程/线程 ID |
+| `%(processName)s` / `%(threadName)s` | 名字 |
+| `%(message)s` | 消息 |
+
+:::warning[`%(lineno)d` 有性能开销]
+**它要求 Python 反查调用栈帧。**
+
+**高并发/高频日志场景下，去掉 `lineno` / `funcName` 能明显降低开销。**
+:::
+
+## 异常的记录方式
+
+```python
+# ❌ 丢了栈
+try:
+    work()
+except Exception:
+    logger.error("失败")
+```
+
+```python
+# ✅ 带完整栈
+try:
+    work()
+except Exception:
+    logger.exception("失败")            # 等价于 error(..., exc_info=True)
+```
+
+:::danger[`logger.exception` 只能在 `except` 块里用]
+```python
+logger.exception("x")      # 不在 except 里 → 输出 NoneType: None
+```
+
+**它靠 `sys.exc_info()` 取当前异常** —— 没有异常就什么也没有。
+:::
+
+```python
+# 记录并继续（不吞掉）
+try:
+    work()
+except ValueError as e:
+    logger.warning("输入非法: %s", e)     # 预期内的错误，warning 就够
+except Exception:
+    logger.exception("未预期错误")        # 未预期的，必须带栈
+    raise                                 # 该抛就抛，别静默
+```
+
+:::warning[用 `%s` 占位而不是 f-string]
+```python
+logger.debug("x=%s", x)        # ✅ 惰性格式化：不输出就不格式化
+logger.debug(f"x={x}")         # ❌ 无论级别如何都先拼字符串
+```
+
+**在 DEBUG 级别高频调用时，这个差异很明显。**
+:::
+
+## 生产配置模板
+
+```python
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "simple": {"format": "%(levelname)s %(message)s"},
+        "detail": {"format": "%(asctime)s %(levelname)-8s [%(name)s:%(lineno)d] %(message)s"},
+    },
+    "handlers": {
+        "console": {"class": "logging.StreamHandler", "level": "INFO",
+                    "formatter": "simple"},
+        "file": {"class": "logging.handlers.RotatingFileHandler",
+                 "level": "DEBUG", "formatter": "detail",
+                 "filename": "/var/log/app/app.log",
+                 "maxBytes": 10485760, "backupCount": 5,
+                 "encoding": "utf-8"},
+    },
+    "loggers": {
+        "app": {"handlers": ["console", "file"], "level": "DEBUG", "propagate": False},
+        "urllib3": {"level": "WARNING"},          # 降噪
+    },
+    "root": {"handlers": ["console"], "level": "WARNING"},
+}
+
+import logging.config
+logging.config.dictConfig(LOGGING)
+```
+
+:::tip[用 `dictConfig` 而不是手写 `addHandler`]
+- **集中在一处**：所有配置一眼看全
+- **可从 YAML/JSON 加载**：运维能改而不改代码
+- **能精确控制"哪个 logger 用哪个 handler"**
+:::
+
+## 多进程 / 多线程
+
+:::danger[多进程写同一个文件会有问题]
+**多个进程各自持有一个 `FileHandler` 写同一文件** → 内容可能交错、轮转时互相覆盖。
+
+**三种解法**：
+
+| 方案 | 说明 |
+| --- | --- |
+| **每个进程写自己的文件** | `app-{pid}.log`，最简单可靠 |
+| **`QueueHandler` + 单独的日志进程** | 所有进程发到队列，一个进程统一写 |
+| syslog / 集中式日志 | 交给系统处理 |
+:::
+
+```python
+# 每进程一个文件：最省事
+handler = RotatingFileHandler(f"app-{os.getpid()}.log", ...)
+```
+
+:::warning[`logging` 是线程安全的（但 handler 要小心]
+**`Logger` 内部有锁，多线程 `logger.info()` 不会交错。**
+
+**但如果多个线程各自 `addHandler` 同一个文件** → 会有多个句柄，可能重复写。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 日志打印两次 | `propagate` + root 也有 handler | `propagate=False` |
+| `basicConfig` 不生效 | 已经配置过 | `force=True` |
+| DEBUG 日志不显示 | 级别是 WARNING | `setLevel(DEBUG)` |
+| 中文乱码 | 没指定 `encoding` | `encoding="utf-8"` |
+| 日志文件不轮转 | 用了 `FileHandler` | `RotatingFileHandler` |
+| 轮转后日志"消失" | 外部 logrotate 与句柄冲突 | 用 `copytruncate` 或 Python 自己轮转 |
+| 异常没有栈 | 用了 `logger.error` | `logger.exception` |
+| 库污染了全项目配置 | 库调了 `basicConfig` | 库里只 `getLogger` |
+| 日志拖慢程序 | 同步写文件 + `lineno` | `QueueHandler` + 去掉 `lineno` |
+
+:::danger[日志里不要打敏感信息]
+```python
+logger.info("登录成功 token=%s", token)      # ❌ 令牌进了日志文件
+logger.info("登录成功 user=%s", user_id)     # ✅
+```
+
+**日志文件经常被同步到第三方系统、被打包发给支持人员** —— 密码、令牌、身份证、卡号绝不能出现。
+:::
+
+## 本课自检
+
+- [ ] **知道该用 `logging` 而不是 `print` 的五个理由**
+- [ ] 理解 logger 层级与传播机制
+- [ ] **知道传播 + root handler 会导致日志重复**
+- [ ] **知道库代码只 `getLogger`，绝不 `basicConfig`**
+- [ ] **知道 `basicConfig` 重复调用会被忽略，要用 `force=True`**
+- [ ] 会用多个 handler 实现"屏幕 INFO / 文件 DEBUG / 告警 ERROR"
+- [ ] **知道 `FileHandler` 与外部 logrotate 冲突，应改用 `TimedRotatingFileHandler`**
+- [ ] 会用 `logger.exception` 记录完整栈（且只能在 except 里）
+- [ ] **知道日志用 `%s` 占位而不是 f-string（惰性格式化）**
+- [ ] 会用 `dictConfig` 集中配置
+- [ ] **知道多进程写同一日志文件的问题与三种解法**
+- [ ] **知道日志里不能打令牌/密码等敏感信息**
+
+## 下一步
+
+[性能剖析与优化](./perf) 或 [类型注解](./typing)。

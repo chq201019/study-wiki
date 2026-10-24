@@ -1,0 +1,174 @@
+---
+id: toolchain-03
+title: "03 gcc 常用参数速查"
+sidebar_position: 4
+description: "从源码到可执行文件 第 3 部分：gcc 常用参数速查"
+---
+
+# 03 gcc 常用参数速查
+按使用频率分类：
+
+### 必用
+
+| 参数 | 作用 |
+| --- | --- |
+| `-std=c17` | 指定 C 标准。**一定要显式写** |
+| `-Wall` | 打开主要警告 |
+| `-Wextra` | 打开额外警告（未使用参数、符号比较等） |
+| `-o FILE` | 指定输出文件名 |
+| `-c` | 只编译汇编，不链接（产出 `.o`） |
+| `-I DIR` | 添加头文件搜索路径 |
+| `-D NAME[=VAL]` | 定义宏，等价于源码里写 `#define` |
+| `-L DIR` | 添加库搜索路径 |
+| `-l NAME` | 链接名为 `libNAME.a` 的库 |
+
+### 调试与优化
+
+| 参数 | 作用 |
+| --- | --- |
+| `-O0` | 不优化（默认），调试时用，变量不会被优化掉 |
+| `-O1` / `-O2` / `-O3` | 递增优化。`-O2` 是发布常用 |
+| `-Os` | 优化体积，**嵌入式首选** |
+| `-g` | 加入调试信息，用 gdb 必需 |
+| `-g3` | 调试信息含宏定义 |
+| `-Og` | 优化但不牺牲调试体验 |
+
+### 诊断
+
+| 参数 | 作用 |
+| --- | --- |
+| `-Werror` | 警告升级为错误，CI/量产推荐 |
+| `-Wpedantic` | 严格按标准检查，拒绝编译器扩展 |
+| `-Wconversion` | 隐式转换可能丢值时警告（嵌入式强烈建议开） |
+| `-Wshadow` | 变量遮蔽警告 |
+| `-E` | 只预处理，输出到 stdout |
+| `-S` | 只编译到汇编 |
+| `-v` | 打印完整调用链（看它到底干了什么） |
+| `-H` | 打印每个被包含的头文件（查头文件问题） |
+
+### 实测：警告能抓到什么
+
+故意写错的代码：
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int x;
+    int arr[3] = {1, 2, 3};
+    printf("uninitialized x = %d\n", x);
+    printf("arr[5] = %d\n", arr[5]);
+    if (x = 5) {
+        printf("assignment in if\n");
+    }
+    return 0;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -c warn.c -o warn.o
+```
+
+```text
+C:\cprobe\warn.c:8:11: warning: using the result of an assignment as a condition without parentheses [-Wparentheses]
+C:\cprobe\warn.c:7:29: warning: array index 5 is past the end of the array (that has type 'int[3]') [-Warray-bounds]
+C:\cprobe\warn.c:6:38: warning: variable 'x' is uninitialized when used here [-Wuninitialized]
+C:\cprobe\warn.c:4:10: note: initialize the variable 'x' to silence this warning
+3 warnings generated.
+```
+
+三个都是**真 bug**：未初始化读、越界读、`if` 里把赋值当比较（几乎是手误）。**没有 `-Wall` 的话这些全部静默通过。**
+
+### 实测：缺头文件在 C99 之后是错误
+
+```c
+int *heap = (int*)malloc(sizeof(int));   /* 忘了 #include <stdlib.h> */
+```
+
+```bash
+gcc -std=c17 -Wall layout.c -o layout.exe
+```
+
+```text
+C:\cprobe\layout.c:18:23: error: call to undeclared library function 'malloc' with type 'void *(__size_t)' (aka 'void *(unsigned long long)'); ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+   18 |     int *heap = (int*)malloc(sizeof(int));
+      |                       ^
+C:\cprobe\layout.c:18:23: note: include the header <stdlib.h> or explicitly provide a declaration for 'malloc'
+```
+
+:::caution[C89 和 C99 之后的关键差异]
+**C89** 允许隐式函数声明：调用没声明的函数时，编译器假设它返回 `int`。这个特性在 **C99 被移除**，C99 之后是**约束违反**。
+
+本站用的编译器把它报成 error（因为它同时也是一个警告选项控制的诊断），但标准术语上它是"约束违反"，编译器**可以**只给警告继续编译。无论如何，**永远不要依赖隐式声明**——它会让参数传递按错误的原型进行，是真正的 UB 来源。
+
+在 ESP-IDF 里你会看到 `malloc` 返回 `void *`，如果隐式声明成返回 `int`，在指针比 `int` 宽的平台上返回值会被截断——这就是经典的"忘了包含头文件导致崩溃"。
+:::
+
+## 七、推荐的编译配置
+
+不同阶段用不同的选项组合：
+
+```bash
+# 开发调试：不优化 + 调试信息 + 全警告
+gcc -std=c17 -Wall -Wextra -Wshadow -g -O0 main.c -o main
+
+# 发布：优化体积 + 调试信息分离
+gcc -std=c17 -Wall -Wextra -Werror -Os -g main.c -o main
+
+# 嵌入式交叉编译（示意）
+xtensa-esp32-elf-gcc -std=gnu17 -Wall -Wextra -Os -g \
+    -I components/include -mlongcalls main.c -o main.o
+
+# 排查宏问题
+gcc -E -P main.c | tail -40
+
+# 排查链接问题
+nm -C main.o | grep -i ' U '
+```
+
+:::tip[嵌入式额外建议]
+- **始终开 `-Wall -Wextra`**，量产加 `-Werror`
+- 考虑加 `-Wconversion`：它能抓到 `int` 赋给 `int8_t` 这类截断，在 8/16 位 MCU 上是高频 bug
+- `-Os` 优先于 `-O2`：Flash 通常比 CPU 时间更紧张
+- **保留 `-g`**：发布固件带调试信息不影响运行（信息在单独节里，不烧进 Flash），但崩溃回溯时救命
+:::
+
+## 常见坑
+
+| 陷阱 | 现象 | 原因 | 正确做法 |
+| --- | --- | --- | --- |
+| `undefined reference to X` | 链接失败 | 声明了但任何 `.o` 和库里都没有定义 | `nm` 确认符号在哪；检查 `-l` 是否漏写、顺序是否对 |
+| `duplicate symbol: X` | 链接失败 | 两个文件都定义了同名的外部链接符号 | 头文件只放 `extern` 声明，定义放进一个 `.c`；或用 `static` |
+| `-l` 放在源文件前面 | 明明有库却报 undefined | 链接器按需抽取，扫到库时还没有欠账 | `-l` 永远放在引用它的文件**之后** |
+| 头文件里定义变量 | 多文件项目链接冲突 | 每个包含者都生成一份定义 | 头文件 `extern` 声明，`.c` 里定义 |
+| `ar` 忘加 `s` | 库打包成功但链接时找不到符号 | 没有生成符号索引 | 用 `ar rcs` |
+| 忘了 `-std=` | 换机器行为不同 | 编译器默认方言可能不同 | 显式 `-std=c17` |
+| 不加 `-Wall` | 未初始化/越界静默通过 | 默认警告级别低 | 固定加 `-Wall -Wextra` |
+| 以为 `-O0` 和 `-O2` 等价 | 调试时正常，发布时崩 | UB 被优化器利用，或依赖了未初始化值 | 用 UBSan/ASan 验证；不要依赖 UB |
+| `static` 以为只是"保持值" | 文件作用域的 `static` 用法混淆 | `static` 有两种完全不同的语义 | 文件作用域 = 改链接属性；块作用域 = 改存储期 |
+| 大全局数组让 `.o` 变大 | 误以为会占磁盘 | `bss` 只记录大小不占空间 | 这是正常的，无需处理 |
+
+## 自检清单
+
+- [ ] 能说出 `gcc` 四阶段各自的命令（`-E`/`-S`/`-c`/链接）和产物后缀吗？
+- [ ] 能解释 `nm` 输出里 `T` 和 `t` 的区别吗？`U` 又代表什么？
+- [ ] 知道 `size` 输出的 text/data/bss 各是什么吗？为什么 `bss` 不占文件空间？
+- [ ] 能解释 `duplicate symbol: public_var` 是怎么产生的吗？给出两种修法
+- [ ] 文件作用域的 `static` 改变了什么？和块作用域的 `static` 有什么区别？
+- [ ] 知道 `-l` 必须放在源文件后面的原因吗？
+- [ ] 能说出静态库和动态库在"链接时机""体积""运行时依赖"三点上的区别吗？
+- [ ] 知道嵌入式为什么几乎只用静态库吗？
+- [ ] 能在自己机器上跑通 `ar rcs` 打包并用 `-L`/`-l` 链接吗？
+- [ ] 知道怎么用 `gcc -E` 排查宏问题吗？
+
+## 下一步
+
+- [语法基础](./syntax) —— 类型系统和运算符，最容易埋雷的地方
+- [指针专章](./pointers) —— 分水岭，看懂 `nm` 之后理解地址会更顺
+- [函数](./functions) —— 深入栈帧和链接属性 `static`/`extern`
+- [内存模型](./memory) —— text/data/bss 背后的运行时内存布局
+- [回到导读](./)
+
+---
+
+**翻页**：[← 上一页](./toolchain-02) · [返回目录](./)

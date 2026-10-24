@@ -1,0 +1,267 @@
+---
+id: kernel-03
+title: "03 写一个完整的内核模块"
+sidebar_position: 4
+description: "内核与驱动入门 第 3 部分：写一个完整的内核模块"
+---
+
+# 03 写一个完整的内核模块
+下面是一个**最小可加载**的字符设备驱动（📋 代码为**标准示例，本机未编译**——服务器无内核头文件）。
+
+```c
+/*
+ * mydev.c —— 最小字符设备驱动示例
+ * 实现一个"回显"设备：写入什么，读出来就是什么（存在内核缓冲区里）
+ */
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/device.h>
+#include <linux/uaccess.h>      /* copy_to_user / copy_from_user */
+#include <linux/slab.h>         /* kmalloc / kfree */
+
+#define DEV_NAME  "mydev"
+#define BUF_SIZE  1024
+
+static int    major;                 /* 主设备号（动态分配） */
+static struct cdev   my_cdev;
+static struct class *my_class;
+static char  *dev_buf;               /* 内核缓冲区 */
+
+static int mydev_open(struct inode *inode, struct file *filp)
+{
+    pr_info("mydev: opened\n");
+    return 0;
+}
+
+static int mydev_release(struct inode *inode, struct file *filp)
+{
+    pr_info("mydev: closed\n");
+    return 0;
+}
+
+static ssize_t mydev_read(struct file *filp, char __user *buf,
+                          size_t count, loff_t *ppos)
+{
+    int len = strlen(dev_buf);
+    if (*ppos >= len)
+        return 0;                     /* EOF */
+    if (count > len - *ppos)
+        count = len - *ppos;
+
+    /* 关键：内核空间 → 用户空间，必须用 copy_to_user，不能直接 memcpy */
+    if (copy_to_user(buf, dev_buf + *ppos, count))
+        return -EFAULT;
+
+    *ppos += count;
+    return count;
+}
+
+static ssize_t mydev_write(struct file *filp, const char __user *buf,
+                           size_t count, loff_t *ppos)
+{
+    if (count > BUF_SIZE - 1)
+        count = BUF_SIZE - 1;
+
+    if (copy_from_user(dev_buf, buf, count))
+        return -EFAULT;
+
+    dev_buf[count] = '\0';
+    pr_info("mydev: got %zu bytes: %s\n", count, dev_buf);
+    return count;
+}
+
+/* 回调函数表 —— 驱动的核心 */
+static const struct file_operations mydev_fops = {
+    .owner   = THIS_MODULE,
+    .open    = mydev_open,
+    .release = mydev_release,
+    .read    = mydev_read,
+    .write   = mydev_write,
+};
+
+static int __init mydev_init(void)
+{
+    dev_t devno;
+    int ret;
+
+    /* 1. 动态申请设备号（推荐，避免冲突） */
+    ret = alloc_chrdev_region(&devno, 0, 1, DEV_NAME);
+    if (ret < 0) {
+        pr_err("mydev: alloc_chrdev_region failed\n");
+        return ret;
+    }
+    major = MAJOR(devno);
+
+    /* 2. 初始化并添加 cdev */
+    cdev_init(&my_cdev, &mydev_fops);
+    my_cdev.owner = THIS_MODULE;
+    ret = cdev_add(&my_cdev, devno, 1);
+    if (ret < 0) {
+        unregister_chrdev_region(devno, 1);
+        return ret;
+    }
+
+    /* 3. 创建设备类与设备节点（配合 udev/mdev 自动生成 /dev/mydev） */
+    my_class = class_create(DEV_NAME);
+    device_create(my_class, NULL, devno, NULL, DEV_NAME);
+
+    /* 4. 分配内核缓冲区 */
+    dev_buf = kmalloc(BUF_SIZE, GFP_KERNEL);
+    if (!dev_buf)
+        return -ENOMEM;
+
+    pr_info("mydev: loaded, major=%d\n", major);
+    return 0;
+}
+
+static void __exit mydev_exit(void)
+{
+    dev_t devno = MKDEV(major, 0);
+    kfree(dev_buf);
+    device_destroy(my_class, devno);
+    class_destroy(my_class);
+    cdev_del(&my_cdev);
+    unregister_chrdev_region(devno, 1);
+    pr_info("mydev: unloaded\n");
+}
+
+module_init(mydev_init);
+module_exit(mydev_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("your name");
+MODULE_DESCRIPTION("A minimal echo character device");
+```
+
+### 5.1 关键 API 说明
+
+| API | 作用 |
+| --- | --- |
+| `alloc_chrdev_region()` | **动态**申请设备号（推荐） |
+| `register_chrdev_region()` | 静态指定设备号（容易冲突） |
+| `cdev_init()` | 把 `file_operations` 绑到 `cdev` |
+| `cdev_add()` | 注册到内核，**之后才会响应 open** |
+| `class_create()` / `device_create()` | 在 `/sys/class/` 建条目，**触发 udev 自动创建 `/dev/xxx`** |
+| `copy_to_user()` / `copy_from_user()` | **内核↔用户数据交换的唯一合法方式** |
+| `kmalloc()` | 内核态分配内存（`GFP_KERNEL` 可睡眠） |
+
+:::danger[永远不要直接解引用用户空间指针]
+```c
+/* ❌ 致命错误 */
+char c = *user_ptr;
+strcpy(kernel_buf, user_ptr);
+
+/* ✅ 正确 */
+copy_from_user(kernel_buf, user_ptr, count);
+```
+
+原因：
+1. 用户空间指针**可能是恶意的/无效的**，直接访问会导致内核 oops
+2. 用户态页面**可能已被换出**，访问会触发无法在内核上下文处理的缺页
+3. 在有 SMAP（Supervisor Mode Access Prevention）的 CPU 上，**硬件会直接拒绝**内核访问用户页
+
+`copy_*_user` 会做地址合法性检查，失败返回**未拷贝的字节数**（非 0 就返回 `-EFAULT`）。
+:::
+
+### 5.2 模块的 Makefile
+
+```makefile
+# 在内核源码树外编译模块的标准写法
+KDIR ?= /lib/modules/$(shell uname -r)/build
+PWD  := $(shell pwd)
+
+obj-m += mydev.o
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+```
+
+**交叉编译时**：
+
+```bash
+make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- \
+     KDIR=/path/to/kernel/source \
+     -C /path/to/kernel/source M=$(pwd) modules
+```
+
+**关键**：`KDIR` 必须使用**与目标板运行的内核完全相同的、已编译过的内核源码树**。版本不匹配会报 `Invalid module format`。
+
+### 5.3 加载与卸载
+
+```bash
+insmod mydev.ko              # 加载（不处理依赖）
+modprobe mydev               # 加载（自动处理依赖，推荐）
+lsmod                        # 查看已加载
+rmmod mydev                  # 卸载
+modinfo mydev.ko             # 查看模块信息
+dmesg | tail                 # 看 printk 输出
+
+# 创建设备节点（若 udev 没自动做）
+mknod /dev/mydev c <major> 0
+```
+
+### 5.4 实测：系统里的模块与依赖关系
+
+```bash
+$ lsmod | head -6
+Module                  Size  Used by
+tcp_diag               12288  0
+udp_diag               12288  0
+inet_diag              28672  2 tcp_diag,udp_diag
+nf_conntrack_netlink    61440  0
+xt_nat                 12288  45
+```
+
+`Used by` 列是**引用计数**：`inet_diag` 被 2 个模块引用（`tcp_diag` 和 `udp_diag`），**引用计数非 0 时无法卸载**。
+
+```bash
+$ modinfo ext4 | grep -E 'filename|softdep|depends|license|description'
+filename:       /lib/modules/6.12.94+deb13-amd64/kernel/fs/ext4/ext4.ko.xz
+softdep:        pre: crypto-crc32c
+license:        GPL
+description:    Fourth Extended Filesystem
+depends:        jbd2,crc16,mbcache
+```
+
+- `depends` = 硬依赖，**加载 ext4 前必须先加载 `jbd2`、`crc16`、`mbcache`**（`modprobe` 会自动处理，`insmod` 不会）
+- `softdep pre:` = 软依赖，建议先加载但不是必须
+
+模块目录结构：
+
+```bash
+$ ls -1 /lib/modules/6.12.94+deb13-amd64/
+kernel
+modules.alias
+modules.alias.bin
+modules.builtin
+modules.builtin.alias.bin
+modules.builtin.bin
+modules.builtin.modinfo
+modules.dep
+modules.dep.bin
+modules.devname
+
+$ ls -1 /lib/modules/6.12.94+deb13-amd64/kernel/
+arch block crypto drivers fs lib mm net sound virt
+```
+
+`modules.dep` 是 `depmod` 生成的**依赖关系数据库**，记录了哪个模块依赖哪个：
+
+```bash
+$ head -2 /lib/modules/6.12.94+deb13-amd64/modules.dep
+kernel/arch/x86/events/amd/power.ko.xz:
+kernel/arch/x86/events/intel/intel-uncore.ko.xz:
+```
+
+:::tip[模块文件是 .ko.xz？]
+注意上面是 `.ko.xz`——Debian 把模块**压缩**了以节省空间。内核加载时会自动解压。嵌入式 rootfs 上常见同样做法（配合 `CONFIG_MODULE_COMPRESS`），或干脆不压缩换取更快的加载速度。
+:::
+
+---
+
+**翻页**：[← 上一页](./kernel-02) · [下一页 →](./kernel-04) · [返回目录](./)

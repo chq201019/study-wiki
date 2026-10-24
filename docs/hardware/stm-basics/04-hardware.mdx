@@ -1,0 +1,245 @@
+---
+id: 04-hardware
+title: 04 硬件准备与 ST-Link
+sidebar_position: 4
+description: SWD 是什么、为什么 STM32 不能用 USB 直接烧录、完整接线步骤、装 ST-Link 驱动，以及连不上的排查。
+---
+
+# 04 硬件准备与 ST-Link
+
+**本课目标**：把板子、下载器、串口模块都接对，电脑能认出来。
+
+## 为什么不能像 ESP32 那样插 USB 就烧
+
+:::danger[STM32 出厂没有内置 USB 下载功能]
+ESP32 芯片内部**自带 USB 转串口逻辑**（或板上有转换芯片），插上就是一个串口，能烧录。
+
+**STM32F103 没有**：
+
+```text
+USB 线 ──→ ❌ 什么都不发生（板子上的 USB 口通常只是供电）
+```
+
+**它需要一个专门的调试接口来烧录：SWD。**
+:::
+
+## SWD 是什么
+
+**SWD = Serial Wire Debug（串行线调试）**，ARM 定义的**两线调试协议**。
+
+| 线 | 全名 | 作用 |
+| --- | --- | --- |
+| **SWDIO** | Serial Wire Data I/O | 数据（双向） |
+| **SWCLK** | Serial Wire Clock | 时钟 |
+| GND | —— | 地 |
+| （可选）NRST | Reset | 复位 |
+
+:::tip[SWD 最值钱的地方：能调试，不只是能烧录]
+| 能力 | 说明 |
+| --- | --- |
+| 烧录固件 | ✅ |
+| **单步执行** | 一行一行跑 |
+| **打断点** | 停在指定位置 |
+| **实时看变量** | 不用加 `printf` |
+| **看寄存器** | 查外设到底配没配对 |
+| **读回 Flash** | 校验烧进去的是什么 |
+
+**ESP32 靠串口打日志猜，STM32 能直接看。** 这是它最大的优势。
+:::
+
+:::info[和 JTAG 的关系]
+**JTAG 是更老的调试协议**（4~5 根线），SWD 是它的精简版（2 根线）。
+
+STM32 同时支持两者，**实际都用 SWD**（省引脚）。
+
+ST-Link 两种都支持，接 SWD 就行。
+:::
+
+## 完整接线
+
+### ① ST-Link 接板子（SWD）
+
+```text
+ST-Link V2              STM32 蓝板
+──────────              ──────────
+3.3V    ──────────────  3V3
+GND     ──────────────  GND
+SWDIO   ──────────────  DIO  (SWDIO)
+SWCLK   ──────────────  CLK  (SWCLK)
+RST     ─ ─ ─ ─ ─ ─ ──  NRST （可选，连不上时接）
+```
+
+:::danger[三个接线雷区]
+**① 不要把 ST-Link 的 5V 接到板子的 3V3**
+
+```text
+ST-Link 5V  →  ❌ 板子 3V3（烧稳压芯片）
+ST-Link 3.3V → ✅ 板子 3V3
+```
+
+**② 不要双重供电**
+
+板子插着 USB 供电，**同时** ST-Link 又供 3.3V —— 两个电源顶在一起，可能烧。
+
+**二选一**：
+- 只用 ST-Link 的 3.3V 供电（推荐调试时）
+- 或板子自己用 USB 供电，ST-Link 只接 GND/SWDIO/SWCLK 三根
+
+**③ SWDIO/SWCLK 不要接反**
+
+接反了**不会烧**（是低压信号），但连不上。对调试试。
+:::
+
+### ② USB-TTL 接板子（串口）
+
+```text
+USB-TTL 模块            STM32 蓝板
+─────────────           ──────────
+3.3V（或不接）────────   3V3（板子已供电就不接）
+GND     ──────────────  GND
+TXD     ──────────────  PA10 (USART1_RX)   ← 注意交叉
+RXD     ──────────────  PA9  (USART1_TX)   ← 注意交叉
+```
+
+:::danger[TX 和 RX 必须交叉]
+```text
+模块 TXD → 板子 RX   ✅
+模块 RXD → 板子 TX   ✅
+模块 TXD → 板子 TX   ❌ 两边都在发，收不到
+```
+
+**记忆法：一个说，一个听。**
+:::
+
+:::warning[USB-TTL 的电压选择]
+很多模块有 **3.3V / 5V 跳线**或两个 VCC 引脚。
+
+**一定选 3.3V**——STM32 的 IO 是 3.3V 电平，5V 会损坏引脚。
+
+（有些模块标注"5V 供电但信号 3.3V"，那种也能用，**但信号线必须是 3.3V**。）
+:::
+
+## 装驱动
+
+### ST-Link 驱动
+
+:::tip[Windows 上的两种情况]
+**① 装了 STM32CubeIDE / STM32CubeProgrammer** → 驱动已自动装好，插上就能用。
+
+**② 只买了 ST-Link 没装工具** → 需要装驱动：
+
+- 到 ST 官网下 **STM32CubeProgrammer**（自带驱动）
+- 或者装 **ST-Link USB driver**（独立驱动包）
+
+插上 ST-Link 后，设备管理器里应该出现：
+
+```text
+通用串行总线设备 → STMicroelectronics STLink dongle
+```
+
+（**不是 COM 口**——SWD 不模拟串口。）
+:::
+
+:::warning[ST-Link 不显示 COM 口是正常的]
+很多人以为"没 COM 口 = 驱动没装好"。
+
+**ST-Link 走的是 USB 原生协议，不是串口**，所以在"端口(COM)"里看不到它。
+
+**要找的是"通用串行总线设备"或"USB 设备"里有没有 STLink。**
+:::
+
+### USB-TTL 驱动
+
+和你给 ESP32 装的是同一类（[ESP32 第 4 课](../esp-basics/04-driver)）：
+
+| 芯片 | 驱动 |
+| --- | --- |
+| CH340/CH341 | `CH341SER` |
+| CP2102 | `slabvcp` |
+
+装好后设备管理器会出现 **COM 口**。
+
+## 验证接线是否正确
+
+:::tip[三步验证]
+**① 板子的电源 LED 亮了吗**
+
+亮了 = 有供电（ST-Link 或 USB）。
+
+**② 设备管理器里有 STLink 吗**
+
+有 = 驱动正常。没有 = 驱动问题。
+
+**③ 用 STM32CubeProgrammer 连一下**
+
+打开软件 → 选 `ST-LINK` → 点 **Connect**：
+
+```text
+成功：显示芯片型号、Flash 大小、UID
+失败：报 "No STM32 target found" 或 "Error in initializing ST-LINK"
+```
+:::
+
+:::danger[验证顺序很重要]
+**先只接 ST-Link、不接其他东西**，确认能连上。
+
+连上了再接 USB-TTL、再接面包板上的元件。
+
+**一次只加一样**——出问题才知道是哪一样。
+:::
+
+## 连不上怎么查
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 设备管理器没 STLink | 驱动没装 | 装 STM32CubeProgrammer |
+| 有 STLink 但 `No target found` | **SWDIO/SWCLK 接反** | 对调 |
+| 同上 | 板子没供电 | 看电源 LED |
+| 同上 | 线太长/接触不良 | 短线、换杜邦线 |
+| 同上 | **芯片是假货**（CH32 冒充） | 换板子 |
+| 同上 | 芯片被读保护 | CubeProgrammer 里 `Full chip erase` |
+| 同上 | 芯片里跑着把 SWD 引脚复用了的程序 | 接 NRST，用 "Connect under reset" |
+| 偶尔连上 | 接触不良 / 速度太快 | 降 SWD 速度到 100 kHz |
+
+:::tip[最有效的两招]
+**① 接上 NRST，用 "Connect under reset"**
+
+CubeProgrammer 里有这个选项（`Mode: Under reset`）。
+
+**② 降速**
+
+`Frequency` 从默认降到 **100 kHz** 或 1.8 MHz。
+
+**这两招能解决大部分"连不上"。**
+:::
+
+## 供电方案怎么选
+
+| 方案 | 接线 | 适合 |
+| --- | --- | --- |
+| **只 ST-Link 供电** | ST-Link 3.3V → 板 3V3 | 调试阶段（推荐） |
+| **只 USB 供电** | 板子插 USB | 需要板载 USB 功能时 |
+| 外部电源 | 3.3V 电源 → 3V3 | 外接大电流外设 |
+
+:::warning[调试阶段推荐"只 ST-Link 供电"]
+好处：**一根线搞定供电 + 调试**，接线最少，不容易出错。
+
+**代价**：ST-Link 的 3.3V 输出电流有限（约 100 mA），带不动大电流外设（WiFi 模块、电机）。
+:::
+
+## 本课自检
+
+- [ ] **知道 STM32 不能用 USB 直接烧录，要 SWD**
+- [ ] 知道 SWD 只有 SWDIO/SWCLK 两根信号线
+- [ ] **知道 SWD 能单步调试，比串口打日志强**
+- [ ] 会正确接 SWD 四根线
+- [ ] **知道不要接 5V，不要双重供电**
+- [ ] **知道 USB-TTL 的 TX/RX 必须交叉**
+- [ ] **知道 ST-Link 不显示 COM 口是正常的**
+- [ ] 会用 CubeProgrammer 验证连接
+- [ ] **知道连不上先试"接 NRST + Connect under reset"和降速**
+- [ ] 知道调试阶段推荐只 ST-Link 供电
+
+## 下一步
+
+[05 装工具链](./05-toolchain) —— CubeMX、CubeIDE、Keil 怎么选怎么装。

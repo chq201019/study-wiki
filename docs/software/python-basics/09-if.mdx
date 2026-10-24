@@ -1,0 +1,369 @@
+---
+title: 09 条件判断 if
+sidebar_position: 9
+description: 比较运算符、if/elif/else 的写法、缩进即语法、以及哪些值会被判定为假。
+id: 09-if
+---
+
+# 09 条件判断 if
+
+**本课目标**：会让程序根据条件做不同的事，理解「缩进就是语法」。
+
+## 最基本的 if
+
+```python
+age = 18
+
+if age >= 18:
+    print("已成年")
+```
+
+输出：
+
+```text
+已成年
+```
+
+结构拆解：
+
+```text
+if   条件:          ← 冒号不能少
+    要执行的代码     ← 必须缩进
+```
+
+:::danger[两个必须记住的语法点]
+**① 冒号 `:` 不能少**
+
+```python
+if age >= 18        # SyntaxError
+```
+
+**② 缩进不能少，也不能乱**
+
+```python
+if age >= 18:
+print("已成年")      # IndentationError
+```
+
+Python **用缩进表示代码的从属关系**，而不是像 C 语言那样用大括号。这是 Python 最显著的特点，也是新手最容易踩的坑。
+:::
+
+## 缩进到底怎么算
+
+```python
+if True:
+    print("我在 if 里面")      # 缩进 4 空格 → 属于 if
+    print("我也在")
+
+print("我在 if 外面")          # 不缩进 → 不管条件如何都会执行
+```
+
+输出：
+
+```text
+我在 if 里面
+我也在
+我在 if 外面
+```
+
+:::tip[缩进用几个空格]
+**统一用 4 个空格**，这是 Python 官方规范（PEP 8）。
+
+不要用 Tab，也不要混用 Tab 和空格——混用会报 `TabError`，而且肉眼看不出来（Tab 显示宽度因人而异）。
+
+**好消息**：VS Code 会自动帮你缩进，按回车就行。但复制别人代码时容易出问题，所以「粘贴代码后检查缩进」是个好习惯。
+:::
+
+## if-else：两条路
+
+```python
+score = 55
+
+if score >= 60:
+    print("及格")
+else:
+    print("不及格")
+```
+
+输出：
+
+```text
+不及格
+```
+
+## if-elif-else：多条路
+
+```python
+score = 85
+
+if score >= 90:
+    print("优秀")
+elif score >= 80:
+    print("良好")
+elif score >= 60:
+    print("及格")
+else:
+    print("不及格")
+```
+
+输出：
+
+```text
+良好
+```
+
+:::warning[elif 的顺序很重要]
+`elif` 是**从上往下逐个检查，命中一个就跳出**。
+
+所以顺序必须**从严格到宽松**。如果写成：
+
+```python
+if score >= 60:
+    print("及格")
+elif score >= 90:
+    print("优秀")      # 永远执行不到！
+```
+
+`score = 95` 会先命中 `>= 60`，直接输出「及格」，后面不再检查。
+
+**这是逻辑错误，不会报错，所以特别难发现。**
+:::
+
+## 比较运算符
+
+```python
+print(5 > 3)      # True
+print(5 < 3)      # False
+print(5 >= 5)     # True
+print(5 <= 4)     # False
+print(5 == 5)     # True   注意是两个等号
+print(5 != 3)     # True   不等于
+```
+
+:::danger[`=` 和 `==` 千万别搞混]
+- `=` 是**赋值**：把右边的值给左边
+- `==` 是**比较**：判断两边是否相等
+
+```python
+x = 5         # 赋值
+if x == 5:    # 比较
+    print("等于 5")
+```
+
+**在 if 里写一个等号**：
+
+```python
+if x = 5:     # SyntaxError（Python 3 会直接报错，这是好事）
+```
+
+老版本 Python 或某些语言里这会「静默地把 5 赋给 x 然后永远为真」，是个著名事故来源。Python 3 会报错，算是保护了你。
+:::
+
+## 真值测试：哪些值算「假」
+
+Python 里**不需要写 `== True`**，任何值都能直接放进 if：
+
+```python
+for v in [0, 0.0, "", " ", "0", [], [0], {}, None, False]:
+    print(f"{repr(v):<8} -> {bool(v)}")
+```
+
+输出（本机实测）：
+
+```text
+0        -> False
+0.0      -> False
+''       -> False
+' '      -> True
+'0'      -> True
+[]       -> False
+[0]      -> True
+{}       -> False
+None     -> False
+False    -> False
+```
+
+**规律**：
+
+| 类型 | 什么算 False |
+| --- | --- |
+| 数字 | `0`、`0.0` |
+| 字符串 | 空字符串 `""` |
+| 列表/字典/集合 | 空的 `[]`、`{}`、`set()` |
+| 特殊值 | `None`、`False` |
+
+:::warning[三个反直觉的点]
+1. **`" "`（一个空格）是 True** —— 它不是空的
+2. **`"0"` 是 True** —— 字符串 `"0"` 非空，跟数字 `0` 无关
+3. **`[0]` 是 True** —— 列表里有一个元素，列表本身非空
+
+所以判断「列表是不是空」写 `if not my_list:` 是对的，但判断「输入了内容吗」要小心 `" "` 这种。
+:::
+
+### 实战用法
+
+```python
+name = input("名字：").strip()
+
+if name:                      # 比 if name != "" 更地道
+    print(f"你好，{name}")
+else:
+    print("名字不能为空")
+```
+
+## 逻辑运算符
+
+```python
+age = 25
+has_ticket = True
+
+if age >= 18 and has_ticket:
+    print("可以入场")
+
+if age < 18 or age > 60:
+    print("有优惠")
+
+if not has_ticket:
+    print("请先买票")
+```
+
+| 运算符 | 含义 | 都为真才真 / 一个真就真 |
+| --- | --- | --- |
+| `and` | 并且 | 两边都 True 才 True |
+| `or` | 或者 | 一边 True 就 True |
+| `not` | 取反 | True 变 False |
+
+### 短路求值：一个有用的特性
+
+```python
+def check():
+    print("check 被调用了")
+    return True
+
+if False and check():      # check 不会被调用
+    pass
+
+print("---")
+
+if True or check():        # check 也不会被调用
+    pass
+```
+
+输出：
+
+```text
+---
+```
+
+:::tip[短路求值的实用价值]
+```python
+# 安全访问：先判断非空，再取属性
+if user and user.name:
+    print(user.name)
+```
+
+如果 `user` 是 `None`，`and` 会直接短路，**不会去取 `user.name`**，从而避免 `AttributeError`。
+
+这个写法在真实项目里非常常见。但注意：**别把有副作用的函数放在右边**，否则它可能不被执行。
+:::
+
+## 链式比较
+
+Python 支持数学式的连写：
+
+```python
+score = 85
+
+if 80 <= score < 90:          # 等价于 score >= 80 and score < 90
+    print("良好")
+```
+
+输出：
+
+```text
+良好
+```
+
+## 嵌套判断
+
+```python
+age = 20
+has_id = False
+
+if age >= 18:
+    if has_id:
+        print("可以入场")
+    else:
+        print("请出示身份证")
+else:
+    print("未成年，不能入场")
+```
+
+:::tip[嵌套太深就拆开]
+超过 3 层嵌套就很难读了。两种改进方式：
+
+**① 用 and 合并**
+
+```python
+if age >= 18 and has_id:
+    print("可以入场")
+```
+
+**② 提前返回（在函数里最有效）**
+
+```python
+def check(age, has_id):
+    if age < 18:
+        return "未成年"
+    if not has_id:
+        return "请出示身份证"
+    return "可以入场"
+```
+
+这种「先排除异常情况」的写法叫**卫语句**，能大幅降低嵌套层级。
+:::
+
+## 条件表达式（一行写法）
+
+```python
+score = 75
+result = "及格" if score >= 60 else "不及格"
+print(result)
+```
+
+输出：
+
+```text
+及格
+```
+
+语法：`值1 if 条件 else 值2`
+
+**只在简单场景用**。如果有多个分支或逻辑复杂，老老实实写 if-else 更清晰。
+
+## 常见错误
+
+| 错误 | 报错 | 原因 |
+| --- | --- | --- |
+| `if age >= 18` 少冒号 | SyntaxError | 忘了 `:` |
+| `if` 下没缩进 | IndentationError | 必须缩进 |
+| Tab 和空格混用 | TabError | 统一用 4 空格 |
+| `if x = 5:` | SyntaxError | 应是 `==` |
+| elif 顺序从宽到严 | 逻辑错但不报错 | 从严格开始写 |
+| `if name == True` | 不报错但冗余 | 直接 `if name:` |
+
+## 本课自检
+
+- [ ] 会写 if / if-else / if-elif-else
+- [ ] 知道冒号不能少、必须缩进
+- [ ] 知道缩进统一用 4 空格
+- [ ] 知道 elif 要从严格到宽松排列
+- [ ] 分清 `=` 和 `==`
+- [ ] 记得住哪些值算 False（尤其 `" "` 和 `"0"` 是 True）
+- [ ] 会用 and / or / not
+- [ ] 知道短路求值，会用 `if user and user.name`
+- [ ] 会用一行条件表达式
+
+## 下一步
+
+[10 循环 for 与 while](./10-loops) —— 让程序重复做事，这是自动化能力的核心。

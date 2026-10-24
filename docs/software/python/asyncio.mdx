@@ -1,0 +1,299 @@
+---
+id: asyncio
+title: 异步编程（asyncio）
+sidebar_position: 15
+description: 协程函数不 await 就不执行（实测）、并发与串行耗时对比、一个阻塞调用让并发耗时翻倍（实测 0.402s vs 0.202s）、to_thread 的用法与适用边界。
+---
+
+# 异步编程（asyncio）
+
+**本课目标**：会写并发 IO 代码，知道什么情况下异步帮不上忙。
+
+## 调用协程函数不等于执行它
+
+:::danger[`f()` 只是创建了一个协程对象]
+```python
+async def f():
+    print("body ran")
+
+c = f()          # 什么都没打印
+```
+
+**本机实测（Python 3.11.9）**：
+
+```text
+1 调 f() 返回: coroutine —— body 执行了吗: 没有
+```
+
+**必须 `await c` 或 `asyncio.run(c)` 才会真正执行。**
+
+**忘了 await 的后果**：
+
+```text
+sys:1: RuntimeWarning: coroutine 'f' was never awaited
+```
+
+**实测：未 await 时产生了 1 条 RuntimeWarning。**
+
+**这个警告默认只在 GC 时打印，很容易被日志淹没** —— 表现为"函数逻辑没跑，但也没报错"。
+:::
+
+:::warning[在 `async def` 里调普通函数会阻塞整个事件循环]
+```python
+async def handler():
+    requests.get(url)          # ❌ 阻塞！整个循环停住
+    time.sleep(1)              # ❌ 同样阻塞
+    open("big.bin").read()     # ❌ 磁盘 IO 也是阻塞的
+```
+
+**异步只对"await 出去"的操作有并发效果。普通同步调用会把整个事件循环卡住。**
+:::
+
+## 并发 vs 串行：实测对比
+
+![asyncio 事件循环：单线程在就绪队列与等待队列之间轮转，协作式地推进多个协程](/img/diagrams/python-asyncio-loop.svg)
+
+
+:::tip[本机实测（Python 3.11.9）]
+```python
+async def work(n, d):
+    await asyncio.sleep(d)
+    return n
+
+# 串行
+await work(1, 0.2)
+await work(2, 0.2)          # 总耗时 0.403s
+
+# 并发
+await asyncio.gather(work(1, 0.2), work(2, 0.2))    # 总耗时 0.202s
+```
+
+**两个 0.2 秒的操作：串行 0.403s，并发 0.202s。**
+
+**这就是 asyncio 的全部价值 —— 在"等"的时候去干别的。**
+:::
+
+## 头号坑：一个阻塞调用毁掉全部并发
+
+:::danger[本机实测：混入一个 `time.sleep` 让耗时翻倍]
+```python
+async def async_sleep(d):
+    await asyncio.sleep(d)
+
+async def block_sleep(d):
+    time.sleep(d)                # ← 阻塞整个事件循环
+```
+
+实测结果：
+
+| 场景 | 耗时 | 说明 |
+| --- | --- | --- |
+| A：两个 `asyncio.sleep(0.2)` | **0.202s** | ✅ 真并发 |
+| B：`time.sleep(0.2)` + `asyncio.sleep(0.2)` | **0.402s** | ❌ **退化成串行** |
+| C：`asyncio.to_thread(time.sleep, 0.2)` + `asyncio.sleep(0.2)` | **0.215s** | ✅ 修好了 |
+
+**只要有一个协程阻塞，整个事件循环就停下来等它 —— 其他协程全部无法推进。**
+:::
+
+:::tip[三种修复方式]
+```python
+# ① 换成异步库（最好）
+import aiohttp
+async with aiohttp.ClientSession() as s:
+    async with s.get(url) as r: ...
+
+# ② 用 to_thread 把阻塞调用丢到线程池
+result = await asyncio.to_thread(blocking_func, arg)
+
+# ③ 用 loop.run_in_executor（更早的写法）
+loop = asyncio.get_running_loop()
+result = await loop.run_in_executor(None, blocking_func, arg)
+```
+
+**`asyncio.to_thread` 是 Python 3.9+ 的语法糖，底层就是 `run_in_executor`。**
+:::
+
+:::warning[`to_thread` 有线程池上限，不是无限的]
+默认线程池大小是 `min(32, os.cpu_count() + 4)`。
+
+**如果同时有几百个阻塞调用要靠 `to_thread` 救，会排队等待** —— 这时候应该换成真正的异步库，或者用多进程。
+:::
+
+## 常用 API
+
+| API | 作用 |
+| --- | --- |
+| `asyncio.run(main())` | 程序入口，创建事件循环（**不能在已有事件循环里再调**） |
+| `asyncio.gather(*aws)` | 并发跑多个，**等全部完成** |
+| `asyncio.gather(..., return_exceptions=True)` | 同上，但异常作为返回值而非抛出 |
+| `asyncio.wait_for(aw, timeout)` | 超时取消 |
+| `asyncio.as_completed(aws)` | 谁先完成先处理谁 |
+| `asyncio.TaskGroup()`（3.11+） | 结构化并发，异常自动向上传播 |
+| `asyncio.create_task(coro)` | 后台启动（**要保存引用，否则可能被 GC**） |
+| `asyncio.Queue()` | 协程间的同步队列 |
+
+### `gather` 与 `TaskGroup` 的区别
+
+:::danger[`gather` 默认"一个失败就整个失败"，但不取消其他任务]
+```python
+results = await asyncio.gather(a(), b(), c())
+# 如果 b() 抛异常，gather 立刻抛，但 a() 和 c() 还在跑
+```
+
+**这些"孤儿任务"可能一直跑下去、继续占资源。**
+
+```python
+# 要么收集异常
+results = await asyncio.gather(a(), b(), c(), return_exceptions=True)
+# results 里会是 [值, 异常对象, 值]
+```
+:::
+
+```python
+# 要么用 TaskGroup（3.11+）：一个失败自动取消其余
+async with asyncio.TaskGroup() as tg:
+    t1 = tg.create_task(a())
+    t2 = tg.create_task(b())
+# 退出 with 时全部完成；任一出错则其余被取消，异常以 ExceptionGroup 抛出
+```
+
+:::tip[新代码优先用 `TaskGroup`]
+**它保证"结构化并发"**：所有子任务的生命周期不会超出 `async with` 块。
+
+**这消除了"函数返回了但后台任务还在跑"这类最难查的 bug。**
+:::
+
+## `create_task` 的引用陷阱
+
+:::danger[不保存引用，任务可能被 GC 掉]
+```python
+async def main():
+    asyncio.create_task(background())    # ❌ 没有引用
+    await asyncio.sleep(10)
+```
+
+**事件循环只持有任务的弱引用。如果任务没有其他强引用，它可能在执行中途被垃圾回收** —— 表现是"任务莫名其妙不跑了"。
+
+**Python 文档明确警告了这一点。**
+:::
+
+```python
+# ✅ 保存引用
+_tasks = set()
+
+def spawn(coro):
+    t = asyncio.create_task(coro)
+    _tasks.add(t)
+    t.add_done_callback(_tasks.discard)     # 完成后移除
+```
+
+## 什么时候该用 asyncio
+
+:::tip[适合的]
+- **大量并发 IO**：HTTP 请求、数据库查询、socket 连接
+- **需要单线程管理成千上万连接**（协程比线程轻得多）
+- 已有异步生态（`aiohttp`、`asyncpg`、`httpx`）
+
+**协程的切换成本远低于线程**（不需要内核参与），所以"一万个连接"用协程很自然，用线程会爆。
+:::
+
+:::danger[不适合的]
+| 场景 | 为什么不行 | 该用什么 |
+| --- | --- | --- |
+| **CPU 密集** | GIL 仍然存在，协程不能并行算 | 多进程 |
+| **要用只支持同步的老库** | 会阻塞事件循环 | 线程池 / `to_thread` |
+| **逻辑简单的一次性脚本** | 引入的复杂度超过收益 | 直接同步写 |
+:::
+
+:::warning[不要为了"异步"而异步]
+```python
+# 这个"异步"版本没有任何好处
+async def add(a, b):
+    return a + b
+```
+
+**没有 await 的 `async def` 只是多了协程包装开销** —— 它既不会更快，还让调用方必须 `await`。
+:::
+
+## 一个完整的并发请求例子
+
+```python
+import asyncio
+import aiohttp
+
+async def fetch(session, url):
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        r.raise_for_status()
+        return await r.text()
+
+async def main(urls):
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch(session, u) for u in urls]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for url, res in zip(urls, results):
+        if isinstance(res, Exception):
+            print(f"{url} 失败: {res}")
+        else:
+            print(f"{url} -> {len(res)} 字节")
+
+asyncio.run(main([...]))
+```
+
+:::tip[并发数要限制]
+上面这样会**一次性发起所有请求**。URLs 有 1000 个就会把连接数和内存打满。
+
+```python
+sem = asyncio.Semaphore(20)          # 最多 20 个并发
+
+async def fetch_limited(session, url):
+    async with sem:
+        return await fetch(session, url)
+```
+
+**这是生产代码必须做的。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 函数逻辑没跑也没报错 | 忘了 `await` | 检查 `RuntimeWarning` |
+| 并发没有效果 | 混入了阻塞调用 | 换异步库或 `to_thread` |
+| 后台任务莫名停了 | `create_task` 没保存引用 | 存到集合里 |
+| `asyncio.run` 报错 | 在已有循环里又调了一次 | 用 `await` 或 `nest_asyncio` |
+| 异常被吞 | `gather` 中某个任务失败 | `return_exceptions=True` 或 `TaskGroup` |
+| 内存暴涨 | 一次性创建太多任务 | `Semaphore` 限流 |
+| 取消不生效 | 协程里有阻塞调用或吞了 `CancelledError` | 不要 `except Exception` 拦取消 |
+
+:::danger[不要吞掉 `CancelledError`]
+```python
+try:
+    await something()
+except Exception:          # ❌ CancelledError 在 3.8+ 继承自 BaseException
+    pass
+```
+
+**Python 3.8 起 `CancelledError` 继承自 `BaseException`，所以 `except Exception` 抓不到它** —— 这是好事。
+
+**但如果你写 `except BaseException` 就会拦下取消信号**，导致 `wait_for` 超时后任务停不下来。
+:::
+
+## 本课自检
+
+- [ ] **知道 `async def` 函数调用了也不执行，要 `await`**
+- [ ] **知道未 await 会产生 `RuntimeWarning`（实测 1 条）**
+- [ ] **实测记住：两个 0.2s 操作串行 0.403s、并发 0.202s**
+- [ ] **实测记住：混入一个 `time.sleep` 让 0.202s 变 0.402s**
+- [ ] 会用三种修复方式（异步库 / `to_thread` / `run_in_executor`）
+- [ ] 知道 `to_thread` 有线程池上限
+- [ ] 会区分 `gather` 与 `TaskGroup`
+- [ ] **知道 `create_task` 不保存引用可能被 GC**
+- [ ] 知道 asyncio 适合 IO 密集、不适合 CPU 密集
+- [ ] **知道没有 await 的 `async def` 没有收益**
+- [ ] 知道生产代码要用 `Semaphore` 限流
+- [ ] **知道 `CancelledError` 继承自 `BaseException`，不要拦它**
+
+## 下一步
+
+[并发模型：线程、进程与异步怎么选](./concurrency) 讲了三种模型的对比。

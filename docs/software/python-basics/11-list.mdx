@@ -1,0 +1,395 @@
+---
+title: 11 列表 list
+sidebar_position: 11
+description: 列表的创建、增删改查、排序、以及赋值与拷贝的区别这个最容易踩的坑。
+id: 11-list
+---
+
+# 11 列表 list
+
+**本课目标**：熟练使用列表存放一组数据，并彻底搞懂「赋值 vs 拷贝」。
+
+## 列表是什么
+
+**列表 = 有序的一串值**，可以存放任何东西，长度可变。
+
+```python
+fruits = ["苹果", "香蕉", "橘子"]
+numbers = [1, 2, 3, 4, 5]
+mixed = ["文字", 42, 3.14, True]      # 可以混放不同类型
+empty = []
+```
+
+## 索引与切片
+
+规则和字符串完全一样：
+
+```python
+fruits = ["苹果", "香蕉", "橘子", "西瓜"]
+
+print(fruits[0])       # 苹果
+print(fruits[-1])      # 西瓜
+print(fruits[1:3])     # ['香蕉', '橘子']
+print(fruits[::-1])    # ['西瓜', '橘子', '香蕉', '苹果']
+print(len(fruits))     # 4
+```
+
+:::tip[列表和字符串的切片规则一模一样]
+既然一样，**学一次就够了**：含头不含尾、负数倒数、`[::-1]` 反转。
+
+区别在于：列表**可以修改**，字符串不行。
+:::
+
+## 修改元素
+
+```python
+fruits = ["苹果", "香蕉", "橘子"]
+fruits[1] = "葡萄"
+print(fruits)
+```
+
+输出：
+
+```text
+['苹果', '葡萄', '橘子']
+```
+
+## 增加元素
+
+```python
+fruits = ["苹果"]
+
+fruits.append("香蕉")            # 末尾加一个
+print(fruits)
+
+fruits.insert(1, "橘子")         # 在指定位置插入
+print(fruits)
+
+fruits.extend(["西瓜", "葡萄"])   # 末尾加多个
+print(fruits)
+```
+
+输出：
+
+```text
+['苹果', '香蕉']
+['苹果', '橘子', '香蕉']
+['苹果', '橘子', '香蕉', '西瓜', '葡萄']
+```
+
+:::warning[append 和 extend 的区别，非常容易搞错]
+```python
+a = [1, 2]
+a.append([3, 4])
+print(a)          # [1, 2, [3, 4]]  ← 整个列表变成一个元素
+
+b = [1, 2]
+b.extend([3, 4])
+print(b)          # [1, 2, 3, 4]    ← 拆开加进去
+```
+
+- `append(x)`：把 **x 当作一个元素**加进去
+- `extend(seq)`：把 **seq 里的元素逐个**加进去
+
+只想加一个元素用 append，想合并两个列表用 extend（或 `+`）。
+:::
+
+## 删除元素
+
+```python
+nums = [10, 20, 30, 40, 50]
+
+nums.remove(30)        # 按值删除（删第一个匹配的）
+print(nums)
+
+last = nums.pop()      # 删除并返回最后一个
+print(last, nums)
+
+first = nums.pop(0)    # 删除并返回指定位置
+print(first, nums)
+
+del nums[0]            # 按下标删除
+print(nums)
+
+nums.clear()           # 清空
+print(nums)
+```
+
+输出：
+
+```text
+[10, 20, 40, 50]
+50 [10, 20, 40]
+10 [20, 40]
+[40]
+[]
+```
+
+| 方法 | 作用 | 找不到时 |
+| --- | --- | --- |
+| `remove(x)` | 按值删第一个匹配 | **报 ValueError** |
+| `pop()` | 删末尾并返回 | 列表空时报 IndexError |
+| `pop(i)` | 删下标 i 并返回 | 下标越界报 IndexError |
+| `del lst[i]` | 按下标删 | 同上 |
+| `clear()` | 清空 | —— |
+
+:::danger[remove 找不到会报错，不是静默失败]
+```python
+nums = [1, 2, 3]
+nums.remove(99)      # ValueError: list.remove(x): x not in list
+```
+
+删之前先判断：`if 99 in nums: nums.remove(99)`。
+:::
+
+## 查找与判断
+
+```python
+fruits = ["苹果", "香蕉", "橘子"]
+
+print("香蕉" in fruits)          # True
+print("西瓜" in fruits)          # False
+print(fruits.index("橘子"))      # 2  返回下标
+print(fruits.count("苹果"))      # 1
+```
+
+:::warning[index 找不到也会报错]
+`fruits.index("西瓜")` 会抛 `ValueError`。
+
+要安全查找，用 `in` 先判断，或者用 try/except。这也解释了为什么**判断存在性优先用 `in`**。
+:::
+
+## 排序
+
+```python
+nums = [3, 1, 4, 1, 5]
+
+print(sorted(nums))      # [1, 1, 3, 4, 5]  返回新列表
+print(nums)              # [3, 1, 4, 1, 5]  原列表没变
+
+nums.sort()              # 就地排序
+print(nums)              # [1, 1, 3, 4, 5]
+```
+
+:::warning[sorted() 和 .sort() 的区别]
+| | 返回 | 原列表 |
+| --- | --- | --- |
+| `sorted(lst)` | 新列表 | **不变** |
+| `lst.sort()` | `None` | **被修改** |
+
+最常见的错误：
+
+```python
+nums = [3, 1, 2]
+result = nums.sort()      # result 是 None！
+print(result)             # None
+print(nums)               # [1, 2, 3] 原列表被改了
+```
+
+**记住：`sort()` 返回 None，不要拿它赋值。**
+:::
+
+### 自定义排序规则
+
+```python
+words = ["banana", "Apple", "cherry"]
+
+print(sorted(words))                      # 大写字母排前面
+print(sorted(words, key=str.lower))       # 忽略大小写
+print(sorted(words, key=len))             # 按长度
+print(sorted(words, key=len, reverse=True))  # 按长度倒序
+```
+
+输出：
+
+```text
+['Apple', 'banana', 'cherry']
+['Apple', 'banana', 'cherry']
+['Apple', 'banana', 'cherry']
+['banana', 'cherry', 'Apple']
+```
+
+:::tip[key 参数是排序的核心用法]
+`key` 接收一个函数，Python 会用**每个元素调用它，按返回值排序**。
+
+```python
+students = [
+    {"name": "小明", "score": 85},
+    {"name": "小红", "score": 92},
+    {"name": "小刚", "score": 78},
+]
+
+by_score = sorted(students, key=lambda s: s["score"], reverse=True)
+for s in by_score:
+    print(f"{s['name']}: {s['score']}")
+```
+
+输出：
+
+```text
+小红: 92
+小明: 85
+小刚: 78
+```
+
+`lambda` 是匿名函数，[第 15 课](./15-functions)会讲。现在照抄即可。
+:::
+
+## 反转
+
+```python
+nums = [1, 2, 3, 4]
+
+print(nums[::-1])      # [4, 3, 2, 1]  返回新列表
+print(nums)            # [1, 2, 3, 4]  不变
+
+nums.reverse()         # 就地反转
+print(nums)            # [4, 3, 2, 1]
+```
+
+## 最重要的坑：赋值不等于拷贝
+
+:::danger[这一节是整个 Python 最经典的陷阱]
+```python
+a = [1, 2, 3]
+b = a              # b 和 a 指向同一个列表
+b.append(4)
+print(a)           # [1, 2, 3, 4]  ← a 也变了！
+```
+
+**原因**：`b = a` 只是让 `b` 这个标签也贴在同一个列表上（还记得[第 5 课](./05-variables)说的「变量是标签」吗）。
+
+**想得到独立的副本，必须显式拷贝**：
+
+```python
+a = [1, 2, 3]
+b = a.copy()       # 或者 b = a[:]  或 b = list(a)
+b.append(4)
+print(a)           # [1, 2, 3]      a 没变
+print(b)           # [1, 2, 3, 4]
+```
+:::
+
+### 三种拷贝写法
+
+```python
+a = [1, 2, 3]
+b = a.copy()
+c = a[:]
+d = list(a)
+
+b.append(4); c.append(5); d.append(6)
+print(a)      # [1, 2, 3]
+print(b)      # [1, 2, 3, 4]
+```
+
+三种都可以，`a.copy()` 最清晰。
+
+### 但这些都是「浅拷贝」
+
+```python
+nested = [[1, 2], [3, 4]]
+shallow = nested.copy()
+
+shallow[0].append(99)      # 修改内层列表
+print(nested)              # [[1, 2, 99], [3, 4]]  ← 原列表也被改了！
+```
+
+:::warning[浅拷贝只复制了「外层」]
+`copy()` 复制了外层列表，但内层的子列表**还是同一批对象**。
+
+要彻底独立，用 `copy.deepcopy()`：
+
+```python
+import copy
+
+nested = [[1, 2], [3, 4]]
+deep = copy.deepcopy(nested)
+deep[0].append(99)
+print(nested)      # [[1, 2], [3, 4]]  原列表安全
+```
+
+**记忆**：只有一层用 `copy()`，有嵌套用 `deepcopy()`。
+:::
+
+### 函数传参也会遇到这个问题
+
+```python
+def add_item(lst):
+    lst.append("新元素")      # 直接在原列表上改
+
+my_list = ["原有"]
+add_item(my_list)
+print(my_list)                # ['原有', '新元素']
+```
+
+**列表作为参数传进函数，传的是引用**，函数里的修改会影响外面。
+
+不想影响外面就传副本：`add_item(my_list.copy())`。
+
+## 嵌套列表
+
+```python
+matrix = [
+    [1, 2, 3],
+    [4, 5, 6],
+    [7, 8, 9],
+]
+
+print(matrix[0][1])      # 2
+print(matrix[2])         # [7, 8, 9]
+
+# 遍历二维
+for row in matrix:
+    for val in row:
+        print(val, end=" ")
+    print()
+```
+
+输出：
+
+```text
+1 2 3
+4 5 6
+7 8 9
+```
+
+## 常用操作速查
+
+```python
+nums = [5, 2, 8, 1]
+
+print(sum(nums))       # 16
+print(max(nums))       # 8
+print(min(nums))       # 1
+print(len(nums))       # 4
+print(sum(nums) / len(nums))   # 4.0  平均值（没有内置的 avg）
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `b = a` 后改 b | a 也变了 | 只是别名 | `b = a.copy()` |
+| `nested.copy()` 后改内层 | 原列表变了 | 浅拷贝 | `deepcopy()` |
+| `result = lst.sort()` | result 是 None | sort 就地排序 | 用 `sorted(lst)` |
+| `lst.remove(x)` 不存在 | ValueError | remove 不静默 | 先 `if x in lst` |
+| 循环里 `remove` | 漏删元素 | 下标错位 | 遍历副本或用推导式 |
+| `a.append([3,4])` | 变成嵌套 | append 整体加入 | 用 `extend` |
+| `a[10]` | IndexError | 越界 | 先检查 len |
+
+## 本课自检
+
+- [ ] 会创建列表、用索引和切片
+- [ ] 分清 `append` 和 `extend`
+- [ ] 会用 `remove` / `pop` / `del` 删元素
+- [ ] 知道 `index` 和 `remove` 找不到会报错
+- [ ] 分清 `sorted()` 和 `.sort()`
+- [ ] 会用 `key` 参数做自定义排序
+- [ ] **彻底理解 `b = a` 不是拷贝**
+- [ ] 知道 `copy()` 是浅拷贝，嵌套要用 `deepcopy()`
+- [ ] 知道列表传进函数会影响外面
+
+## 下一步
+
+[12 字典 dict](./12-dict) —— 存「名字 → 值」对应关系的最佳工具，比列表更适合查表。

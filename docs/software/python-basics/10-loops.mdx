@@ -1,0 +1,455 @@
+---
+title: 10 循环 for 与 while
+sidebar_position: 10
+description: range 的用法、for 遍历、while 条件循环、break 与 continue、以及 for-else 这个容易被忽略的写法。
+id: 10-loops
+---
+
+# 10 循环 for 与 while
+
+**本课目标**：掌握两种循环，会用 break/continue 控制流程，能写出不死的循环。
+
+## 为什么需要循环
+
+要打印 1 到 100，不循环要写 100 行 `print`。循环让你写 2 行搞定：
+
+```python
+for i in range(1, 101):
+    print(i)
+```
+
+**循环 = 让电脑重复做事**，这是编程最核心的能力之一。
+
+## range：生成一串数字
+
+```python
+print(list(range(5)))
+print(list(range(1, 6)))
+print(list(range(0, 10, 2)))
+print(list(range(5, 0, -1)))
+```
+
+输出：
+
+```text
+[0, 1, 2, 3, 4]
+[1, 2, 3, 4, 5]
+[0, 2, 4, 6, 8]
+[5, 4, 3, 2, 1]
+```
+
+| 写法 | 含义 |
+| --- | --- |
+| `range(n)` | `0` 到 `n-1` |
+| `range(a, b)` | `a` 到 `b-1` |
+| `range(a, b, step)` | `a` 到 `b-1`，每次跨 `step` |
+| `range(a, b, -1)` | 倒着来 |
+
+:::warning[range 也是「含头不含尾」]
+`range(1, 5)` 给的是 `1,2,3,4`，**不包括 5**。
+
+这和[切片](./07-strings)的规则一致。想包含 5 就写 `range(1, 6)`。
+
+**记忆方法**：`range(a, b)` 的个数是 `b - a`。`range(1,6)` 有 5 个数。
+:::
+
+:::info[`list()` 是为了看结果]
+`range(5)` 本身不是一个列表，而是一个「按需生成」的对象，直接 `print` 会显示 `range(0, 5)`。
+
+套上 `list()` 才能看到完整内容。**循环里直接用 `range()` 就行，不用套 `list()`。**
+:::
+
+## for 循环：遍历一个一个来
+
+### 遍历数字
+
+```python
+for i in range(3):
+    print(f"第 {i} 次")
+```
+
+输出：
+
+```text
+第 0 次
+第 1 次
+第 2 次
+```
+
+### 遍历字符串
+
+```python
+for ch in "Python":
+    print(ch)
+```
+
+输出：
+
+```text
+P
+y
+t
+h
+o
+n
+```
+
+### 遍历列表
+
+```python
+fruits = ["苹果", "香蕉", "橘子"]
+
+for fruit in fruits:
+    print(f"我喜欢吃{fruit}")
+```
+
+输出：
+
+```text
+我喜欢吃苹果
+我喜欢吃香蕉
+我喜欢吃橘子
+```
+
+### 同时要下标和值：enumerate
+
+```python
+fruits = ["苹果", "香蕉", "橘子"]
+
+for i, fruit in enumerate(fruits, start=1):
+    print(f"{i}. {fruit}")
+```
+
+输出：
+
+```text
+1. 苹果
+2. 香蕉
+3. 橘子
+```
+
+:::tip[别用 range(len(...)) 这种笨写法]
+```python
+# 不推荐（虽然能用）
+for i in range(len(fruits)):
+    print(fruits[i])
+
+# 推荐
+for fruit in fruits:
+    print(fruit)
+
+# 需要下标时
+for i, fruit in enumerate(fruits):
+    print(i, fruit)
+```
+
+Python 的原则是「**直接遍历元素**」，只有在真需要下标时才用 `enumerate`。
+:::
+
+## while 循环：条件成立就一直做
+
+```python
+count = 0
+while count < 3:
+    print(f"count = {count}")
+    count += 1
+```
+
+输出：
+
+```text
+count = 0
+count = 1
+count = 2
+```
+
+:::danger[while 最容易写出死循环]
+```python
+count = 0
+while count < 3:
+    print(count)
+    # 忘了 count += 1  → 永久循环！
+```
+
+**检查清单**：写 while 时，一定问自己「**什么条件下会退出**」。
+
+真卡住了按 `Ctrl + C` 中断。
+:::
+
+### for 还是 while？
+
+| 场景 | 用哪个 |
+| --- | --- |
+| 遍历一个已知的集合 | **for** |
+| 知道要循环几次 | **for + range** |
+| 不知道几次，按条件停 | **while** |
+| 等用户输入直到正确 | **while** |
+
+```python
+# while 的典型场景：一直问到输入正确为止
+while True:
+    raw = input("请输入一个正整数：")
+    if raw.isdigit() and int(raw) > 0:
+        print(f"你输入了 {raw}")
+        break
+    print("输入无效，请重试")
+```
+
+## break：立刻跳出整个循环
+
+```python
+for i in range(10):
+    if i == 3:
+        break
+    print(i)
+print("循环结束")
+```
+
+输出：
+
+```text
+0
+1
+2
+循环结束
+```
+
+`break` 一旦执行，**整个循环立刻结束**。
+
+## continue：跳过本次，继续下一个
+
+```python
+for i in range(6):
+    if i % 2 == 0:
+        continue          # 偶数跳过
+    print(i)
+```
+
+输出：
+
+```text
+1
+3
+5
+```
+
+`continue` 只是跳过**这一次**剩下的代码，循环会继续。
+
+:::warning[break 和 continue 别搞混]
+- `break` = **不干了，整个循环结束**
+- `continue` = **这一轮跳过，下一轮继续**
+
+**记忆**：break 是「打破」，continue 是「继续」。
+:::
+
+## for-else：容易被忽略但有用的写法
+
+```python
+for i in range(3):
+    if i == 5:
+        break
+else:
+    print("没有触发 break，else 执行了")
+
+print("---")
+
+for i in range(3):
+    if i == 1:
+        break
+else:
+    print("这行不会打印")
+```
+
+输出：
+
+```text
+没有触发 break，else 执行了
+---
+```
+
+:::tip[else 在这里是什么意思]
+`for ... else` 的 `else` 是「**循环正常走完了（没被 break 打断）**」时才执行。
+
+典型用途：**判断「找了没找到」**
+
+```python
+names = ["小明", "小红"]
+target = "小刚"
+
+for n in names:
+    if n == target:
+        print(f"找到了 {target}")
+        break
+else:
+    print(f"列表里没有 {target}")
+```
+
+这比用标记变量更清晰。不过很多人不知道这个语法，团队协作时要考虑可读性。
+:::
+
+## while-else 同理
+
+```python
+n = 0
+while n < 3:
+    n += 1
+else:
+    print(f"正常结束，n = {n}")
+```
+
+输出：
+
+```text
+正常结束，n = 3
+```
+
+## 嵌套循环
+
+```python
+for i in range(1, 3):
+    for j in range(1, 4):
+        print(f"{i}×{j}={i*j}", end="  ")
+    print()      # 内层结束后换行
+```
+
+输出：
+
+```text
+1×1=1  1×2=2  1×3=3
+2×1=2  2×2=4  2×3=6
+```
+
+**外层循环一次，内层跑完一整圈。**
+
+### 嵌套循环里的 break
+
+```python
+for i in range(3):
+    for j in range(3):
+        if j == 1:
+            break        # 只跳出内层循环
+    print(f"i={i} 结束")
+```
+
+输出：
+
+```text
+i=0 结束
+i=1 结束
+i=2 结束
+```
+
+:::warning[break 只跳出「最内层」]
+要一次跳出两层，需要用标记变量或函数：
+
+```python
+found = False
+for i in range(3):
+    for j in range(3):
+        if i * j == 2:
+            found = True
+            break
+    if found:
+        break
+```
+
+或者在函数里直接 `return`（更干净）。
+:::
+
+## 实战：几个典型循环
+
+### 累加求和
+
+```python
+total = 0
+for i in range(1, 101):
+    total += i
+print(f"1 到 100 的和是 {total}")
+```
+
+输出：
+
+```text
+1 到 100 的和是 5050
+```
+
+### 求最大值
+
+```python
+numbers = [34, 78, 12, 99, 56]
+max_val = numbers[0]
+
+for n in numbers:
+    if n > max_val:
+        max_val = n
+
+print(f"最大值是 {max_val}")
+```
+
+输出：
+
+```text
+最大值是 99
+```
+
+（实际项目里直接用内置的 `max(numbers)` 就行，这里是练手。）
+
+### 九九乘法表
+
+```python
+for i in range(1, 10):
+    for j in range(1, i + 1):
+        print(f"{j}×{i}={i*j}", end="\t")
+    print()
+```
+
+输出（前几行）：
+
+```text
+1×1=1
+1×2=2	2×2=4
+1×3=3	2×3=6	3×3=9
+...
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| while 忘了改条件变量 | 死循环 | 条件永远为真 | 检查循环体内有没有修改条件变量 |
+| `range(1, 5)` 期望含 5 | 少了最后一个 | 含头不含尾 | 写 `range(1, 6)` |
+| 嵌套里 break 想跳两层 | 只跳了一层 | break 只跳最内层 | 用标记变量或 return |
+| 循环里修改正在遍历的列表 | 结果错乱 | 遍历中改变长度 | 遍历副本 `for x in list(a)` |
+| `for i in 5:` | TypeError | 5 不能直接遍历 | `range(5)` |
+| 缩进错了，代码跑在循环外 | 结果只执行一次 | 缩进级别错 | 检查缩进 |
+
+:::danger[不要在遍历列表时增删元素]
+```python
+nums = [1, 2, 3, 4]
+for n in nums:
+    if n % 2 == 0:
+        nums.remove(n)      # 危险！
+print(nums)                 # 结果是 [1, 3]，但不是每次都正确
+```
+
+遍历时删除元素会导致**跳过元素**，因为列表长度变了、下标错位。
+
+**正确做法**：遍历副本，或者用列表推导式生成新列表（[第 23 课](./23-comprehension)）。
+:::
+
+## 本课自检
+
+- [ ] 会用 `range` 的三种形式
+- [ ] 知道 `range(1, 5)` 不含 5
+- [ ] 会 for 遍历字符串、列表
+- [ ] 会用 `enumerate` 同时取下标和值
+- [ ] 会写 while，并知道如何避免死循环
+- [ ] 分清 `break` 和 `continue`
+- [ ] 知道 `for-else` 的含义
+- [ ] 知道嵌套循环里 break 只跳最内层
+- [ ] 能独立写出九九乘法表
+- [ ] 知道不能在遍历列表时增删元素
+
+## 下一步
+
+[11 列表 list](./11-list) —— 这是 Python 最常用的数据结构，必须练熟。

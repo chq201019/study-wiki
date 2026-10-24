@@ -1,0 +1,310 @@
+---
+id: 31-lowpower
+title: 31 低功耗与深度睡眠
+sidebar_position: 31
+description: ESP32 五种功耗模式的实际电流量级、深度睡眠下 RTC 内存能存什么、为什么 WiFi 保持连接极其耗电、以及一块电池能用多久的算法。
+---
+
+# 31 低功耗与深度睡眠
+
+**本课目标**：知道该选哪种睡眠模式，能算出电池续航。
+
+## 五种功耗模式
+
+![ESP32 一次唤醒周期的电流曲线：唤醒峰值 40mA、工作几百 ms、深度睡眠 10~150µA](/img/diagrams/esp32-sleep-current.svg)
+
+
+| 模式 | 电流量级 | 唤醒方式 | 内存保持 |
+| --- | --- | --- | --- |
+| **Active** | 100~240 mA（WiFi 发射时峰值） | — | 全部 |
+| **Modem-sleep** | 15~30 mA | 自动 | 全部 |
+| **Light-sleep** | 0.8~2 mA | 任意中断 | 全部 |
+| **Deep-sleep** | **10~150 µA** | RTC 定时器、EXT0/EXT1、触摸 | **仅 RTC 内存** |
+| **Hibernation** | **约 5 µA** | RTC 定时器、EXT1 | 几乎全丢 |
+
+:::danger[这些是典型值，实际差距可能几倍]
+**影响因素**：
+
+- **开发板上的 USB 转串口芯片**（CH340 约 300µA，CP2102 约 100µA）
+- **LDO 静态电流**
+- **电源指示灯 LED**（一颗 3.3V/1kΩ 的 LED 就是 3.3mA！）
+- 温度（漏电随温度上升）
+
+**量电流前先把开发板上的 LED 和串口芯片处理掉**，否则你测的是整块板而不是芯片。
+:::
+
+:::warning[WiFi 是功耗黑洞]
+**保持 WiFi 连接（即使不发数据）就要周期性收发信标**，平均 15~30mA。
+
+**所以"低功耗 + 需要联网"是个矛盾**：
+
+- 要么**定期醒来连一下再睡**（连接时间通常 2~5 秒）
+- 要么用 LoRa / NB-IoT 这类专门的低功耗协议
+:::
+
+## 深度睡眠
+
+```c
+#include "esp_sleep.h"
+
+#define SLEEP_SEC 60
+
+void app_main(void)
+{
+    /* 判断唤醒原因 */
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    switch (cause) {
+    case ESP_SLEEP_WAKEUP_TIMER:
+        ESP_LOGI(TAG, "定时器唤醒");
+        break;
+    case ESP_SLEEP_WAKEUP_EXT0:
+        ESP_LOGI(TAG, "GPIO 唤醒");
+        break;
+    case ESP_SLEEP_WAKEUP_UNDEFINED:
+        ESP_LOGI(TAG, "上电/复位启动");
+        break;
+    default:
+        break;
+    }
+
+    /* 做活：读传感器、发数据 */
+    do_work();
+
+    /* 睡下去 */
+    esp_sleep_enable_timer_wakeup(SLEEP_SEC * 1000000ULL);   /* 单位：微秒 */
+    esp_deep_sleep_start();       /* 不返回 */
+}
+```
+
+:::danger[`esp_deep_sleep_start()` 不返回]
+**它相当于软关机** —— 唤醒后从 `app_main` 开头重新执行。
+
+**所以"睡眠前后的状态"必须靠 RTC 内存或 NVS 保存**，不能用普通全局变量。
+:::
+
+## RTC 内存：睡眠时唯一能保留的地方
+
+```c
+/* 放在 RTC 内存里的变量，深度睡眠期间保持 */
+RTC_DATA_ATTR int boot_count = 0;
+
+void app_main(void)
+{
+    boot_count++;
+    ESP_LOGI(TAG, "第 %d 次启动", boot_count);
+    ...
+}
+```
+
+:::info[RTC 内存能用多少]
+| 芯片 | RTC 慢速内存 |
+| --- | --- |
+| ESP32 | 8 KB |
+| ESP32-S2/S3 | 8 KB |
+| ESP32-C3 | 8 KB |
+
+**8KB 看着小，但存几十个状态变量绰绰有余。**
+
+**注意 `RTC_DATA_ATTR` 的变量初始化只在上电时执行一次**，深度睡眠唤醒不会重新初始化。
+:::
+
+:::warning[`RTC_DATA_ATTR` 不等于不丢]
+**它在这些情况下会丢**：
+
+- 完全断电（拔电池）
+- `esp_deep_sleep_start()` 之前调了 `esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_SLOW_MEM, ESP_PD_OPTION_OFF)`
+- 某些复位（看具体芯片）
+
+**关键状态建议同时写一份到 NVS（Flash）**。
+:::
+
+## GPIO 唤醒
+
+```c
+/* EXT0：单个引脚，指定电平唤醒 */
+esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);      /* 0 = 低电平唤醒 */
+
+/* EXT1：多个引脚，任意一个满足就唤醒 */
+esp_sleep_enable_ext1_wakeup(
+    (1ULL << GPIO_NUM_2) | (1ULL << GPIO_NUM_4),
+    ESP_EXT1_WAKEUP_ANY_HIGH);
+```
+
+:::danger[EXT0 的引脚必须是 RTC GPIO]
+**不是所有 GPIO 都能在深度睡眠时唤醒** —— 只有 RTC GPIO（0~15 在 ESP32 上，具体看芯片）。
+
+**普通 GPIO 在深度睡眠时是断电的**，无法检测电平。
+:::
+
+:::warning[浮空引脚会导致意外唤醒]
+**如果唤醒引脚没有上拉/下拉，噪声就会触发唤醒** —— 电池几天就耗光。
+
+```c
+/* 配内部上拉，确保未按下时是高电平 */
+rtc_gpio_pullup_en(GPIO_NUM_0);
+```
+
+**或者外部加一个 10k 电阻。**
+:::
+
+## 一个完整的低功耗传感器节点
+
+```c
+RTC_DATA_ATTR static uint32_t s_boot_count = 0;
+RTC_DATA_ATTR static float    s_last_temp = 0;
+
+void app_main(void)
+{
+    s_boot_count++;
+
+    /* 1. 读传感器（尽量缩短唤醒时间） */
+    float t = read_temperature();
+    s_last_temp = t;
+
+    /* 2. 每 10 次才联网上报一次 */
+    if (s_boot_count % 10 == 0) {
+        wifi_connect();                  /* 约 2~5 秒，最耗电 */
+        mqtt_publish(t);
+        wifi_disconnect();
+    }
+
+    /* 3. 睡到下次 */
+    esp_sleep_enable_timer_wakeup(60ULL * 1000000ULL);
+    esp_deep_sleep_start();
+}
+```
+
+:::tip[关键优化：把"高频动作"和"联网"分开]
+**读传感器只要 10ms，联网要 3 秒** —— 差 300 倍。
+
+**所以：每 60 秒醒一次读数据（存 RTC 内存），每 10 分钟才联网上报一次。**
+
+**平均电流能从 20mA 降到几百 µA。**
+:::
+
+## 电池续航怎么算
+
+:::info[用"电荷量"而不是"平均电流"来算更准]
+```text
+每次唤醒的电荷量 = Σ(各阶段电流 × 该阶段时长)
+
+续航时间 = 电池容量(mAh) / (每次电荷量(mAh) × 每天唤醒次数) 
+```
+
+**举一个具体例子**（ESP32 + 2000mAh 电池，每 60 秒醒一次，每小时联网一次）：
+
+| 阶段 | 电流 | 时长 | 电荷量 (µAh) |
+| --- | --- | --- | --- |
+| 唤醒 + 启动 | 40 mA | 300 ms | 3.3 |
+| 读传感器 | 20 mA | 20 ms | 0.11 |
+| 联网上报（每小时 1 次，均摊） | 120 mA | 3 s / 60 | 1.67 |
+| **深度睡眠（60s）** | **50 µA** | 60 s | **0.83** |
+| **每次唤醒合计** | | | **约 5.9 µAh** |
+
+```text
+每天唤醒 1440 次 → 1440 × 5.9 µAh ≈ 8.5 mAh/天
+
+2000 mAh / 8.5 mAh/天 ≈ 235 天 ≈ 7.8 个月
+```
+
+**打个五折（温度、电池老化、峰值损耗）→ 约 4 个月。**
+:::
+
+:::danger[注意联网那项占了 28%]
+**虽然它只占 1/60 的时间，但电流是睡眠的 2400 倍。**
+
+**降低联网频率的收益远大于优化睡眠电流。**
+:::
+
+## 降低功耗的清单
+
+:::tip[按收益排序]
+1. **降低联网频率 / 缩短联网时间**（收益最大）
+2. **去掉板上的 LED 和串口芯片**（开发板常见 3mA+ 浪费）
+3. **关闭不用的外设电源域**：`esp_sleep_pd_config()`
+4. 缩短唤醒后的工作时间（少打日志、少初始化）
+5. **降低 WiFi 发射功率**：`esp_wifi_set_max_tx_power()`
+6. 用更省电的传感器（或让它也睡眠）
+7. 降低 CPU 频率（`CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ`）
+:::
+
+```c
+/* 关闭不用的电源域，进一步省电 */
+esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_OFF);
+esp_sleep_pd_config(ESP_PD_DOMAIN_XTAL,      ESP_PD_OPTION_OFF);
+```
+
+:::warning[关掉 RTC 外设会失去某些唤醒能力]
+**`ESP_PD_DOMAIN_RTC_PERIPH` 关掉后，RTC IO / 触摸唤醒就不能用了。**
+
+**要 GPIO 唤醒就必须保持它开着**（约多 10µA）。
+:::
+
+## 测量方法
+
+:::danger[万用表测不准]
+**两个问题**：
+
+1. **电流档内阻大**（几百 Ω），在 µA 级会产生明显压降
+2. **采样率跟不上** mA ↔ µA 的快速切换
+
+**正确做法**：
+
+- 串一个 10Ω 采样电阻，用示波器测压降
+- 或用专门的功耗分析仪（Nordic PPK2、Joulescope、Otii）
+:::
+
+```bash
+# 也可以用串口打电流估算（粗略）
+# 但需要外部电流检测电路
+```
+
+:::tip[实用技巧：测之前先确认"真的睡了"]
+```c
+ESP_LOGI(TAG, "准备睡眠，当前时间 %lld", esp_timer_get_time());
+esp_deep_sleep_start();
+```
+
+**如果串口还在打日志，说明它根本没睡下去** —— 某处有中断或任务在阻止睡眠。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 电流比预期大 100 倍 | 开发板的 LED/串口芯片 | 断开或换裸模块测 |
+| 深度睡眠后电流仍 mA 级 | 某个 GPIO 浮空或外设没关 | 配上下拉、关电源域 |
+| 频繁意外唤醒 | 唤醒引脚浮空 | 加上拉/下拉 |
+| 唤醒后变量是 0 | 用了普通全局变量 | `RTC_DATA_ATTR` |
+| `boot_count` 不增长 | RTC 内存被掉电清了 | 检查电源域配置 |
+| 联网一次就没电 | WiFi 保持连接 | 用完就 `esp_wifi_stop()` |
+| 唤醒时间太长 | 初始化了太多东西 | 精简启动路径 |
+| 电池几个月就鼓包 | 充电电路问题，不是软件 | 查硬件 |
+
+:::danger[开发板和裸模块的电流差 10 倍以上]
+**DevKit 板上的 CP2102/CH340 + LDO + LED 可能吃掉 1~5mA。**
+
+**所以"我的 ESP32 待机 3mA 降不下来"通常不是芯片的问题，是板子的问题。**
+
+**测芯片功耗必须用裸模块（或断开板上稳压器改外部供电）。**
+:::
+
+## 本课自检
+
+- [ ] 能说出五种功耗模式的电流量级与唤醒方式
+- [ ] **知道开发板的 LED 和串口芯片会吃掉 mA 级电流**
+- [ ] **知道保持 WiFi 连接就要 15~30mA**
+- [ ] **知道 `esp_deep_sleep_start()` 不返回，唤醒后从头执行**
+- [ ] **知道深度睡眠只能用 `RTC_DATA_ATTR` 保存变量**
+- [ ] 知道 `RTC_DATA_ATTR` 只在上电时初始化一次
+- [ ] **知道 `RTC_DATA_ATTR` 在完全断电时会丢，关键状态要同时写 NVS**
+- [ ] **知道只有 RTC GPIO 能做深度睡眠唤醒**
+- [ ] **知道唤醒引脚浮空会导致意外唤醒耗光电**
+- [ ] 会用 `esp_sleep_get_wakeup_cause()` 区分唤醒原因
+- [ ] **会用"电荷量"算法估算续航，知道联网那项占大头**
+- [ ] 知道关 RTC 外设电源域会失去 GPIO/触摸唤醒
+- [ ] **知道万用表测不准 µA 级，要用采样电阻 + 示波器**
+
+## 下一步
+
+回到 [ESP32 零基础导读](../esp-basics/) 或看 [内存管理](../esp-basics/29-memory)。

@@ -1,0 +1,30 @@
+---
+title: L3 Arduino 快速通道
+sidebar_position: 1
+description: Arduino 框架的本质、能力边界与适用场景，3~4 小时可读完。
+---
+
+# L3 Arduino 快速通道
+
+如果你已经按 [快速上手](../../quickstart/) 走了一遍，这一章就是给你"知道边界在哪"的。
+
+| 章节 | 内容 |
+| --- | --- |
+| [框架本质](./framework-nature) | Arduino 是 IDF 的一个 component，能力边界在哪 |
+
+## 核心结论
+
+```mermaid
+flowchart TD
+  A[我要做个东西] --> B{时间 < 3 天 或 只是验证想法?}
+  B -->|是| C[Arduino / Mixly]
+  B -->|否| D{需要 多任务/深度睡眠/音频/AI/LVGL/双核?}
+  D -->|是| E[ESP-IDF]
+  D -->|否| F[混合：IDF 主工程 + arduino component]
+```
+
+一句话：Arduino 的边界不在"能不能做"，而在"要做对的时候有多痛苦"。
+
+## 下一步
+
+[框架本质](./framework-nature)

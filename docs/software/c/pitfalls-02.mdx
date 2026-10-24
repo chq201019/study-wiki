@@ -1,0 +1,328 @@
+---
+id: pitfalls-02
+title: "02 UB 4：序列点违规"
+sidebar_position: 3
+description: "未定义行为与经典陷阱 第 2 部分：UB 4：序列点违规"
+---
+
+# 02 UB 4：序列点违规
+### 规则
+
+在两个**序列点**之间，一个对象**最多只能被修改一次**；如果它被修改，它的值只能用于"计算新值"这一个目的。
+
+序列点在：`;` 结尾、`&&`、`||`、`?:`、逗号运算符、函数调用（实参全部求值完后）。
+
+### 实测
+
+```c
+int x = 1;
+int y = x++ + x++;
+```
+
+编译器警告：
+
+```text
+C:\cprobe\macro.c:21:60: warning: multiple unsequenced modifications to 'x' [-Wunsequenced]
+```
+
+实测打印了 `y = 3`。但这是 **UB**——不同的编译器可能给 `2`、`3`、`4` 或其他值。
+
+### 常见违规形式
+
+```c
+i = i++;              /* UB */
+i = ++i + 1;          /* UB */
+a[i] = i++;           /* UB */
+f(i++, i++);          /* UB：两次修改，且实参求值顺序未指定 */
+printf("%d %d", i++, i++);   /* UB */
+x = x++ + ++x;        /* UB */
+```
+
+### 未指定（不是 UB，但同样危险）
+
+```c
+f(g(), h());          /* g 和 h 谁先执行？未指定 */
+```
+
+这不是 UB（因为每个函数只被调用一次），但**求值顺序未指定**。如果 `g()` 和 `h()` 有相互依赖的副作用，结果就不可预测。
+
+```c
+int i = 0;
+f(i++, i++);          /* 这个是 UB（i 被改两次） */
+f(i, i++);            /* 这个也是 UB（i 被改一次，但另一次读取不是"计算新值"的目的） */
+```
+
+**准则：一个表达式里最多修改一个变量一次，且不要同时读它。拆成多条语句。**
+
+## 六、陷阱：隐式转换
+
+这一节的行为**大部分不是 UB**，而是"合法但反直觉"——所以编译器常常不警告，更难发现。
+
+### 实测：有符号 ↔ 无符号
+
+```c
+int i = -1;
+unsigned int ui = 1;
+printf("-1 < 1u        ? %s\n", (-1 < 1u) ? "true" : "false");
+printf("-1 > 0u        ? %s\n", (-1 > 0u) ? "true" : "false");
+printf("i < ui         ? %s\n", (i < ui) ? "true" : "false");
+```
+
+```text
+-1 < 1u        ? false  (because -1 converts to huge unsigned)
+(int)(-1 < 1u) = 0
+-1 > 0u        ? true
+i < ui        ? false
+```
+
+**`-1 < 1u` 是 false。** 因为 `-1` 转换成 `unsigned int` 变成 4294967295。
+
+### 实测：`sizeof` 与负数
+
+```c
+int n = -1;
+if (sizeof(int) > n) { }
+```
+
+```text
+if (sizeof(int) > n) -> false  (n converts to size_t)
+```
+
+`sizeof` 结果是 `size_t`（无符号），`n` 被转换成 `size_t` 变成巨值。
+
+### 危险场景：反向循环
+
+```c
+/* 经典 bug */
+for (size_t i = n - 1; i >= 0; i--) { }   /* i >= 0 恒真 → 死循环 + 下溢 */
+
+/* 正确 */
+for (size_t i = n; i-- > 0; ) { }         /* 惯用写法 */
+/* 或 */
+for (size_t i = n; i > 0; ) { --i; ... }
+```
+
+`size_t` 是无符号，`i >= 0` **永远为真**，循环变成无限且 `i` 下溢。
+
+### 截断
+
+```c
+uint8_t a = 300;        /* 截断为 44（合法，实现定义的结果？不——值在范围内的转换是定义的） */
+int16_t b = 40000;      /* 实现定义（值超出范围） */
+```
+
+有符号整数转换时如果值**无法表示**，结果是**实现定义**（gcc/clang 通常是二补数截断）。无符号转换是**定义的**（模运算）。
+
+**用 `-Wconversion` 让编译器帮你抓**：
+
+```bash
+gcc -Wconversion -Wall src.c
+```
+
+## 七、陷阱：`sizeof`
+
+`sizeof` 是**运算符**，不是函数。
+
+### 实测
+
+```text
+sizeof(arr)        = 40
+sizeof(arr)/sizeof(arr[0]) = 10
+sizeof("abc")      = 4 (includes NUL)
+sizeof(char)       = 1
+sizeof('a')        = 4  <-- C char literal is int!
+```
+
+### 陷阱 1：数组退化
+
+```c
+void f(int arr[10]) {
+    sizeof(arr);      /* 8！不是 40 */
+}
+```
+
+函数参数里的 `int arr[10]` 就是 `int *`。**数组长度必须额外传。**
+
+### 陷阱 2：`sizeof` 的结果类型
+
+`sizeof` 的结果是 `size_t`（无符号）。和负数比较会出问题（见上）。
+
+### 陷阱 3：`sizeof` 不求值操作数
+
+```c
+int i = 0;
+sizeof(i++);      /* i 不会被递增！sizeof 不求值 */
+```
+
+除了 VLA（变长数组），`sizeof` 的操作数**不会被求值**——它是编译期运算符。
+
+### 陷阱 4：指针 vs 数组
+
+```c
+char *p = "hello";      sizeof(p) = 8      /* 指针大小 */
+char arr[] = "hello";   sizeof(arr) = 6    /* 数组大小（含 \0） */
+```
+
+### 陷阱 5：`sizeof` 与结构体
+
+[复合类型页](./aggregate)实测过：`sizeof(struct)` 包含 padding，`sizeof` 柔性数组成员**不包含**数组部分。
+
+## 八、陷阱：其他高频错误
+
+### 未初始化变量
+
+```c
+int x;
+printf("%d\n", x);    /* 读未初始化值 —— 自动存储期对象的值是"不确定的" */
+```
+
+编译器警告：
+
+```text
+C:\cprobe\warn.c:6:38: warning: variable 'x' is uninitialized when used here [-Wuninitialized]
+```
+
+严格说：读一个**未初始化的自动变量**且它**没有取过地址**，是 UB（C11 起把"不确定值"细化了，可能变成"陷阱表示"）。无论如何，**永远初始化变量**。
+
+### 赋值 vs 比较
+
+```c
+if (x = 5) { }   /* 手误：赋值，恒真（x=5 的值是 5，非 0） */
+if (x == 5) { }
+```
+
+编译器警告：
+
+```text
+C:\cprobe\warn.c:8:11: warning: using the result of an assignment as a condition without parentheses [-Wparentheses]
+```
+
+防御写法：`if (5 == x)`——把常量放左边，这样写成 `5 = x` 会编译错误。**但可读性略差**，现代做法是开 `-Wparentheses`（在 `-Wall` 里）。
+
+### `=` vs `==` 在 while 里
+
+同理，但 `-Wparentheses` 也能抓。
+
+### 忘记 `break`
+
+`switch` 的 fallthrough——见 [语法页](./syntax)。编译器 `-Wimplicit-fallthrough` 会警告。
+
+### 宏参数副作用
+
+```c
+#define MAX(a,b) ((a)>(b)?(a):(b))
+MAX(a++, b++);    /* UB：a/b 被修改多次 */
+```
+
+见 [预处理器页](./preprocessor)。
+
+### `memcpy` 重叠区域
+
+```c
+char buf[16] = "hello world";
+memcpy(buf, buf + 2, 8);    /* UB！memcpy 的区域不能重叠 */
+memmove(buf, buf + 2, 8);   /* 正确：memmove 处理重叠 */
+```
+
+`memcpy` 的参数是 `restrict` 限定的（[指针页](./pointers)），所以重叠是 UB。`memmove` 没有 `restrict`，可以重叠。
+
+### 严格别名违规
+
+```c
+float f = 3.14f;
+unsigned u = *(unsigned *)&f;   /* UB：违反严格别名规则 */
+```
+
+实测的正确做法输出 `0x4048F5C3`（用 `__builtin_memcpy`）。见 [指针页](./pointers)。
+
+### 格式化字符串不匹配
+
+```c
+printf("%d", 3.14);    /* UB */
+printf("%s", 123);     /* UB */
+int64_t x = 1;
+printf("%d", x);       /* 在 32 位上 UB（int 是 32 位） */
+```
+
+**用 `-Wformat -Werror=format`**。定宽类型用 `<inttypes.h>` 的 `PRId64` 等宏。
+
+## 九、检测工具链
+
+### 编译器警告（第一道防线）
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -Wconversion -Wshadow \
+    -Wstrict-prototypes -Wmissing-prototypes -Wcast-qual \
+    -Werror src.c -o out
+```
+
+| 选项 | 抓什么 |
+| --- | --- |
+| `-Wall` | 主要警告（未初始化、赋值当条件、`-Wparentheses` 等） |
+| `-Wextra` | 符号比较、未使用参数、空的 if 体等 |
+| `-Wpedantic` | 拒绝编译器扩展，严格按标准 |
+| `-Wconversion` | 隐式转换可能丢值 |
+| `-Wshadow` | 变量遮蔽 |
+| `-Wstrict-prototypes` | 函数声明要有完整原型 |
+| `-Wcast-qual` | 转换丢弃 `const`/`volatile` |
+| `-Werror` | 全部升级为错误 |
+
+### Sanitizer（第二道防线）
+
+```bash
+# AddressSanitizer：内存错误
+clang -fsanitize=address -fno-omit-frame-pointer -g -O1 src.c -o out
+
+# UndefinedBehaviorSanitizer：UB
+clang -fsanitize=undefined -fno-sanitize-recover=all -g -O1 src.c -o out
+
+# 两者一起
+clang -fsanitize=address,undefined -fno-sanitize-recover=all -g -O1 src.c -o out
+```
+
+实测有效的检测：
+
+| 问题 | UBSan | ASan |
+| --- | --- | --- |
+| 有符号溢出 | **抓到**（实测） | — |
+| 移位越界 | **抓到**（实测） | — |
+| 堆越界 | — | **抓到**（实测） |
+| use-after-free | — | **抓到**（实测） |
+| double free | — | **抓到**（实测） |
+| 栈越界 | — | 抓到 |
+| 内存泄漏 | — | Linux 上抓到，**Windows 上不支持**（实测确认） |
+| 未初始化读 | — | MSan（单独工具） |
+| 严格别名 | 部分 | — |
+
+:::caution[MSan 需要特殊编译]
+MemorySanitizer 检测未初始化读，但要求**所有**链接的代码（包括 C 库）都被 MSan 编译过——实践中要用 `-fsanitize=memory` 重新编译整个依赖链，比较麻烦。
+:::
+
+### 静态分析（第三道防线）
+
+```bash
+cppcheck --enable=all src/
+clang-tidy src.c -- -std=c17
+```
+
+嵌入式项目常用的还有：
+- **MISRA C 检查**（商业工具：PC-lint、Coverity、Polyspace）
+- **编译器自带的静态分析**（`-fanalyzer`，gcc 10+）
+
+### 嵌入式上的现实
+
+:::info[MCU 上怎么测]
+ASan/UBSan 在 MCU 上**基本不可用**（需要大量内存和运行时支持）。实际做法：
+
+1. **在 PC 上测核心逻辑**：把协议解析、状态机、算法等硬件无关的代码抽出来，用 ASan/UBSan 跑单元测试
+2. **用 `-fstack-usage`** 静态分析栈用量
+3. **开满警告 + `-Werror`**：这是 MCU 上最有性价比的防线
+4. **硬件防护**：MPU（内存保护单元）配置、栈溢出钩子、看门狗
+5. **代码审查 + MISRA 规则**
+
+ESP-IDF 支持在 Linux 主机上跑组件单元测试（Unity/CMock），就是这个思路。
+:::
+
+---
+
+**翻页**：[← 上一页](./pitfalls-01) · [下一页 →](./pitfalls-03) · [返回目录](./)

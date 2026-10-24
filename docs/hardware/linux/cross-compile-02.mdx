@@ -1,0 +1,227 @@
+---
+id: cross-compile-02
+title: "02 静态链接 vs 动态链接"
+sidebar_position: 3
+description: "交叉编译与工具链 第 2 部分：静态链接 vs 动态链接"
+---
+
+# 02 静态链接 vs 动态链接
+### 5.1 实测对比
+
+```bash
+$ gcc -o hello_dyn hello.c
+$ gcc -static -o hello_static hello.c
+$ ls -l hello_dyn hello_static
+-rwxr-xr-x 1 root root  15952 Oct 18 00:59 hello_dyn
+-rwxr-xr-x 1 root root 758448 Oct 18 00:59 hello_static
+```
+
+**体积差了 47 倍**（15KB vs 758KB）——因为静态链接把整个 glibc 都塞进了可执行文件。
+
+```bash
+$ ldd hello_dyn
+	linux-vdso.so.1 (0x00007f5be26ac000)
+	libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f5be24a2000)
+	/lib64/ld-linux-x86-64.so.2 (0x00007f5be26ae000)
+$ ldd hello_static
+	not a dynamic executable
+$ file hello_static
+hello_static: ELF 64-bit LSB executable, x86-64, version 1 (GNU/Linux), statically linked, ...
+```
+
+### 5.2 对比表
+
+| 维度 | 静态链接 | 动态链接 |
+| --- | --- | --- |
+| 体积 | **大**（每个程序一份库代码） | 小（多个程序**共享**一份库） |
+| 部署 | **单文件即可运行**，拷过去就跑 | 必须保证目标板有对应的 `.so` |
+| 内存 | 每个进程一份库代码 | **共享库只加载一次**，省内存 |
+| 库升级 | 要重新编译 | 换 `.so` 即可（**但要防 ABI 破坏**） |
+| 启动速度 | 略快（不用加载器解析） | 略慢 |
+| 许可证 | 可能触发 GPL 传染问题 | 较清晰 |
+
+**嵌入式选型建议**：
+
+- **存储极度紧张**（`< 32MB`）且程序少 → 静态链接 + musl，或静态 busybox
+- **程序多、存储一般** → 动态链接，因为共享库省空间
+- **单一用途的固件** → 静态链接最省心（不用担心缺库）
+
+### 5.3 glibc 静态链接的陷阱（实测警告原文）
+
+**这是静态链接最著名的坑**。当静态链接的程序用到 **NSS（Name Service Switch，用户/主机名解析）** 相关的函数（如 `getpwnam`、`gethostbyname`）时，链接器会警告：
+
+```bash
+$ gcc -static -o nss_static nss.c
+/usr/bin/ld: /tmp/ccre25K1.o: in function `main':
+nss.c:(.text+0x13): warning: Using 'getpwnam' in statically linked applications requires
+at runtime the shared libraries from the glibc version used for linking
+```
+
+**原因**：glibc 的 NSS 是**插件化**的（`libnss_files.so`、`libnss_dns.so` 等运行时动态加载）。静态链接时这些插件进不来，所以运行时**仍然要去文件系统里加载那些 .so**。
+
+**后果**：你的"静态"程序**并不完全自包含**。如果目标板的 glibc 版本与编译时的不一致，`getpwnam` 可能失败或崩溃。
+
+:::danger[哪些函数会触发这个警告]
+`getpwnam`、`getpwuid`、`gethostbyname`、`getaddrinfo`、`getservbyname` 等——**一切需要查 `/etc/passwd`、`/etc/hosts`、DNS 的函数**。
+
+**解决办法**：
+1. 改用 **musl**（它的 NSS 实现是静态友好的），这是最干净的方案
+2. 避免用这些函数（自己解析配置文件）
+3. 接受警告，并确保目标板 glibc 版本一致
+
+**这条也解释了为什么 Alpine Linux（musl）在容器和嵌入式领域这么流行。**
+:::
+
+## 6. 动态库查找路径（重点）
+
+### 6.1 完整查找顺序
+
+当程序启动时，内核先读 ELF 的 **INTERP** 段找到动态链接器（`ld.so`），然后由 `ld.so` 按以下顺序查找 `NEEDED` 里列出的库：
+
+```
+1. DT_RPATH（若存在）—— ELF 里硬编码的路径（已废弃，但优先级最高）
+2. LD_LIBRARY_PATH 环境变量      ← 调试时最常用的手段
+3. DT_RUNPATH（若存在）—— RPATH 的现代替代品
+4. /etc/ld.so.cache —— ldconfig 生成的缓存（binary cache，很快）
+5. 默认路径：/lib → /usr/lib（以及多架构目录）
+```
+
+:::warning[RPATH 与 RUNPATH 的优先级差异很反直觉]
+注意顺序 **1 在 2 前面，但 3 在 2 后面**：
+
+| | 相对 `LD_LIBRARY_PATH` 的位置 | 是否**传递**给依赖的依赖 |
+| --- | --- | --- |
+| `DT_RPATH` | **更高优先**（先查） | ✅ 会传递给间接依赖 |
+| `DT_RUNPATH` | **更低优先**（后查） | ❌ 只作用于直接依赖 |
+
+这导致一个经典困惑：你设了 `LD_LIBRARY_PATH` 想覆盖程序自带的路径，但**如果该程序用的是 RPATH 而非 RUNPATH，你的设置会被忽略**。
+
+现代工具链默认生成 RUNPATH（用 `--enable-new-dtags`）。
+:::
+
+### 6.2 实测：RPATH 与 RUNPATH 的生成
+
+```bash
+$ gcc -o old_rpath uselib.c -L/tmp/labR/lib -ld -Wl,-rpath,/tmp/labR/lib -Wl,--disable-new-dtags
+$ readelf -d old_rpath | grep -E 'PATH'
+ 0x000000000000000f (RPATH)              Library rpath: [/tmp/labR/lib]
+
+$ gcc -o new_runpath uselib.c -L/tmp/labR/lib -ld -Wl,-rpath,/tmp/labR/lib -Wl,--enable-new-dtags
+$ readelf -d new_runpath | grep -E 'PATH'
+ 0x000000000000001d (RUNPATH)            Library runpath: [/tmp/labR/lib]
+```
+
+**注意两个不同的 tag 值**：`0xf` 是 `RPATH`，`0x1d` 是 `RUNPATH`。用 `readelf -d` 能看到区别。
+
+### 6.3 实测：INTERP 与 NEEDED
+
+```bash
+$ readelf -d /bin/ls | grep -E 'NEEDED|RUNPATH|RPATH'
+ 0x0000000000000001 (NEEDED)             Shared library: [libselinux.so.1]
+ 0x0000000000000001 (NEEDED)             Shared library: [libcap.so.2]
+ 0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]
+```
+
+**动态链接器的绝对路径被写死在 ELF 里**（INTERP 段）：
+
+```bash
+$ file /bin/ls
+/bin/ls: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked,
+interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=0243f2a3ad64d635299a574bbc8ef951ddde9b21,
+for GNU/Linux 3.2.0, stripped
+```
+
+注意 `interpreter /lib64/ld-linux-x86-64.so.2`——这个路径是**绝对路径**，在目标板上必须存在。交叉编译的 aarch64 程序里，它通常是 `/lib/ld-linux-aarch64.so.1`。
+
+:::danger[这个路径不存在会导致什么]
+如果目标板上的 `ld.so` 路径与 ELF 里写的不一致，内核加载时会直接失败：
+
+```
+$ ./app
+-bash: ./app: No such file or directory
+```
+
+**这个报错极具迷惑性**——文件明明在那里！正确的排查方式是 `file ./app` 看 interpreter，再确认目标板有那个文件。
+
+**常见原因**：在 glibc 系统上编了程序，放到 musl 系统上跑（或反之），两者的 ld.so 路径不同。
+:::
+
+### 6.4 实测：ldconfig 与 /etc/ld.so.cache
+
+```bash
+$ ldconfig -p | head -1
+719 libs found in cache `/etc/ld.so.cache'
+$ ldconfig -p | grep -E 'libc\.so\.6|libm\.so\.6'
+	libm.so.6 (libc6,x86-64) => /lib/x86_64-linux-gnu/libm.so.6
+	libc.so.6 (libc6,x86-64) => /lib/x86_64-linux-gnu/libc.so.6
+```
+
+`ld.so.cache` 是**二进制缓存**，避免每次启动都遍历目录。它由 `ldconfig` 生成：
+
+```bash
+$ ldconfig -v 2>/dev/null | grep -v '^\s' | head -10
+/usr/lib/x86_64-linux-gnu/libfakeroot: (from /etc/ld.so.conf.d/fakeroot-x86_64-linux-gnu.conf:1)
+/usr/local/lib: (from /etc/ld.so.conf.d/libc.conf:2)
+/lib/x86_64-linux-gnu: (from /etc/ld.so.conf.d/x86_64-linux-gnu.conf:3)
+/lib: (from <builtin>:0)
+```
+
+配置文件结构：
+
+```bash
+$ cat /etc/ld.so.conf
+include /etc/ld.so.conf.d/*.conf
+$ ls -1 /etc/ld.so.conf.d/
+fakeroot-x86_64-linux-gnu.conf
+libc.conf
+x86_64-linux-gnu.conf
+$ cat /etc/ld.so.conf.d/x86_64-linux-gnu.conf
+# Multiarch support
+/usr/local/lib/x86_64-linux-gnu
+/lib/x86_64-linux-gnu
+/usr/lib/x86_64-linux-gnu
+```
+
+:::tip[往板子上装新库后必须做的动作]
+把交叉编译好的 `.so` 拷到板子的 `/lib` 或 `/usr/lib` 后，**必须运行 `ldconfig`** 刷新缓存，否则程序仍然找不到它：
+
+```bash
+cp libfoo.so.1 /usr/lib/
+ldconfig                  # ← 别忘！
+ldconfig -p | grep foo    # 验证
+```
+
+对于**不在标准路径**的库（如 `/opt/mylib`），推荐做法是加一个 conf 文件而不是一直依赖 `LD_LIBRARY_PATH`：
+
+```bash
+echo "/opt/mylib" > /etc/ld.so.conf.d/mylib.conf
+ldconfig
+```
+:::
+
+### 6.5 排查"找不到库"的标准流程
+
+```bash
+# 1. 看它依赖哪些库
+readelf -d ./app | grep NEEDED
+
+# 2. 看哪些找不到（ldd 会标 "not found"）
+ldd ./app
+
+# 3. 确认解释器路径在目标板存在
+file ./app                       # 看 interpreter
+ls -l /lib/ld-linux-aarch64.so.1
+
+# 4. 库在文件系统里存在吗
+find / -name "libfoo.so*"
+
+# 5. 存在但 ldd 说找不到 → 缓存没刷新
+ldconfig && ldd ./app
+
+# 6. 临时验证（不改系统）
+LD_LIBRARY_PATH=/path/to/lib ./app
+```
+
+---
+
+**翻页**：[← 上一页](./cross-compile-01) · [下一页 →](./cross-compile-03) · [返回目录](./)

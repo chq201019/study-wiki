@@ -1,0 +1,504 @@
+---
+id: 29-style
+title: 29 代码风格与命名
+sidebar_position: 29
+description: PEP 8 核心要点、命名规范、注释与文档字符串、以及用工具自动格式化，让代码别人看得懂、自己一个月后也看得懂。
+---
+
+# 29 代码风格与命名
+
+**本课目标**：写出「不只是能跑，而且好读」的代码。
+
+## 为什么风格重要
+
+代码**读的时间是写的时间的 10 倍**。而且第一个读者往往是**一个月后的你自己**。
+
+```python
+# 能跑，但看不懂
+def f(l):
+    r=[]
+    for i in l:
+        if i%2==0:r.append(i*2)
+    return r
+```
+
+```python
+# 同样的功能，一眼看懂
+def double_even_numbers(numbers):
+    """把列表里的偶数翻倍，返回新列表"""
+    result = []
+    for n in numbers:
+        if n % 2 == 0:
+            result.append(n * 2)
+    return result
+```
+
+多打几十个字符，省下未来几小时的困惑。
+
+## PEP 8：Python 官方风格指南
+
+PEP 8 是 Python 社区的公认标准。核心几条：
+
+### 缩进：4 个空格
+
+```python
+def f():
+    if True:
+        print("好")
+```
+
+**永远用 4 个空格，不要用 Tab。** 混用会报 `TabError`。
+
+### 行长度：不超过 79 字符
+
+太长的行要折行：
+
+```python
+# 太长
+result = some_function(argument_one, argument_two, argument_three, argument_four)
+
+# 折行（括号内换行）
+result = some_function(
+    argument_one,
+    argument_two,
+    argument_three,
+    argument_four,
+)
+```
+
+:::tip[79 还是 88 还是 120]
+PEP 8 原文是 79。但**现代屏幕宽**，很多团队用 88（black 格式化工具默认）或 120。
+
+**关键是团队统一**。个人项目用 88~100 都没问题，别超过 120。
+:::
+
+### 空格规则
+
+```python
+# ✅ 正确
+x = 1
+y = x + 2
+def f(a, b):
+    return a + b
+items = [1, 2, 3]
+d = {"a": 1}
+
+# ❌ 错误
+x=1
+y = x+2
+def f( a,b ):
+    return a+b
+items = [1,2,3]
+d = {"a":1}
+```
+
+| 位置 | 规则 |
+| --- | --- |
+| 赋值 `=` 两边 | 有空格 |
+| 运算符 `+ - * /` 两边 | 有空格 |
+| 逗号后 | 有空格 |
+| 函数参数括号内 | 无空格 |
+| 默认值 `=` 两边 | **无空格**（`def f(a=1)`） |
+
+:::warning[默认值的等号没有空格]
+```python
+def f(a=1, b=2):        # ✅
+def f(a = 1, b = 2):    # ❌
+```
+
+这和普通赋值的规则不同，容易搞错。不过用格式化工具就不用记这些。
+:::
+
+### 空行
+
+```python
+import os
+
+
+def f():
+    pass
+
+
+def g():
+    pass
+
+
+class A:
+    def m1(self):
+        pass
+
+    def m2(self):
+        pass
+```
+
+| 位置 | 空行数 |
+| --- | --- |
+| 顶层函数/类之间 | 2 行 |
+| 类内方法之间 | 1 行 |
+
+## 命名规范
+
+### 四种命名风格
+
+| 风格 | 例子 | 用于 |
+| --- | --- | --- |
+| `snake_case` | `user_name` | 变量、函数、模块 |
+| `UPPER_CASE` | `MAX_SIZE` | 常量 |
+| `PascalCase` | `UserInfo` | 类名 |
+| `_leading` | `_internal` | 内部使用（约定私有） |
+
+```python
+# 变量和函数：小写 + 下划线
+user_name = "小明"
+total_price = 99.9
+is_valid = True
+
+def calculate_total(items):
+    ...
+
+# 常量：全大写
+MAX_RETRY = 3
+PI = 3.14159
+
+# 类：每个单词首字母大写
+class UserAccount:
+    ...
+
+# 私有：前导下划线
+class Foo:
+    def __init__(self):
+        self._cache = {}       # 内部用，外部别碰
+```
+
+:::danger[千万别用拼音缩写]
+```python
+# ❌ 灾难
+def js(a, b):        # 计算？
+    pass
+xm = "小明"           # xiaoming？
+sfz = "123"          # shenfenzheng？
+
+# ✅ 好
+def add(a, b):
+    pass
+name = "小明"
+id_card = "123"
+```
+
+**要么写完整英文，要么写完整拼音，别写不伦不类的缩写。**
+
+英文不好没关系，常见词汇就那几十个：`get/set/add/remove/check/create/update/delete/load/save`。
+:::
+
+### 命名要「见名知意」
+
+| 差 | 好 | 原因 |
+| --- | --- | --- |
+| `data` | `student_scores` | 具体是什么 |
+| `flag` | `is_logged_in` | 布尔值用 is/has 开头 |
+| `n` | `retry_count` | 不用单字母 |
+| `list1` | `active_users` | 不按序号命名 |
+| `temp` | `swap_buffer` | 不用无意义名字 |
+
+:::tip[布尔值命名的技巧]
+布尔变量/函数用 **`is_` / `has_` / `can_` / `should_`** 开头：
+
+```python
+is_valid = True
+has_permission = False
+can_edit = True
+should_retry = False
+
+def is_adult(age):
+    return age >= 18
+```
+
+读起来像一句话：`if is_valid and has_permission:` —— 语义清晰。
+:::
+
+## 注释：什么时候该写
+
+:::danger[注释不要重复代码已经说的事]
+```python
+# ❌ 废话注释
+i = i + 1          # i 加 1
+names.append("小明")  # 添加小明到列表
+
+# ✅ 解释「为什么」
+i += 1             # 跳过表头行，从数据行开始
+names.append("小明")  # 历史遗留：这个用户必须有默认权限
+```
+:::
+
+**注释应该解释「为什么」，而不是「做什么」**——「做什么」代码本身就能看出来。
+
+### 需要注释的场景
+
+```python
+# ① 为什么这么做（代码看不出的意图）
+# 用 3 次重试而不是 1 次，因为设备启动需要约 2 秒
+retry_count = 3
+
+# ② 反直觉的写法
+# 这里故意不用 == ，因为浮点比较要用误差
+if abs(a - b) < 1e-9:
+
+# ③ 待办和已知问题
+# TODO: 换成异步实现，当前版本在大量请求时会阻塞
+# FIXME: 临时绕过，等 upstream 修复 issue #123
+
+# ④ 复杂算法的说明
+# 用二分查找定位插入位置，O(log n)
+```
+
+### 文档字符串（docstring）
+
+**函数、类、模块的第一行三引号字符串**，说明它的用途：
+
+```python
+def calculate_grade(score, full_score=100):
+    """根据得分计算等级。
+
+    参数:
+        score: 实际得分，0 到 full_score 之间
+        full_score: 满分，默认 100
+
+    返回:
+        等级字符串：'A' / 'B' / 'C' / 'D'
+
+    异常:
+        ValueError: score 超出范围时抛出
+    """
+    if not 0 <= score <= full_score:
+        raise ValueError(f"分数必须在 0~{full_score} 之间")
+
+    ratio = score / full_score
+    if ratio >= 0.9:
+        return "A"
+    if ratio >= 0.8:
+        return "B"
+    if ratio >= 0.6:
+        return "C"
+    return "D"
+```
+
+:::tip[docstring 的实际好处]
+1. **编辑器悬停就能看到**（VS Code、PyCharm 都支持）
+2. `help(calculate_grade)` 能显示
+3. 能自动生成 API 文档
+
+**简单函数写一行就够了**：
+
+```python
+def add(a, b):
+    """返回 a 和 b 的和"""
+    return a + b
+```
+
+**不用给每行代码都写文档**，给「别人会调用的接口」写就行。
+:::
+
+## 用工具自动格式化（强烈推荐）
+
+**别手动调格式**——工具一秒搞定，而且不会出错。
+
+### black：自动格式化
+
+```bash
+python -m pip install black
+black my_script.py
+```
+
+它会自动：统一引号、调整空格、折长行、规范空行。
+
+:::tip[black 的特点：不给选项]
+black 自称「不妥协的格式化工具」——**几乎不提供配置项**。
+
+好处：团队不用争论风格，**所有人都一样**。刚开始可能不习惯它某些选择，但省下的争论时间远超这点不适。
+:::
+
+### ruff：检查 + 自动修复
+
+```bash
+python -m pip install ruff
+
+ruff check my_script.py          # 检查问题
+ruff check --fix my_script.py    # 自动修复能修的
+```
+
+能发现：未使用的变量和导入、未定义的变量、可能的 bug 模式、风格问题。
+
+`ruff` 是用 Rust 写的，**速度极快**，近年已基本取代 flake8/pylint。
+
+:::tip[建议的日常配置]
+在项目根目录建 `pyproject.toml`：
+
+```toml
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.black]
+line-length = 100
+```
+
+然后每次改完代码跑一下：
+
+```bash
+black . && ruff check --fix .
+```
+
+**两秒钟，代码就整齐了。**
+:::
+
+### 编辑器里自动格式化
+
+VS Code 安装 Python 扩展后：
+
+1. 按 `Ctrl+Shift+P`
+2. 输入 `Format Document`（或用默认快捷键 `Shift+Alt+F`）
+
+也可以开启「保存时自动格式化」：设置里搜 `format on save`，勾选。
+
+## 代码可读性的其他要点
+
+### 函数要短
+
+```python
+# ❌ 一个函数做了五件事
+def process_order(order):
+    # 校验
+    # 计算价格
+    # 扣库存
+    # 生成订单号
+    # 发送邮件
+    ...
+
+# ✅ 拆开，每个只做一件事
+def validate_order(order): ...
+def calculate_price(order): ...
+def deduct_stock(order): ...
+def generate_order_id(): ...
+def send_confirmation(order): ...
+```
+
+**经验：一个函数超过 30 行，就该考虑拆了。**
+
+### 减少嵌套层级
+
+```python
+# ❌ 三层嵌套，难读
+def check(user):
+    if user:
+        if user.is_active:
+            if user.has_permission:
+                return "允许"
+    return "拒绝"
+
+# ✅ 卫语句，提前返回
+def check(user):
+    if not user:
+        return "拒绝"
+    if not user.is_active:
+        return "拒绝"
+    if not user.has_permission:
+        return "拒绝"
+    return "允许"
+```
+
+这种「先排除异常情况」的写法叫**卫语句**，能大幅降低嵌套。
+
+### 用有意义的常量代替魔法数字
+
+```python
+# ❌ 这个 86400 是什么
+if elapsed > 86400:
+    ...
+
+# ✅ 一眼看懂
+SECONDS_PER_DAY = 86400
+if elapsed > SECONDS_PER_DAY:
+    ...
+```
+
+## 一个改进前后的完整对比
+
+**改进前**：
+
+```python
+def p(l):
+    r = []
+    for i in l:
+        if i[2] > 60:
+            r.append((i[0], i[1] * 0.9))
+    return r
+```
+
+**改进后**：
+
+```python
+def apply_discount_for_passed(students):
+    """对及格的学生打 9 折，返回 [(姓名, 折扣价), ...]
+
+    参数:
+        students: [(姓名, 价格, 分数), ...]
+    """
+    DISCOUNT_RATE = 0.9
+    PASS_LINE = 60
+
+    result = []
+    for name, price, score in students:
+        if score > PASS_LINE:
+            result.append((name, price * DISCOUNT_RATE))
+    return result
+```
+
+**功能完全相同，但第二个：**
+
+- 名字能看懂
+- 有文档说明
+- 魔数有了名字
+- 解包比 `i[0]`、`i[1]` 清晰
+- 加了空格和换行
+
+## 常见错误
+
+| 坏习惯 | 问题 | 改法 |
+| --- | --- | --- |
+| 拼音缩写混用 | 完全看不懂 | 完整英文或用注释 |
+| 单字母变量 | 不知道是什么 | 除了循环 `i`，都用完整名 |
+| 注释重复代码 | 废话 | 只解释「为什么」 |
+| 函数超过 100 行 | 难维护 | 拆成小函数 |
+| 魔法数字 | 不知道含义 | 定义常量 |
+| Tab 和空格混用 | TabError | 只用空格，4 个 |
+| 长行不折 | 要横向滚动 | 折行或用格式化工具 |
+
+:::warning[不要为了「优雅」牺牲清晰]
+```python
+# ❌ 炫技，可读性差
+r = list(map(lambda x: x*2, filter(lambda x: x%2==0, nums)))
+
+# ✅ 清晰
+r = [x * 2 for x in nums if x % 2 == 0]
+```
+
+**代码是写给人看的，顺便让机器执行。** 任何让「人」更难懂的写法都要警惕，哪怕它更短。
+:::
+
+## 本课自检
+
+- [ ] 知道缩进用 4 个空格，不用 Tab
+- [ ] 知道行长度上限，会折行
+- [ ] 记得住四种命名风格分别用于什么
+- [ ] 变量名见名知意，不用无意义缩写
+- [ ] 布尔值用 `is_` / `has_` 开头
+- [ ] 注释解释「为什么」而不是「做什么」
+- [ ] 会给函数写 docstring
+- [ ] 装了 black 和 ruff 并会使用
+- [ ] 知道用卫语句减少嵌套
+- [ ] 会用常量代替魔法数字
+- [ ] 知道「清晰」比「简短」重要
+
+## 下一步
+
+[30 实战：批量处理文件](./30-project-files) —— 把学到的一切用起来，做一个真正省时间的工具。

@@ -1,0 +1,200 @@
+---
+id: type-traits-in-practice
+title: 类型萃取实战
+sidebar_position: 25
+description: decay 与 remove_cvref 的区别、declval 的用途、检测成员是否存在的三种方法、以及 C++20 之后哪些可以换成 concepts。
+---
+
+# 类型萃取实战
+
+**本课目标**：能读懂库里那些 type_traits 代码，知道该用哪个。
+
+## 最常用的六个
+
+| 萃取 | 作用 | 例子 |
+| --- | --- | --- |
+| remove_cvref_t | 去掉 const 和引用 | const int& 变 int |
+| decay_t | 模拟按值传参的退化 | int 数组 变 int 指针 |
+| enable_if_t | SFINAE 开关 | 限制重载参与 |
+| conditional_t | 三元选择类型 | 条件选类型 |
+| is_same_v | 类型相同 | 编译期断言 |
+| void_t | 检测成员存在 | C++17 惯用法 |
+
+## decay 与 remove_cvref 的区别
+
+:::danger[它们不是同一个东西]
+```cpp
+remove_cvref_t<const int&>     // int（只去 const 和引用）
+decay_t<const int&>            // int（同上）
+
+remove_cvref_t<int[3]>         // int[3]（数组还是数组）
+decay_t<int[3]>                // int*（数组退化成指针）
+
+remove_cvref_t<int(int)>       // int(int)（函数类型）
+decay_t<int(int)>              // int(*)(int)（函数变指针）
+```
+
+**decay 额外做了数组到指针、函数到函数指针的退化** —— 它模拟的是按值传参会发生什么。
+:::
+
+:::tip[什么时候用哪个]
+- **想去掉参数的 const 和引用** 用 remove_cvref_t
+- **想要按值存储时的真实类型** 用 decay_t
+
+```cpp
+template <typename T>
+void store(T&& v) {
+    using Stored = std::decay_t<T>;      // 按值存，退化正确
+    Stored copy = std::forward<T>(v);
+}
+```
+:::
+
+## declval：不需要构造就能假装有个对象
+
+```cpp
+// 想知道 T 有没有 .size()，但不能真的构造 T
+decltype(std::declval<T>().size())
+```
+
+:::info[declval 做了什么]
+```cpp
+template <typename T>
+T&& declval();        // 只有声明，没有定义
+```
+
+**它只在 decltype / sizeof 这类不求值上下文里用** —— 因为不需要真正调用，所以不需要定义。
+
+**如果真去调用它，链接会失败。**
+:::
+
+## 检测成员是否存在：三代写法
+
+### 第一代：void_t（C++17）
+
+```cpp
+template <typename T, typename = void>
+struct has_size : std::false_type {};
+
+template <typename T>
+struct has_size<T, std::void_t<decltype(std::declval<T>().size())>>
+    : std::true_type {};
+
+static_assert(has_size<std::vector<int>>::value);
+static_assert(!has_size<int>::value);
+```
+
+:::warning[void_t 的原理很巧妙但难读]
+**如果 decltype 合法**，第二个模板参数就是 void，匹配特化版本（true_type）。
+
+**如果不合法**，SFINAE 让特化版本被丢弃，回退到主模板（false_type）。
+
+**这套写法在库里很常见，但确实不好读。**
+:::
+
+### 第二代：detection idiom（更通用）
+
+```cpp
+template <typename T, template <typename> class Op, typename = void>
+struct is_detected : std::false_type {};
+
+template <typename T, template <typename> class Op>
+struct is_detected<T, Op, std::void_t<Op<T>>> : std::true_type {};
+
+template <typename T>
+using has_size_t = decltype(std::declval<T>().size());
+
+static_assert(is_detected<std::vector<int>, has_size_t>::value);
+```
+
+**好处**：一套机制检测任意成员，不用为每个成员写一遍。
+
+### 第三代：concepts（C++20，推荐）
+
+```cpp
+template <typename T>
+concept HasSize = requires(T t) { t.size(); };
+
+static_assert(HasSize<std::vector<int>>);
+static_assert(!HasSize<int>);
+```
+
+:::tip[新代码直接用 concepts]
+**同样的功能，从 6 行模板变成 2 行声明。**
+
+**而且报错可读性天差地别**：void_t 版是一长串推导失败，concepts 版直接说 T does not satisfy HasSize。
+:::
+
+## if constexpr 替代标签分派
+
+:::danger[老写法：用重载加类型标签]
+```cpp
+template <typename T> void f_impl(T v, std::true_type);   // 整数版
+template <typename T> void f_impl(T v, std::false_type);
+
+template <typename T>
+void f(T v) {
+    f_impl(v, std::is_integral<T>{});
+}
+```
+
+**C++17 之后直接写**：
+
+```cpp
+template <typename T>
+void f(T v) {
+    if constexpr (std::is_integral_v<T>) {
+        /* 整数分支 */
+    } else {
+        /* 其他分支 */
+    }
+}
+```
+:::
+
+:::warning[if constexpr 丢弃的是实例化，不是语法检查]
+```cpp
+if constexpr (false) {
+    undefined_function();     /* 可以：不会实例化 */
+}
+if constexpr (false) {
+    int x = ;                 /* 报错：语法错误照样检查 */
+}
+```
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| decay 把数组变指针 | 它的语义如此 | 要保留数组用 remove_cvref |
+| declval 链接错误 | 在求值上下文里用了 | 只在 decltype/sizeof 里用 |
+| void_t 检测永远为 false | 表达式写法不对 | 用 declval 而非直接构造 |
+| SFINAE 报错几百行 | 模板展开 | 换 concepts |
+| if constexpr 里语法错还报错 | 语法检查不做丢弃 | 保证语法正确 |
+| is_same 比较失败 | 一边有引用/const | 先 remove_cvref |
+
+:::danger[比较类型前先去掉引用和 const]
+```cpp
+static_assert(std::is_same_v<decltype(x), int>);                        // 可能是错的
+static_assert(std::is_same_v<std::remove_cvref_t<decltype(x)>, int>);   // 对
+```
+
+**decltype(x) 对左值会带引用** —— 这是最容易踩的坑。
+:::
+
+## 本课自检
+
+- [ ] 会用 remove_cvref_t / decay_t / enable_if_t / conditional_t / is_same_v / void_t
+- [ ] **知道 decay 额外做了数组退化与函数退化**
+- [ ] **知道 remove_cvref 不退化数组**
+- [ ] **知道 declval 在求值上下文里用会链接失败**
+- [ ] 理解 void_t 检测成员存在的原理
+- [ ] 知道 detection idiom 是通用化的 void_t
+- [ ] **知道 C++20 应直接用 concepts**
+- [ ] **知道 if constexpr 丢弃实例化但不丢弃语法检查**
+- [ ] **知道比较类型前要先 remove_cvref**
+
+## 下一步
+
+[C++20 概念](./concepts) 或 [模板元编程](./metaprogramming)。

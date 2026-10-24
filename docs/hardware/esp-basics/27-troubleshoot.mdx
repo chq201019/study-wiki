@@ -1,0 +1,211 @@
+---
+id: 27-troubleshoot
+title: 27 常见故障排查
+sidebar_position: 27
+description: 烧不进去、一直重启、WiFi 连不上、传感器读不到、内存不足——一张表定位问题。
+---
+
+# 27 常见故障排查
+
+**本课目标**：遇到问题时能自己定位，不用到处问。
+
+## 通用排查思路
+
+:::tip[五步法]
+```text
+① 看现象：能不能复现？什么操作触发的？
+② 看日志：idf.py monitor 里最后几行写了什么？
+③ 缩小范围：改回上一个能跑的版本，逐步加回
+④ 一次只改一处：改五处出问题，不知道是哪处
+⑤ 验证后记录：怎么解决的，下次省时间
+```
+:::
+
+**`idf.py monitor` 是你的第一工具**——99% 的答案在日志里。
+
+## 一、烧不进去
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `Failed to connect to ESP32` | 没进下载模式 | **按住 BOOT → 按 RESET → 松开 BOOT** |
+| 同上 | 端口错 | `idf.py -p COM3 flash` |
+| 同上 | 串口被占用 | 关掉串口助手/Mind+/Arduino IDE |
+| `Permission denied`（Linux） | 没权限 | `sudo usermod -aG dialout $USER` |
+| 卡在 `Connecting.....` | 充电线/没供电 | 换数据线，看电源 LED |
+| 烧到一半失败 | 波特率太高 | `idf.py -b 115200 flash` |
+| 一直 `waiting for download` | BOOT 一直按着 | 松开 BOOT 再复位 |
+
+:::danger[90% 的"烧不进去"靠这个动作解决]
+```text
+① 按住 BOOT 键不放
+② 按一下 RESET（或拔插 USB）
+③ 松开 BOOT 键
+④ 再执行 idf.py flash
+```
+
+**别急着重装工具链**——先试这个。
+:::
+
+## 二、烧完一直重启
+
+:::danger[这是最吓人的故障，但八成有日志]
+现象：串口不停刷重启信息。
+
+**先完整看一遍日志**：
+
+```bash
+idf.py monitor
+```
+
+常见原因：
+
+| 日志关键词 | 原因 | 解决 |
+| --- | --- | --- |
+| `panic: Load access fault` | 访问非法地址（空指针/野指针） | 查指针 |
+| `***ERROR*** A stack overflow in task xxx` | **栈溢出** | 加大栈 |
+| `Guru Meditation Error: ... (StoreProhibited)` | 往非法地址写 | 查数组越界 |
+| `abort() was called` | `assert` 失败或 `ESP_ERROR_CHECK` 失败 | 看前一行 |
+| `Task watchdog got triggered` | 任务不让 CPU | 加 `vTaskDelay` |
+| `Brownout detector was triggered` | **供电不足** | 换线/换电源 |
+| 无任何日志只是重启 | 供电或硬件问题 | 量电压 |
+
+**`Brownout` 是供电问题，不是代码问题**——很多人在这里白查代码。
+:::
+
+:::tip[看崩溃地址对应的代码行]
+ESP-IDF 的 monitor 会自动解析 backtrace：
+
+```text
+Backtrace: 0x4200a1b2:0x3fc9a1b0 0x4200b3c4:0x3fc9a1d0
+```
+
+`idf.py monitor` 会直接显示函数名和行号。
+
+**如果没显示**，手动解析：
+
+```bash
+idf.py monitor
+# 或
+xtensa-esp32s3-elf-addr2line -pfiaC -e build/myapp.elf 0x4200a1b2
+```
+:::
+
+## 三、WiFi 连不上
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 一直重连，reason=15 | **密码错**或加密方式不匹配 | 核对密码；路由器改 WPA2 |
+| reason=201 | 路由器主动断开 | 检查 MAC 过滤/黑名单 |
+| reason=200 | 信标超时（信号弱） | 靠近路由器 |
+| `ESP_ERR_NVS_NOT_INITIALIZED` | 没初始化 NVS | 加 `nvs_flash_init()` |
+| 连上但拿不到 IP | DHCP 问题 | 试固定 IP |
+| **完全搜不到 5G 信号** | **ESP32 只支持 2.4GHz** | 连 2.4G |
+| SSID 带中文/emoji | 编码问题 | 改英文测试 |
+| 频繁断开重连 | `client_id` 冲突（MQTT） | 用 MAC 生成唯一 ID |
+
+## 四、传感器读不到
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| I2C 扫描不到任何设备 | **SDA/SCL 接反** | 对调 |
+| 同上 | 没供电 | 量 VCC 对 GND |
+| 同上 | 没上拉电阻 | 加 4.7k 或开内部上拉 |
+| 扫到但读失败 | 地址错（0x3C vs 0x3D） | 用扫描出的地址 |
+| 偶发失败 | 线太长/接触不良 | 缩短线、换杜邦线 |
+| ADC 一直是 4095 | 没设衰减 | `ADC_ATTEN_DB_12` |
+| ADC 一直是 0 | 通道/引脚错 | 查对应表 |
+| ADC 值乱跳 | 噪声 | 多值平均 + 加滤波电容 |
+
+:::tip[I2C 排查三步]
+```text
+① 量电压：VCC-GND 是 3.3V 吗
+② 跑扫描程序：能不能发现设备（第 12 课）
+③ 换个已知好的模块试：排除模块坏
+```
+
+**跳过第 ① 步直接查代码，是在浪费时间。**
+:::
+
+## 五、内存不足
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `malloc failed` / `no mem` | 堆耗尽 | 查泄漏、减小缓冲 |
+| 跑几小时后崩 | **内存泄漏** | 查漏掉的 `free`/`cJSON_Delete` |
+| HTTPS 请求失败 | 单个请求吃 40~60KB | 串行发、减少并发 |
+| `esp_wifi_init` 失败 | 内存不够 | 减少任务数/栈 |
+| 创建任务失败 | 堆或栈不够 | 减小栈、删无用任务 |
+
+```c
+/* 随时查剩余堆 */
+ESP_LOGI(TAG, "空闲堆 %d 字节", esp_get_free_heap_size());
+ESP_LOGI(TAG, "最小历史值 %d", esp_get_minimum_free_heap_size());
+```
+
+:::danger[`esp_get_minimum_free_heap_size` 是找泄漏的关键]
+**如果这个值随着运行时间持续下降 → 一定有内存泄漏。**
+
+**常见泄漏点**：
+
+- `cJSON_Parse` 后没 `cJSON_Delete`（[第 15 课](./15-http)）
+- `esp_http_client_init` 后没 `cleanup`
+- `malloc` 后没 `free`
+- 队列/信号量创建了从不删除（一般可接受）
+:::
+
+## 六、代码逻辑问题
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 按键触发多次 | 没消抖 | 第 9 课 |
+| 定时周期不准 | 用了 `vTaskDelay` | 改 `vTaskDelayUntil` |
+| 多任务数据错乱 | 共享变量 | 用队列/锁 |
+| LED 亮度不变 | 忘 `ledc_update_duty` | 第 8 课 |
+| 串口满屏乱码 | 波特率不对 | 统一 115200 |
+| 打印看不到 | `ESP_LOGD` 默认不显示 | menuconfig 调级别 |
+
+## 七、编译与链接问题
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `undefined reference to xxx` | 没加组件依赖 | `idf.py add-dependency` 或改 CMake |
+| `fatal error: xxx.h: No such file` | 头文件路径没加 | `INCLUDE_DIRS` 或 `REQUIRES` |
+| `region 'iram0_0_seg' overflowed` | 代码太大放不进 IRAM | 去掉 `IRAM_ATTR` 或减小代码 |
+| `app partition is too small` | 分区太小 | 改分区表或开 `-Os` 优化 |
+| 改了代码行为没变 | 没重新烧 | `idf.py build flash` |
+| 奇怪的编译错误 | 缓存坏了 | `idf.py fullclean` 再编译 |
+
+:::tip[`idf.py fullclean` 能解决很多怪问题]
+改了 `CMakeLists.txt`、换了组件、遇到莫名其妙的链接错误——
+
+**先 `idf.py fullclean` 再编译**，排除缓存问题。
+:::
+
+## 一张速查表
+
+| 你遇到的 | 先去查 |
+| --- | --- |
+| 烧不进去 | 手动进下载模式（BOOT+RESET） |
+| 一直重启 | **看 monitor 日志**，找 panic/stack overflow/brownout |
+| WiFi 连不上 | 密码、2.4GHz、NVS init |
+| 传感器没数据 | 先量电压，再跑 I2C 扫描 |
+| 内存问题 | `esp_get_minimum_free_heap_size` 看趋势 |
+| 编译错误 | `idf.py fullclean` 后重编 |
+| 完全没思路 | 回退到上一个能跑的版本，逐步加回 |
+
+## 本课自检
+
+- [ ] 记住五步排查法（看现象→看日志→缩小范围→一次改一处→记录）
+- [ ] **知道绝大多数烧录问题靠 BOOT+RESET 解决**
+- [ ] 能读懂 panic / stack overflow / Brownout 三种典型日志
+- [ ] **知道 Brownout 是供电问题不是代码问题**
+- [ ] 知道 WiFi reason 码的含义
+- [ ] **知道 ESP32 只支持 2.4GHz**
+- [ ] 会 I2C 三步排查（量电压→扫描→换模块）
+- [ ] **会用 `esp_get_minimum_free_heap_size` 找内存泄漏**
+- [ ] 知道常见泄漏点（cJSON/HTTP client）
+- [ ] 知道 `idf.py fullclean` 解决缓存问题
+
+## 下一步
+
+[28 从米思齐过渡到 ESP-IDF](./28-mixly-to-idf) —— 看懂"积木生成的代码"到底在做什么。

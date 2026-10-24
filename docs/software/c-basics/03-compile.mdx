@@ -1,0 +1,315 @@
+---
+id: 03-compile
+title: 03 编译与运行：四个阶段
+sidebar_position: 3
+description: 从 .c 到可执行文件要经过预处理、编译、汇编、链接四步，理解它能解释大部分链接错误。
+---
+
+# 03 编译与运行：四个阶段
+
+**本课目标**：搞清 `gcc hello.c -o hello` 这一条命令背后发生了什么。
+
+## 为什么要知道这个
+
+新手最困惑的报错往往来自这里：
+
+```text
+undefined reference to `sqrt'
+```
+
+这**不是语法错误**，而是**链接**阶段的问题。不懂四阶段，就不知道从哪查。
+
+## 一条命令 = 四个阶段
+
+![C 编译四阶段：hello.c 经预处理得 .i、编译得 .s、汇编得 .o、链接得可执行文件，含实测体积与各阶段报错类型](/img/diagrams/c-compile-stages.svg)
+
+
+```mermaid
+flowchart LR
+    A["hello.c<br/>源代码"] -->|预处理| B["hello.i<br/>展开后"]
+    B -->|编译| C["hello.s<br/>汇编代码"]
+    C -->|汇编| D["hello.o<br/>目标文件"]
+    D -->|链接| E["hello<br/>可执行文件"]
+```
+
+`gcc hello.c -o hello` 其实偷偷跑了全部四步。
+
+**可以手动让它在某一步停下来看产物**，这就是理解它的最好方式。
+
+## 准备一个测试程序
+
+`t.c`：
+
+```c
+#include <stdio.h>
+#define MAX 10
+
+int main(void) {
+    int a = MAX;
+    printf("a=%d\n", a);
+    return 0;
+}
+```
+
+## 第一阶段：预处理（Preprocessing）
+
+```bash
+gcc -E t.c -o t.i
+```
+
+`-E` = 只做预处理，输出到 `t.i`。
+
+**预处理只做三件事**，全是纯文本替换，不懂语法：
+
+| 做什么 | 例子 |
+| --- | --- |
+| 展开 `#include` | 把 `stdio.h` 的内容**整个复制进来** |
+| 替换 `#define` | `MAX` → `10` |
+| 处理 `#if` 等条件编译 | 按条件保留或删除代码 |
+
+### 看看产物有多大
+
+本机实测：
+
+```text
+t.i 行数: 1750
+```
+
+**你的 `t.c` 只有 8 行，预处理后变成 1750 行！**
+
+因为 `#include <stdio.h>` 把整个头文件展开进来了——里面全是函数声明、类型定义、宏。
+
+### 确认宏被替换了
+
+在 `t.i` 里搜 `int a`，能找到：
+
+```c
+int a = 10;
+```
+
+`MAX` 已经被替换成 `10`。
+
+:::tip[预处理产物不能直接看懂，但有诊断价值]
+`t.i` 里有几千行，不适合通读。但当你怀疑"宏展开了什么"时：
+
+```bash
+gcc -E t.c | grep 关键字
+```
+
+立刻就能看到宏到底变成了什么。这是排查宏问题的利器。
+:::
+
+## 第二阶段：编译（Compilation）
+
+```bash
+gcc -S t.c -o t.s
+```
+
+`-S` = 编译到汇编，输出 `t.s`。
+
+**这一步把 C 代码翻译成汇编指令**，会做语法检查、类型检查、代码优化。
+
+本机实测：
+
+```text
+t.s 行数: 76
+```
+
+产物开头长这样（x86-64 汇编）：
+
+```asm
+	.def	@feat.00;
+	.scl	3;
+	.type	0;
+```
+
+:::info[绝大多数报错发生在这一阶段]
+像下面的错误都是**编译阶段**的：
+
+```text
+error: expected ';' before 'return'      ← 语法错
+error: 'x' undeclared                     ← 变量没定义
+warning: unused variable 'y'              ← 定义了没用
+```
+
+看到 `error:` 开头，说明**还没到链接**，先修语法和类型。
+:::
+
+## 第三阶段：汇编（Assembly）
+
+```bash
+gcc -c t.c -o t.o
+```
+
+`-c` = 编译+汇编，但不链接，输出**目标文件** `.o`（Windows 上是 `.obj`）。
+
+本机实测：
+
+```text
+t.o 大小: 1053 字节
+```
+
+### 目标文件里有什么
+
+它是**机器码**，但不是完整程序：
+
+- ✅ 有：你自己写的函数的机器码
+- ❌ 没有：`printf` 的实现代码（在别的地方）
+
+:::tip[目标文件就像"零件"]
+`.o` 是半成品。它引用了外部的东西（比如 `printf`），但那些东西还没接上。
+
+**链接阶段的工作就是"把零件组装成整机"。**
+:::
+
+## 第四阶段：链接（Linking）
+
+```bash
+gcc t.o -o t.exe
+```
+
+把目标文件和**库**（标准库、你自己写的其他 .o）拼起来，生成最终可执行文件。
+
+本机实测：
+
+```text
+t.exe 大小: 67072 字节
+a=10
+```
+
+**从 1 KB 的目标文件变成 67 KB 的可执行文件**——多出来的就是链接进来的标准库代码和启动代码。
+
+## 最关键的认知：链接错误长什么样
+
+:::danger[`undefined reference` 是最常见的链接错误]
+故意调用一个不存在的函数：
+
+```c
+#include <stdio.h>
+
+void not_exist(void);      /* 只声明，没有实现 */
+
+int main(void) {
+    not_exist();
+    return 0;
+}
+```
+
+**编译能过**（语法和类型都对），但**链接会失败**：
+
+```text
+undefined reference to `not_exist'
+```
+
+**含义**：编译器知道 `not_exist` 存在（你声明了），但链接时找不到它的实现代码。
+:::
+
+### 这个错误怎么排查
+
+| 原因 | 现象 | 解决 |
+| --- | --- | --- |
+| 函数只声明没定义 | `undefined reference to 'foo'` | 补上实现，或链接含它的文件 |
+| 忘了链接库 | `undefined reference to 'sqrt'` | 加 `-lm`（数学库） |
+| 库的顺序不对 | 同上 | 把 `-lxxx` 放到**源文件后面** |
+| 文件名拼错 | 同上 | 检查 `.c` 名字 |
+
+:::tip[数学库必须显式链接]
+```bash
+gcc calc.c -o calc              # ❌ undefined reference to `sqrt'
+gcc calc.c -o calc -lm          # ✅ 链接数学库
+```
+
+`-lm` 表示链接 `libm`（math 库）。**Linux/macOS 上必须加**，Windows 的 MinGW 通常自动带上。
+:::
+
+## 自己跑一遍四个阶段
+
+```bash
+# ① 预处理
+gcc -E t.c -o t.i
+wc -l t.i              # 看展开后有多少行
+
+# ② 编译成汇编
+gcc -S t.c -o t.s
+head -20 t.s           # 看看汇编长什么样
+
+# ③ 汇编成目标文件
+gcc -c t.c -o t.o
+ls -l t.o              # 看大小
+
+# ④ 链接
+gcc t.o -o t
+./t                    # 运行
+```
+
+（Windows 上 `wc -l` 用 `find /c /v ""` 或直接在编辑器里看行数。）
+
+## 为什么这个知识有用
+
+:::tip[四个实际场景]
+**① 看到 `error:`** → 编译阶段问题，改语法/类型
+
+**② 看到 `undefined reference`** → 链接阶段问题，检查函数有没有实现、库有没有链接
+
+**③ 怀疑宏展开错了** → `gcc -E` 看真实展开结果
+
+**④ 想知道代码被优化成什么样** → `gcc -S -O2` 看汇编（嵌入式性能调优时常用）
+:::
+
+## `-c` 的实际用途：多文件编译
+
+这是四阶段知识最实际的应用。有 `a.c` 和 `b.c` 两个文件时：
+
+```bash
+# 分别编译成目标文件
+gcc -c a.c -o a.o
+gcc -c b.c -o b.o
+
+# 链接在一起
+gcc a.o b.o -o program
+```
+
+**好处**：改了 `a.c` 只需重新编译 `a.o`，不用重编 `b.c`。项目大了能省大量时间。
+
+第 27 课会详细讲多文件工程。
+
+## 常见错误
+
+| 报错 | 阶段 | 原因 |
+| --- | --- | --- |
+| `expected ';'` | 编译 | 语法错 |
+| `'x' undeclared` | 编译 | 变量未声明 |
+| `implicit declaration of function` | 编译 | 用了函数但没 `#include` 头文件 |
+| `undefined reference to` | **链接** | 函数没实现，或库没链接 |
+| `multiple definition of` | **链接** | 同一个函数定义了两次 |
+| `No such file or directory: stdio.h` | 预处理 | 编译器装得不完整 |
+
+:::warning[`implicit declaration` 是警告但很危险]
+```c
+#include <stdio.h>
+int main(void) {
+    printf("%d\n", strlen("abc"));   /* 忘了 #include <string.h> */
+    return 0;
+}
+```
+
+会警告 `implicit declaration of function 'strlen'`。
+
+**为什么危险**：C 会假设这个函数返回 `int`。如果实际返回别的类型（比如 `strlen` 返回 `size_t`，8 字节），就会产生**难以发现的错误**。
+
+**看到这个警告一定要修**——补上对应的 `#include`。
+:::
+
+## 本课自检
+
+- [ ] 能说出四个阶段的名称和顺序
+- [ ] 知道 `-E` `-S` `-c` 分别停在哪一步
+- [ ] 知道 `#include` 是"复制粘贴"头文件内容
+- [ ] 知道预处理只做文本替换，不懂语法
+- [ ] **能区分 `error:` 和 `undefined reference` 分属哪个阶段**
+- [ ] 知道数学库要加 `-lm`
+- [ ] 知道 `.o` 是半成品，需要链接才能运行
+
+## 下一步
+
+[04 第一个完整程序](./04-first-program) —— 逐行讲清一个 C 程序里每个部分的作用。

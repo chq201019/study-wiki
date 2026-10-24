@@ -1,0 +1,177 @@
+import io
+content = '''---
+id: sockets
+title: Socket 编程陷阱
+sidebar_position: 36
+description: TIME_WAIT 与 SO_REUSEADDR、粘包、短读短写、非阻塞下的 EAGAIN、以及 select/epoll 的真实边界。
+---
+
+# Socket 编程陷阱
+
+**本课目标**：避开写网络程序时最耗时间的那几个坑。
+
+## 重启用不了端口：SO_REUSEADDR
+
+:::danger[服务重启时报 Address already in use]
+**不是上一个进程没死** —— 是连接进了 TIME_WAIT 状态。
+
+```c
+int on = 1;
+setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+```
+
+**这一行应该写在所有服务端代码里**，紧跟在 socket() 之后。
+:::
+
+**为什么 TIME_WAIT 必须存在**：
+
+- 保证最后一个 ACK 能重发（丢了对方会重发 FIN）
+- 让旧连接的残留报文在网络中消亡，不串到新连接
+
+**所以把 TIME_WAIT 调短是在牺牲正确性**。
+
+## 短读与短写
+
+:::danger[read / write 不保证一次传完]
+```c
+int n = write(fd, buf, 1000);      /* 可能只写了 300 字节 */
+```
+
+**write 返回实际写入量**，可能小于请求（发送缓冲区满、被信号打断）。
+
+**read 同理**：可能小于请求量，也可能返回 0（对端关闭）。
+:::
+
+```c
+ssize_t write_all(int fd, const void *buf, size_t len)
+{
+    const char *p = buf;
+    size_t left = len;
+    while (left > 0) {
+        ssize_t n = write(fd, p, left);
+        if (n < 0) {
+            if (errno == EINTR) continue;    /* 被信号打断则重试 */
+            return -1;
+        }
+        p += n;
+        left -= n;
+    }
+    return (ssize_t)len;
+}
+```
+
+:::warning[返回值必须用 ssize_t 而不是 size_t]
+```c
+size_t n = read(fd, buf, len);      /* 错：-1 变成巨大正数 */
+if (n < 0) { ... }                  /* 永远为假 */
+```
+
+**这是最经典的 bug 之一。** 凡是函数可能返回 -1，都要先存进有符号类型。
+:::
+
+## TCP 粘包
+
+:::info[TCP 是字节流，没有消息边界]
+```text
+发送方 write 三次：abc / de / f
+接收方可能一次 read 到 abcde，也可能 read 到 ab 再 read 到 cdef
+```
+
+**完全合法。** TCP 不保留 write 的边界。
+:::
+
+| 定界方式 | 做法 | 适合 |
+| --- | --- | --- |
+| 定长 | 每条消息固定 N 字节 | 二进制协议 |
+| **长度前缀** | 先 4 字节长度再跟内容 | **最常用** |
+| 分隔符 | 用换行或 NUL 分隔 | 文本协议 |
+
+:::danger[长度前缀必须校验上限]
+```c
+uint32_t len = ntohl(be_len);
+char *buf = malloc(len);       /* len 可能是 4GB，malloc 失败 */
+read_all(fd, buf, len);        /* buf 是 NULL，段错误 */
+```
+
+**攻击者发一个 0xFFFFFFFF 的长度就能让服务端崩。**
+
+**规矩：长度必须校验上限，且在分配内存之前。**
+:::
+
+## 非阻塞下的 EAGAIN
+
+```c
+ssize_t n = read(fd, buf, len);
+if (n < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return 0;        /* 数据还没到，不是错误 */
+    }
+    return -1;           /* 这才是真错误 */
+}
+```
+
+:::warning[EAGAIN 与 EWOULDBLOCK 在 Linux 上是同一个值]
+**但为可移植性两个都要判。**
+:::
+
+## epoll 的两个陷阱
+
+:::danger[accept 返回的新 socket 默认仍是阻塞的]
+**即使监听 socket 设了非阻塞，accept 出来的新连接仍是阻塞。**
+
+**必须对每个新连接单独设非阻塞**，否则一个慢客户端会卡住整个事件循环。
+
+**这是 epoll 服务端最常见的 bug。**
+:::
+
+:::warning[水平触发 vs 边缘触发]
+| 模式 | 行为 |
+| --- | --- |
+| **LT（默认）** | 只要还有数据就持续通知 |
+| **ET（EPOLLET）** | 只在状态变化时通知一次 |
+
+**ET 必须配非阻塞 + 循环读到 EAGAIN**，否则剩下的数据永远不被通知。
+
+**新手先用 LT** —— 连接数不多时性能差距很小。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| Address already in use | 没设 SO_REUSEADDR | 加上 |
+| 客户端连不上 | 端口没 htons | 用 htons |
+| 只收到部分数据 | read 返回小于请求量 | 写读循环 |
+| 偶尔丢数据 | write 返回值没检查 | 写循环 |
+| 消息边界错乱 | 没处理粘包 | 长度前缀 |
+| 服务端崩溃 | 没校验长度就 malloc | 校验上限 |
+| 一个慢客户端拖垮全部 | 新连接没设非阻塞 | 每个连接单独设 |
+| read 返回巨大正数 | 用无符号类型接负返回值 | 用 ssize_t |
+
+:::tip[排查工具]
+```bash
+ss -tanp                        # 所有 TCP 连接与状态
+ss -tlnp                        # 只看监听
+ss -tan | awk \'NR>1{print $1}\' | sort | uniq -c | sort -rn   # 状态分布
+```
+:::
+
+## 本课自检
+
+- [ ] **知道服务端必须设 SO_REUSEADDR**
+- [ ] **知道 TIME_WAIT 必须存在，调短是牺牲正确性**
+- [ ] **知道 read/write 不保证一次传完，必须写循环**
+- [ ] **知道返回值要用 ssize_t 而非 size_t**
+- [ ] 知道 EINTR 要重试
+- [ ] **理解 TCP 粘包，会用长度前缀**
+- [ ] **知道长度必须校验上限（否则是远程崩溃漏洞）**
+- [ ] 知道非阻塞下 EAGAIN 不是错误
+- [ ] **知道 accept 出的新 socket 默认仍是阻塞的**
+- [ ] 知道 LT 与 ET 的区别
+
+## 下一步
+
+[网络编程：Socket](./network) 或 [TCP/IP 协议深入](./tcp-ip)。
+'''
+io.open('docs/hardware/linux/sockets.mdx', 'w', encoding='utf-8', newline=chr(10)).write(content)
+print('written', len(content.split(chr(10))))

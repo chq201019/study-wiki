@@ -1,0 +1,346 @@
+---
+id: 28-mixly-to-idf
+title: 28 从米思齐过渡到 ESP-IDF
+sidebar_position: 28
+description: 积木代码翻译成 C 的对照表、Arduino 的 setup/loop 怎么对应、为什么米思齐会卡在复杂项目上。
+---
+
+# 28 从米思齐过渡到 ESP-IDF
+
+**本课目标**：把你会拖的积木，翻译成看得懂的代码。
+
+## 为什么迟早要过渡
+
+:::danger[米思齐会在这几个地方卡住]
+| 场景 | 米思齐的表现 |
+| --- | --- |
+| 逻辑超过 20 个积木 | 图变成蜘蛛网，改不动 |
+| 需要自定义协议 | **没有对应积木** |
+| 多任务并发 | 积木表达不了 |
+| 精确定时（微秒级） | 做不到 |
+| 优化内存/性能 | 无手段 |
+| 出 bug 排查 | 生成的代码很难读 |
+
+**积木适合"快速验证"，不适合"做产品"。**
+:::
+
+## 积木 → C 代码对照表
+
+### 点亮 LED
+
+**积木**：
+
+```text
+[设置数字引脚] [4] [为] [高电平]
+```
+
+**Arduino**：
+
+```cpp
+digitalWrite(4, HIGH);
+```
+
+**ESP-IDF**：
+
+```c
+gpio_set_level(4, 1);
+```
+
+### 延时
+
+| 积木 | Arduino | ESP-IDF |
+| --- | --- | --- |
+| 等待 1 秒 | `delay(1000);` | `vTaskDelay(pdMS_TO_TICKS(1000));` |
+
+:::danger[这三种"延时"行为不同]
+| 写法 | 行为 |
+| --- | --- |
+| `delay(1000)`（Arduino） | 忙等，**CPU 空转**，其他任务饿死 |
+| `vTaskDelay(...)`（ESP-IDF） | **让出 CPU**，其他任务能跑 |
+| `esp_rom_delay_us(us)` | 微秒级忙等，用于极短精确延时 |
+
+**Arduino 的 `delay()` 在 FreeRTOS 下会喂看门狗，但仍然浪费 CPU。**
+
+**ESP-IDF 里一律用 `vTaskDelay`。**
+:::
+
+### 读引脚
+
+| 积木 | Arduino | ESP-IDF |
+| --- | --- | --- |
+| 读数字引脚 | `digitalRead(4)` | `gpio_get_level(4)` |
+
+### 设置引脚模式
+
+| 积木 | Arduino | ESP-IDF |
+| --- | --- | --- |
+| 设为输出 | `pinMode(4, OUTPUT);` | `gpio_set_direction(4, GPIO_MODE_OUTPUT);` |
+| 设为输入 | `pinMode(4, INPUT_PULLUP);` | `gpio_set_direction(...)` + `gpio_set_pull_mode(...)` |
+
+### 串口打印
+
+| 积木 | Arduino | ESP-IDF |
+| --- | --- | --- |
+| 串口输出 | `Serial.println("hi");` | `ESP_LOGI(TAG, "hi");` |
+
+### PWM
+
+| 积木 | Arduino | ESP-IDF |
+| --- | --- | --- |
+| 模拟输出 | `analogWrite(4, 128);` | `ledc_set_duty(...)` + `ledc_update_duty(...)` |
+
+（[第 8 课](./08-pwm)讲了完整的 PWM 配置。）
+
+### 读模拟量
+
+| 积木 | Arduino | ESP-IDF |
+| --- | --- | --- |
+| 读模拟引脚 | `analogRead(34);` | `adc_oneshot_read(...)` |
+
+（[第 10 课](./10-adc)）
+
+## Arduino 的 `setup`/`loop` 对应什么
+
+:::tip[这是最容易理解过渡的切入点]
+**Arduino 代码**：
+
+```cpp
+void setup() {
+    pinMode(4, OUTPUT);       // 只执行一次
+}
+
+void loop() {
+    digitalWrite(4, HIGH);    // 反复执行
+    delay(1000);
+    digitalWrite(4, LOW);
+    delay(1000);
+}
+```
+
+**等价的 ESP-IDF 代码**：
+
+```c
+void app_main(void)
+{
+    /* setup 部分 */
+    gpio_reset_pin(4);
+    gpio_set_direction(4, GPIO_MODE_OUTPUT);
+
+    /* loop 部分 */
+    while (1) {
+        gpio_set_level(4, 1);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        gpio_set_level(4, 0);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+```
+
+**`setup()` = `app_main` 的开头，`loop()` = `while(1)` 里的内容。**
+:::
+
+:::info[Arduino 背后藏着什么]
+Arduino 框架在 ESP32 上的实际结构是：
+
+```c
+void app_main(void) {
+    initArduino();          /* 初始化 */
+    setup();                /* 调用你的 setup */
+    while (1) {
+        loop();             /* 反复调用你的 loop */
+        /* 还有一些系统维护工作 */
+    }
+}
+```
+
+**所以你写的 `setup`/`loop` 只是被"包"起来了。**
+
+**理解这一点，你就明白为什么 Arduino 有些事做不到**（比如你想在 `loop` 之外跑另一个任务）。
+:::
+
+## 米思齐生成的代码长什么样
+
+:::warning[积木生成的代码通常很冗长]
+米思齐拖 5 个积木，生成的代码可能有 50 行——因为它要处理各种兼容性。
+
+**你不用读懂全部**，只需找到关键的几行：
+
+```c
+// 生成的代码里通常长这样
+void loop() {
+    digitalWrite(4, HIGH);      // ← 这行对应"设为高电平"
+    delay(1000);                // ← 这行对应"等待1秒"
+    digitalWrite(4, LOW);
+    delay(1000);
+}
+```
+
+**规矩：看生成的代码时，只找"和我拖的积木对应"的那几行，忽略其余。**
+:::
+
+:::danger[Mind+ 路径过长/中文路径的报错]
+如果你在米思齐里遇到：
+
+```text
+路径过长
+找不到文件
+编译失败（在很深的目录下）
+```
+
+**先怀疑路径，不是代码**：
+
+1. 装到 `D:\MindPlus` 这种**纯英文短路径**
+2. 项目文件放 `D:\esp\proj1`
+3. **用户目录含中文时，别把项目放桌面**
+
+**改完路径通常就好了。**
+:::
+
+## 迁移的实用步骤
+
+:::tip[不要"重写"，要"逐步替换"]
+**① 先在米思齐里把逻辑跑通**
+
+确认硬件、接线、传感器都正常。**这一步排除硬件问题。**
+
+**② 把积木逻辑写成文字**
+
+```text
+每 2 秒：
+  读温湿度
+  打印到串口
+  如果温度 > 30，点亮 LED
+```
+
+**③ 用 ESP-IDF 实现同一份文字逻辑**
+
+一次只实现一部分，跑通了再加下一部分。
+
+**④ 对照现象验证**
+
+两边现象一致 = 迁移成功。
+:::
+
+## 一个完整的迁移例子
+
+**需求**：按键按一下切换 LED，同时每秒打印温度。
+
+**米思齐积木（文字描述）**：
+
+```text
+当启动：
+  设置引脚 4 为输出
+  设置引脚 0 为输入上拉
+
+每秒重复：
+  读温度，串口输出
+
+当引脚 0 检测到下降沿：
+  翻转引脚 4
+```
+
+**ESP-IDF 实现**：
+
+```c
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+
+static const char *TAG = "migrate";
+#define LED_GPIO 4
+#define BTN_GPIO 0
+
+static QueueHandle_t s_btn_q;
+
+static void IRAM_ATTR btn_isr(void *arg)
+{
+    uint32_t v = 1;
+    xQueueSendFromISR(s_btn_q, &v, NULL);
+}
+
+/* 任务一：按键处理（对应"当检测到下降沿"） */
+static void btn_task(void *arg)
+{
+    bool on = false;
+    uint32_t v;
+    while (1) {
+        if (xQueueReceive(s_btn_q, &v, portMAX_DELAY) == pdTRUE) {
+            vTaskDelay(pdMS_TO_TICKS(20));       /* 消抖 */
+            if (gpio_get_level(BTN_GPIO) == 0) {
+                on = !on;
+                gpio_set_level(LED_GPIO, on);
+                ESP_LOGI(TAG, "LED %s", on ? "ON" : "OFF");
+            }
+        }
+    }
+}
+
+/* 任务二：每秒打印温度（对应"每秒重复"） */
+static void temp_task(void *arg)
+{
+    TickType_t last = xTaskGetTickCount();
+    while (1) {
+        float t = read_temperature();             /* 你的读传感器函数 */
+        ESP_LOGI(TAG, "温度 %.1f°C", t);
+        vTaskDelayUntil(&last, pdMS_TO_TICKS(1000));
+    }
+}
+
+void app_main(void)
+{
+    /* 对应"当启动" */
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << BTN_GPIO),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .intr_type    = GPIO_INTR_NEGEDGE,
+    };
+    gpio_config(&cfg);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(BTN_GPIO, btn_isr, NULL);
+
+    s_btn_q = xQueueCreate(10, sizeof(uint32_t));
+
+    xTaskCreate(btn_task,  "btn",  3072, NULL, 6, NULL);
+    xTaskCreate(temp_task, "temp", 4096, NULL, 4, NULL);
+}
+```
+
+:::tip[这个例子的关键差别]
+**积木的"每秒重复"和"当检测到下降沿"是两段并列的积木**，但在代码里它们是**两个任务**。
+
+**这是从"图形化思维"到"并发思维"的转变**——也是过渡中最难的一步。
+
+**记住：多个"同时进行"的积木块 → 多个任务。**
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 把两个积木块写进一个 `while` | 按键不响应 | 打印阻塞了按键 | 拆成两个任务 |
+| 用 `delay()` | CPU 浪费 | Arduino 习惯 | `vTaskDelay` |
+| 以为 `setup/loop` 是全部的 | 找不到入口 | 实际在 `app_main` 里 | 理解封装 |
+| 想读懂所有生成代码 | 浪费时间 | 代码冗长 | 只找关键几行 |
+| 迁移时不改路径 | 编译报错 | 中文/长路径 | 放纯英文短路径 |
+
+## 本课自检
+
+- [ ] 能说出米思齐会卡住的五个场景
+- [ ] 会查积木 → Arduino → ESP-IDF 对照表
+- [ ] **知道 `delay()` 和 `vTaskDelay` 的行为差别**
+- [ ] **理解 `setup`/`loop` 对应 `app_main` 的开头和 `while(1)`**
+- [ ] 知道 Arduino 是在 `app_main` 里被"包"起来的
+- [ ] 看米思齐生成的代码只找关键几行
+- [ ] 知道路径过长/中文路径要先改路径
+- [ ] **理解"多个并列积木块 → 多个任务"**
+- [ ] 能按"跑通→写文字→分步实现→验证"四步迁移
+
+## 下一步
+
+[29 内存与性能](./29-memory) —— 让程序跑得稳、跑得快。

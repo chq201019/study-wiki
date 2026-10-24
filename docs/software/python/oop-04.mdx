@@ -1,0 +1,179 @@
+---
+id: oop-04
+title: "04 私有与名称改写"
+sidebar_position: 5
+description: "面向对象 第 4 部分：私有与名称改写"
+---
+
+# 04 私有与名称改写
+Python **没有真正的私有**。约定是单下划线 `_x` 表示「内部用，别碰」。
+
+双下划线 `__x` 会触发**名称改写**（name mangling）：
+
+```python
+class Bank:
+    def __init__(self):
+        self.__bal = 0
+    def deposit(self, n):
+        self.__bal += n
+    def get(self):
+        return self.__bal
+
+b = Bank()
+b.deposit(10)
+print("余额:", b.get())
+print("实例里的属性名:", list(vars(b)))
+print("仍可访问:", b._Bank__bal)
+```
+
+```text
+余额: 10
+实例里的属性名: ['_Bank__bal']
+仍可访问: True（值是 10）
+```
+
+`self.__bal` 被改写成 `self._Bank__bal`。**目的是避免子类意外覆盖父类的属性，不是安全机制**——外面照样能访问。
+
+## 12. 一个完整例子
+
+把本页串起来：一个用 dataclass + property + 魔术方法实现的购物车。
+
+```python
+from dataclasses import dataclass, field
+from typing import Iterable
+
+
+@dataclass(frozen=True)
+class Item:
+    """不可变的商品条目（可哈希，能进 set）。"""
+    sku: str
+    name: str
+    price: int          # 用「分」为单位，避免浮点误差
+
+
+@dataclass
+class Cart:
+    items: list[tuple[Item, int]] = field(default_factory=list)
+
+    def add(self, item: Item, qty: int = 1) -> None:
+        if qty <= 0:
+            raise ValueError("数量必须为正")
+        for i, (it, q) in enumerate(self.items):
+            if it.sku == item.sku:
+                self.items[i] = (it, q + qty)
+                return
+        self.items.append((item, qty))
+
+    @property
+    def total(self) -> int:
+        return sum(it.price * q for it, q in self.items)
+
+    def __len__(self) -> int:
+        return sum(q for _, q in self.items)
+
+    def __iter__(self) -> Iterable[tuple[Item, int]]:
+        return iter(self.items)
+
+    def __repr__(self) -> str:
+        return f"Cart({len(self)} 件, 合计 {self.total} 分)"
+
+
+if __name__ == "__main__":
+    apple = Item("A1", "苹果", 500)
+    milk = Item("M1", "牛奶", 800)
+
+    cart = Cart()
+    cart.add(apple, 2)
+    cart.add(milk)
+    cart.add(apple, 1)
+
+    print(cart)
+    print("总件数:", len(cart))
+    print("总价:", cart.total, "分")
+    for it, q in cart:
+        print(f"  {it.name} x{q} = {it.price * q}")
+    print("apple 可哈希:", hash(apple) is not None)
+    print("去重:", len({Item('A1','苹果',500), Item('A1','苹果',500)}))
+```
+
+预期输出：
+
+```text
+Cart(4 件, 合计 2300 分)
+总件数: 4
+总价: 2300 分
+  苹果 x3 = 1500
+  牛奶 x1 = 800
+apple 可哈希: True
+去重: 1
+```
+
+注意总件数是 **4**（苹果 3 + 牛奶 1）——`add` 方法对同 SKU 是累加而不是新增一行，这是它合并条目的效果。
+
+这里体现了本页要点：`frozen=True` 使 Item 可哈希且能去重；`field(default_factory=list)` 避开共享可变默认；`property` 提供计算属性；`__len__`/`__iter__` 让 Cart 用起来像内建容器。
+
+## 13. 验证：预测这些输出
+
+```python
+class S:
+    items = []
+
+a, b = S(), S()
+a.items.append(1)
+print(b.items)
+
+class P:
+    def __eq__(self, o): return True
+print(P.__hash__)
+```
+
+:::info[答案]
+```text
+[1]
+None
+```
+
+1. 类属性 `items` 被所有实例共享，改一个全变
+2. 定义了 `__eq__` 却没定义 `__hash__` → `__hash__` 被置为 `None`，实例不可哈希
+:::
+
+## 常见坑
+
+| 现象 | 真实原因 | 解决 |
+| --- | --- | --- |
+| 改一个实例，另一个也变了 | 可变类属性被共享 | 可变容器放进 `__init__` |
+| `TypeError: unhashable type` | 定义了 `__eq__` 导致 `__hash__` 变 `None` | 同时定义 `__hash__`，或用 `frozen=True` |
+| 多继承报「Cannot create a consistent MRO」 | 父类顺序自相矛盾 | 调整基类顺序 |
+| 某个父类的 `__init__` 没被调用 | 中间类没调 `super().__init__()` | 协作式继承，全部透传 |
+| `dataclass` 报「mutable default not allowed」 | 直接写了 `= []` | 用 `field(default_factory=list)` |
+| `ImportError: cannot import InitVar from typing` | `InitVar` 在 `dataclasses` 里 | `from dataclasses import InitVar` |
+| `frozen=True` 但列表字段还能改 | 冻结是浅层的 | 需要深不可变就用 tuple |
+| 加 `__slots__` 后不能加新属性 | 这是设计目的 | 需要动态属性就别用 slots |
+| 子类加了属性但父类有 slots | 子类没声明 `__slots__`，又有了 `__dict__` | 子类也声明 |
+| `@classmethod` 里返回了父类实例 | 硬编码了类名 | 用 `cls(...)` |
+| 比较时返回 `False` 而不是 `NotImplemented` | 阻断了反射调用 | 返回 `NotImplemented` |
+| 以为 `__x` 是私有的 | 只是名称改写 | 别用它做安全边界 |
+
+## 自检清单
+
+- [ ] 能画出属性查找链（实例 → 类 → MRO → `__getattr__`）
+- [ ] 能解释为什么可变类属性会共享，并知道正确写法
+- [ ] 知道 `super()` 是「沿 MRO 找下一个」而不是「调父类」
+- [ ] 能对一个菱形继承手算出 MRO 顺序
+- [ ] 知道定义 `__eq__` 会导致 `__hash__` 变 `None`，以及如何修复
+- [ ] 能说出至少 8 个魔术方法及其触发场景
+- [ ] 知道 `__repr__` 和 `__str__` 的分工
+- [ ] 会用 `@dataclass`，知道 `frozen` / `order` / `slots` 的作用
+- [ ] 知道 `field(default_factory=...)` 为什么必须存在
+- [ ] 知道 `__slots__` 的收益与三个限制
+- [ ] 能解释名称改写（name mangling）的真实目的
+
+## 下一步
+
+类的机制清楚了，接下来看 Python 最强大的一批特性：[进阶特性](./advanced)。
+
+**参考链接**：[类官方文档](https://docs.python.org/zh-cn/3/tutorial/classes.html) · [dataclasses 文档](https://docs.python.org/zh-cn/3/library/dataclasses.html) · [数据模型（魔术方法全表）](https://docs.python.org/zh-cn/3/reference/datamodel.html) · [MRO 说明](https://docs.python.org/zh-cn/3/howto/mro/)
+
+---
+
+**翻页**：[← 上一页](./oop-03) · [返回目录](./)

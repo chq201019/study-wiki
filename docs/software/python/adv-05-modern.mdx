@@ -1,0 +1,241 @@
+---
+id: adv-05-modern
+title: 05 模式匹配、异常组与综合实战
+sidebar_position: 6
+description: 结构模式匹配、except* 异常组、把六个特性串起来的完整例子，以及常见坑与自检清单。
+---
+
+# 05 模式匹配、异常组与综合实战
+## 8. 结构化模式匹配（3.10+）
+
+`match` 不是 `switch`——它做的是**结构解构**，能同时判断类型和形状并绑定变量。
+
+```python
+def classify(obj):
+    match obj:
+        case 0 | 1:
+            return "很小"
+        case int() if obj > 100:           # 带守卫
+            return "大整数"
+        case [x, y]:                       # 序列解构
+            return f"两元素列表 {x},{y}"
+        case {"kind": kind, **rest}:       # 映射解构
+            return f"字典 kind={kind} 其余={rest}"
+        case str() as s:                   # 类型模式 + 绑定
+            return f"字符串 {s}"
+        case _:                            # 通配（不可省略）
+            return "其他"
+
+print(classify(0))
+print(classify(500))
+print(classify([1, 2]))
+print(classify({"kind": "a", "v": 2}))
+print(classify("hi"))
+print(classify(3.5))
+```
+
+```text
+很小
+大整数
+两元素列表 1,2
+字典 kind=a 其余={'v': 2}
+字符串 hi
+其他
+```
+
+要点：
+
+- `case 0 | 1` 用 `|` 表示多个模式
+- `case int()` 是**类型模式**（注意括号，它是在做 `isinstance` 检查）
+- `if` 后面是**守卫**（guard），模式匹配成功后再判断
+- `case _` 是通配符，**必须放最后**，且它不是变量名而是特殊语法
+- 类也能匹配：`case Point(x=0, y=y)` 需要类支持（dataclass 默认通过 `match_args` 支持）
+
+:::caution[别把 `match` 当 `switch` 滥用]
+只判断一个整数值的话，`if/elif/else` 更清楚。`match` 的价值在于**同时判断结构并取出里面的值**——处理 JSON、AST、协议报文时它的优势才显现出来。
+:::
+
+## 9. 异常组与 `except*`（3.11+）
+
+`asyncio.TaskGroup` 这类并发场景会同时抛出**多个**异常。3.11 引入 `ExceptionGroup` 和 `except*`：
+
+```python
+try:
+    raise ExceptionGroup("多个错误", [ValueError("v"), TypeError("t")])
+except* ValueError as eg:
+    print("  捕获 ValueError:", eg.exceptions)
+except* TypeError as eg:
+    print("  捕获 TypeError:", eg.exceptions)
+```
+
+```text
+  捕获 ValueError: (ValueError('v'),)
+  捕获 TypeError: (TypeError('t'),)
+```
+
+和 `except` 的区别：
+
+- `except ValueError` 对 `ExceptionGroup` **不生效**（它不匹配组）
+- `except* ValueError` 会**拆开组**，只取出匹配的那些，剩下的继续被后面的 `except*` 处理
+- 所有 `except*` 子句都会被执行（不是只匹配第一个）
+
+`except*` 语法只在 3.11+ 可用。3.11 之前的替代是手动遍历 `eg.exceptions`。
+
+## 10. 一个完整例子：把六个特性串起来
+
+一个「重试 + 计时 + 缓存」的实用工具集：
+
+```python
+import functools
+import time
+from contextlib import contextmanager
+from typing import Callable, Iterator
+
+
+@contextmanager
+def timer(label: str) -> Iterator[None]:
+    """测量 with 块的耗时。"""
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        print(f"  [{label}] 耗时 {time.perf_counter() - start:.4f}s")
+
+
+def retry(times: int, *, delay: float = 0.01) -> Callable:
+    """失败时重试的装饰器。"""
+    def decorator(fn: Callable) -> Callable:
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            last = None
+            for attempt in range(1, times + 1):
+                try:
+                    return fn(*args, **kwargs)
+                except Exception as exc:
+                    last = exc
+                    print(f"  第 {attempt} 次失败: {exc}")
+                    if attempt < times:
+                        time.sleep(delay)
+            raise last
+        return wrapper
+    return decorator
+
+
+class Pipeline:
+    """用生成器搭的数据管道。"""
+    def __init__(self, source):
+        self.source = source
+
+    def __iter__(self) -> Iterator:
+        for item in self.source:
+            yield item
+
+    def map(self, fn: Callable) -> "Pipeline":
+        return Pipeline(fn(x) for x in self)
+
+    def filter(self, pred: Callable) -> "Pipeline":
+        return Pipeline(x for x in self if pred(x))
+
+
+if __name__ == "__main__":
+    attempts = {"n": 0}
+
+    @retry(3, delay=0.001)
+    def flaky():
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise ConnectionError("连接失败")
+        return "成功"
+
+    with timer("flaky"):
+        print("结果:", flaky())
+    print("尝试次数:", attempts["n"])
+
+    with timer("pipeline"):
+        result = (Pipeline(range(10))
+                  .filter(lambda x: x % 2 == 0)
+                  .map(lambda x: x * x))
+        print("管道结果:", list(result))
+```
+
+预期输出（时间数字会有波动）：
+
+```text
+  第 1 次失败: 连接失败
+  第 2 次失败: 连接失败
+结果: 成功
+  [flaky] 耗时 0.0012s
+尝试次数: 3
+管道结果: [0, 4, 16, 36, 64]
+  [pipeline] 耗时 0.0000s
+```
+
+这个例子体现了：装饰器（带参数 + wraps）、上下文管理器（`@contextmanager`）、生成器管道（惰性链式）、以及 `Iterator` 类型注解。
+
+## 11. 验证：预测这些输出
+
+```python
+def deco(fn):
+    def wrapper():
+        return "wrapped"
+    return wrapper
+
+@deco
+def f():
+    return "original"
+
+print(f(), f.__name__)
+
+g = (x for x in range(3))
+print(list(g), list(g))
+```
+
+:::info[答案]
+```text
+wrapped wrapper
+[0, 1, 2] []
+```
+
+1. 装饰器把 `f` 换成了 `wrapper`，返回值是 `"wrapped"`，而且**没加 `@wraps` 所以名字是 `wrapper`**
+2. 生成器只能用一次——第二次 `list()` 得到空列表
+:::
+
+## 常见坑
+
+| 现象 | 真实原因 | 解决 |
+| --- | --- | --- |
+| 所有函数都叫 `wrapper` | 装饰器没加 `@functools.wraps` | 一律加 |
+| `lru_cache` 结果不更新 | 缓存了非纯函数 | 只缓存纯函数；或 `cache_clear()` |
+| 生成器第二次遍历是空的 | 生成器是一次性的 | 重新创建，或改存列表 |
+| `with` 里抛的异常消失了 | `__exit__` 返回了 `True` | 只在明确要忽略时这么做 |
+| `__setattr__` 导致 `RecursionError` | 方法内部又触发了自己 | 用 `super().__setattr__(...)` |
+| 描述符不生效 | 少了 `__set__`（非数据描述符被实例字典遮蔽） | 需要拦截赋值就加 `__set__` |
+| 元类让代码难以理解 | 过度使用 | 优先用 `__init_subclass__` 或装饰器 |
+| `match` 里 `case x:` 匹配一切 | 裸名字是「捕获模式」，不是变量比较 | 用 `case 0:` 或 `case int()` |
+| `except ValueError` 抓不到异常组 | 异常组要用 `except*` | 3.11+ 用 `except*` |
+| 装饰器在导入时就执行了 | 装饰器在定义时运行（这是设计） | 需要延迟的话放进函数体 |
+
+## 自检清单
+
+- [ ] 能说出 `@decorator` 等价于哪行赋值语句
+- [ ] 知道为什么必须写 `@functools.wraps`
+- [ ] 能写出带参数的装饰器（三层的那种）
+- [ ] 能解释 `yield` 如何暂停函数并保留状态
+- [ ] 知道生成器为什么省内存，以及它是一次性的
+- [ ] 能说清「可迭代对象」与「迭代器」的区别
+- [ ] 知道 `__enter__` / `__exit__` 的调用时机，以及 `__exit__` 返回 `True` 的后果
+- [ ] 能解释数据描述符与非数据描述符的优先级差异
+- [ ] **能解释为什么「方法绑定」是描述符的应用**
+- [ ] 知道元类 `__new__` 与 `__call__` 的分工
+- [ ] 知道 `__init_subclass__` 比元类更轻量、优先用它
+- [ ] 能用 `match` 做结构解构（序列 / 映射 / 类型 + 守卫）
+
+## 下一步
+
+现在看 Python 最容易被误解的一块：[并发](./concurrency)。
+
+**参考链接**：[装饰器与 functools](https://docs.python.org/zh-cn/3/library/functools.html) · [迭代器与生成器](https://docs.python.org/zh-cn/3/howto/functional.html#iterators) · [contextlib](https://docs.python.org/zh-cn/3/library/contextlib.html) · [描述符指南](https://docs.python.org/zh-cn/3/howto/descriptor.html) · [元类](https://docs.python.org/zh-cn/3/reference/datamodel.html#metaclasses) · [结构化模式匹配](https://docs.python.org/zh-cn/3/whatsnew/3.10.html#pep-634-structural-pattern-matching)
+
+---
+
+**翻页**：[← 04 描述符、元类与属性钩子](./adv-04-descriptor) · [返回目录](./)

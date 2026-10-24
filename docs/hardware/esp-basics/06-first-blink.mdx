@@ -1,0 +1,343 @@
+---
+id: 06-first-blink
+title: 06 第一个程序：点灯
+sidebar_position: 6
+description: 用 ESP-IDF 编译烧录第一个程序、读懂真实 blink 示例、改引脚改频率，以及烧不进去怎么办。
+---
+
+# 06 第一个程序：点灯
+
+**本课目标**：把代码真正烧进板子，看到灯闪——这是嵌入式开发的"Hello World"。
+
+:::tip[点灯为什么是第一步]
+它同时验证了**整条链路**：
+
+```text
+代码写对 → 编译通过 → 烧录成功 → 接线正确 → 引脚配置对 → 灯真的亮
+```
+
+任何一环出错，灯就不闪。**所以点灯通了，说明环境真的通了。**
+:::
+
+## 先看官方 blink 示例的真实代码
+
+本机 ESP-IDF v5.3.5 的 `examples/get-started/blink/main/blink_example_main.c`（104 行）。
+
+它支持两种 LED：普通 GPIO 和可寻址 RGB 灯带。**普通 LED 那部分**：
+
+```c
+#elif CONFIG_BLINK_LED_GPIO
+
+static void blink_led(void)
+{
+    /* Set the GPIO level according to the state (LOW or HIGH)*/
+    gpio_set_level(BLINK_GPIO, s_led_state);
+}
+
+static void configure_led(void)
+{
+    ESP_LOGI(TAG, "Example configured to blink GPIO LED!");
+    gpio_reset_pin(BLINK_GPIO);
+    /* Set the GPIO as a push/pull output */
+    gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT);
+}
+
+#endif
+
+void app_main(void)
+{
+    configure_led();
+
+    while (1) {
+        ESP_LOGI(TAG, "Turning the LED %s!", s_led_state == true ? "ON" : "OFF");
+        blink_led();
+        s_led_state = !s_led_state;
+        vTaskDelay(CONFIG_BLINK_PERIOD / portTICK_PERIOD_MS);
+    }
+}
+```
+
+:::info[几个值得注意的点]
+| 代码 | 含义 |
+| --- | --- |
+| `app_main(void)` | **ESP-IDF 的入口**（不是 `main`） |
+| `gpio_reset_pin()` | 先把引脚复位成默认状态 |
+| `gpio_set_direction(..., GPIO_MODE_OUTPUT)` | 设为输出 |
+| `gpio_set_level(pin, level)` | 输出高/低 |
+| `vTaskDelay(...)` | **FreeRTOS 的延时**，不是 `sleep` |
+| `CONFIG_BLINK_GPIO` | 来自 `menuconfig` 的配置项 |
+
+**为什么是 `app_main` 而不是 `main`**：真正的 `main` 在 ESP-IDF 内部，它启动 FreeRTOS、初始化系统，然后调用你的 `app_main`。
+:::
+
+## 写一个最简单的版本
+
+官方示例为了兼容多种板子写得很绕。**你自己写就简单得多**：
+
+```c
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+
+#define LED_GPIO  4              /* 换成你实际接线用的引脚 */
+
+void app_main(void)
+{
+    /* ① 配置引脚为输出 */
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+
+    /* ② 无限循环 */
+    while (1) {
+        gpio_set_level(LED_GPIO, 1);      /* 高电平 → 灯亮 */
+        vTaskDelay(pdMS_TO_TICKS(500));   /* 等 500 毫秒 */
+
+        gpio_set_level(LED_GPIO, 0);      /* 低电平 → 灯灭 */
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+```
+
+:::tip[`pdMS_TO_TICKS` 比手算好]
+```c
+vTaskDelay(CONFIG_BLINK_PERIOD / portTICK_PERIOD_MS);   /* 官方写法 */
+vTaskDelay(pdMS_TO_TICKS(500));                        /* 更直白 ✅ */
+```
+
+两者等价——`pdMS_TO_TICKS(ms)` 就是把毫秒转成 tick。
+:::
+
+## 完整工程结构
+
+```text
+my_blink/
+├── CMakeLists.txt
+└── main/
+    ├── CMakeLists.txt
+    └── main.c
+```
+
+**顶层 `CMakeLists.txt`**（内容与官方示例一致）：
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(my_blink)
+```
+
+**`main/CMakeLists.txt`**：
+
+```cmake
+idf_component_register(SRCS "main.c"
+                    INCLUDE_DIRS "")
+```
+
+:::danger[两个 CMakeLists 的顺序不能变]
+顶层那个 `include(...)` **必须在 `project(...)` 之前**——官方示例注释里明确写了要"in this exact order"。
+
+顺序错了会报找不到 `project` 宏。
+:::
+
+## 编译、烧录、看输出（三步）
+
+```bash
+# ① 设定芯片型号（只需一次）
+idf.py set-target esp32s3
+
+# ② 配置（可选，比如改 LED 引脚）
+idf.py menuconfig
+
+# ③ 编译 + 烧录 + 打开串口监视器（一条命令搞定）
+idf.py build flash monitor
+```
+
+:::tip[`idf.py build flash monitor` 是最常用的组合]
+| 部分 | 作用 |
+| --- | --- |
+| `build` | 编译 |
+| `flash` | 烧录到板子 |
+| `monitor` | 打开串口看输出 |
+
+**退出 monitor：按 `Ctrl + ]`**（不是 `Ctrl+C`）。
+
+也可以用短写：
+
+```bash
+idf.py b f m
+```
+:::
+
+### 单独执行各步
+
+```bash
+idf.py build                    # 只编译
+idf.py -p COM3 flash            # 只烧录（指定端口）
+idf.py -p COM3 monitor          # 只看串口
+idf.py fullclean                # 彻底清理（编译出怪问题时用）
+```
+
+:::warning[不指定端口时会自动找]
+`idf.py flash` 通常能自动找到唯一的串口。
+
+**如果接了多个串口设备，必须 `-p COM3` 明确指定。**
+:::
+
+## 预期现象
+
+1. **编译**：屏幕上刷过大量编译信息，最后出现类似
+
+```text
+Project build complete. To flash, run:
+ idf.py flash
+```
+
+2. **烧录**：出现进度条
+
+```text
+Writing at 0x00010000... (100 %)
+Wrote ... bytes ...
+Hash of data verified.
+Leaving...
+Hard resetting via RTS pin...
+```
+
+3. **灯**：开始每 500 ms 亮灭一次
+4. **串口**：看到启动日志和你的打印
+
+## 改一改：三个实验
+
+:::tip[实验比读代码有用]
+**① 改闪烁频率**
+
+把 `500` 改成 `100`（很快）和 `2000`（很慢），重新 `idf.py flash monitor`。
+
+**② 改引脚**
+
+把 `LED_GPIO` 改成你实际接线的引脚号。**改了代码就要改接线，或改了接线就要改代码**——两者必须一致。
+
+**③ 加打印**
+
+```c
+ESP_LOGI("blink", "灯亮了，第 %d 次", count++);
+```
+
+看串口里有没有输出。**这是后面所有调试的基础。**
+:::
+
+## 烧不进去怎么办
+
+这是新手第一个大坎。按顺序排查：
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `Failed to connect to ESP32` | 没进下载模式 | **按住 BOOT → 按一下 RESET → 松开 BOOT** |
+| 同上 | 端口选错 | `idf.py -p COM3 flash` |
+| 同上 | 串口被占用 | 关掉串口助手/其他 IDE |
+| 同上 | 波特率太高 | `idf.py -b 115200 flash` |
+| `Permission denied`（Linux） | 权限不够 | `sudo usermod -aG dialout $USER` |
+| 卡在 `Connecting.....` | 板子没供电/线是充电线 | 换线、看电源 LED |
+| 烧完一直重启 | 代码崩溃 | `idf.py monitor` 看报错 |
+
+:::danger[手动进下载模式：记这一条就够]
+**绝大多数"烧不进去"靠这个动作解决**：
+
+```text
+① 按住 BOOT 键不放
+② 按一下 RESET 键（或重新插 USB）
+③ 松开 BOOT 键
+④ 再执行 idf.py flash
+```
+
+**原理**：BOOT 键拉低 GPIO0，芯片上电时检测到 GPIO0 为低就进入"等待下载"，而不是运行已有固件。
+:::
+
+## 看串口输出的正确姿势
+
+```bash
+idf.py monitor
+```
+
+退出：**`Ctrl + ]`**
+
+:::tip[monitor 里的实用功能]
+| 功能 | 说明 |
+| --- | --- |
+| 自动解析崩溃地址 | 程序崩溃时会还原出函数名和行号 |
+| 彩色日志 | 按级别上色 |
+| `Ctrl+T Ctrl+H` | 查看帮助 |
+| `Ctrl+T Ctrl+R` | 复位板子 |
+
+**程序崩溃时，monitor 会打印 backtrace**——这是排查问题最重要的信息。
+:::
+
+## 认识日志级别
+
+```c
+ESP_LOGE(TAG, "错误");      /* E - 红 */
+ESP_LOGW(TAG, "警告");      /* W - 黄 */
+ESP_LOGI(TAG, "信息");      /* I - 绿 */
+ESP_LOGD(TAG, "调试");      /* D - 需要开日志级别才显示 */
+ESP_LOGV(TAG, "详细");      /* V - 最详细 */
+```
+
+`TAG` 是个字符串常量，用来标识日志来源：
+
+```c
+static const char *TAG = "blink";
+```
+
+**规矩：每个文件一个 TAG，用文件名。** 这样看日志就知道是哪个模块打的。
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 写 `main` 而不是 `app_main` | 程序不执行 | 入口函数名错 | 改 `app_main` |
+| 忘 `gpio_set_direction` | 灯不亮 | 引脚还是输入态 | 设为 `GPIO_MODE_OUTPUT` |
+| 引脚号与接线不一致 | 灯不亮 | 代码/硬件不符 | 核对后改一处 |
+| 用 `sleep()` | 编译错/不生效 | 应该用 FreeRTOS 延时 | `vTaskDelay` |
+| 按 `Ctrl+C` 退 monitor | 没退出 | 快捷键不对 | `Ctrl + ]` |
+| 两个 CMakeLists 顺序反了 | 配置失败 | 官方要求固定顺序 | `include` 在前 |
+| 改代码不重新 build | 行为没变 | 烧的是旧固件 | `idf.py build flash` |
+
+:::danger[`vTaskDelay` 参数别传 0 毫秒]
+```c
+vTaskDelay(0);        /* 不是"不延时"，是"让出 CPU 一次" */
+```
+
+**循环里密集调用 `vTaskDelay(0)` 会让看门狗报警或 CPU 占满。**
+
+要短延时用 `vTaskDelay(1)`（1 个 tick，通常 1 ms）。
+:::
+
+## 本课自检
+
+- [ ] 知道 ESP-IDF 的入口是 **`app_main`** 不是 `main`
+- [ ] 会用 `gpio_reset_pin` / `gpio_set_direction` / `gpio_set_level`
+- [ ] **知道延时用 `vTaskDelay` 而不是 `sleep`**
+- [ ] 会用 `pdMS_TO_TICKS` 把毫秒转 tick
+- [ ] 知道标准工程结构（两个 CMakeLists）
+- [ ] **知道顶层 CMakeLists 里 `include` 必须在 `project` 之前**
+- [ ] 会 `idf.py set-target` / `build` / `flash` / `monitor`
+- [ ] **知道 monitor 用 `Ctrl + ]` 退出**
+- [ ] **会手动进下载模式（按 BOOT + RESET）**
+- [ ] 会用 `ESP_LOGI` 打日志，知道日志级别
+- [ ] 做了"改频率/改引脚/加打印"三个实验
+
+## 第一阶段小结
+
+你现在已经：
+
+- 知道 ESP32 是什么、买了对的板子
+- **会接线、会算电阻、知道 3.3V 的雷区**
+- **能让电脑认出板子**（驱动）
+- 选定了一条开发路线
+- **真的把代码烧进板子并看到灯闪**
+
+**这是从"什么都不懂"到"能动手"的关键一步。**
+
+## 下一步
+
+[07 串口：板子的嘴和耳朵](./07-serial) —— 学会用打印调试，这是后面最常用的技能。

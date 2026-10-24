@@ -1,0 +1,346 @@
+---
+id: shell-advanced
+title: Shell 脚本进阶
+sidebar_position: 28
+description: set -euo pipefail 的三个开关各防什么、引号与 word splitting、参数处理、trap 清理、以及六个让脚本"偶尔出错"的陷阱。
+---
+
+# Shell 脚本进阶
+
+**本课目标**：写出出错就停、不会误删文件的脚本。
+
+## 第一行：安全开关
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+```
+
+:::danger[这四行能防住大部分"脚本继续跑把系统搞坏"]
+| 开关 | 作用 |
+| --- | --- |
+| **`-e`** | **命令失败（退出码非 0）立即退出** |
+| **`-u`** | **使用未定义变量时报错** |
+| **`-o pipefail`** | **管道中任一环失败就算失败** |
+| `IFS=$'\n\t'` | 按换行/tab 分词，**不按空格** |
+
+**没有 `-e` 的脚本会在某步失败后继续跑后面所有步骤** —— 这是最危险的行为。
+:::
+
+:::warning[`-e` 有很多"失效"场景]
+**这些情况下 `set -e` 不生效**：
+
+```bash
+# ① 命令在 if / while 条件里
+if ! grep -q x file; then ... fi        # 不退出（这是预期的）
+
+# ② 命令在 || 或 && 链里
+cmd || true                             # 不退出
+
+# ③ 命令在子 shell 里（某些情况）
+( false )                               # 会退出，但 ( false ) || true 不会
+
+# ④ 命令在 $() 里被赋值
+local x=$(false)                        # ⚠️ local 会吞掉退出码！
+```
+
+**最后一条最坑**：`local` 是命令，它的退出码覆盖了 `$()` 的结果。
+
+```bash
+# ✅ 正确写法：分开
+local x
+x=$(false)          # 这里会触发 -e
+```
+:::
+
+:::tip[`-o pipefail` 为什么必需]
+```bash
+# 没有 pipefail
+false | true        # 退出码是 0（最后一条命令的）
+# 有 pipefail
+false | true        # 退出码是 1
+```
+
+**默认管道的退出码取"最后一个命令"** —— `data | gzip > out` 里 `data` 失败了你不会知道。
+:::
+
+## 引号：word splitting 的头号坑
+
+:::danger[不加引号，变量会按空格拆开]
+```bash
+f="my file.txt"
+
+rm $f               # ❌ 等价于 rm "my" "file.txt"
+rm "$f"             # ✅
+```
+
+**而且如果 `$f` 是空的**：
+
+```bash
+rm $f               # ❌ 变成 `rm`（报错）或者更糟：`rm -rf /` 之类
+rm "$f"             # ✅ 变成 `rm ""`（报错但安全）
+```
+
+**规矩：变量一律加双引号，除非你明确要分词。**
+:::
+
+| 写法 | 行为 |
+| --- | --- |
+| `"$var"` | **保留原样（推荐默认）** |
+| `$var` | 分词 + 通配符展开 |
+| `"${var}"` | 同上，但能拼接（`"${var}_x"`） |
+| `'$var'` | 字面量 `$var` |
+| `"$@"` | **每个参数单独一项（总是用这个）** |
+| `"$*"` | 所有参数合成一项 |
+
+```bash
+# 遍历参数的正确写法
+for arg in "$@"; do
+    echo "arg: $arg"
+done
+```
+
+:::danger[`$@` 不加引号会丢参数边界]
+```bash
+args=("a b" "c")
+for x in $@; do echo "[$x]"; done      # [a] [b] [c]     ❌
+for x in "$@"; do echo "[$x]"; done    # [a b] [c]       ✅
+```
+:::
+
+## 参数处理
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    echo "用法: $0 [-n NUM] [-o FILE] ARG" >&2
+    exit 1
+}
+
+num=10
+out=""
+
+while getopts ":n:o:h" opt; do
+    case "$opt" in
+        n) num="$OPTARG" ;;
+        o) out="$OPTARG" ;;
+        h) usage ;;
+        :) echo "选项 -$OPTARG 需要参数" >&2; usage ;;
+        *) echo "未知选项 -$OPTARG" >&2; usage ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+arg="${1:-default}"        # 有默认值的必需参数
+```
+
+:::info[参数展开的常用形式]
+| 写法 | 含义 |
+| --- | --- |
+| `${var:-default}` | var 未设置或为空 → 用 default |
+| `${var:=default}` | 同上且把值赋给 var |
+| `${var:?消息}` | 未设置就报错退出 |
+| `${var:+other}` | 设置了才用 other |
+| `${var%.txt}` | 去掉最短的后缀 `.txt` |
+| `${var%%.*}` | 去掉最长的匹配 |
+| `${var#prefix}` | 去掉最短前缀 |
+| `${var//a/b}` | 全部替换 |
+| `${#var}` | 长度 |
+:::
+
+```bash
+# 实用的组合
+name="${1:?必须提供名字}"          # 没参数直接报错退出
+file="${path##*/}"                 # 取文件名（去掉目录）
+dir="${path%/*}"                   # 取目录
+ext="${file##*.}"                  # 取扩展名
+base="${file%.*}"                  # 取不含扩展名
+```
+
+## `trap`：清理与信号
+
+```bash
+cleanup() {
+    rm -f "$tmpfile"
+    echo "cleaned up" >&2
+}
+trap cleanup EXIT                  # 任何退出（正常/出错）都会执行
+```
+
+:::tip[`trap ... EXIT` 是脚本必备]
+**它保证临时文件被清理**，即使脚本在中间失败（配合 `set -e`）。
+
+```bash
+tmpfile=$(mktemp)
+trap 'rm -f "$tmpfile"' EXIT
+
+# 之后随便 return / exit，都会清理
+```
+:::
+
+| 信号 | 场景 |
+| --- | --- |
+| `EXIT` | 任何退出方式（**最常用**） |
+| `ERR` | 命令失败时（配合 `-e`） |
+| `INT` | Ctrl+C |
+| `TERM` | `kill` 默认信号 |
+| `HUP` | 终端断开 |
+
+:::warning[`trap ... ERR` 的坑]
+```bash
+trap 'echo "failed at line $LINENO"' ERR
+```
+
+**它只在"简单命令失败"时触发** —— 在 `if`/`&&`/`||` 里的失败不算。
+
+**另外 `$LINENO` 在函数里指向函数内部行号**，不是调用处。
+:::
+
+## 六个让脚本"偶尔出错"的陷阱
+
+:::danger[① `cd` 失败后继续在错误目录操作]
+```bash
+cd /some/dir            # ❌ 如果失败，后面 rm 就在当前目录执行
+rm -rf *
+```
+
+```bash
+cd /some/dir || exit 1          # ✅
+rm -rf ./*
+```
+:::
+
+:::danger[② `rm -rf "$DIR"/` 里 DIR 为空]
+```bash
+rm -rf "$DIR"/          # 如果 DIR="" → rm -rf /   灾难
+```
+
+**防护**：
+
+```bash
+: "${DIR:?DIR 不能为空}"
+[[ "$DIR" != "/" ]] || { echo "拒绝操作根目录" >&2; exit 1; }
+rm -rf -- "$DIR"/
+```
+
+**`--` 表示"后面不是选项"**，能防住路径以 `-` 开头的情况。
+:::
+
+:::danger[③ 命令替换里的输出被分词]
+```bash
+files=$(ls)             # ❌ 文件名有空格就断
+for f in $files; do ...
+```
+
+```bash
+while IFS= read -r f; do        # ✅
+    echo "$f"
+done < <(find . -maxdepth 1 -type f -print0 | xargs -0 -n1 echo)
+```
+
+**或者直接 `find ... -print0 | while IFS= read -r -d '' f`。**
+:::
+
+:::danger[④ `[ ]` 与 `[[ ]]` 混用]
+```bash
+if [ $x = "a" ]; then          # ❌ x 为空时语法错误
+if [ "$x" = "a" ]; then        # ✅
+if [[ "$x" == "a" ]]; then     # ✅ 更安全（[[ ]] 不做分词）
+```
+
+**`[[ ]]` 是 bash 扩展**，支持 `&&`、`||`、正则 `=~`、不做分词 —— **脚本里优先用它**。
+:::
+
+:::danger[⑤ 管道里的 `while` 在子 shell 里]
+```bash
+count=0
+cat file | while read -r line; do
+    ((count++))
+done
+echo "$count"           # ❌ 0（子 shell 的修改不影响父 shell）
+```
+
+**解法**：用进程替换或改结构
+
+```bash
+while read -r line; do
+    ((count++))
+done < file
+echo "$count"           # ✅
+```
+:::
+
+:::danger[⑥ `set -e` 下 `((count++))` 返回非 0]
+```bash
+set -e
+count=0
+((count++))             # ❌ 当 count 为 0 时，((0++)) 返回 1 → 脚本退出！
+```
+
+**因为 `((expr))` 的退出码是"表达式的值是否为 0"** —— 后自增返回旧值 0 → 退出码 1。
+
+```bash
+((++count))             # ✅ 前自增返回新值 1 → 退出码 0
+((count++)) || true     # ✅ 或者忽略
+```
+
+**这个坑极隐蔽** —— 只在 `count` 恰好为 0 时炸。
+:::
+
+## 调试技巧
+
+```bash
+bash -x script.sh              # 打印每条执行的命令
+bash -n script.sh              # 只检查语法
+set -x                          # 从某处开始跟踪
+set +x                          # 关闭跟踪
+```
+
+:::tip[让 `-x` 的输出可读]
+```bash
+export PS4='+ ${BASH_SOURCE}:${LINENO}: ${FUNCNAME[0]:-main}: '
+set -x
+```
+
+**输出会变成**：
+
+```text
++ script.sh:12: main: cp source dest
+```
+
+**带文件和行号，比默认的 `+ cmd` 有用得多。**
+:::
+
+```bash
+# shellcheck 是必装的静态检查器
+shellcheck script.sh
+```
+
+:::danger[`shellcheck` 能抓出绝大多数这类坑]
+**它会警告**：未加引号的变量、`[ ]` 的用法、`cd` 没检查、`rm` 的危险写法、`local x=$(...)` 的问题……
+
+**新脚本一律先跑一遍 `shellcheck`**。
+:::
+
+## 本课自检
+
+- [ ] **会用 `set -euo pipefail` 四行开头**
+- [ ] **知道 `-e` 在 `if`/`&&`/`local x=$(...)` 里会失效**
+- [ ] **理解 `-o pipefail` 解决什么问题**
+- [ ] **知道变量一律加双引号防 word splitting**
+- [ ] **知道 `"$@"` 是遍历参数的唯一正确写法**
+- [ ] 会用 `getopts` 处理选项、`${1:-default}` 给默认值
+- [ ] **会写 `trap cleanup EXIT` 保证清理**
+- [ ] **知道 `rm -rf "$DIR"/` 在 DIR 为空时是灾难，要用 `: "${DIR:?}"`**
+- [ ] 知道 `--` 表示"后面不是选项"
+- [ ] **知道 `cat | while` 在子 shell 里改不了外部变量**
+- [ ] **知道 `set -e` 下 `((count++))` 在 count 为 0 时会退出脚本**
+- [ ] 会用 `bash -n` 检查语法、`bash -x` 跟踪
+- [ ] 会用 `shellcheck`
+
+## 下一步
+
+[系统故障排查](./troubleshoot) 或 [SSH 深入](./ssh)。

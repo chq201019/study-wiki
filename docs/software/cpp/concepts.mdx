@@ -1,0 +1,269 @@
+---
+id: concepts
+title: C++20 概念（Concepts）
+sidebar_position: 12
+description: 用真实报错对比 SFINAE 与 concepts 的差别、requires 表达式的四种写法、标准库现成概念、concepts 如何参与重载决议。
+---
+
+# C++20 概念（Concepts）
+
+**本课目标**：会用 `concept` 把模板约束写清楚，并知道它比 SFINAE 好在哪。
+
+## 先看报错：这是 concepts 最大的价值
+
+:::danger[传统模板的报错：几十屏的噪音]
+```cpp
+template <typename T>
+T twice(T x) { return x * 2; }
+
+struct Point { int x, y; };
+
+int main() { Point p{1,2}; twice(p); }
+```
+
+C++17 下报错会从 `twice` 内部那一行 `x * 2` 开始，**往上堆几十屏**，指向 `std::ostream` 或 `operator*` 的各种候选。
+:::
+
+:::tip[用 concepts 后，报错一眼看懂（本机实测 clang 23.1.1）]
+```cpp
+template <typename T>
+concept Numeric = std::integral<T> || std::floating_point<T>;
+
+template <Numeric T>
+T twice(T x) { return x * 2; }
+```
+
+报错变成：
+
+```text
+error: no matching function for call to 'twice'
+note: candidate template ignored: constraints not satisfied [with T = Point]
+note: because 'Point' does not satisfy 'Numeric'
+```
+
+**三行就告诉你：`Point` 不满足 `Numeric`。**
+
+**这就是 concepts 的核心收益——把"约束"从"函数体深处的报错"提到"签名里"。**
+:::
+
+## 四种写法
+
+### ① 最简：直接用标准概念
+
+```cpp
+#include <concepts>
+
+template <std::integral T>
+T sum(T a, T b) { return a + b; }
+```
+
+### ② 简写：只有类型约束时用 `auto`
+
+```cpp
+void print(std::integral auto x) { std::cout << x; }
+```
+
+**注意这是"缩写函数模板"**，等价于 `template <std::integral T> void print(T x)`。
+
+### ③ requires 子句：约束可以依赖多个参数
+
+```cpp
+template <typename T, typename U>
+    requires std::convertible_to<T, U>
+T convert(U u) { return static_cast<T>(u); }
+```
+
+### ④ requires 表达式：当"有某个操作"本身就是要求
+
+```cpp
+template <typename T>
+concept Addable = requires(T a, T b) {
+    { a + b } -> std::convertible_to<T>;
+};
+
+template <Addable T>
+T add(T a, T b) { return a + b; }
+```
+
+:::tip[`requires` 表达式的四种内层写法]
+```cpp
+template <typename T>
+concept C = requires(T a, T b) {
+    a + b;                          // ① 简单要求：这个表达式能编译
+    typename T::value_type;         // ② 类型要求：这个类型存在
+    { a * b } -> std::same_as<T>;   // ③ 复合要求：表达式合法 + 返回值满足概念
+    requires sizeof(T) > 4;         // ④ 嵌套要求：另一个布尔条件
+};
+```
+:::
+
+## 标准库现成的概念
+
+:::info[`<concepts>` 里大部分需求都已经有了]
+| 概念 | 含义 |
+| --- | --- |
+| `std::integral` / `std::floating_point` | 整数 / 浮点 |
+| `std::same_as<T, U>` | 类型完全相同 |
+| `std::convertible_to<From, To>` | 可隐式转换 |
+| `std::derived_from<D, B>` | 继承关系 |
+| `std::copyable` / `std::movable` | 可拷贝 / 可移动 |
+| `std::equality_comparable` | 支持 `==` |
+| `std::totally_ordered` | 支持全套比较 |
+| `std::invocable<F, Args...>` | 能用这些参数调用 |
+| `std::predicate<F, Args...>` | 调用后返回 bool |
+| `std::ranges::range` | 是个范围（有 begin/end） |
+
+**先查标准库，别自己重造。**
+:::
+
+## 概念参与重载决议
+
+:::tip[这比 SFINAE 干净得多]
+```cpp
+template <typename T>
+concept HasSize = requires(T t) { t.size(); };
+
+// ① 有 size() 的走这个
+template <HasSize T>
+void describe(const T& x) { std::cout << "容器，大小 " << x.size(); }
+
+// ② 其他走这个（注意：约束更强的优先）
+template <typename T>
+void describe(const T& x) { std::cout << "不是容器"; }
+
+describe(std::vector<int>{1,2,3});     // 容器，大小 3
+describe(42);                           // 不是容器
+```
+
+**编译器按"约束强度"选**：更受约束的版本优先。
+
+**SFINAE 时代这需要 `enable_if` + 一堆 `typename` 技巧，而且两个重载容易互相干扰。**
+:::
+
+:::warning[约束之间的"偏序"关系要理解]
+```cpp
+template <typename T> requires std::integral<T>
+void f(T) { }                              // A：约束更强
+
+template <typename T>
+void f(T) { }                              // B：无约束
+
+f(1);       // 选 A（更受约束）
+f(1.0);     // 选 B
+```
+
+**规则**：如果 A 的约束"蕴含"B 的约束，且反过来不成立，则 A 更特化。
+
+**两个约束互不蕴含时**（比如一个要 `integral`，一个要 `floating_point`），传 `int` 只有 A 可行，没问题；**但如果两个都可行且无偏序关系，就是二义性错误**。
+:::
+
+## 在类模板上用
+
+```cpp
+template <typename T>
+    requires std::copyable<T>
+class Box {
+    T value_;
+public:
+    explicit Box(T v) : value_(std::move(v)) {}
+    T get() const { return value_; }
+};
+
+Box<int> b{1};           // OK
+// Box<std::unique_ptr<int>> b2{...};   // 错误：unique_ptr 不可拷贝
+```
+
+:::danger[类模板的约束检查时机]
+**约束在实例化时检查**，不是定义时。
+
+**所以"写了 `Box<std::unique_ptr<int>>` 才报错"** —— 这和函数模板一致。
+
+**好处**：定义了但没用的模板不会因为约束不满足而报错。
+:::
+
+## 与 `static_assert` 的分工
+
+:::tip[两者互补，不是替代]
+| 工具 | 时机 | 报错质量 | 适合 |
+| --- | --- | --- | --- |
+| **concept** | 重载决议 / 实例化 | 好（指出不满足哪个概念） | **约束接口** |
+| `static_assert` | 模板实例化内部 | 中（你写的消息） | **检查实现里的假设** |
+
+```cpp
+template <typename T>
+T dot(const std::vector<T>& a, const std::vector<T>& b) {
+    static_assert(std::is_arithmetic_v<T>,
+                  "dot 只支持算术类型");       // 补充性检查
+    // ...
+}
+```
+
+**有了 concepts 后 `static_assert` 用得少了，但检查"算法内部的数学假设"时仍然有用。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `concept` 编译不通过 | 忘了 `-std=c++20` | 加编译选项 |
+| `requires` 里写的表达式语法错 | 少了分号或花括号形态不对 | 对照四种写法 |
+| 两个重载报二义性 | 约束互不蕴含 | 加更强的约束或用 `if constexpr` |
+| 概念里用了未声明的成员 | `requires` 内的表达式也要能解析 | 用 `t.member` 形式而非 `T::member` |
+| 标准概念名找不到 | 忘了 `#include <concepts>` | 加头文件 |
+| 约束太严导致本该能用的类型被拒 | 概念写得过于具体 | 用最小要求（`requires` 表达式） |
+
+:::danger[`requires` 里的表达式"不求值"，但必须语法正确]
+```cpp
+template <typename T>
+concept C = requires(T t) {
+    t.foo(1, 2, 3);        // 只检查这个调用是否合法，不会真的执行
+};
+```
+
+**所以可以放心写"会崩"的表达式**（比如 `t[0]`），因为根本不执行。
+
+**但语法必须成立**——写错括号就编译错误，而不是"概念不满足"。
+:::
+
+:::warning[小心"过于宽松"的概念]
+```cpp
+template <typename T>
+concept Any = true;        // 什么都能满足 —— 等于没约束
+```
+
+**另一种隐蔽的过宽**：
+
+```cpp
+template <typename T>
+concept HasBegin = requires(T t) { t.begin(); };    // 不检查返回值能不能用
+```
+
+**`begin()` 返回 `void` 也满足**。**要检查返回值就用复合要求**：
+
+```cpp
+template <typename T>
+concept Iterable = requires(T t) {
+    { t.begin() } -> std::input_or_output_iterator;
+    { t.end()   } -> std::input_or_output_iterator;
+};
+```
+:::
+
+## 本课自检
+
+- [ ] **知道 concepts 最大价值是把约束提到签名、报错可读**
+- [ ] 能背出实测报错的三行结构（no matching / constraints not satisfied / does not satisfy）
+- [ ] 会用四种写法（直接标准概念 / `auto` 简写 / `requires` 子句 / `requires` 表达式）
+- [ ] **知道 `requires` 表达式里四种内层写法**
+- [ ] 知道标准库已有哪些概念（`integral`/`same_as`/`convertible_to`/`invocable`…）
+- [ ] **知道更受约束的重载优先**
+- [ ] 理解约束偏序（蕴含关系决定谁更特化）
+- [ ] 知道类模板约束在实例化时检查
+- [ ] 能说清 concept 与 `static_assert` 的分工
+- [ ] **知道 `requires` 里的表达式不求值，但必须语法正确**
+- [ ] **知道要用复合要求检查返回值，否则概念会过宽**
+
+## 下一步
+
+[模板与泛型编程](./templates) 是这条线的前置内容；
+或者看 [STL 算法](./stl-algorithms) 里 concepts 如何影响算法约束。

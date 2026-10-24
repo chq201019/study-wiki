@@ -1,0 +1,224 @@
+---
+title: QS-7 PWM 与执行器
+sidebar_position: 10
+description: PWM 输出控制舵机、电机、灯带，含 LEDC API 与频率/分辨率的取舍。
+---
+
+# QS-7 PWM 与执行器
+
+**时长 60 分钟 · 产出：电位器转舵机，电机能正反转调速**
+
+:::tip[串口波特率]
+所有示例程序里的串口都初始化成 9600（米思齐的默认值）。
+在米思齐里点开串口窗口，把右下角的波特率也选成 `9600`，两边不一致串口就是乱码。
+:::
+
+:::tip[这一页的代码块要不要看]
+不用看，也不用抄。这些代码就是米思齐「混合」模式里显示的内容，只读、不能编辑。
+你要做的事只有两个：照着接线，照着拖积木。
+出问题时看不懂代码没关系，把当时的串口打印贴出来就行。
+:::
+
+## PWM 是什么
+
+PWM（脉宽调制）通过快速开关、改变高电平占比，来等效输出不同的电压/功率/亮度。
+
+```
+占空比 25%：▓▓▓░░░░░░░░░░░░    ▓▓▓░░░░░░░░░░░░
+占空比 75%：▓▓▓▓▓▓▓░░░░░░░░    ▓▓▓▓▓▓▓░░░░░░░░
+```
+
+LED 亮度、电机转速、舵机角度，本质都是控制高电平的时间比例。
+
+在米思齐里这些全被积木包好了：**「模拟输出」积木就是 PWM 输出**，频率、分辨率、通道都不用你管；「执行器」分类里连舵机、电机的专用积木都有。下面三个实战都先给积木摆法，代码只做对照。
+
+## LEDC API（写代码时的 PWM 底层）
+
+用积木的话跳过这节。要在代码里直接控 PWM，ESP32 用的是 LEDC 外设，核心是三个参数：
+
+| 参数 | 含义 | 常见值 |
+| --- | --- | --- |
+| 频率 | PWM 周期 | LED 1k～5kHz；舵机 50Hz；电机 1～20kHz |
+| 分辨率 | 占空比的级数 | 8～12 位 |
+| 通道 | **S3 一共 8 个（0～7）**，`ledcAttach` 按引脚自动分配 | 一块板最多 8 路独立 PWM |
+
+```cpp
+ledcAttach(pin, freq, resolution);   // 一步绑定引脚、频率、分辨率
+ledcWrite(pin, duty);                // duty 范围 0 ~ (2^resolution - 1)
+```
+
+网上老例程里的 `ledcSetup/ledcAttachPin/ledcWrite` 是旧 API，也能跑，但新代码用上面两行就够。
+
+## 实战一：呼吸灯（积木版）
+
+亮度自己会爬升和回落，用两个变量：
+
+```text
+初始化
+  ├─ 声明 全局变量 亮度 为 整数 并赋值 0     ← 「变量」分类
+  └─ 声明 全局变量 方向 为 整数 并赋值 1
+模拟输出 管脚# 4 赋值为 <亮度>
+把 亮度 增加 <方向>                     ← 「数学」分类的 += 积木
+如果 <亮度 ≥ 255> 执行 → 把 方向 设为 -1
+如果 <亮度 ≤ 0> 执行 → 把 方向 设为 1
+延时 20 毫秒
+```
+
+上传后 LED 由暗到亮再由亮到暗，循环往复。对照代码：
+
+```cpp
+const int LED_PIN = 4;
+
+void setup() {
+  Serial.begin(9600);
+  ledcAttach(LED_PIN, 2000, 8);   // 2kHz，8 位（0~255）
+}
+
+void loop() {
+  static unsigned long last = 0;
+  static int  breath = 0;
+  static int  dir = 1;
+
+  if (millis() - last < 20) return;    // 50fps 足够顺滑
+  last = millis();
+
+  breath += dir;
+  if (breath <= 0)   { breath = 0;   dir = 1; }
+  if (breath >= 255) { breath = 255; dir = -1; }
+
+  ledcWrite(LED_PIN, breath);
+  Serial.printf("PWM = %3d/255\n", breath);
+}
+```
+
+## 实战二：电位器控制舵机（积木版）
+
+这是全教程里"性价比"最高的一节——三块积木，就能让舵机跟着电位器转：
+
+```text
+舵机 管脚# 18 角度(0~180) <映射 整数 <模拟输入 管脚# 1> 从 [0, 4095] 到 [0, 180]> 延时(毫秒) 20
+```
+
+- 「舵机」在**执行器**分类；把映射结果咬进角度槽
+- 电位器中点接 GPIO1（同 QS-6）
+
+对照代码（用了专门的 Servo 库，参数更细）：
+
+```cpp
+#include <ESP32Servo.h>   // 库管理器搜索 ESP32Servo 安装
+
+Servo myservo;
+const int POT_PIN = 1;
+const int SERVO_PIN = 18;
+
+void setup() {
+  Serial.begin(9600);
+  myservo.setPeriodHertz(50);   // 标准舵机必须是 50Hz
+  myservo.attach(SERVO_PIN, 500, 2500);   // 脉宽 500~2500us 对应 0~180°
+}
+
+void loop() {
+  static unsigned long last = 0;
+  if (millis() - last < 20) return;
+  last = millis();
+
+  int raw = analogRead(POT_PIN);
+  int angle = map(raw, 0, 4095, 0, 180);
+  angle = constrain(angle, 0, 180);
+
+  myservo.write(angle);
+  Serial.printf("角度 = %d 度\n", angle);
+}
+```
+
+没有舵机也能验证：拿示波器或逻辑分析仪看 GPIO18 上的方波，20ms 一个周期，高电平宽度在 0.5～2.5ms 之间变化。
+
+:::warning[舵机供电]
+舵机堵转电流能到 1A 以上。**绝对不能从开发板 3.3V 取电**，会拉垮整块板。单独接一个 5V/2A 电源，并与开发板共地。
+:::
+
+## 实战三：直流电机调速（积木版）
+
+电机本体接驱动模块（TB6612/DRV8833），板子只出两个信号：一根方向脚给高低电平，一根使能脚给 PWM。积木摆法：
+
+```text
+数字输出 管脚# 17 设为 高        ← IN1，方向脚
+数字输出 管脚# 16 设为 低        ← IN2，和 IN1 相反就是正转
+模拟输出 管脚# 5 赋值为 <映射 整数 <模拟输入 管脚# 1> 从 [0, 4095] 到 [0, 255]>   ← ENA，调速
+```
+
+想反转，把 IN1、IN2 两块的"高/低"对调就行。对照代码（多了停止和封装）：
+
+```cpp
+const int ENA = 5;   // PWM 调速
+const int IN1 = 17;  // 方向
+const int IN2 = 16;  // 方向
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  ledcAttach(ENA, 1000, 8);
+  motorStop();
+}
+
+void motor(int speed, bool forward) {
+  if (speed <= 0) { motorStop(); return; }
+  digitalWrite(forward ? IN1 : IN2, HIGH);
+  digitalWrite(forward ? IN2 : IN1, LOW);
+  ledcWrite(ENA, speed);
+}
+
+void motorStop() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  ledcWrite(ENA, 0);
+}
+
+void loop() {
+  int raw = analogRead(1);
+  int speed = map(raw, 0, 4095, 0, 255);
+
+  static unsigned long last = 0;
+  if (millis() - last < 100) return;
+  last = millis();
+
+  motor(speed, true);
+  Serial.printf("转速 PWM = %d\n", speed);
+}
+```
+
+常见驱动模块：L298N（双路、效率低）、TB6612FNG（推荐，效率高、有待机）、DRV8833（小电流）。
+
+:::caution[L298N 的坑]
+L298N 压降高达 1.8～2V，3.3V 供电时电机只能得到 1.5V 左右，基本转不动。3.3V 系统一律用 TB6612 或 DRV8833。
+:::
+
+## 频率与分辨率怎么选
+
+| 场景 | 频率 | 分辨率 | 原因 |
+| --- | --- | --- | --- |
+| LED 呼吸灯 | 1～5 kHz | 8 位 | 太高反而看不出渐变，太低会有闪烁感 |
+| 舵机 | 50 Hz | 10 位 | 协议规定，改了就动不了 |
+| 直流电机 | 5～20 kHz | 8～10 位 | 高频可减少可闻啸叫 |
+| 蜂鸣器 | 1～10 kHz | 8 位 | 音调 = 频率 |
+| LED 灯带（WS2812） | 800 kHz | — | 协议规定，不能改 |
+
+## 常见坑
+
+| 现象 | 原因 |
+| --- | --- |
+| 电机只嗡嗡响不转 | 电压不够（压降/供电不足）；`motorStop()` 没初始化 |
+| 电机反转了 | 方向引脚接反，交换 IN1/IN2 或改 `forward` 参数 |
+| 开发板反复重启 | 电机启动电流大，用独立电源并共地 |
+| 舵机抖动回中 | 电源不足；或 PWM 频率不是 50Hz |
+| LED 亮度很低 | 超过 2kHz 后人眼对亮度的感知反而下降，改低频试试 |
+| PWM 路数多了没反应 | S3 只有 8 个 LEDC 通道（0～7），超出的绑定不上；经典 ESP32 才有 16 通道 |
+
+## 之后想深入？
+
+想搞懂"为什么"，去 [完整教程 · PWM 与电机控制](../course/l4-peripherals/pwm)。
+
+## 下一步
+
+[QS-8 总线：I2C / SPI / UART](./bus) —— 接上真正的智能模块（屏幕、SD 卡、温湿度）。

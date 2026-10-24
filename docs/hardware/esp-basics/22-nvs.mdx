@@ -1,0 +1,321 @@
+---
+id: 22-nvs
+title: 22 NVS 保存配置
+sidebar_position: 22
+description: 断电不丢数据的 NVS、键值对怎么读写、为什么必须检查 NVS 初始化错误，以及什么时候该用文件系统。
+---
+
+# 22 NVS 保存配置
+
+**本课目标**：让 WiFi 密码、设备设置这些数据断电不丢。
+
+## 为什么需要 NVS
+
+```c
+char wifi_ssid[] = "mywifi";        /* 全局变量 */
+```
+
+:::danger[全局变量断电就没了]
+RAM 是**易失性**的——断电全部清零。
+
+**但设备需要记住**：
+
+- WiFi 名称和密码（配网后）
+- 用户的设置（亮度、模式）
+- 累计运行时间、校准参数
+- 设备是否已激活
+
+**NVS 就是干这个的。**
+:::
+
+## NVS 是什么
+
+**NVS = Non-Volatile Storage（非易失存储）**
+
+| 特点 | 说明 |
+| --- | --- |
+| 存储位置 | **Flash**（掉电保留） |
+| 数据形式 | **键值对**（key-value） |
+| 容量 | 由分区表决定（singleapp 模板默认 24 KB；双 OTA 模板默认 16 KB） |
+| 支持类型 | 整数、字符串、二进制块 |
+| 掉电安全 | ✅ 有磨损均衡和电源丢失保护 |
+
+:::info[默认分区表里就有 NVS]
+本机 ESP-IDF v5.3.5 的 `partitions_singleapp.csv`：
+
+```text
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     ,        0x6000,     ← 24 KB
+phy_init, data, phy,     ,        0x1000,
+factory,  app,  factory, ,        1M,
+```
+
+**`nvs` 分区默认 24 KB，够存几百个键值对。**
+:::
+
+![NVS 布局：Flash 上 0x9000 起的 24KB data 分区，内部按命名空间分文件夹、命名空间里装键值对；分区大小、命名空间名与键名（最长 15 字节）、单值上限（97% 分区 ≈ 4KB）、写入几十毫秒级这四条共同决定了它只适合少量低频配置](/img/diagrams/esp32-nvs-layout.svg)
+
+## 必须初始化
+
+```c
+#include "nvs_flash.h"
+
+esp_err_t ret = nvs_flash_init();
+
+if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    /* 分区满了 或 数据格式版本变了 → 擦掉重来 */
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    ret = nvs_flash_init();
+}
+ESP_ERROR_CHECK(ret);
+```
+
+:::danger[不处理这两种错误会直接崩]
+```c
+nvs_flash_init();             /* ❌ 返回值没处理 */
+```
+
+**两种情况会失败**：
+
+| 错误 | 原因 |
+| --- | --- |
+| `ESP_ERR_NVS_NO_FREE_PAGES` | NVS 分区写满了 |
+| `ESP_ERR_NVS_NEW_VERSION_FOUND` | 固件升级后 NVS 格式版本变了 |
+
+**处理办法都是"擦掉重来"**——代价是丢失已保存的配置（可接受，比崩溃强）。
+
+**这也是 WiFi 初始化必须包这段的原因**（[第 14 课](./14-wifi)）。
+:::
+
+## 读写的完整流程
+
+```c
+#include "nvs.h"
+#include "nvs_flash.h"
+
+/* ① 打开命名空间 */
+nvs_handle_t handle;
+esp_err_t err = nvs_open("config", NVS_READWRITE, &handle);
+if (err != ESP_OK) {
+    ESP_LOGE(TAG, "打开 NVS 失败: %s", esp_err_to_name(err));
+    return;
+}
+
+/* ---------- 写 ---------- */
+nvs_set_i32(handle, "bright", 80);            /* 整数 */
+nvs_set_str(handle, "ssid", "mywifi");        /* 字符串 */
+nvs_set_blob(handle, "calib", buf, len);      /* 二进制块 */
+
+nvs_commit(handle);                            /* ← 必须提交！ */
+
+/* ---------- 读 ---------- */
+int32_t bright = 0;
+nvs_get_i32(handle, "bright", &bright);
+
+char ssid[33] = {0};
+size_t len = sizeof(ssid);
+nvs_get_str(handle, "ssid", ssid, &len);
+
+/* ③ 关掉 */
+nvs_close(handle);
+```
+
+:::danger[写完必须 `nvs_commit`]
+```c
+nvs_set_i32(handle, "bright", 80);
+/* 忘了 commit → 断电后数据没了 */
+```
+
+**`nvs_set_*` 只是写进缓存，`nvs_commit` 才真正落到 Flash。**
+
+**虽然 `nvs_close` 也会隐式提交**，但显式调用更清楚、也更安全（比如程序在 close 前崩溃）。
+
+**频繁写时要注意**：每次 commit 都擦写 Flash，**Flash 寿命约 10 万次**。别在循环里写。
+:::
+
+## 命名空间（namespace）
+
+```c
+nvs_open("config", NVS_READWRITE, &handle);     /* 命名空间 "config" */
+nvs_open("user",   NVS_READWRITE, &handle2);    /* 另一个空间 */
+```
+
+:::tip[命名空间相当于"文件夹"]
+**不同命名空间的键互不冲突**：
+
+```text
+config / ssid = "mywifi"
+user   / ssid = "admin"
+```
+
+**规矩：按模块分命名空间**（`wifi`、`app`、`calib`），避免键名打架。
+
+（命名空间名最长 15 字节，键名最长 15 字节。）
+:::
+
+## 读取时要处理"键不存在"
+
+:::danger[第一次启动时所有键都不存在]
+```c
+int32_t bright;
+nvs_get_i32(handle, "bright", &bright);        /* 返回 ESP_ERR_NVS_NOT_FOUND */
+/* bright 的值是未定义的！*/
+```
+
+**必须检查返回值并给默认值**：
+
+```c
+int32_t bright = 80;                            /* 先放默认值 */
+esp_err_t err = nvs_get_i32(handle, "bright", &bright);
+if (err == ESP_ERR_NVS_NOT_FOUND) {
+    ESP_LOGI(TAG, "首次启动，使用默认值 %d", bright);
+} else if (err != ESP_OK) {
+    ESP_LOGE(TAG, "读取失败: %s", esp_err_to_name(err));
+}
+```
+
+**不检查就用，第一次开机会读到垃圾值。**
+:::
+
+## 完整示例：记住开机次数
+
+```c
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+#include "esp_log.h"
+
+static const char *TAG = "nvs";
+
+static void nvs_demo(void)
+{
+    /* ① 初始化（含错误处理） */
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    /* ② 打开命名空间 */
+    nvs_handle_t h;
+    ESP_ERROR_CHECK(nvs_open("app", NVS_READWRITE, &h));
+
+    /* ③ 读开机次数（带默认值） */
+    int32_t boot = 0;
+    esp_err_t err = nvs_get_i32(h, "boot_count", &boot);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGI(TAG, "首次启动");
+        boot = 0;
+    } else if (err != ESP_OK) {
+        ESP_LOGE(TAG, "读取失败: %s", esp_err_to_name(err));
+        nvs_close(h);
+        return;
+    }
+
+    /* ④ 加一后写回 */
+    boot++;
+    ESP_ERROR_CHECK(nvs_set_i32(h, "boot_count", boot));
+    ESP_ERROR_CHECK(nvs_commit(h));
+
+    ESP_LOGI(TAG, "这是第 %ld 次启动", (long)boot);
+
+    /* ⑤ 顺便演示存字符串 */
+    ESP_ERROR_CHECK(nvs_set_str(h, "fw_ver", "1.0.3"));
+    ESP_ERROR_CHECK(nvs_commit(h));
+
+    char ver[16] = {0};
+    size_t len = sizeof(ver);
+    if (nvs_get_str(h, "fw_ver", ver, &len) == ESP_OK) {
+        ESP_LOGI(TAG, "固件版本 %s", ver);
+    }
+
+    nvs_close(h);
+}
+
+void app_main(void)
+{
+    nvs_demo();
+    /* 重启板子（按 RESET），第二次会打印"第 2 次启动" */
+}
+```
+
+:::tip[这个例子怎么验证]
+**烧录后按 RESET 键**，串口里 `boot_count` 会加一。
+
+**断电再上电也会加** —— 证明数据真的存在 Flash 里。
+:::
+
+## 常用 API 速查
+
+| 操作 | API |
+| --- | --- |
+| 初始化 | `nvs_flash_init()` |
+| 擦除整个分区 | `nvs_flash_erase()` |
+| 打开命名空间 | `nvs_open(ns, mode, &h)` |
+| 写整数 | `nvs_set_i32/i8/i16/i64` |
+| 写字符串 | `nvs_set_str` |
+| 写二进制 | `nvs_set_blob` |
+| 提交 | `nvs_commit(h)` |
+| 读整数 | `nvs_get_i32(h, key, &out)` |
+| 读字符串 | `nvs_get_str(h, key, buf, &len)` |
+| 查键是否存在 | `nvs_find_key` |
+| 删除某个键 | `nvs_erase_key(h, key)` |
+| 删除所有键 | `nvs_erase_all(h)` |
+| 关闭 | `nvs_close(h)` |
+
+## NVS 用不了怎么办
+
+:::warning[NVS 的几个限制]
+| 限制 | 说明 |
+| --- | --- |
+| **单值最大 97% 分区大小** | 默认分区下大约 4 KB |
+| **不适合大数据** | 存图片、日志要用文件系统 |
+| **不适合高频写** | Flash 寿命有限 |
+| **写入较慢** | 几十毫秒级 |
+:::
+
+| 需求 | 用什么 |
+| --- | --- |
+| 配置项、密码、计数 | **NVS** |
+| 文件、日志、图片 | **文件系统**（下一课） |
+| 高频写入的数据 | 先缓存在 RAM，定期批量写 |
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 不处理 init 返回 | 首次启动崩溃 | 分区满/版本变 | 擦除重来 |
+| 写后不 `commit` | 断电丢失 | 只在缓存 | 加 commit |
+| 不判 `NOT_FOUND` | 读到垃圾值 | 首次启动无值 | 给默认值 |
+| 循环里疯狂写 | Flash 磨损 | 擦写次数有限 | 累积后写 |
+| 命名空间/键超 15 字节 | 失败 | 长度限制 | 用短名 |
+| 用 NVS 存大文件 | 失败 | 单值上限 | 改用文件系统 |
+
+:::danger[不要把 WiFi 密码用明文长期存在日志里]
+```c
+ESP_LOGI(TAG, "SSID=%s, PASS=%s", ssid, pass);     /* ❌ 密码进日志 */
+```
+
+**日志可能被串口抓走、被上传。**
+
+**只打印 SSID，不打印密码。**
+:::
+
+## 本课自检
+
+- [ ] 知道 NVS 是 Flash 上的键值对存储
+- [ ] **知道默认 NVS 分区是 24 KB**
+- [ ] **知道 `nvs_flash_init` 的两种错误要擦除重来**
+- [ ] 会 `nvs_open` / `set` / `commit` / `get` / `close`
+- [ ] **知道写完必须 `nvs_commit`**
+- [ ] **知道读取要判 `ESP_ERR_NVS_NOT_FOUND` 并给默认值**
+- [ ] 知道命名空间相当于文件夹，键名有 15 字节限制
+- [ ] 知道 NVS 不适合大数据和高频写
+- [ ] 知道 Flash 擦写寿命约 10 万次
+- [ ] **知道不要把密码打进日志**
+
+## 下一步
+
+[23 深度睡眠省电](./23-sleep) —— 让电池撑几个月。

@@ -1,0 +1,269 @@
+---
+id: makefile
+title: Makefile 与构建
+sidebar_position: 14
+description: 目标与依赖的本质、为什么必须用 tab、变量与自动变量的用法、头文件依赖怎么自动生成、以及六个常见坑。
+---
+
+# Makefile 与构建
+
+**本课目标**：能写出"改一个文件只重编该编的"的 Makefile。
+
+## 最小可用
+
+```makefile
+CC      = gcc
+CFLAGS  = -std=c11 -Wall -Wextra -O2 -g
+TARGET  = app
+
+$(TARGET): main.o util.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+clean:
+	rm -f *.o $(TARGET)
+
+.PHONY: clean
+```
+
+:::danger[命令行必须用 TAB 开头，不是空格]
+```makefile
+target:
+    gcc ...        # ❌ 四个空格 → "missing separator" 错误
+target:
+	gcc ...        # ✅ 一个 TAB
+```
+
+**这是 Makefile 的头号坑**，而且报错信息（`missing separator`）完全没提 tab。
+
+**编辑器里记得关掉"自动把 tab 转空格"。**
+:::
+
+## 目标、依赖、命令
+
+![Make 依赖图：app 依赖 main.o/util.o/Makefile，.o 依赖 .c，头文件依赖需要 -MMD 自动生成](/img/diagrams/c-makefile-graph.svg)
+
+
+```makefile
+目标: 依赖1 依赖2
+	命令
+```
+
+:::info[Make 的规则就一句话]
+**如果"依赖"比"目标"新（mtime 更晚），就执行命令重新生成目标。**
+
+**所以**：
+
+- 第一次构建：目标不存在 → 执行
+- 什么都不改：目标比依赖新 → 跳过（"Nothing to be done"）
+- 改了 `util.c`：`util.o` 重新生成，然后 `app` 重新链接
+:::
+
+:::warning[`touch` 会让 Make 重编]
+```bash
+touch util.c        # 只改 mtime，不改内容
+make                # 会重新编译 util.o
+```
+
+**Make 只看时间戳，不看内容哈希。**
+
+**反过来**：如果你从版本库 checkout 了旧版文件（mtime 变旧），**Make 可能认为不需要重编** → 手动 `touch` 或 `make clean`。
+:::
+
+## 变量与自动变量
+
+| 变量 | 含义 |
+| --- | --- |
+| `$@` | **目标名** |
+| `$<` | **第一个依赖** |
+| `$^` | 所有依赖（去重） |
+| `$+` | 所有依赖（保留重复） |
+| `$*` | 模式匹配的部分（`%.o: %.c` 里的 `%`） |
+
+```makefile
+# 运算符
+A  = raw              # 递归展开（用到时才展开）
+B := $(A)             # 立即展开（赋值时就固定）
+C ?= default          # 只有未定义时才赋值
+D += extra            # 追加
+```
+
+:::danger[`=` 与 `:=` 的差异会让你抓狂]
+```makefile
+A = $(B)
+B = hello
+$(info $(A))          # hello（A 用的时候才展开 B）
+```
+
+```makefile
+A := $(B)             # B 此时还没定义 → A 是空
+B = hello
+$(info $(A))          # 空
+```
+
+**经验：除了确实需要延迟展开的情况，一律用 `:=`。**
+:::
+
+## 自动生成头文件依赖
+
+:::danger[不处理头文件依赖 = 改了 .h 不会重编]
+```makefile
+util.o: util.c         # ❌ 没有 util.h
+```
+
+**改 `util.h` 后 `util.o` 不会重新编译** → 你看到的是旧的行为，调试半天找不出原因。
+:::
+
+```makefile
+# 让编译器生成依赖文件（.d）
+CFLAGS += -MMD -MP
+DEPS := $(OBJS:.o=.d)
+-include $(DEPS)
+```
+
+:::tip[`-MMD -MP` 做了什么]
+- **`-MMD`**：编译时顺便生成 `util.d`，内容形如
+  ```makefile
+  util.o: util.c util.h config.h
+  ```
+- **`-MP`**：为每个头文件加一条空规则，**防止头文件被删除时 Make 报错**
+- **`-include`**（带减号）：文件不存在时**不报错**（首次构建还没有 `.d`）
+:::
+
+**这是 C 项目 Makefile 里最值得抄的三行。**
+
+## 目录结构与递归
+
+```makefile
+SRC_DIR := src
+OBJ_DIR := build
+SRCS    := $(wildcard $(SRC_DIR)/*.c)
+OBJS    := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SRCS))
+
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(OBJ_DIR):
+	mkdir -p $@
+```
+
+:::tip[`|` 是"仅顺序依赖"（order-only）]
+```makefile
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
+```
+
+**竖线后面的依赖"只要存在就行"，其时间戳不影响是否重编。**
+
+**不加竖线的话，每次 `mkdir` 更新了目录 mtime，所有目标都会重编** —— 这是"每次都全量编译"的常见原因。
+:::
+
+## `make` 的几个常用参数
+
+```bash
+make -j8                 # 并行编译（8 个任务）
+make -n                  # 只打印要执行的命令，不执行（dry run）
+make -B                  # 强制全部重编
+make -k                  # 出错继续（看全部错误）
+make VAR=value           # 覆盖 Makefile 里的变量
+make -C subdir           # 切到子目录执行
+make --debug=b           # 看"为什么重编了"
+```
+
+:::tip[`make -n` 是排查"到底执行了什么"的最佳工具]
+```bash
+make -n | head -20
+```
+
+**特别适合：怀疑 Makefile 逻辑不对但不想真跑的时候。**
+:::
+
+:::warning[`make -j` 不加数字会让机器卡死]
+**默认 `-j` 无限制** —— 有多少目标就并行多少，可能几百个进程。
+
+**永远写具体数字**：`make -j$(nproc)` 或 `-j8`。
+:::
+
+## `CMake` 还是手写 Makefile
+
+| 场景 | 建议 |
+| --- | --- |
+| 单文件 / 三五个文件的小工具 | **手写 Makefile**（够用，无依赖） |
+| 需要跨平台（Windows/MSVC） | **CMake** |
+| 依赖第三方库 | **CMake**（`find_package`） |
+| 需要 IDE 集成 | **CMake**（生成 compile_commands.json） |
+| 嵌入式固定工具链 | 手写 Makefile 也常见（简单直接） |
+
+```cmake
+# 最小 CMakeLists.txt
+cmake_minimum_required(VERSION 3.20)
+project(app C)
+set(CMAKE_C_STANDARD 11)
+
+add_executable(app src/main.c src/util.c)
+target_compile_options(app PRIVATE -Wall -Wextra)
+
+find_package(Threads REQUIRED)
+target_link_libraries(app PRIVATE Threads::Threads)
+```
+
+:::tip[CMake 一定要开 `compile_commands.json`]
+```cmake
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+```
+
+**生成的 `compile_commands.json` 让 clangd / IDE / 各种静态分析工具能正确理解你的代码**（头文件路径、宏定义）。
+
+**不开的话，编辑器里全是红色波浪线。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `missing separator` | 用了空格不是 tab | 用 tab |
+| 改了 `.h` 不重编 | 没生成依赖 | `-MMD -MP` + `-include` |
+| 每次都全量编译 | 目录依赖影响了 mtime | 用 `\|` 顺序依赖 |
+| 并行编译报错 | 目标之间没正确声明依赖 | 补依赖或 `-j1` |
+| `make` 说没事可做但不该这样 | mtime 比目标旧 | `touch` 或 `make -B` |
+| 变量是空的 | `:=` 时它还没定义 | 调整顺序或改用 `=` |
+| 改了 Makefile 不生效 | 目标比 Makefile 新 | 加 `Makefile` 为依赖 |
+| `-j` 让机器卡死 | 没限制并行度 | `-j$(nproc)` |
+
+:::danger[改 Makefile 后不重编是个真实陷阱]
+```makefile
+app: main.o util.o
+	$(CC) $(CFLAGS) -o $@ $^
+```
+
+**改了 `CFLAGS`（比如从 `-O0` 改成 `-O2`），`make` 认为 `main.o` 还是新的，不会重编。**
+
+**解法：把 Makefile 本身列为依赖**
+
+```makefile
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c Makefile | $(OBJ_DIR)
+```
+
+**注意：`-MMD` 生成的 `.d` 文件里没有 Makefile**，所以要手动加。
+:::
+
+## 本课自检
+
+- [ ] 能写出目标/依赖/命令三部分
+- [ ] **知道命令必须 tab 开头**
+- [ ] **理解 Make 只看 mtime，不看内容**
+- [ ] 会用 `$@` / `$<` / `$^`
+- [ ] **知道 `=` 与 `:=` 的展开时机差异，经验上优先 `:=`**
+- [ ] **知道必须用 `-MMD -MP` 自动生成头文件依赖**
+- [ ] 知道 `-include`（带减号）在文件不存在时不报错
+- [ ] **知道 `|` 顺序依赖能避免"每次全量编译"**
+- [ ] 会用 `wildcard` / `patsubst` 组织源文件
+- [ ] 知道 `make -n` 用于排查、`-j` 必须限数字
+- [ ] 知道改 Makefile 后要不重编，需把 Makefile 加成依赖
+- [ ] 能判断该用手写 Makefile 还是 CMake
+- [ ] **知道 CMake 要开 `CMAKE_EXPORT_COMPILE_COMMANDS`**
+
+## 下一步
+
+[工具链与交叉编译](./toolchain) 或 [构建系统深入](../../hardware/linux/build-system)。

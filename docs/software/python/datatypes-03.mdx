@@ -1,0 +1,287 @@
+---
+id: datatypes-03
+title: "03 tuple：不可变序列"
+sidebar_position: 4
+description: "内建数据类型 第 3 部分：tuple：不可变序列"
+---
+
+# 03 tuple：不可变序列
+```python
+t = (1, 2, [3])
+
+try:
+    t[0] = 9
+except TypeError as e:
+    print("赋值 ->", e)
+
+t[2].append(4)          # 里面的 list 可以改
+print(t)
+```
+
+```text
+赋值 -> 'tuple' object does not support item assignment
+(1, 2, [3, 4])
+```
+
+**「不可变」指的是tuple 本身的结构不能变**（不能增删改元素），但**它指向的对象可以是可变的**。这是 tuple 最容易引起误解的地方。
+
+### 单元素元组必须写逗号
+
+```python
+print((1), type((1)).__name__)
+print((1,), type((1,)).__name__)
+print((), type(()).__name__)
+```
+
+```text
+1 int
+(1,) tuple
+() tuple
+```
+
+`(1)` 只是「加了括号的整数」，**逗号才是元组的标志**。空元组写 `()`。
+
+### tuple 的三个用途
+
+1. **作 dict 的键**（因为可哈希）：`locations[(x, y)] = value`
+2. **多返回值**（Python 的 `return a, b` 实际返回的就是 tuple）
+3. **保护数据不被误改**（比 list 更安全，且占用内存更少）
+
+## 7. str：不可变与驻留
+
+字符串**不可变**——所有「修改」方法都返回新字符串：
+
+```python
+s = "python"
+print(s.upper(), "| 原字符串:", s)
+print(s.replace("p", "P"), "| 原字符串:", s)
+```
+
+```text
+PYTHON | 原字符串: python
+Python | 原字符串: python
+```
+
+### 字符串驻留（interning）
+
+```python
+import sys
+
+a = "hello world!"
+b = "hello world!"
+print("相同字面量 is:", a is b)
+print("sys.intern 强制:", sys.intern(a) is sys.intern(b))
+```
+
+```text
+相同字面量 is: True
+intern 强制: True
+```
+
+CPython 会自动驻留**看起来像标识符的字符串**（字母、数字、下划线），以节省内存并加速比较。含空格或标点的字符串不一定驻留——但**比较字符串永远用 `==`，不要用 `is`**，驻留只是实现细节。
+
+:::info[str 与 bytes 的分界]
+`str` 是 Unicode 文本，`bytes` 是字节序列。**读写文件、网络传输统统是 bytes**，必须显式编解码：
+
+```python
+print("中".encode("utf-8"))       # str -> bytes
+print(len("中"), len("中".encode("utf-8")))   # 字符数 vs 字节数
+```
+
+```text
+b'\xe4\xb8\xad'
+1 3
+```
+
+一个汉字是 1 个字符、3 个 UTF-8 字节。搞混这两者在处理中文和网络协议时会出各种乱码。
+:::
+
+## 8. 推导式
+
+推导式是 Python 的标志性语法，比 `map` + `lambda` 更快也更好读。
+
+```python
+print("列表:", [x * x for x in range(5)])
+print("带过滤:", [x for x in range(10) if x % 3 == 0])
+print("嵌套循环:", [(x, y) for x in range(2) for y in range(2)])
+print("字典:", {x: x * x for x in range(3)})
+print("集合:", {x % 3 for x in range(6)})
+print("带三元:", ["e" if x % 2 == 0 else "o" for x in range(4)])
+print("生成器（惰性）:", sum(x * x for x in range(5)))
+```
+
+```text
+列表: [0, 1, 4, 9, 16]
+带过滤: [0, 3, 6, 9]
+嵌套循环: [(0, 0), (0, 1), (1, 0), (1, 1)]
+字典: {0: 0, 1: 1, 2: 4}
+集合: {0, 1, 2}
+带三元: ['e', 'o', 'e', 'o']
+生成器（惰性）: 30
+```
+
+**嵌套循环的顺序**和写成 `for` 时一致——`for x ... for y ...` 里 x 是外层：
+
+```python
+matrix = [[1, 2], [3, 4]]
+print("展平:", [v for row in matrix for v in row])
+```
+
+```text
+展平: [1, 2, 3, 4]
+```
+
+:::info[推导式有自己的作用域]
+列表推导式在 Python 3 里有独立作用域，**不会污染外部变量**：
+
+```python
+x = "outer"
+result = [x for x in range(2)]
+print(result, "| 外部 x 仍是:", x)
+```
+
+```text
+[0, 1] | 外部 x 仍是: outer
+```
+
+但**生成器表达式不同**——它是惰性求值的，会延迟绑定外部变量（第 5 页讲闭包时会再遇到这个问题）。
+:::
+
+:::warning[推导式别写太长]
+超过两层循环或两个条件时，推导式会从「优雅」变成「折磨」。这时候老老实实写 `for` 循环：
+
+```python
+# 难以阅读
+result = [f(x, y) for x in xs if p(x) for y in ys if q(y)]
+
+# 更清楚
+result = []
+for x in xs:
+    if not p(x):
+        continue
+    for y in ys:
+        if q(y):
+            result.append(f(x, y))
+```
+:::
+
+## 9. 排序：`key` 函数与稳定性
+
+`sorted()` 返回新列表，`list.sort()` 原地排序（返回 `None`）。
+
+```python
+data = [("bob", 70), ("amy", 90), ("cy", 70)]
+
+print("按分数:", sorted(data, key=lambda r: r[1]))
+print("分数降序、同分按名:", sorted(data, key=lambda r: (-r[1], r[0])))
+```
+
+```text
+按分数: [('bob', 70), ('cy', 70), ('amy', 90)]
+分数降序、同分按名: [('amy', 90), ('bob', 70), ('cy', 70)]
+```
+
+两个要点：
+
+- **`key` 函数只调用一次每个元素**（Schwartzian 变换），所以里面放复杂计算也不慢
+- **排序是稳定的**——键相等时保持原有相对顺序。上面 `bob` 和 `cy` 都是 70 分，排序后 `bob` 仍在 `cy` 前面
+
+降序且键是数字时，用 `key=lambda r: -r[1]` 比 `reverse=True` 更好——因为后者会把**所有**键的顺序都反过来（包括你想保持升序的第二键）。
+
+```python
+print(sorted(["10", "9"]))     # 字符串按字典序
+print(sorted([10, 9]))         # 数字按数值
+```
+
+```text
+['10', '9']
+[9, 10]
+```
+
+**字符串排序是字典序**，所以 `"10" < "9"`。处理文件名、版本号时经常要补零或拆分。
+
+## 10. 容器选型：一张决策表
+
+| 需求 | 用什么 | 原因 |
+| --- | --- | --- |
+| 有序、可变的序列 | `list` | 动态数组，按下标 O(1) |
+| 有序、不改动的序列 | `tuple` | 可哈希、省内存、防误改 |
+| 键值映射 | `dict` | 哈希，查找 O(1) |
+| 去重、成员判断 | `set` | 哈希，`in` 是 O(1) |
+| 频繁头尾增删 | `collections.deque` | 双端队列，两端都是 O(1) |
+| 固定长度的数值数组 | `array.array` | 存值不存指针，省内存 |
+| 计数 | `collections.Counter` | 见第 9 页 |
+| 带默认值的 dict | `collections.defaultdict` | 见第 9 页 |
+
+## 11. 验证：预测这些输出
+
+```python
+m = [[0]] * 2
+m[0].append(1)
+print(m)
+
+d = {}
+d[1] = "a"
+d[1.0] = "b"
+d[True] = "c"
+print(d)
+
+print(sorted(["10", "9", "1"]))
+print({x % 3 for x in range(6)})
+```
+
+:::info[答案]
+```text
+[[0, 1], [0, 1]]
+{1: 'c'}
+['1', '10', '9']
+{0, 1, 2}
+```
+
+1. `[[0]] * 2` 的两行是同一个列表，改一个全变
+2. `1`、`1.0`、`True` 相等且哈希相同 → 同一个键，最后写入的 `"c"` 胜出
+3. 字符串按字典序，`"1"` 小于 `"10"` 小于 `"9"`
+4. `x % 3` 的结果只有 0/1/2，集合去重后三个元素
+:::
+
+## 常见坑
+
+| 现象 | 真实原因 | 解决 |
+| --- | --- | --- |
+| 改 `y` 后 `x` 也变了 | `y = x` 只加标签 | `x.copy()` / `list(x)` |
+| 嵌套列表改一处全变 | 浅拷贝共享子对象 | `copy.deepcopy()` |
+| `[[0]] * 3` 三行一起变 | `*` 复制引用 | `[[0] for _ in range(3)]` |
+| `dict` 遍历时增删键报 `RuntimeError` | 遍历中改变大小 | `for k in list(d)` |
+| `hash(list)` 报 `unhashable` | 可变对象不可哈希 | 转 `tuple` / `frozenset` |
+| `{1: "a", 1.0: "b"}` 只剩一个键 | 相等的对象哈希必相同 | 别混用 `bool`/`int` 作键 |
+| `pop(0)` 在长列表上很慢 | O(n)，要搬移全部元素 | 用 `deque.popleft()` |
+| `lst.sort()` 返回 `None` | 原地排序 | 先 `sort()` 再用 `lst`；或 `sorted(lst)` |
+| 字符串排序顺序不对 | 字典序不是数值序 | `key=int` 或补零 |
+| `s[10]` 报错但 `s[10:20]` 不报 | 索引越界报错，切片静默截断 | 这是设计，按需选择 |
+| 循环里 `s += x` 越来越慢 | 字符串不可变，反复新建 | `"".join(...)` |
+| `set` 遍历顺序每次不一样 | 顺序取决于哈希 | 不要依赖 set 顺序；要顺序用 list |
+| 中文长度算不对 | 字符数 ≠ 字节数 | `len(s)` vs `len(s.encode("utf-8"))` |
+
+## 自检清单
+
+- [ ] 能画出 list 的内部结构（指针数组 + `ob_size` + 容量）
+- [ ] 能解释「均摊 O(1)」，并说出扩容策略大约是什么
+- [ ] 知道 `pop(0)` 是 O(n) 以及替代方案
+- [ ] 能说清 dict 查找的两步（比哈希 + 比相等）和键的两条铁律
+- [ ] 能解释为什么 `1`、`1.0`、`True` 是同一个 dict 键
+- [ ] 能解释浅拷贝与深拷贝的区别，并举出会踩坑的场景
+- [ ] 知道 `[[0]] * n` 的陷阱和正确写法
+- [ ] 知道 `in` 用 set 比 list 快几个数量级（有实测直觉）
+- [ ] 能解释「tuple 不可变」到底指什么（结构不变，元素可变）
+- [ ] 会写列表/字典/集合推导式，知道嵌套循环的书写顺序
+- [ ] 知道排序是稳定的，以及 `key=lambda r: -r[1]` 的作用
+
+## 下一步
+
+容器用熟了，接下来把逻辑装进函数：[函数与作用域](./functions)。
+
+**参考链接**：[内建类型文档](https://docs.python.org/zh-cn/3/library/stdtypes.html) · [dict 实现说明](https://docs.python.org/zh-cn/3/faq/design.html#how-are-dictionaries-implemented-in-cpython) · [时间复杂度表](https://wiki.python.org/moin/TimeComplexity) · [copy 模块](https://docs.python.org/zh-cn/3/library/copy.html)
+
+---
+
+**翻页**：[← 上一页](./datatypes-02) · [返回目录](./)

@@ -1,0 +1,299 @@
+---
+id: 02-first-program
+title: 02 第一个 C++ 程序
+sidebar_position: 2
+description: iostream 与 cout/cin、为什么用 std::、编译方式，以及和 printf/scanf 的对比。
+---
+
+# 02 第一个 C++ 程序
+
+**本课目标**：跑通第一个 C++ 程序，掌握 `cout`/`cin`，知道它和 `printf` 的区别。
+
+## 最小程序
+
+```cpp
+#include <iostream>
+
+int main() {
+    std::cout << "Hello, C++!" << std::endl;
+    return 0;
+}
+```
+
+编译运行：
+
+```bash
+g++ -std=c++17 -Wall -Wextra hello.cpp -o hello
+./hello
+```
+
+输出：
+
+```text
+Hello, C++!
+```
+
+## 和 C 的四个不同
+
+| C | C++ |
+| --- | --- |
+| `#include <stdio.h>` | `#include <iostream>` |
+| `printf("...")` | `std::cout << ...` |
+| `scanf("%d", &x)` | `std::cin >> x` |
+| 文件后缀 `.c` | 后缀 `.cpp` |
+
+:::info[`int main()` 不用写 `void` 了]
+```cpp
+int main(void)      /* C 的写法，C++ 里也合法 */
+int main()          /* C++ 里的惯例：不接收参数 */
+```
+
+C++ 里 `()` 就表示「无参数」，不需要 `(void)`。
+:::
+
+## `std::cout`：输出
+
+```cpp
+#include <iostream>
+
+int main() {
+    int n = 42;
+    double d = 3.14159;
+    std::string s = "world";
+
+    std::cout << "n=" << n << " d=" << d << " s=" << s << "\n";
+    return 0;
+}
+```
+
+输出：
+
+```text
+n=42 d=3.14159 s=world
+```
+
+:::tip[`<<` 是「往流里塞」]
+```cpp
+std::cout << "n=" << n << "\n";
+```
+
+读作：把 `"n="` 塞进 `cout`，再把 `n` 塞进去，再把换行塞进去。
+
+**关键优势：类型自动识别**。`n` 是 `int` 就按 int 打印，是 `double` 就按浮点打印——**不用写格式符**。
+
+对比 C：
+
+```c
+printf("n=%d d=%f s=%s\n", n, d, s);    /* 格式符写错就崩 */
+```
+:::
+
+### `\n` 还是 `std::endl`
+
+```cpp
+std::cout << "a" << "\n";        /* 只换行 */
+std::cout << "a" << std::endl;   /* 换行 + 刷新缓冲区 */
+```
+
+:::warning[日常优先用 `\n`]
+`std::endl` 每次都强制刷新缓冲区（flush），**在大量输出时会明显变慢**。
+
+**规矩**：
+
+- 普通换行用 `"\n"`
+- 需要立刻看到输出（比如调试、进度条）时才用 `std::endl`
+:::
+
+### 控制格式
+
+```cpp
+#include <iostream>
+#include <iomanip>          /* setprecision 在这个头文件里 */
+
+int main() {
+    double d = 3.14159;
+
+    std::cout << std::fixed << std::setprecision(2) << d << "\n";
+    std::cout << std::boolalpha << true << " " << false << "\n";
+
+    return 0;
+}
+```
+
+输出：
+
+```text
+3.14
+true false
+```
+
+| 操纵符 | 作用 |
+| --- | --- |
+| `std::fixed` | 定点小数 |
+| `std::setprecision(2)` | 2 位小数 |
+| `std::boolalpha` | `true`/`false` 而不是 `1`/`0` |
+| `std::setw(10)` | 宽度 10（**只对下一次输出生效**） |
+| `std::left` / `std::right` | 对齐方向 |
+
+:::warning[`setw` 只影响下一个输出]
+```cpp
+std::cout << std::setw(10) << "a" << std::setw(10) << "b";
+```
+
+宽度设置是**一次性的**，每次都要重新写。这和 `setprecision`（持续生效）不同。
+:::
+
+## `std::cin`：输入
+
+```cpp
+#include <iostream>
+
+int main() {
+    int x;
+    std::cout << "请输入一个数: ";
+
+    if (std::cin >> x) {
+        std::cout << "读到 " << x << "\n";
+    } else {
+        std::cout << "读取失败\n";
+    }
+    return 0;
+}
+```
+
+运行：
+
+```text
+请输入一个数: 123
+读到 123
+```
+
+:::danger[`cin >>` 不用加 `&`]
+```cpp
+scanf("%d", &x);      /* C：要取地址 */
+std::cin >> x;        /* C++：不用 & */
+```
+
+因为 `cin >>` 的参数是**引用**（第 3 课会讲），引用本身就能修改原变量，不需要手动取地址。
+
+**这是 C++ 相比 C 更方便的地方之一。**
+:::
+
+### 检查输入是否成功
+
+```cpp
+if (std::cin >> x) {
+    /* 成功 */
+} else {
+    /* 失败：输入了非数字，或到达文件末尾 */
+}
+```
+
+`cin >>` 的返回值能直接当布尔用（表示是否成功）。
+
+## 为什么每个都要写 `std::`
+
+```cpp
+std::cout << "hi";
+```
+
+`std::` 是**命名空间**（第 22 课细讲）。简单说：`cout` 放在 `std` 这个"文件夹"里，防止和别人的 `cout` 重名。
+
+:::danger[不要用 `using namespace std;`]
+```cpp
+using namespace std;      /* ❌ 很多教程这么写，但不好 */
+cout << "hi";
+```
+
+**问题**：它把 `std` 里**所有**名字都倒进全局，几千个名字，很容易和你的变量冲突。
+
+**正确做法**：
+
+```cpp
+/* ① 每个地方写全名（推荐，清晰） */
+std::cout << "hi";
+
+/* ② 或者在局部作用域引入个别名字 */
+using std::cout;
+using std::string;
+```
+
+**在头文件里永远不要写 `using namespace std;`**——会污染所有包含它的文件。
+:::
+
+## 完整示例：一个小计算器
+
+```cpp
+#include <iostream>
+#include <iomanip>
+
+int main() {
+    double a, b;
+
+    std::cout << "输入两个数：";
+    if (!(std::cin >> a >> b)) {
+        std::cerr << "输入无效\n";
+        return 1;
+    }
+
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << a << " + " << b << " = " << a + b << "\n";
+    std::cout << a << " - " << b << " = " << a - b << "\n";
+    std::cout << a << " * " << b << " = " << a * b << "\n";
+
+    if (b != 0.0) {
+        std::cout << a << " / " << b << " = " << a / b << "\n";
+    } else {
+        std::cout << "除数不能为 0\n";
+    }
+
+    return 0;
+}
+```
+
+运行：
+
+```text
+输入两个数：10 4
+10.00 + 4.00 = 14.00
+10.00 - 4.00 = 6.00
+10.00 * 4.00 = 40.00
+10.00 / 4.00 = 2.50
+```
+
+:::tip[`std::cerr` 是错误流]
+```cpp
+std::cerr << "出错了\n";       /* 错误信息 */
+std::cout << "正常输出\n";     /* 正常信息 */
+```
+
+区别：`cerr` **不缓冲**，且输出到标准错误（可以被 shell 单独重定向）。
+
+**错误信息用 `cerr`，正常输出用 `cout`**——这是好习惯。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 用 `printf` 但没 include `cstdio` | 编译错 | 缺头文件 | `#include <cstdio>` 或改用 `cout` |
+| `cout << endl` 到处都是 | 输出慢 | 每次都 flush | 用 `"\n"` |
+| 头文件里写 `using namespace std` | 名字冲突 | 污染全局 | 写全名 |
+| `cin >> &x` | 编译错 | 引用不需要 `&` | `cin >> x` |
+| 忘了 `#include <iomanip>` | `setprecision` 找不到 | 头文件缺失 | 加上 |
+| 文件后缀写成 `.c` | 按 C 编译 | 后缀决定语言 | 用 `.cpp` |
+
+## 本课自检
+
+- [ ] 能用 `g++` 编译运行 `.cpp` 文件
+- [ ] 知道 `#include <iostream>` 和 `std::cout`
+- [ ] 会用 `<<` 链式输出，知道类型自动识别
+- [ ] **知道 `"\n"` 优于 `std::endl`**（性能）
+- [ ] 会用 `std::cin >> x`，**知道不用加 `&`**
+- [ ] 知道要检查输入是否成功
+- [ ] 知道 `std::cerr` 用于错误信息
+- [ ] **知道不该写 `using namespace std;`**
+
+## 下一步
+
+[03 引用与 const](./03-reference) —— C++ 最重要的基础概念，贯穿整个语言。

@@ -1,0 +1,242 @@
+---
+id: ranges
+title: Ranges 与视图
+sidebar_position: 13
+description: 视图是惰性的（实测改原容器后视图跟着变）、管道语法怎么读、常用视图速查、视图悬垂引用这个头号坑。
+---
+
+# Ranges 与视图
+
+**本课目标**：会用管道写法处理序列，知道视图的生命周期陷阱。
+
+## 从迭代器对到管道
+
+```cpp
+// 老写法
+std::vector<int> v{1,2,3,4,5,6,7,8,9,10};
+std::vector<int> tmp, out;
+std::copy_if(v.begin(), v.end(), std::back_inserter(tmp),
+             [](int x){ return x % 2 == 0; });
+std::transform(tmp.begin(), tmp.end(), std::back_inserter(out),
+               [](int x){ return x * x; });
+out.resize(std::min<size_t>(3, out.size()));
+
+// ranges 写法
+auto r = v | std::views::filter([](int x){ return x % 2 == 0; })
+           | std::views::transform([](int x){ return x * x; })
+           | std::views::take(3);
+```
+
+**中间那两个临时 `vector` 完全消失了。**
+
+## 视图是惰性的（本机实测）
+
+:::tip[实测：filter→transform→take 的结果]
+```cpp
+auto r = v | std::views::filter(even) | std::views::transform(square) | std::views::take(3);
+for (int x : r) std::cout << x << " ";
+// 输出：4 16 36
+```
+
+**为什么是 `4 16 36`**：
+
+```text
+原始：1 2 3 4 5 6 7 8 9 10
+偶：   2   4   6
+平方：  4  16  36
+取 3：  4  16  36
+```
+
+**注意它没有把整个序列算完再取前 3** —— 取到第 3 个就停了（对无限序列也能用）。
+:::
+
+:::danger[视图不持有数据，改原容器后视图跟着变（实测）]
+```cpp
+std::vector<int> v{1,2,3,4,5,6,7,8,9,10};
+auto first3 = v | std::views::take(3);
+
+v[0] = 100;                    // 改原容器
+
+for (int x : first3) std::cout << x << " ";
+// 输出：100 2 3        ← 视图反映的是"现在"的值
+```
+
+**视图是"带过滤条件的窗口"，不是快照。**
+
+**这既是优点（零拷贝、总是最新）也是陷阱**（你以为拿到的是固定数据）。
+:::
+
+**视图可以继续组合**（实测）：
+
+```cpp
+auto sub = v | std::views::drop(2) | std::views::take(2);
+// 输出：3 4
+```
+
+## 常用视图速查
+
+| 视图 | 作用 |
+| --- | --- |
+| `views::filter(pred)` | 只保留满足条件的 |
+| `views::transform(f)` | 逐个映射 |
+| `views::take(n)` | 取前 n 个 |
+| `views::drop(n)` | 跳过前 n 个 |
+| `views::take_while(pred)` | 取到条件不成立为止 |
+| `views::drop_while(pred)` | 跳过开头满足条件的 |
+| `views::reverse` | 反转 |
+| `views::iota(a, b)` | 生成 `[a, b)` 的序列（**无需容器**） |
+| `views::keys` / `views::values` | 取 map 的键 / 值 |
+| `views::join` | 把嵌套序列展平 |
+| `views::split(delim)` | 按分隔符切 |
+| `views::chunk(n)` | 每 n 个一组 |
+| `views::zip`（C++23） | 把多个序列拉到一起 |
+| `views::enumerate`（C++23） | 带下标 |
+
+```cpp
+// iota 实测：右下界是开区间
+for (int x : std::views::iota(1, 5)) std::cout << x << " ";
+// 输出：1 2 3 4        ← 不含 5
+```
+
+:::warning[`iota(1,5)` 是半开区间 `[1,5)`]
+**和 `begin()/end()` 的惯例一致**——`end()` 不包含。这是 C++ 的一贯风格，但初学容易搞错。
+:::
+
+## 头号坑：视图悬垂
+
+:::danger[把临时容器交给视图 = 未定义行为]
+```cpp
+// ❌ 灾难
+auto r = std::vector<int>{1,2,3} | std::views::filter(pred);
+// 这一行结束时临时 vector 就析构了
+// r 里存着的迭代器全部悬垂
+for (int x : r) { /* 读已释放内存 */ }
+```
+
+**同样的错误还有**：
+
+```cpp
+auto r = make_vector() | std::views::take(3);      // ❌ 临时对象
+auto r2 = std::string("a,b,c") | std::views::split(',');  // ❌
+```
+:::
+
+:::tip[三个安全的做法]
+```cpp
+// ① 底层容器先赋值给具名变量
+std::vector<int> v{1,2,3};
+auto r = v | std::views::take(2);           // ✅ v 活得比 r 久
+
+// ② 需要独立数据时立刻物化
+std::vector<int> out(r.begin(), r.end());   // ✅ 拷贝出来
+// 或 C++23：
+auto out = std::ranges::to<std::vector<int>>(r);
+
+// ③ 作为函数参数时注意生命周期
+void f(const std::vector<int>& v) {
+    auto r = v | std::views::take(2);       // ✅ v 在调用期有效
+}
+```
+:::
+
+:::warning[这个坑有个专有名词：悬垂引用（dangling）]
+**C++ 标准里有一组 "views::xxx_until / temporary_range" 规则**，`std::ranges::borrowed_range` 就是用来表达"这个 range 引用的数据比它本身活得久"。
+
+**编译器不保证报错**（有的实现会警告），**运行时可能"看起来正常"**——这是最坏的情况。
+:::
+
+## 物化：从视图拿到真正的容器
+
+```cpp
+// C++23
+auto v = std::views::iota(1, 10)
+       | std::views::filter([](int x){ return x % 2; })
+       | std::ranges::to<std::vector<int>>();
+
+// C++20（没有 to）
+auto r = std::views::iota(1, 10) | std::views::filter(...);
+std::vector<int> v(r.begin(), r.end());
+```
+
+:::danger[`ranges::to` 需要 `#include <ranges>` 且是 C++23]
+**C++20 没有 `std::ranges::to`**。用 C++20 时只能手动构造容器。
+
+**判断标准**：`__cpp_lib_ranges_to_container` 宏。
+:::
+
+## 与算法配合
+
+```cpp
+#include <algorithm>
+#include <ranges>
+
+// 老写法要写两次 begin/end
+std::sort(v.begin(), v.end());
+
+// ranges 算法只要一个参数
+std::ranges::sort(v);
+
+// 能直接作用在视图上（注意：视图可能是只读的）
+auto evens = v | std::views::filter([](int x){ return x % 2 == 0; });
+bool has_big = std::ranges::any_of(evens, [](int x){ return x > 100; });
+```
+
+:::tip[`ranges::` 版算法的三个好处]
+1. **不用写两次 `begin()/end()`**
+2. **可以直接传容器或视图**
+3. **返回值更友好**（`ranges::find` 返回迭代器，没错；但 `ranges::min_element` 等不再需要比较两个迭代器）
+
+**另外 `ranges::` 版接受投影（projection）参数**：
+
+```cpp
+struct P { int x, y; };
+std::vector<P> ps{{1,5}, {2,3}};
+
+std::ranges::sort(ps, {}, &P::x);        // 按 x 排序，不用写 lambda
+auto it = std::ranges::max_element(ps, {}, &P::y);   // 按 y 找最大
+```
+
+**第三个参数是"投影"** —— `{}` 表示默认比较，`&P::x` 表示先取这个成员再比。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 读到垃圾数据 / 崩溃 | 视图引用了已析构的临时容器 | 底层容器用具名变量 |
+| `views::iota(1,5)` 少了 5 | 半开区间 | 要包含就写 `6` |
+| 编译报找不到 `ranges::to` | C++20 没有 | 手动构造或用 C++23 |
+| 视图上 `sort` 报错 | 视图通常不可写 | 先物化再排序 |
+| 对视图 `size()` 编译失败 | 某些视图不满足 sized_range | 用 `ranges::distance` |
+| 无限序列死循环 | 忘了 `take` | 加 `take` / `take_while` |
+| 性能没提升 | 视图每层多一次函数调用 | 层数太多时手动循环可能更快 |
+
+:::warning[别把视图套太深]
+```cpp
+auto r = v | filter1 | transform1 | filter2 | transform2 | filter3 | take(10);
+```
+
+**每层都是一次间接调用，编译器不一定能全部内联。**
+
+**经验**：3~4 层以内很清晰；再多就该考虑写成普通循环了 —— **可读性和性能都更好**。
+:::
+
+## 本课自检
+
+- [ ] 会把迭代器对写法改成管道写法
+- [ ] **知道视图是惰性的，不会先算完整个序列**
+- [ ] **实测记住 `filter→square→take(3)` 对 1..10 得 `4 16 36`**
+- [ ] **知道视图不持有数据，改原容器后视图跟着变（实测 `100 2 3`）**
+- [ ] 能说出 8 个以上常用视图
+- [ ] **知道 `iota(a,b)` 是半开区间**
+- [ ] **知道"临时容器 + 视图 = 悬垂"是头号坑**
+- [ ] 会用三种安全做法（具名变量 / 立刻物化 / 注意参数生命周期）
+- [ ] 知道 C++20 没有 `ranges::to`
+- [ ] 会用 `ranges::` 版算法，避免写两次 begin/end
+- [ ] **知道投影参数（`&P::x`）能省掉 lambda**
+- [ ] 知道视图层数太多可能反而更慢
+
+## 下一步
+
+[C++20 概念](./concepts) 讲了怎么约束这些泛型接口；
+或者看 [STL 算法](./stl-algorithms)。

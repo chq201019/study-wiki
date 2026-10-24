@@ -1,0 +1,304 @@
+---
+id: ssh
+title: SSH 深入
+sidebar_position: 20
+description: 密钥认证与权限检查、config 文件省掉重复参数、三种端口转发的实际用途、保持连接与跳板机配置、以及连不上时的排查顺序。
+---
+
+# SSH 深入
+
+**本课目标**：配好免密登录与端口转发，连不上时能自己定位。
+
+## 密钥认证
+
+```bash
+ssh-keygen -t ed25519 -C "me@laptop"        # 推荐 ed25519（比 RSA 短且快）
+ssh-copy-id user@host                        # 自动把公钥装到远端
+```
+
+:::danger[权限不对，密钥认证会静默失败]
+```text
+~/.ssh            必须是 700
+~/.ssh/id_*       必须是 600（私钥）
+~/.ssh/authorized_keys  必须是 600
+家目录不能是 group/other 可写
+```
+
+```bash
+chmod 700 ~/.ssh
+chmod 600 ~/.ssh/id_ed25519 ~/.ssh/authorized_keys
+```
+
+**权限过宽时 sshd 会直接忽略你的密钥，然后退回到密码登录** —— 看起来像"密钥没生效"，但日志里才有原因。
+:::
+
+**看服务端日志**：
+
+```bash
+sudo journalctl -u ssh -f              # 或 /var/log/auth.log
+# 会打印：Authentication refused: bad ownership or modes for file ...
+```
+
+:::warning[RSA 密钥在新版 OpenSSH 上可能被拒]
+**OpenSSH 8.8 起默认禁用 `ssh-rsa`（SHA-1 签名）**。
+
+**老密钥连不上时**：
+
+```bash
+# ① 最好：换 ed25519
+ssh-keygen -t ed25519
+
+# ② 或改用 4096 位 RSA 密钥（双方都支持时会自动用 rsa-sha2 签名）
+ssh-keygen -t rsa -b 4096 -o -a 100
+```
+
+**不要为了兼容去改服务端的 `PubkeyAcceptedAlgorithms`** —— 那是降级安全。
+:::
+
+## `~/.ssh/config`：省掉重复参数
+
+```text
+Host myserver
+    HostName 192.168.1.100
+    User root
+    IdentityFile ~/.ssh/id_rsa_server
+    ServerAliveInterval 30
+    ServerAliveCountMax 3
+
+Host *.internal
+    User deploy
+    ProxyJump bastion
+
+Host *
+    # 只用 IdentityFile 指定的密钥，不再把 agent 里的密钥挨个试一遍
+    IdentitiesOnly yes
+```
+
+之后就能：
+
+```bash
+ssh wiki
+scp file wiki:/tmp/
+ssh wiki 'systemctl status nginx'
+```
+
+:::tip[`IdentitiesOnly yes` 能加速连接]
+**不加这一项时，SSH 会把 `~/.ssh` 下所有密钥挨个试一遍** —— 密钥多了会有明显延迟，而且可能触发服务端的失败次数限制。
+
+**指定了 `IdentityFile` 就顺手加 `IdentitiesOnly yes`。**
+:::
+
+:::info[`Host` 后面的模式匹配]
+```text
+Host wiki            精确匹配 "wiki"
+Host *.example.com   通配
+Host a b c           多个名字共用一段配置
+Host *               兜底（放最后，先匹配先生效）
+```
+
+**顺序很重要**：**先匹配到的值生效**，后面的不会覆盖（除了多值项会累加）。
+:::
+
+## 三种端口转发
+
+:::tip[记住方向：`-L` 是"本地发起的"、`-R` 是"远端发起的"]
+| 类型 | 命令 | 效果 |
+| --- | --- | --- |
+| **本地转发** | `ssh -L 8080:localhost:80 host` | 访问**本机 8080** → 到 host 的 80 |
+| **远程转发** | `ssh -R 9000:localhost:3000 host` | 访问 **host 的 9000** → 到本机的 3000 |
+| **动态转发（SOCKS）** | `ssh -D 1080 host` | 本机 1080 是 SOCKS5 代理 |
+:::
+
+```bash
+# 本地转发：把远端的数据库端口映射到本地
+ssh -L 5432:localhost:5432 dbserver
+# 之后本地 psql 连 localhost:5432 就是连远端
+
+# 远程转发：把本地的开发服务暴露给远端
+ssh -R 8080:localhost:3000 server
+# 在 server 上访问 localhost:8080 就是访问你本机的 3000
+
+# 动态转发：把远端当跳板上网
+ssh -D 1080 gateway
+# 浏览器设 SOCKS5 127.0.0.1:1080
+```
+
+:::warning[默认只监听 `127.0.0.1`]
+```bash
+ssh -L 8080:localhost:80 host        # 只有本机能连 8080
+ssh -L 0.0.0.0:8080:localhost:80 host   # 局域网也能连（⚠️ 安全风险）
+```
+
+**开放到 `0.0.0.0` 等于把远端服务暴露给整个网络** —— 只在明确需要时这么做，并配防火墙。
+:::
+
+:::danger[远程转发需要服务端允许]
+```text
+# /etc/ssh/sshd_config
+AllowTcpForwarding yes        # 默认 yes
+GatewayPorts no               # 默认 no（远程转发只能绑 127.0.0.1）
+```
+
+**`-R` 想绑到 `0.0.0.0` 必须服务端 `GatewayPorts yes`**，否则只能本机访问。
+:::
+
+## 保持连接不断
+
+```text
+Host *
+    ServerAliveInterval 30
+    ServerAliveCountMax 3
+    TCPKeepAlive yes
+```
+
+**客户端每 30 秒发一个保活包，3 次无响应就断开** —— 避免"看起来连着但实际已经死了"。
+
+**服务端侧**：
+
+```text
+# /etc/ssh/sshd_config
+ClientAliveInterval 60
+ClientAliveCountMax 3
+```
+
+:::warning[别把间隔设得太短]
+**`ServerAliveInterval 1` 会让 SSH 每秒发包** —— 移动网络下会明显耗电，日志也会被刷满。
+
+**30~60 秒是合理范围。**
+:::
+
+## 跳板机
+
+```bash
+# 一跳
+ssh -J bastion target
+
+# 多跳
+ssh -J user1@hop1,user2@hop2 target
+```
+
+```text
+Host target
+    HostName 10.0.0.5
+    ProxyJump bastion
+```
+
+:::tip[`ProxyJump` 比 `ProxyCommand` 好]
+```bash
+# 老写法
+ssh -o ProxyCommand="ssh -W %h:%p bastion" target
+
+# 新写法（OpenSSH 7.3+）
+ssh -J bastion target
+```
+
+**`-J` 不需要远端有 `nc`，且配置更清晰。**
+:::
+
+## 连不上时的排查顺序
+
+:::tip[按这个顺序，能定位 95% 的问题]
+```bash
+# ① 网络通不通（最基础）
+ping -c2 host
+nc -zv host 22                    # 端口通不通
+
+# ② DNS 解析对不对
+getent hosts host
+
+# ③ 详细看握手过程（-vvv 是最有用的）
+ssh -vvv user@host 2>&1 | head -60
+
+# ④ 只用密钥、不用密码代理（排除 agent 干扰）
+ssh -o PreferredAuthentications=publickey user@host
+
+# ⑤ 服务端日志
+sudo journalctl -u ssh -n 50
+```
+:::
+
+| 现象 | 检查 |
+| --- | --- |
+| `Connection refused` | 服务没跑 / 端口不对 / 防火墙 REJECT |
+| `Connection timed out` | 防火墙 DROP / 路由不通 |
+| `Permission denied (publickey)` | **密钥权限、`authorized_keys`、sshd 配置** |
+| 卡在 `debug1: Authentications that can continue` | 密钥没被接受 |
+| `Host key verification failed` | 主机指纹变了（重装/被劫持） |
+| 连上就断 | `MaxStartups` / 资源限制 / 内存不足 |
+| 很慢才连上 | `GSSAPIAuthentication` 或反向 DNS |
+
+:::danger[`Host key verification failed` 的正确处理]
+```bash
+ssh-keygen -R host            # 从 known_hosts 删掉旧指纹
+```
+
+**但先想清楚"为什么变了"**：
+
+- 服务器重装过 → 正常
+- **你没重装但指纹变了 → 可能被中间人攻击**
+
+**在不可信网络里遇到这个提示，先别删，先确认。**
+:::
+
+:::warning[`GSSAPIAuthentication` 导致的连接慢]
+老版本默认开启 GSSAPI，会做反向 DNS 查询 → 卡几秒。
+
+```text
+# 客户端 ~/.ssh/config
+Host *
+    GSSAPIAuthentication no
+
+# 或服务端 /etc/ssh/sshd_config
+GSSAPIAuthentication no
+UseDNS no
+```
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 密钥不生效 | `~/.ssh` 或私钥权限过宽 | `chmod 700/600` |
+| 老密钥被拒 | OpenSSH 8.8+ 禁用 ssh-rsa | 换 ed25519 |
+| 连接慢 | 试遍所有密钥 / GSSAPI | `IdentitiesOnly yes`、关 GSSAPI |
+| 端口转发只能本机访问 | 默认绑 127.0.0.1 | `-L 0.0.0.0:...` 或 `GatewayPorts` |
+| 远程转发访问不到 | 服务端 `GatewayPorts no` | 服务端开或改绑 127.0.0.1 |
+| 连接莫名断开 | 中间设备回收空闲连接 | `ServerAliveInterval` |
+| `Too many authentication failures` | 试了太多密钥 | `IdentitiesOnly yes` |
+| 断开后进程被杀 | 没 detach | `nohup` / `tmux` / `setsid` |
+
+:::tip[长时间任务必须用 `tmux` 或 `nohup`]
+**SSH 断开时，会话里的前台进程会收到 SIGHUP 并被杀死。**
+
+```bash
+# 方案一：nohup + 重定向（简单任务）
+nohup ./long_task > out.log 2>&1 &
+
+# 方案二：tmux（需要回来看输出时）
+tmux new -s work
+# Ctrl-b d 脱离；tmux attach -t work 回来
+```
+
+**`&` 单独用不够** —— 断开时仍可能被 SIGHUP 带走，`nohup` 或 `disown` 才稳妥。
+:::
+
+## 本课自检
+
+- [ ] 会用 `ssh-keygen` + `ssh-copy-id` 配免密
+- [ ] **知道 `~/.ssh` 700、私钥与 `authorized_keys` 600**
+- [ ] **知道权限过宽会导致密钥被静默忽略**
+- [ ] **知道 OpenSSH 8.8+ 默认禁用 ssh-rsa，要换 ed25519**
+- [ ] 会用 `~/.ssh/config` 简化常用主机
+- [ ] **知道 `IdentitiesOnly yes` 能加速连接**
+- [ ] **能分清 `-L`（本地转发）/ `-R`（远程转发）/ `-D`（SOCKS）**
+- [ ] **知道转发默认只绑 `127.0.0.1`**
+- [ ] 知道 `-R` 要绑 `0.0.0.0` 需服务端 `GatewayPorts yes`
+- [ ] 会用 `ServerAliveInterval` 保活
+- [ ] 会用 `-J` 跳板机
+- [ ] **会按顺序排查（ping → nc → -vvv → 服务端日志）**
+- [ ] **知道 `Host key verification failed` 要先确认原因再删**
+- [ ] **知道长任务要用 `tmux` 或 `nohup`，`&` 不够**
+
+## 下一步
+
+[系统故障排查](./troubleshoot) 或 [性能分析](./performance)。

@@ -1,0 +1,248 @@
+---
+id: stdlib-01
+title: "01 标准库精讲"
+sidebar_position: 2
+description: "标准库精讲 第 1 部分：标准库精讲"
+---
+
+# 01 标准库精讲
+**本页学什么**：Python 的座右铭是「batteries included」（自带电池）。这一页讲九个你天天会用到的模块——目标是**见到问题能立刻点名该用哪个**，而不是自己造轮子。
+
+每个模块按「解决什么问题 → 核心 API → 陷阱」来讲。全部代码在本机实测过。
+
+## 1. collections：更好的容器
+
+### `Counter`：计数
+
+```python
+from collections import Counter
+
+c = Counter("banana")
+print("计数:", c)
+print("最常见的两个:", c.most_common(2))
+print("总数:", sum(c.values()))
+print("展开:", sorted(c.elements()))
+print("相减:", Counter("aab") - Counter("ab"))
+print("相加:", Counter("ab") + Counter("bc"))
+```
+
+```text
+计数: Counter({'a': 3, 'n': 2, 'b': 1})
+最常见的两个: [('a', 3), ('n', 2)]
+总数: 6
+展开: ['a', 'a', 'a', 'b', 'n', 'n']
+相加: Counter({'b': 2, 'a': 1, 'c': 1})
+```
+
+**用于**：词频统计、日志分析、找重复项。比手写 `dict.get(k, 0) + 1` 干净得多。
+
+`Counter` 的 `most_common(n)` 内部对小 n 用堆排序，非常高效。
+
+### `defaultdict`：带默认值的字典
+
+```python
+from collections import defaultdict
+
+groups = defaultdict(list)
+for key, value in [("a", 1), ("b", 2), ("a", 3)]:
+    groups[key].append(value)          # 不用先判断 key 存不存在
+
+print(dict(groups))
+
+counts = defaultdict(int)
+print("缺失的键:", counts["不存在"])     # 自动生成 0
+print("不会抛 KeyError")
+```
+
+```text
+{'a': [1, 3], 'b': [2]}
+缺失的键: 0
+不会抛 KeyError
+```
+
+**用于**：分组、累加、建图（邻接表）。比 `setdefault` 更简洁。
+
+:::warning[`defaultdict` 会悄悄创建条目]
+访问一个不存在的键**会真的把它写进字典**：
+
+```python
+d = defaultdict(list)
+_ = d["x"]          # 只是读了一下
+print("x 现在在里面了:", "x" in d)
+```
+
+```text
+x 现在在里面了: True
+```
+
+这在「只想查询、不想污染字典」时是 bug 来源。另外它也可能掩盖拼写错误——本该报错的地方返回了默认值。
+
+**如果只是想让缺失键返回默认值、不写入，用 `dict.get(k, default)`。**
+:::
+
+### `deque`：双端队列
+
+```python
+from collections import deque
+
+dq = deque([1, 2, 3], maxlen=3)
+dq.append(4)
+print("满了后 append 会挤掉左边:", dq)
+dq.appendleft(0)
+print("appendleft:", dq)
+dq.rotate(1)
+print("rotate(1):", dq)
+```
+
+```text
+满了后 append 会挤掉左边: deque([2, 3, 4], maxlen=3)
+appendleft: deque([0, 2, 3], maxlen=3)
+rotate(1): deque([3, 0, 2], maxlen=3)
+```
+
+两端操作都是 **O(1)**（第 4 页实测：`popleft` 比 `list.pop(0)` 快 51 倍）。
+
+**用于**：队列/栈、滑动窗口（`maxlen` 自动丢弃旧数据）、BFS。
+
+### `namedtuple`：带名字的元组
+
+```python
+from collections import namedtuple
+
+Point = namedtuple("Point", ["x", "y"])
+p = Point(1, 2)
+print(p, "| 按名字访问:", p.x, p.y)
+print("改一个字段:", p._replace(x=9))
+print("转字典:", p._asdict())
+print("仍是元组，可下标:", p[0], "| 可解包:", end=" ")
+x, y = p
+print(x, y)
+```
+
+```text
+Point(x=1, y=2) | 按名字访问: 1 2
+改一个字段: Point(x=9, y=2)
+转字典: {'x': 1, 'y': 2}
+仍是元组，可下标: 1 | 可解包: 1 2
+```
+
+**用于**：替代「下标含义不明」的元组。比 `dict` 省内存，比类轻量。
+
+新代码更推荐 `typing.NamedTuple`（能写类型注解）或 `@dataclass`：
+
+```python
+from typing import NamedTuple
+
+class Point(NamedTuple):
+    x: float
+    y: float
+    def distance(self) -> float:
+        return (self.x ** 2 + self.y ** 2) ** 0.5
+```
+
+### `ChainMap`：多层配置
+
+```python
+from collections import ChainMap
+
+defaults = {"color": "red", "size": "M"}
+user = {"color": "blue"}
+
+merged = ChainMap(user, defaults)       # 前面的优先
+print("color:", merged["color"])        # blue（user 覆盖 defaults）
+print("size:", merged["size"])          # M（回退到 defaults）
+print("合成视图:", dict(merged))
+```
+
+```text
+color: blue
+size: M
+合成视图: {'color': 'blue', 'size': 'M'}
+```
+
+**用于**：配置分层（命令行优先于环境变量，环境变量优先于配置文件，配置文件优先于默认值）。比 `dict` 合并好，因为**不复制数据**，改底层 dict 会实时反映。
+
+## 2. itertools：迭代器工具箱
+
+全部返回**惰性迭代器**，不占内存。
+
+```python
+from itertools import (count, cycle, repeat, chain, islice, compress,
+                       dropwhile, takewhile, groupby, accumulate, product,
+                       permutations, combinations, combinations_with_replacement,
+                       zip_longest, starmap, filterfalse, pairwise)
+
+print("count 无限计数:", list(islice(count(10), 3)))
+print("cycle 循环:", list(islice(cycle("ab"), 5)))
+print("repeat 重复:", list(repeat(7, 3)))
+print("chain 串联:", list(chain([1], [2], [3])))
+print("compress 按掩码筛选:", list(compress("abcdef", [1, 0, 1, 0, 1, 0])))
+print("dropwhile:", list(dropwhile(lambda x: x < 3, [1, 2, 3, 4, 1])))
+print("takewhile:", list(takewhile(lambda x: x < 3, [1, 2, 3, 4, 1])))
+print("accumulate 前缀和:", list(accumulate([1, 2, 3, 4])))
+print("product 笛卡尔积:", list(product("ab", [1, 2])))
+print("permutations 排列:", list(permutations("ab")))
+print("combinations 组合:", list(combinations("abc", 2)))
+print("combinations_with_replacement:", list(combinations_with_replacement("ab", 2)))
+print("zip_longest:", list(zip_longest([1, 2], [3], fillvalue=0)))
+print("starmap:", list(starmap(pow, [(2, 3), (3, 2)])))
+print("filterfalse:", list(filterfalse(lambda x: x % 2, range(6))))
+print("pairwise:", list(pairwise([1, 2, 3])))
+```
+
+```text
+count 无限计数: [10, 11, 12]
+cycle 循环: ['a', 'b', 'a', 'b', 'a']
+repeat 重复: [7, 7, 7]
+chain 串联: [1, 2, 3]
+compress 按掩码筛选: ['a', 'c', 'e']
+dropwhile: [3, 4, 1]
+takewhile: [1, 2]
+accumulate 前缀和: [1, 3, 6, 10]
+product 笛卡尔积: [('a', 1), ('a', 2), ('b', 1), ('b', 2)]
+permutations 排列: [('a', 'b'), ('b', 'a')]
+combinations 组合: [('a', 'b'), ('a', 'c'), ('b', 'c')]
+combinations_with_replacement: [('a', 'a'), ('a', 'b'), ('b', 'b')]
+zip_longest: [(1, 3), (2, 0)]
+starmap: [8, 9]
+filterfalse: [0, 2, 4]
+pairwise: [(1, 2), (2, 3)]
+```
+
+:::danger[`groupby` 必须先排序]
+这是 `itertools` 里最容易踩的坑。`groupby` 只把**相邻的**相同元素分到一组：
+
+```python
+from itertools import groupby
+
+data = "aaabbc"
+print("已排序:", [(k, list(g)) for k, g in groupby(data)])
+
+data2 = "ababcc"
+print("未排序:", [(k, list(g)) for k, g in groupby(data2)])   # a 出现了两次！
+```
+
+```text
+已排序: [('a', ['a', 'a', 'a']), ('b', ['b', 'b']), ('c', ['c'])]
+未排序: [('a', ['a']), ('b', ['b']), ('a', ['a']), ('b', ['b']), ('c', ['c', 'c'])]
+```
+
+**正确用法**：`groupby(sorted(data, key=...), key=...)`
+:::
+
+3.12 新增了 `itertools.batched()`（分批处理），3.11 上不存在：
+
+```python
+import itertools
+print("batched 可用吗:", hasattr(itertools, "batched"))    # 3.12+ 才是 True
+```
+
+```text
+batched 可用吗: False
+```
+
+3.11 上要分批，用 `islice` 手写或用 `more-itertools` 库。
+
+---
+
+**翻页**：[下一页 →](./stdlib-02) · [返回目录](./)

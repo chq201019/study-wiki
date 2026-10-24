@@ -1,0 +1,337 @@
+---
+id: 14-unique-ptr
+title: 14 智能指针 unique_ptr
+sidebar_position: 14
+description: 独占所有权的智能指针、转移语义、为什么 sizeof 只有 8 字节、以及如何替代裸 new/delete。
+---
+
+# 14 智能指针 unique_ptr
+
+**本课目标**：用 `unique_ptr` 替代 `new`/`delete`，从此不再手写 `delete`。
+
+## 为什么需要智能指针
+
+C 的写法（[C 第 20 课](../c-basics/20-malloc)）：
+
+```cpp
+Widget *p = new Widget();
+if (出错了) {
+    delete p;               /* ❌ 每个分支都要记得 */
+    return;
+}
+delete p;                   /* ❌ 忘了就泄漏 */
+```
+
+**换成 `unique_ptr`：**
+
+```cpp
+auto p = std::make_unique<Widget>();
+/* 不用写 delete —— 出作用域自动释放 */
+```
+
+## 基本用法
+
+```cpp
+#include <memory>
+
+auto p = std::make_unique<int>(42);      /* 创建，初始值 42 */
+std::cout << *p;                          /* 42，用 * 解引用 */
+
+auto s = std::make_unique<std::string>("hi");
+std::cout << s->size();                   /* 用 -> 访问成员 */
+```
+
+本机实测：
+
+```text
+*up=42  sizeof=8
+```
+
+:::tip[为什么 `sizeof(unique_ptr) == 8`]
+因为它内部**只有一个裸指针**，没有别的开销。
+
+**这就是"零开销抽象"**——`unique_ptr` 和手写 `T*` 一样大、一样快，但自动释放。
+:::
+
+### 为什么用 `make_unique` 而不是 `new`
+
+```cpp
+auto p = std::make_unique<Widget>(args);     /* ✅ 推荐 */
+
+std::unique_ptr<Widget> p(new Widget(args)); /* ⚠️ 能用但不推荐 */
+```
+
+| 理由 | 说明 |
+| --- | --- |
+| **更短** | 类型名不用写两遍 |
+| **异常安全** | `new` 版本在某些求值顺序下可能泄漏 |
+| **对称** | 和 `make_shared` 一致 |
+
+## 独占所有权：不能拷贝
+
+```cpp
+auto a = std::make_unique<int>(1);
+auto b = a;                  /* ❌ 编译错误：不能拷贝 */
+```
+
+:::danger[为什么禁止拷贝]
+`unique_ptr` 表示**独占所有权**——同一块内存只能有一个所有者。
+
+如果允许拷贝，两个 `unique_ptr` 都以为自己拥有，析构时就会 **double free**（[第 8 课](./08-copy)讲过）。
+:::
+
+### 但可以移动
+
+```cpp
+auto a = std::make_unique<std::string>("hello");
+auto b = std::move(a);       /* ✅ 转移所有权 */
+
+/* 现在 a 是 nullptr，b 拥有对象 */
+std::cout << (a ? "非空" : "nullptr");       /* nullptr */
+```
+
+本机实测：
+
+```text
+  a 为 nullptr
+```
+
+:::tip[移动后源对象变成 `nullptr`]
+这是 `unique_ptr` 的约定：**所有权转移后，源对象不再指向任何东西**。
+
+所以移动之后**不要再用原来的指针**（除了判断是否为空）。
+:::
+
+## 转移所有权的三种场景
+
+### ① 传入函数（转移进去）
+
+```cpp
+void take(std::unique_ptr<Widget> p) {     /* 按值：接收所有权 */
+    /* 用 p ... */
+}   /* p 析构，对象释放 */
+
+auto p = std::make_unique<Widget>();
+take(std::move(p));                        /* 必须 std::move */
+```
+
+### ② 从函数返回（转移出来）
+
+```cpp
+std::unique_ptr<Widget> create() {
+    return std::make_unique<Widget>();     /* 自动移动，不用写 move */
+}
+```
+
+**返回局部 `unique_ptr` 是标准做法**，编译器会优化（RVO），不会有额外开销。
+
+### ③ 放进容器
+
+```cpp
+std::vector<std::unique_ptr<Widget>> v;
+v.push_back(std::make_unique<Widget>());   /* ✅ 临时对象自动移动 */
+```
+
+**这就是第 11 课银行例子里多态容器的做法。**
+
+## 只读访问用引用，不转移
+
+:::warning[只想用一下，不要转移所有权]
+```cpp
+void print(const Widget &w);              /* ✅ 传引用，不涉及所有权 */
+
+auto p = std::make_unique<Widget>();
+print(*p);                                /* 解引用后传引用 */
+```
+
+**不要把 `unique_ptr` 按 `const&` 传**——虽然能编译，但那意味着"我可能要转移"，语义不清。
+
+**规矩**：
+
+- 只是使用 → 传 `T&` 或 `const T&`
+- 要接管所有权 → 传 `unique_ptr<T>` 按值
+:::
+
+## 常用操作
+
+```cpp
+auto p = std::make_unique<int>(42);
+
+p.get()          /* 拿到裸指针（不转移所有权） */
+*p               /* 解引用 */
+p.reset()        /* 释放当前对象，p 变成 nullptr */
+p.reset(new int(7))   /* 释放旧的，接管新的 */
+if (p) { }       /* 判断是否为空 */
+```
+
+:::danger[`get()` 拿到的指针不能 delete]
+```cpp
+int *raw = p.get();
+delete raw;              /* ❌ 灾难：p 析构时又会 delete 一次 */
+```
+
+`get()` 只是"看一眼"，**所有权仍在 `unique_ptr` 手上**。
+
+**用途**：传给需要裸指针的 C 接口（且对方不接管所有权）。
+:::
+
+## 替代裸 new 的完整对比
+
+```cpp
+/* ❌ C 风格 */
+Widget *w = new Widget();
+w->do_something();
+delete w;
+
+/* ❌ 异常时泄漏 */
+Widget *w = new Widget();
+risky_operation();          /* 抛异常 → delete 不执行 */
+delete w;
+
+/* ✅ unique_ptr */
+auto w = std::make_unique<Widget>();
+w->do_something();
+/* 自动释放，异常也安全 */
+```
+
+## 完整示例
+
+```cpp
+#include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
+
+class Resource {
+public:
+    explicit Resource(std::string name) : name_(std::move(name)) {
+        std::cout << "  获取 " << name_ << "\n";
+    }
+    ~Resource() {
+        std::cout << "  释放 " << name_ << "\n";
+    }
+
+    const std::string &name() const { return name_; }
+
+    /* 禁止拷贝，允许移动（unique_ptr 在容器里需要） */
+    Resource(const Resource &) = delete;
+    Resource &operator=(const Resource &) = delete;
+
+private:
+    std::string name_;
+};
+
+/* 工厂函数：返回 unique_ptr，自动转移 */
+std::unique_ptr<Resource> make_resource(const std::string &name) {
+    return std::make_unique<Resource>(name);
+}
+
+int main() {
+    std::cout << "--- 基本使用 ---\n";
+    {
+        auto r = make_resource("A");
+        std::cout << "  使用 " << r->name() << "\n";
+    }   /* 自动释放 */
+
+    std::cout << "--- 转移所有权 ---\n";
+    {
+        auto a = make_resource("B");
+        auto b = std::move(a);
+        std::cout << "  a " << (a ? "非空" : "为空")
+                  << "，b 指向 " << b->name() << "\n";
+    }
+
+    std::cout << "--- 容器里的 unique_ptr ---\n";
+    {
+        std::vector<std::unique_ptr<Resource>> list;
+        list.push_back(make_resource("C"));
+        list.push_back(make_resource("D"));
+        std::cout << "  共 " << list.size() << " 个\n";
+    }   /* 容器析构，全部释放 */
+
+    std::cout << "--- 程序结束 ---\n";
+    return 0;
+}
+```
+
+输出：
+
+```text
+--- 基本使用 ---
+  获取 A
+  使用 A
+  释放 A
+--- 转移所有权 ---
+  获取 B
+  a 为空，b 指向 B
+  释放 B
+--- 容器里的 unique_ptr ---
+  获取 C
+  获取 D
+  共 2 个
+  释放 D
+  释放 C
+--- 程序结束 ---
+```
+
+## 什么时候用 unique_ptr
+
+:::tip[默认就该用 unique_ptr]
+| 场景 | 用什么 |
+| --- | --- |
+| **需要一个堆对象，单一所有者** | **`unique_ptr`（默认选择）** |
+| 需要共享所有权 | `shared_ptr`（第 15 课） |
+| 只是局部对象 | **不用指针**，直接栈上创建 |
+| 要观察但不拥有 | `T*` 或 `T&` |
+
+**规矩：能用栈对象就用栈对象，必须上堆就用 `unique_ptr`。**
+
+**`shared_ptr` 只在真的需要共享时用**——它有引用计数开销。
+:::
+
+:::danger[不需要 new 的时候别 new]
+```cpp
+/* ❌ 没必要 */
+auto p = std::make_unique<std::string>("hello");
+
+/* ✅ 直接栈上对象 */
+std::string s = "hello";
+```
+
+**栈对象更快（无堆分配）、更简单、还自动释放。**
+
+只有在这些情况才需要堆对象：
+
+- 对象很大（避免栈溢出）
+- 生命周期要超出当前作用域
+- 需要多态（基类指针指向子类）
+- 大小运行时才知道
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `auto b = a;` | 编译错 | 不能拷贝 | `std::move(a)` |
+| 移动后又用 `a` | 空指针解引用 | 已转移 | 检查或用前重新赋值 |
+| `delete p.get()` | double free | 所有权还在 p | 不要 delete `get()` 结果 |
+| 传 `const unique_ptr&` 想转移 | 编译错 | const 不能移动 | 按值传 |
+| 用 `new` 构造 unique_ptr | 可能泄漏 | 求值顺序 | 用 `make_unique` |
+| 所有东西都上堆 | 慢、复杂 | 滥用 | 优先栈对象 |
+
+## 本课自检
+
+- [ ] 会用 `std::make_unique<T>(args)`
+- [ ] **知道 `sizeof(unique_ptr)` 和裸指针一样（8）**
+- [ ] 知道不能拷贝，但能 `std::move`
+- [ ] **知道移动后源指针变成 nullptr**
+- [ ] 知道函数返回 `unique_ptr` 会自动转移
+- [ ] 会用 `vector<unique_ptr<T>>`
+- [ ] 知道 `get()` 只是观察，不能 delete
+- [ ] 知道只是使用时传 `T&` 而不是 `unique_ptr`
+- [ ] 知道 `unique_ptr` 是默认选择，`shared_ptr` 只在需要共享时用
+- [ ] 知道能栈上就别上堆
+
+## 下一步
+
+[15 智能指针 shared_ptr](./15-shared-ptr) —— 多个所有者怎么办，以及循环引用这个陷阱。

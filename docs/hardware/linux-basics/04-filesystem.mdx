@@ -1,0 +1,263 @@
+---
+id: 04-filesystem
+title: 04 目录结构
+sidebar_position: 4
+description: 单一树形结构、FHS 标准、每个顶层目录干什么用，以及为什么没有 C 盘 D 盘。
+---
+
+# 04 目录结构
+
+**本课目标**：认识 Linux 的目录树，知道东西该放哪、该去哪找。
+
+## 没有盘符，只有一个树
+
+:::danger[Windows 有 C: D:，Linux 只有一个根 `/`]
+```text
+Windows:  C:\  D:\  E:\        ← 并列的"盘"
+Linux:    /                    ← 唯一的根，一切从这开始
+          ├── etc/
+          ├── home/
+          ├── var/
+          └── usr/
+```
+
+**所有硬盘、U 盘、网络存储都"挂载"到树上的某个目录**，而不是独立成盘。
+:::
+
+本机实测根目录：
+
+```text
+bin@  boot/  dev/  etc/  home/  lib@  lib64@  lost+found/
+media/ mnt/  opt/  proc/  root/  run/  sbin@  srv/
+sys/   tmp/  usr/  var/  vmlinuz@  initrd.img@
+```
+
+:::info[带 `@` 的是什么]
+`ls -F` 会在目录后加 `/`，**符号链接后加 `@`**。
+
+`bin@`、`lib@`、`sbin@` 都是符号链接——现代系统里它们指向 `/usr/bin`、`/usr/lib`、`/usr/sbin`（叫"usr merge"）。
+
+**所以 `/bin/ls` 实际就是 `/usr/bin/ls`。**
+:::
+
+## 每个目录干什么
+
+| 目录 | 用途 | 记忆 |
+| --- | --- | --- |
+| `/bin` | 基本命令（`ls`、`cp`） | **bin**ary |
+| `/sbin` | 系统管理命令（`fdisk`） | **s**ystem bin |
+| `/lib` | 共享库（类似 Windows 的 dll） | **lib**rary |
+| `/etc` | **配置文件** | **e**tc（编辑器配置） |
+| `/home` | 普通用户的家目录 | 你的地盘 |
+| `/root` | root 用户的家目录 | 注意不是 `/home/root` |
+| `/var` | 经常变化的数据（日志、数据库） | **var**iable |
+| `/tmp` | 临时文件 | **t**e**mp**orary |
+| `/usr` | 用户程序和数据（最大的一块） | **u**nix **s**ystem **r**esource |
+| `/opt` | 额外安装的软件 | **opt**ional |
+| `/dev` | 设备文件 | **dev**ice |
+| `/proc` | 进程和内核信息（虚拟） | **proc**ess |
+| `/sys` | 内核和硬件信息（虚拟） | **sys**tem |
+| `/boot` | 内核和启动文件 | 启动用 |
+| `/media` | 自动挂载的可移动设备（U 盘） | 媒介 |
+| `/mnt` | 手动挂载点 | **m**ou**nt** |
+| `/srv` | 服务数据 | **s**e**rv**ice |
+
+## 几个最容易搞混的
+
+### `/etc` —— 配置全在这
+
+```bash
+ls /etc | head -10
+```
+
+常见文件：
+
+| 文件 | 内容 |
+| --- | --- |
+| `/etc/passwd` | 用户账户信息 |
+| `/etc/group` | 用户组 |
+| `/etc/hostname` | 主机名 |
+| `/etc/hosts` | 本地域名解析 |
+| `/etc/fstab` | 开机挂载配置 |
+| `/etc/ssh/sshd_config` | SSH 服务配置 |
+| `/etc/apt/sources.list` | 软件源（Debian） |
+
+:::tip[改配置前先备份]
+```bash
+cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+```
+
+**改坏了能恢复。** 这是运维的基本习惯。
+:::
+
+### `/var` —— 会变大的地方
+
+| 子目录 | 内容 |
+| --- | --- |
+| `/var/log` | **日志**（最常看的地方） |
+| `/var/lib` | 程序的状态数据（数据库文件） |
+| `/var/cache` | 缓存 |
+| `/var/spool` | 待处理队列（打印、邮件） |
+| `/var/www` | 网站根目录（常见） |
+
+:::danger[`/var/log` 能把磁盘占满]
+日志会持续增长。**磁盘满了最常见的原因就是日志。**
+
+```bash
+du -sh /var/log        # 看日志占多大
+```
+
+（第 13、20 课讲怎么清理和配轮转。）
+:::
+
+### `/home` vs `/root`
+
+```bash
+cd ~                    # 回家目录（~ 是当前用户的家目录）
+pwd
+```
+
+- **普通用户**：`/home/用户名`
+- **root 用户**：`/root`（**不是** `/home/root`）
+
+:::warning[为什么 root 的家目录单独放]
+`/home` 可能被单独分区挂载。如果 `/home` 挂载失败或空间满，**root 还能正常登录**（因为家目录在 `/` 上）。
+
+这是为容错做的设计。
+:::
+
+### `/usr` —— 最大的目录
+
+很多人以为 `/usr` 是"用户"，**实际是 Unix System Resource**。
+
+| 子目录 | 内容 |
+| --- | --- |
+| `/usr/bin` | 绝大多数命令（`ls` 实测在这里） |
+| `/usr/sbin` | 系统管理命令 |
+| `/usr/lib` | 库文件 |
+| `/usr/local` | **手动编译安装的软件** |
+| `/usr/share` | 共享数据（文档、图标） |
+| `/usr/include` | C/C++ 头文件 |
+
+:::tip[`/usr/local` 是"自己装的东西"的家]
+```bash
+./configure --prefix=/usr/local
+make && make install
+```
+
+手动编译的软件默认装到 `/usr/local`，**和包管理器装的分开**，互不干扰。
+:::
+
+### `/proc` 和 `/sys` —— 虚拟文件系统
+
+```bash
+cat /proc/version
+cat /proc/cpuinfo | head -5
+```
+
+:::info[这两个目录不在硬盘上]
+`/proc` 和 `/sys` 是**内核生成的虚拟文件**，读写它们等于和内核交互。
+
+| 路径 | 内容 |
+| --- | --- |
+| `/proc/cpuinfo` | CPU 信息 |
+| `/proc/meminfo` | 内存信息 |
+| `/proc/<PID>/` | 某个进程的信息 |
+| `/sys/class/net/` | 网络设备 |
+| `/sys/class/gpio/` | GPIO（嵌入式常用！） |
+
+**这就是"一切皆文件"的体现**——查硬件不用专门工具，`cat` 一个文件就行。
+:::
+
+### `/dev` —— 设备文件
+
+```bash
+ls -l /dev/null /dev/sda 2>/dev/null
+```
+
+本机实测：
+
+```text
+crw-rw-rw- 1 root root 1, 3 ... /dev/null
+```
+
+:::tip[文件类型首字母的含义]
+| 首字符 | 类型 |
+| --- | --- |
+| `-` | 普通文件 |
+| `d` | 目录 |
+| `l` | 符号链接 |
+| `c` | **字符设备**（`/dev/null`、串口） |
+| `b` | **块设备**（硬盘 `/dev/sda`） |
+| `s` | 套接字 |
+| `p` | 管道 |
+
+**`/dev/null` 是"黑洞"**——写进去的东西全部丢弃，常用于丢弃输出：
+
+```bash
+command > /dev/null 2>&1        # 输出全部丢弃
+```
+:::
+
+## FHS：目录结构是有标准的
+
+**FHS**（Filesystem Hierarchy Standard）规定了每个目录该放什么。
+
+为什么重要：**换一个发行版，目录结构基本一样**。学会一个，到处通用。
+
+## 绝对路径 vs 相对路径
+
+```bash
+# 绝对路径：从 / 开始
+cd /etc/ssh
+
+# 相对路径：从当前位置算
+cd ssh                  # 当前在 /etc 时，等价于上面的
+```
+
+| 写法 | 含义 |
+| --- | --- |
+| `/etc/ssh` | 绝对路径 |
+| `ssh` | 相对路径（当前目录下的 ssh） |
+| `./ssh` | 明确表示"当前目录下" |
+| `../ssh` | 上一级目录下的 ssh |
+| `~` | 当前用户家目录 |
+| `-` | 上一次所在的目录 |
+
+:::tip[`cd -` 来回切换]
+```bash
+cd /var/log
+cd /etc
+cd -                    # 回到 /var/log
+```
+
+**在两个目录间来回跳很方便。**
+:::
+
+## 本课自检
+
+- [ ] 知道 Linux 是单一树形结构，从 `/` 开始
+- [ ] 知道没有 C 盘 D 盘，硬盘是"挂载"到目录上
+- [ ] 记得住 `/etc`（配置）、`/var`（可变数据）、`/home`（用户）的用途
+- [ ] 知道 `/root` 不是 `/home/root`
+- [ ] 知道 `/usr` 是"Unix System Resource"不是"用户"
+- [ ] 知道 `/proc` 和 `/sys` 是虚拟文件系统
+- [ ] **知道"一切皆文件"，`/dev/null` 是黑洞**
+- [ ] 能看懂 `ls -l` 首字符（`-` `d` `l` `c` `b`）
+- [ ] 分清绝对路径和相对路径
+- [ ] 会用 `~` 和 `cd -`
+
+## 第一阶段小结
+
+你现在知道：
+
+- Linux 是内核，发行版是完整系统
+- 怎么弄到一个能用的环境
+- 终端、Shell、命令的关系
+- 目录树的结构和每个目录的用途
+
+**接下来开始真正操作文件。**
+
+## 下一步
+
+[05 浏览与操作文件](./05-files) —— `ls` `cd` `cp` `mv` `rm` 这一套。

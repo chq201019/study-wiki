@@ -1,0 +1,251 @@
+---
+id: 08-pwm
+title: 08 PWM 与呼吸灯
+sidebar_position: 8
+description: PWM 原理、ESP-IDF 的 LEDC 用法、频率与分辨率的关系，以及 ledc_set_duty 少一步不生效这个坑。
+---
+
+# 08 PWM 与呼吸灯
+
+**本课目标**：理解 PWM，会用它调 LED 亮度、调电机转速。
+
+## PWM 是什么
+
+**PWM = 脉冲宽度调制（Pulse Width Modulation）**
+
+核心思路：**用"开和关的比例"表示"中间值"**。
+
+```text
+占空比 0%    ________________________   （一直关，全灭）
+
+占空比 25%   ▔▔▔▁▁▁▁▁▁▁▔▔▔▁▁▁▁▁▁▁       （亮 1/4 时间）
+
+占空比 50%   ▔▔▔▔▔▁▁▁▁▁▔▔▔▔▔▁▁▁▁▁       （一半一半）
+
+占空比 100%  ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔       （一直开，全亮）
+```
+
+:::tip[为什么这样能"调亮度"]
+**切换频率足够快时，人眼看到的是平均亮度。**
+
+比如 50% 占空比 + 5 kHz 频率 → 人眼看到"半亮"（看不到闪烁）。
+
+**这就是为什么 PWM 频率要远高于人眼感知（> 100 Hz）。**
+:::
+
+:::info[PWM 能控制什么]
+| 用途 | 怎么起作用 |
+| --- | --- |
+| LED 亮度 | 平均电流变化 |
+| 电机转速 | 平均电压变化 |
+| 舵机角度 | **脉宽直接表示角度**（不是平均） |
+| 蜂鸣器音调 | 频率决定音高 |
+| DAC 模拟输出 | 加低通滤波取平均 |
+:::
+
+## ESP-IDF 的 LEDC
+
+ESP32 用 **LEDC**（LED Control）外设产生 PWM。
+
+本机 ESP-IDF v5.3.5 的实际 API（`driver/ledc.h`）：
+
+```c
+esp_err_t ledc_timer_config(const ledc_timer_config_t *timer_conf);
+esp_err_t ledc_channel_config(const ledc_channel_config_t *ledc_conf);
+esp_err_t ledc_set_duty(ledc_mode_t speed_mode, ledc_channel_t channel, uint32_t duty);
+esp_err_t ledc_update_duty(ledc_mode_t speed_mode, ledc_channel_t channel);
+esp_err_t ledc_set_freq(ledc_mode_t speed_mode, ledc_timer_t timer_num, uint32_t freq_hz);
+esp_err_t ledc_stop(ledc_mode_t speed_mode, ledc_channel_t channel, uint32_t idle_level);
+```
+
+:::danger[`ledc_set_duty` 之后必须调 `ledc_update_duty`]
+```c
+ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 4096);
+/* ❌ 到这里灯没有任何变化！*/
+
+ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+/* ✅ 必须加这一句才真正生效 */
+```
+
+**这是 ESP-IDF PWM 最常见的坑**——`set_duty` 只是写寄存器，`update_duty` 才让它生效。
+
+**忘了这句，代码编译通过、运行不报错，就是灯不变。**
+:::
+
+## 频率和分辨率的关系
+
+LEDC 靠分频产生 PWM，两者互相制约：
+
+```text
+可用最大频率 ≈ 时钟频率 / 2^分辨率
+```
+
+ESP32 的 LEDC 时钟通常是 **80 MHz**。
+
+| 分辨率 | 档位数 | 80MHz 下最大频率 |
+| --- | --- | --- |
+| 8 位 | 256 | 约 312 kHz |
+| 10 位 | 1024 | 约 78 kHz |
+| **13 位** | **8192** | **约 9765 Hz** |
+| 20 位 | 1048576 | 约 76 Hz（**S3 做不到**，S3 上限 14 位） |
+
+:::tip[选参数的实用建议]
+| 用途 | 频率 | 分辨率 |
+| --- | --- | --- |
+| **LED 调光** | **5 kHz** | **13 位**（8192 级，够细腻） |
+| 电机调速 | 10~20 kHz | 10 位（避开人耳听觉） |
+| 舵机 | **50 Hz** | 14 位（S3 上限，要精确脉宽） |
+
+**LED 用 5kHz + 13位是稳妥组合。**
+:::
+
+## 完整示例：呼吸灯
+
+```c
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/ledc.h"
+#include "esp_log.h"
+
+static const char *TAG = "pwm";
+
+#define LED_GPIO        4
+#define LEDC_CHANNEL    LEDC_CHANNEL_0
+#define LEDC_TIMER      LEDC_TIMER_0
+#define LEDC_MODE       LEDC_LOW_SPEED_MODE
+#define LEDC_RES        LEDC_TIMER_13_BIT   /* 8192 档 */
+#define LEDC_FREQ_HZ    5000                /* 5 kHz */
+#define DUTY_MAX        8191                /* 2^13 - 1 */
+
+static void pwm_init(void)
+{
+    /* ① 配置定时器：决定频率和分辨率 */
+    ledc_timer_config_t timer = {
+        .speed_mode      = LEDC_MODE,
+        .timer_num       = LEDC_TIMER,
+        .duty_resolution = LEDC_RES,
+        .freq_hz         = LEDC_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer));
+
+    /* ② 配置通道：绑定到 GPIO */
+    ledc_channel_config_t ch = {
+        .gpio_num   = LED_GPIO,
+        .speed_mode = LEDC_MODE,
+        .channel    = LEDC_CHANNEL,
+        .timer_sel  = LEDC_TIMER,
+        .duty       = 0,                 /* 初始全灭 */
+        .hpoint     = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ch));
+
+    ESP_LOGI(TAG, "PWM 初始化完成：%d Hz, 13 位", LEDC_FREQ_HZ);
+}
+
+/* 设置亮度：0 ~ DUTY_MAX */
+static void set_brightness(uint32_t duty)
+{
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, duty);
+    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);   /* ← 不能漏 */
+}
+
+void app_main(void)
+{
+    pwm_init();
+
+    while (1) {
+        /* 渐亮 */
+        for (int d = 0; d <= DUTY_MAX; d += 100) {
+            set_brightness(d);
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        /* 渐暗 */
+        for (int d = DUTY_MAX; d >= 0; d -= 100) {
+            set_brightness(d);
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+}
+```
+
+:::tip[这就是"呼吸灯"]
+渐亮 + 渐暗循环，看起来像呼吸。
+
+**相位变化周期**：`8192 / 100 × 10 ms ≈ 820 ms` 单程，一个完整呼吸约 1.6 秒。
+
+**改 `10`（延时）能调呼吸快慢，改 `100`（步长）能调流畅度。**
+:::
+
+## 用 ESP-IDF 自带的渐变功能
+
+LEDC 硬件支持自动渐变，比软件循环更平滑：
+
+```c
+ledc_set_fade_with_time(LEDC_MODE, LEDC_CHANNEL, target_duty, 1000 /* ms */);
+ledc_fade_func_install(0);      /* 使用前必须先装 */
+ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+```
+
+:::warning[渐变功能要先 `ledc_fade_func_install`]
+不装会静默失败（不报错，但没效果）。
+
+而且它用的是**中断**，在 `app_main` 里用没问题，但在中断里用要注意。
+:::
+
+## 换成电机
+
+PWM 调电机**电路上完全不同**：
+
+:::danger[电机不能直接接 GPIO]
+| 问题 | 后果 |
+| --- | --- |
+| 电机要几百 mA | **GPIO 只能给 40 mA** → 烧引脚 |
+| 电机是感性负载 | 断电瞬间产生**反向高压** → 烧芯片 |
+| 电机要双向转 | GPIO 只能单向 |
+
+**必须用驱动模块**（如 TB6612、L298N），并且**电机电源和单片机电源分开**。
+
+**新手阶段建议先玩灯，别急着接电机。**
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 忘 `ledc_update_duty` | 灯亮度不变 | 只写了寄存器 | 补上这一句 |
+| 频率设太高 | 初始化失败 | 超过分辨率允许的最大频率 | 降频率或降分辨率 |
+| 分辨率设太高 | 频率上不去 | 同上 | 8~13 位够用 |
+| `duty` 超过最大值 | 亮度异常 | 超出 `2^N - 1` | 用宏定义上限 |
+| 定时器/通道号混用 | 没输出 | timer_sel 指错 | 保持一一对应 |
+| 电机直连 GPIO | 烧引脚 | 电流过大 | 用驱动模块 |
+
+:::warning[`duty` 的取值范围是 0 ~ 2^分辨率 − 1]
+```c
+/* 13 位 → 0 ~ 8191 */
+ledc_set_duty(..., 8192);      /* ❌ 越界（等于 2^13） */
+ledc_set_duty(..., 8191);      /* ✅ 最大 */
+```
+
+**用宏定义避免算错**：
+
+```c
+#define DUTY_MAX  ((1u << 13) - 1)
+```
+:::
+
+## 本课自检
+
+- [ ] **理解 PWM 是"用开关比例表示中间值"**
+- [ ] 知道频率要远高于人眼感知（>100Hz）
+- [ ] 会用 `ledc_timer_config` + `ledc_channel_config`
+- [ ] **知道 `ledc_set_duty` 后必须 `ledc_update_duty`**
+- [ ] **知道频率和分辨率互相制约**（`80MHz / 2^分辨率`）
+- [ ] 知道 LED 用 5kHz + 13 位
+- [ ] 知道 `duty` 范围是 `0 ~ 2^N - 1`
+- [ ] 做出了呼吸灯效果
+- [ ] **知道电机不能直接接 GPIO，必须用驱动模块**
+
+## 下一步
+
+[09 GPIO 输入与按键消抖](./09-gpio-input) —— 让板子听懂你按了按键。

@@ -1,0 +1,408 @@
+---
+id: systemd
+title: systemd：单元与依赖
+sidebar_position: 13
+description: 服务为什么起不来、unit 文件的每个字段什么意思、依赖关系与启动顺序的区别、如何只重启必要的东西、日志怎么查。
+---
+
+# systemd：单元与依赖
+
+**本课目标**：能自己写一个正确的 service，能查出服务为什么起不来。
+
+## 一个最小的 service
+
+```ini
+# /etc/systemd/system/mydaemon.service
+[Unit]
+Description=My Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mydaemon --config /etc/mydaemon.conf
+Restart=on-failure
+RestartSec=5
+User=mydaemon
+Group=mydaemon
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload        # 改了 unit 文件必须执行
+sudo systemctl enable --now mydaemon
+sudo systemctl status mydaemon
+```
+
+:::danger[忘了 `daemon-reload` 是最常见的"改了没用"]
+systemd 会把 unit 文件解析后缓存在内存里。
+
+**改完 `.service` 文件不 `daemon-reload`，systemd 用的还是旧配置** —— 而且不会报任何错。
+
+**规矩**：每次编辑 unit 文件后立刻 `daemon-reload`。
+:::
+
+## 三个段的作用
+
+| 段 | 管什么 |
+| --- | --- |
+| **`[Unit]`** | 元信息、依赖关系、启动顺序 |
+| **`[Service]`** | 怎么启动、怎么重启、以谁的身份 |
+| **`[Install]`** | `systemctl enable` 时装到哪个 target |
+
+## Type：最容易配错的一项
+
+:::info[四种常见的 Type]
+| Type | systemd 怎么判断"启动完成" | 适合 |
+| --- | --- | --- |
+| **`simple`** | 主进程一启动就算完成 | **前台运行的程序（最常用）** |
+| `forking` | 父进程退出后算完成 | 自己 daemonize 的老程序 |
+| `oneshot` | 进程退出后算完成 | 一次性任务 |
+| `notify` | 程序调 `sd_notify(READY=1)` | **支持 sd_notify 的程序（最准确）** |
+:::
+
+:::danger[`Type=simple` 配"自己 fork 到后台"的程序 = 假成功]
+```ini
+Type=simple
+ExecStart=/usr/bin/old-daemon --daemon    # 它自己 fork 了就退了
+```
+
+**systemd 看到主进程退出，以为服务停了** → 反复重启 → 最后 `start-limit-hit` 失败。
+
+**这种程序要用 `Type=forking`**，并且通常要配 `PIDFile=`。
+
+**判断方法**：手动前台运行它，**如果它自己不返回、一直占着终端，就是 `simple`**；如果它立刻返回而进程在后台，就是 `forking`。
+:::
+
+```ini
+# forking 的典型配置
+[Service]
+Type=forking
+PIDFile=/run/mydaemon.pid
+ExecStart=/usr/bin/old-daemon --daemon
+```
+
+:::tip[`Type=notify` 是最好但最少人用的]
+程序启动完成后主动告诉 systemd：
+
+```c
+#include <systemd/sd-daemon.h>
+
+sd_notify(0, "READY=1");            /* 我准备好了 */
+/* ... 干活 ... */
+sd_notify(0, "STOPPING=1");         /* 我要停了 */
+```
+
+```ini
+[Service]
+Type=notify
+```
+
+**好处**：依赖它的服务能准确知道"什么时候真的可用"，而不是"进程起来了但服务还没就绪"。
+
+**代价**：程序要链接 `libsystemd`（或直接写 socket 不依赖库）。
+:::
+
+## 依赖与顺序：两件不同的事
+
+![systemd 依赖关系：After 只管顺序，Requires 管依赖；只写 Requires 不写 After 会导致两个服务同时启动](/img/diagrams/linux-systemd-dep.svg)
+
+
+:::danger[`After` 和 `Requires` 完全不是一回事]
+| 指令 | 含义 |
+| --- | --- |
+| **`After=X`** | **顺序**：X 先启动，我再启动 |
+| **`Before=X`** | 顺序：我先启动 |
+| **`Requires=X`** | **依赖**：X 起不来，我也起不来（X 停了我也停） |
+| **`Wants=X`** | 弱依赖：X 起不来我照样起 |
+| **`BindsTo=X`** | 强依赖：X 一停我立刻停 |
+
+**最常见的错误：只写 `Requires` 不写 `After`。**
+
+```ini
+[Unit]
+Requires=postgresql.service       # ❌ 只有依赖关系，没有顺序保证
+```
+
+**两个服务会同时启动，你的程序可能比数据库起得还快 → 连接失败。**
+
+**正确写法（两个都要）**：
+
+```ini
+[Unit]
+Requires=postgresql.service
+After=postgresql.service
+```
+:::
+
+:::warning[`Wants` 比 `Requires` 更常用]
+```ini
+[Unit]
+Wants=network-online.target
+After=network-online.target
+```
+
+**为什么不用 `Requires`**：网络起不来时，你宁愿程序起来后重试，也不希望它直接不启动。
+
+**`Requires + After` 会让你的服务因为别人的问题而瘫痪**。
+
+**除了真正"没有它就没法工作"的依赖，其余一律用 `Wants`。**
+:::
+
+## 网络依赖的坑
+
+:::danger[`network.target` 不等于"网络可用"]
+```ini
+After=network.target          # ❌ 这只是"网络栈初始化完了"
+```
+
+**`network.target` 触发时，网卡可能还没拿到 IP。**
+
+```ini
+After=network-online.target
+Wants=network-online.target   # ✅ 这才是"有 IP、能通" 
+```
+
+**而且 `network-online.target` 需要 `systemd-networkd-wait-online` 或 `NetworkManager-wait-online` 服务才真的等待。**
+
+```bash
+systemctl is-enabled systemd-networkd-wait-online
+# 或
+systemctl is-enabled NetworkManager-wait-online
+```
+
+**没启用的话 `network-online.target` 也立刻触发，等于没等。**
+:::
+
+## 重启策略
+
+```ini
+[Unit]
+StartLimitIntervalSec=60  # 60 秒内
+StartLimitBurst=3         # 最多重启 3 次
+
+[Service]
+Restart=on-failure        # 非 0 退出、被信号杀、超时 时重启
+RestartSec=5              # 等 5 秒再重启
+```
+
+:::info[`Restart` 的几个取值]
+| 值 | 什么时候重启 |
+| --- | --- |
+| `no` | 从不（默认） |
+| **`on-failure`** | 非正常退出（**最常用**） |
+| `always` | 无论如何 |
+| `on-abnormal` | 被信号杀（不含 HUP/INT/TERM/PIPE）/ 超时 / 看门狗 |
+| `on-abort` | 只在不被捕获的信号时 |
+:::
+
+:::warning[重启次数超限后要手动清]
+```bash
+systemctl status mydaemon
+# Active: failed (Result: start-limit-hit)
+```
+
+**这时候光 `systemctl start` 是不行的**（还是会被限制挡住）：
+
+```bash
+systemctl reset-failed mydaemon
+systemctl start mydaemon
+```
+
+**根因通常是服务启动就崩**——先看日志，别急着重启。
+:::
+
+## 日志：journalctl
+
+```bash
+# 看某个服务的全部日志
+journalctl -u mydaemon
+
+# 实时跟踪
+journalctl -u mydaemon -f
+
+# 只看最近 100 行
+journalctl -u mydaemon -n 100
+
+# 看本次启动以来
+journalctl -u mydaemon -b
+
+# 按时间
+journalctl -u mydaemon --since "10 min ago"
+journalctl -u mydaemon --since "2026-01-01 10:00:00"
+
+# 只看错误级别
+journalctl -u mydaemon -p err
+```
+
+:::tip[日志的持久化]
+**默认 journald 只存在内存（`/run/log/journal`），重启就没了。**
+
+要保留历史：
+
+```bash
+sudo mkdir -p /var/log/journal
+sudo systemd-tmpfiles --create --prefix /var/log/journal
+sudo systemctl restart systemd-journald
+```
+
+**或者改配置**：
+
+```ini
+# /etc/systemd/journald.conf
+[Journal]
+Storage=persistent
+SystemMaxUse=500M
+```
+:::
+
+:::danger[程序没输出日志？看这两个原因]
+**① 输出被缓冲了**
+
+程序往 stdout 写，但用了全缓冲（连管道时就变成全缓冲）→ 日志几个小时才出现一次。
+
+**解决**：程序里用行缓冲或显式 flush；或设环境变量
+
+```ini
+[Service]
+Environment=PYTHONUNBUFFERED=1
+```
+
+**② systemd 把 stdout 接到了 journal，但程序写的是 stderr 且被重定向到了别处**
+
+```ini
+StandardOutput=journal
+StandardError=journal
+```
+:::
+
+## 常用加固选项
+
+:::tip[几个成本低、收益高的安全项]
+```ini
+[Service]
+# 文件系统只读（除了下面显式允许的）
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mydaemon
+
+# 家目录不可访问
+ProtectHome=true
+
+# /tmp 私有
+PrivateTmp=true
+
+# 禁止提权
+NoNewPrivileges=true
+
+# 设备访问限制
+PrivateDevices=true
+
+# 只允许 IPv4/IPv6
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+```
+
+**这些不需要改代码，加几行就显著缩小攻击面。**
+
+**注意**：`ProtectSystem=strict` 会让整个文件系统只读，程序要写的目录必须列进 `ReadWritePaths`，否则会报"只读文件系统"。
+:::
+
+## 排查：服务起不来怎么办
+
+:::tip[按这个顺序查]
+```bash
+# ① 看状态（会直接显示退出码和最后的日志）
+systemctl status mydaemon
+
+# ② 看详细日志
+journalctl -u mydaemon -n 50 --no-pager
+
+# ③ 看 unit 文件是否被正确解析（含所有默认值）
+systemctl cat mydaemon
+
+# ④ 看依赖是否满足
+systemctl list-dependencies mydaemon
+
+# ⑤ 手动跑 ExecStart 那条命令，看是不是程序本身的问题
+sudo -u mydaemon /usr/local/bin/mydaemon --config /etc/mydaemon.conf
+
+# ⑥ 看是不是权限/路径问题
+systemd-analyze verify /etc/systemd/system/mydaemon.service
+```
+:::
+
+:::warning[`systemctl status` 里的几个关键字段]
+```text
+Loaded: loaded (/etc/systemd/system/mydaemon.service; enabled; ...)
+        ↑ 路径对不对、enabled 还是 disabled
+
+Active: failed (Result: exit-code) since ...
+        ↑ 失败原因
+
+Process: 1234 ExecStart=... (code=exited, status=203/EXEC)
+                                        ↑ 203/EXEC = 找不到可执行文件或没执行权限
+```
+
+**常见退出码**：
+
+| 码 | 含义 |
+| --- | --- |
+| `203/EXEC` | 可执行文件不存在 / 无执行权限 / shebang 错 |
+| `1` | 程序自己返回了 1 |
+| `2` | 参数错误 |
+| `signal=TERM` | 被 SIGTERM 杀了 |
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 改了 unit 没生效 | 忘了 `daemon-reload` | 执行 reload |
+| `203/EXEC` | 路径错 / 没 `+x` / shebang 用了 `/bin/sh` 但脚本是 CRLF | 检查路径与权限 |
+| 反复重启后 failed | `start-limit-hit` | `reset-failed` 并查根因 |
+| 服务比数据库先起 | 只写 `Requires` 没写 `After` | 两个都写 |
+| 拿不到 IP 就启动 | 用了 `network.target` | 改 `network-online.target` |
+| 日志看不到 | stdout 被全缓冲 | `PYTHONUNBUFFERED=1` 或改代码 |
+| 重启后日志全丢 | journald 默认非持久 | `Storage=persistent` |
+| 只读文件系统报错 | `ProtectSystem=strict` | 加 `ReadWritePaths` |
+| `Type=simple` 但程序自己 daemonize | 类型选错 | 改 `forking` + `PIDFile` |
+| 停止时要等 10 秒 | 程序没处理 SIGTERM | 注册信号处理 |
+
+:::danger[脚本服务最常见的坑：CRLF]
+**Windows 上编辑的脚本带 `\r\n`，shebang 变成 `#!/bin/bash\r`** → 内核找不到 `/bin/bash\r` → `203/EXEC`。
+
+**现象**：手动跑正常（shell 容忍）、systemd 跑报 203。
+
+**检查**：
+
+```bash
+file /usr/local/bin/myscript
+# 出现 "with CRLF line terminators" 就是这个问题
+
+sed -i 's/\r$//' /usr/local/bin/myscript
+```
+:::
+
+## 本课自检
+
+- [ ] 会写一个完整的 service（三个段都能填对）
+- [ ] **知道改 unit 文件必须 `daemon-reload`**
+- [ ] **能区分四种 Type，知道 `simple` 配 daemonize 程序会假成功**
+- [ ] **知道 `Type=notify` 是最准确的方式**
+- [ ] **能说清 `After`（顺序）与 `Requires`（依赖）的区别**
+- [ ] **知道"只写 Requires 不写 After"会导致同时启动**
+- [ ] 知道优先用 `Wants` 而不是 `Requires`
+- [ ] **知道 `network.target` ≠ 网络可用，要用 `network-online.target`**
+- [ ] 知道 `network-online.target` 需要等待服务启用才有效
+- [ ] 会配 `Restart` + `StartLimitBurst`
+- [ ] **知道 `start-limit-hit` 后要 `reset-failed`**
+- [ ] 会用 `journalctl -u` 的各种过滤
+- [ ] **知道 journald 默认非持久，重启丢日志**
+- [ ] 知道 `203/EXEC` 的三种常见原因
+- [ ] **知道 CRLF 会让 systemd 报 203 而手动跑正常**
+
+## 下一步
+
+[容器与隔离](./containers) 讲了 namespace/cgroup/overlayfs；
+或者回到 [Linux 进阶导读](../linux/)。

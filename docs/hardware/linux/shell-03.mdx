@@ -1,0 +1,236 @@
+---
+id: shell-03
+title: "03 常用命令精讲：五把瑞士军刀"
+sidebar_position: 4
+description: "Shell 与命令行 第 3 部分：常用命令精讲：五把瑞士军刀"
+---
+
+# 03 常用命令精讲：五把瑞士军刀
+这五个命令的分工必须分清，很多人用 `grep` 干 `awk` 的活，或者用 `find` 干 `ls` 的活。
+
+| 命令 | 本质 | 一句话定位 |
+| --- | --- | --- |
+| `find` | 遍历**目录树**找**文件** | 按名字/类型/时间/大小找文件 |
+| `grep` | 在**文件内容**里找**行** | 按正则匹配文本 |
+| `sed` | 流式**编辑**文本 | 替换、删除、插入行 |
+| `awk` | 按**列**处理结构化文本 | 字段切分、统计、报表 |
+| `xargs` | 把**标准输入**转成**命令行参数** | 让不支持管道的命令能接管道 |
+
+### 3.1 find：按属性找文件
+
+```bash
+$ find . -name '*.txt' | sort
+./a.txt
+./b.txt
+./deep/y/1.txt
+$ find . -type f -newer a.txt | sort
+./deep/x/1.log
+./deep/y/1.txt
+```
+
+常用谓词（predicate）：
+
+| 选项 | 作用 |
+| --- | --- |
+| `-name '*.c'` | 按文件名匹配（glob，注意要加引号防 shell 提前展开） |
+| `-iname` | 忽略大小写 |
+| `-type f` / `d` / `l` | 类型：普通文件/目录/符号链接 |
+| `-size +10M` | 大于 10MB（`-10M` 是小于） |
+| `-mtime -7` | 7 天内修改过（`-7` 内、`+7` 外） |
+| `-newer file` | 比某个文件新 |
+| `-perm 644` / `-perm -u+x` | 按权限找 |
+| `-user root` | 按属主 |
+| `-maxdepth 2` | 限制递归深度 |
+| `-exec cmd {} \;` | 对每个结果执行命令 |
+| `-delete` | 删除匹配到的文件 |
+
+:::tip[-exec 的花括号与反斜杠]
+`-exec echo {} \;` 中：
+- `{}` 是**占位符**，会被替换成当前文件名
+- `\;` 是**结束标记**（分号要转义，否则 shell 会把它当命令分隔符吃掉）
+
+`-exec cmd {} +` 是**批量版**：把多个文件拼成一次调用（类似 xargs），效率远高于 `\;`（后者每个文件起一个进程）。
+:::
+
+### 3.2 xargs：把管道接上"不支持管道的命令"
+
+很多命令（如 `rm`、`echo`、`kill`）只接受**命令行参数**，不接受标准输入。xargs 就是桥：
+
+```bash
+$ find . -type f -name '*.txt' -print0 | xargs -0 -n1 echo "xargs:"
+xargs: ./deep/y/1.txt
+xargs: ./b.txt
+xargs: ./a.txt
+$ printf '1\n2\n3\n4\n' | xargs -P 2 -I{} sh -c 'echo "job {} pid $$"'
+job 1 pid 695283
+job 2 pid 695284
+job 3 pid 695285
+job 4 pid 695286
+```
+
+关键参数：
+
+| 参数 | 作用 |
+| --- | --- |
+| `-n1` | 每次只传 1 个参数给命令（默认是尽可能多） |
+| `-0` | 输入以 **NUL 字符**分隔（配合 `find -print0`） |
+| `-I{}` | 用 `{}` 做占位符，可放在命令的任意位置 |
+| `-P 4` | **并行**执行，最多 4 个进程 |
+| `-t` | 先打印要执行的命令（调试用） |
+| `-r` | 输入为空时不执行 |
+
+:::danger[文件名有空格时的经典 bug]
+```bash
+find . -name '*.txt' | xargs rm      # 危险！"my file.txt" 会被拆成两个参数
+find . -name '*.txt' -print0 | xargs -0 rm    # 正确：用 NUL 分隔
+```
+
+`find -print0` + `xargs -0` 是处理含空格/换行文件名的**标准做法**，务必养成习惯。
+:::
+
+### 3.3 grep：在内容里找行
+
+```bash
+$ grep -rn 'beta' .
+./a.txt:2:beta
+./b.txt:1:beta
+$ grep -c 'a' a.txt
+3
+$ grep -v 'beta' b.txt
+delta
+$ grep -oE '[a-z]+' a.txt | tr '\n' ' '
+alpha beta gamma 
+```
+
+常用选项：
+
+| 选项 | 作用 |
+| --- | --- |
+| `-n` | 显示行号 |
+| `-r` / `-R` | 递归目录（`-R` 跟随符号链接） |
+| `-i` | 忽略大小写 |
+| `-v` | **反向**：显示不匹配的行 |
+| `-c` | 只显示匹配的行数 |
+| `-l` | 只显示**含匹配的文件名**（找"哪个文件里有"时用） |
+| `-o` | 只输出**匹配的部分**（提取用） |
+| `-E` | 扩展正则（等价 `egrep`） |
+| `-F` | 固定字符串（不当正则，更快更安全） |
+| `-A3` / `-B3` / `-C3` | 显示匹配行的后 3 行 / 前 3 行 / 前后各 3 行 |
+| `--include='*.c'` | 只搜指定文件名 |
+
+:::tip[在板子上排查内核配置的最高频用法]
+```bash
+grep -rn "CONFIG_I2C" /boot/config-$(uname -r)      # 查当前内核有没有开 I2C
+grep -rn "xxx" /sys/kernel/debug/ 2>/dev/null        # 在 debugfs 里找
+```
+
+查内核源码里某个符号定义在哪，也是 `grep -rn`（配合 `--include='*.c'`）。
+:::
+
+### 3.4 sed：流式编辑
+
+```bash
+$ sed 's/beta/BETA/' b.txt        # 输出到 stdout，不改原文件
+BETA
+delta
+$ sed -n '2p' a.txt               # 只打印第 2 行
+beta
+$ sed -i 's/delta/DELTA/' c.txt   # -i 原地修改
+$ cat c.txt
+beta
+DELTA
+```
+
+核心语法是 `s/查找/替换/标志`：
+
+| 部分 | 说明 |
+| --- | --- |
+| `s` | substitute 命令 |
+| `/` | 分隔符，**可以换成别的**，如 `s#/a#/b#`（路径含 `/` 时很有用） |
+| `g` 标志 | 一行内**全部**替换（默认只替换每行第一个） |
+| `p` 标志 | 打印（配合 `-n` 只输出被改的行） |
+| `i` 标志 | 忽略大小写 |
+
+其他常用命令：
+
+```bash
+sed -n '10,20p' file       # 打印 10~20 行
+sed '5d' file              # 删除第 5 行
+sed '/^#/d' file           # 删除所有注释行（以 # 开头）
+sed -i.bak 's/a/b/' file   # -i 带备份后缀，先备份成 file.bak 再改
+```
+
+:::warning[`-i` 的 GNU/BSD 差异]
+- **GNU sed（Linux）**：`sed -i 's/a/b/' f` 可以直接用
+- **BSD sed（macOS）**：必须写成 `sed -i '' 's/a/b/' f`，否则会把 `'s/a/b/'` 当成备份后缀
+
+写跨平台脚本时用 `sed -i.bak` 然后删备份最保险。
+:::
+
+### 3.5 awk：按列处理
+
+awk 把每行切成字段：`$1` 第一列、`$2` 第二列……`$0` 整行，`NF` 字段数，`NR` 行号。
+
+```bash
+$ awk '{print NR": "$0}' a.txt
+1: alpha
+2: beta
+3: gamma
+$ printf '10\n20\n30\n' > n.txt
+$ awk '{s+=$1} END {print "sum="s, "count="NR}' n.txt
+sum=60 count=3
+$ printf 'a,b,c\n' | awk -F, '{print $3, $1}'
+c a
+```
+
+awk 程序结构是 `模式 { 动作 }`：
+
+| 部分 | 说明 |
+| --- | --- |
+| `BEGIN { }` | 处理**前**执行一次（初始化、打印表头） |
+| `{ }` | 对**每一行**执行 |
+| `END { }` | 处理**完**执行一次（打印汇总） |
+| `-F,` | 指定输入分隔符（默认任意空白） |
+| `NF` | 当前行的字段数 |
+| `NR` | 当前行号（跨文件累计） |
+| `FNR` | 当前文件内的行号 |
+
+实用例子（嵌入式场景）：
+
+```bash
+# 看内存信息：打印 MemTotal 那行的第 2 列
+awk '/^MemTotal/ {print $2}' /proc/meminfo
+
+# 统计 dmesg 里各级别日志数量（-x 把 facility/level 解码成前缀，级别在 $2）
+dmesg -x | awk '{print $2}' | sort | uniq -c
+
+# 把 ps 输出的某一列抽出来
+ps aux | awk '{print $2, $11}'
+```
+
+:::info[grep 还是 awk？]
+- **只要"有没有/在哪一行"** → `grep`（更快更简单）
+- **要按列切、要算、要汇总** → `awk`
+- `grep -oE 'pattern'` 也能提取，但**不能做算术和跨行状态**，那是 awk 的地盘
+:::
+
+### 3.6 组合起来：一个真实场景
+
+统计当前目录下所有 `.c` 和 `.h` 文件的总行数：
+
+```bash
+find . -type f \( -name '*.c' -o -name '*.h' \) -print0 \
+  | xargs -0 wc -l \
+  | awk '{s+=$1} END {print "total lines:", s}'
+```
+
+这条链的责任划分非常清晰：
+
+1. `find` —— **选出文件**（按名字和类型）
+2. `xargs` —— **把文件名变成参数**（因为 `wc` 不吃管道）
+3. `wc -l` —— **数每个文件的行数**
+4. `awk` —— **求和汇总**
+
+---
+
+**翻页**：[← 上一页](./shell-02) · [下一页 →](./shell-04) · [返回目录](./)

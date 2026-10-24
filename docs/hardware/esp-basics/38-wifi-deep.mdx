@@ -1,0 +1,165 @@
+---
+id: 38-wifi-deep
+title: 25 WiFi 深入
+sidebar_position: 38
+description: WiFi 连接流程与状态机、为什么连不上、信号强度与吞吐的关系、省电模式、以及配网方案对比。
+---
+
+# 25 WiFi 深入
+
+**本课目标**：能诊断"连不上 WiFi"的各类原因，知道配网该选哪种方案。
+
+## 连接流程
+
+```text
+1. esp_wifi_init          初始化（NVS 存配置）
+2. esp_wifi_set_mode      STA / AP / APSTA
+3. esp_wifi_set_config    填 SSID 与密码
+4. esp_wifi_start         启动
+5. esp_wifi_connect       发起连接
+6. 等待 GOT_IP 事件        ← 只有这个才算真的连上
+```
+
+:::danger[`WIFI_EVENT_STA_CONNECTED` 不等于能上网]
+**它只表示"关联到 AP 成功"，还没拿到 IP。**
+
+**必须等到 `IP_EVENT_STA_GOT_IP`**，这时才有可用的网络。
+
+**很多"连上了但请求失败"的 bug 就出在这里。**
+:::
+
+```c
+static void event_handler(void *arg, esp_event_base_t base,
+                          int32_t id, void *data) {
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
+        ESP_LOGI(TAG, "got ip: " IPSTR, IP2STR(&e->ip_info.ip));
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        /* 处理断开原因 */
+    }
+}
+```
+
+## 断开原因码
+
+| reason | 含义 | 常见原因 |
+| --- | --- | --- |
+| 2 | AUTH_EXPIRE | 密码错 |
+| **15** | **4WAY_HANDSHAKE_TIMEOUT** | **密码错**（最常见） |
+| 201 | NO_AP_FOUND | SSID 不存在 / 距离远 |
+| 204 | HANDSHAKE_TIMEOUT | 信号弱 / 干扰 |
+| 205 | CONNECTION_FAIL | AP 拒绝 |
+| 200 | BEACON_TIMEOUT | 信号丢失 |
+
+:::tip[`4WAY_HANDSHAKE_TIMEOUT` 基本都是密码错]
+**ESP-IDF 的示例里很容易把密码打错** —— 注意大小写、特殊字符。
+
+**也可能**：AP 是 5GHz only（ESP32 只支持 2.4GHz）。
+:::
+
+:::danger[ESP32 只支持 2.4GHz]
+**连 5GHz 的 SSID 永远失败** —— 而且报 `NO_AP_FOUND`，看起来像"信号不好"。
+
+**排查时先确认路由器是双频合一还是分开的 2.4G/5G SSID。**
+:::
+
+## RSSI 与吞吐
+
+| RSSI (dBm) | 质量 | 体验 |
+| --- | --- | --- |
+| 大于 -50 | 极好 | 满速 |
+| -50 ~ -60 | 好 | 正常 |
+| -60 ~ -70 | 一般 | 还行 |
+| **-70 ~ -80** | **差** | **容易掉线** |
+| 小于 -80 | 极差 | 基本不可用 |
+
+```c
+wifi_ap_record_t ap;
+esp_wifi_sta_get_ap_info(&ap);
+ESP_LOGI(TAG, "rssi = %d", ap.rssi);
+```
+
+:::warning[RSSI 不等于吞吐]
+**同 RSSI 下，2.4GHz 拥挤环境（邻居多）的吞吐可能远低于空旷环境。**
+
+**要测真实吞吐就得实际传数据**，不能只看 RSSI。
+:::
+
+## 省电模式
+
+| 模式 | 电流 | 延迟 |
+| --- | --- | --- |
+| `WIFI_PS_NONE` | 高（约 100mA+） | 低 |
+| **`WIFI_PS_MIN_MODEM`** | **中** | 中（默认） |
+| `WIFI_PS_MAX_MODEM` | 低 | 高 |
+
+:::danger[省电模式会大幅增加延迟]
+**Modem sleep 让 ESP32 周期性关闭射频** —— 别人发来的数据要等你醒来才收到。
+
+**延迟可能从几毫秒变成几百毫秒。**
+
+**交互类应用（遥控、实时控制）应该用 `WIFI_PS_NONE`。**
+:::
+
+## 配网方案对比
+
+| 方案 | 用户体验 | 复杂度 | 适合 |
+| --- | --- | --- |
+| **SmartConfig** | 手机 App 发广播 | 低 | 简单产品 |
+| **AP 配网** | 连 ESP32 的 AP 再填表单 | 中 | **最可靠** |
+| BLE 配网 | App 连蓝牙传配置 | 高 | 已有 App |
+| 串口配网 | 连线配置 | 低 | 开发/工业 |
+| 二维码 | 扫码解析 | 中 | 有屏幕的产品 |
+
+:::tip[AP 配网最可靠]
+**ESP32 起一个 AP，手机连上去访问配置页面。**
+
+**优点**：兼容所有手机、能显示更多选项、失败可重试
+
+**缺点**：用户要手动切换 WiFi
+
+**SmartConfig 快但兼容性差**（部分手机/路由器型号失败）。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 连不上，reason=201 | 5GHz 或 SSID 隐藏 | 用 2.4GHz |
+| 连不上，reason=15 | 密码错 | 核对密码 |
+| 反复重连 | 信号弱 | 靠近 AP 或换天线 |
+| 拿到了 IP 但请求失败 | DNS 没配 | 检查 DHCP |
+| 延迟突然变大 | 省电模式 | 关 PS 或用 NONE |
+| 内存不足 | 开了太多 socket | 复用连接 |
+| 长时间运行后断连 | 路由器踢了空闲连接 | 加心跳 |
+
+:::danger[`esp_wifi_connect` 要限次数重试]
+**无限快速重连会让路由器把你拉黑**（或者功耗爆炸）。
+
+```c
+static int retry = 0;
+if (++retry > 5) {
+    esp_wifi_disconnect();
+    /* 进入配网模式或休眠重试 */
+} else {
+    esp_wifi_connect();
+}
+```
+:::
+
+## 本课自检
+
+- [ ] 知道连接流程的六步
+- [ ] **知道 `STA_CONNECTED` 不等于能上网，要等 `GOT_IP`**
+- [ ] **知道 reason=15（4WAY_HANDSHAKE_TIMEOUT）基本都是密码错**
+- [ ] **知道 ESP32 只支持 2.4GHz**
+- [ ] 知道 RSSI 分级，知道 RSSI 不等于吞吐
+- [ ] **知道省电模式会大幅增加延迟**
+- [ ] 能对比五种配网方案，知道 AP 配网最可靠
+- [ ] **知道要限制重连次数**
+
+## 下一步
+
+[24 MQTT 实战](./37-mqtt) 或回到 [ESP32 零基础导读](../esp-basics/)。

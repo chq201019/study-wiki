@@ -1,0 +1,199 @@
+---
+id: subprocess
+title: subprocess 调用外部命令
+sidebar_position: 29
+description: run 与 Popen 的分工、shell=True 的注入风险、超时与信号处理、管道与死锁、以及返回值编码问题。
+---
+
+# subprocess 调用外部命令
+
+**本课目标**：安全地调用外部命令，不被死锁和注入坑到。
+
+## `run` 一统天下
+
+```python
+import subprocess
+
+r = subprocess.run(["ls", "-l", "/tmp"], capture_output=True, text=True)
+print(r.returncode, r.stdout, r.stderr)
+```
+
+| 参数 | 作用 |
+| --- | --- |
+| `capture_output=True` | 等价于 `stdout=PIPE, stderr=PIPE` |
+| `text=True` | 返回 `str` 而不是 `bytes` |
+| `check=True` | 非 0 退出码时抛 `CalledProcessError` |
+| `timeout=N` | 超时抛 `TimeoutExpired` |
+| `cwd=` | 工作目录 |
+| `env=` | 环境变量（**会完全替换，不是追加**） |
+| `input=` | 传给 stdin 的内容 |
+
+:::danger[`env=` 是"替换"不是"合并"]
+```python
+subprocess.run(cmd, env={"FOO": "1"})      # ❌ 连 PATH 都没了
+subprocess.run(cmd, env={**os.environ, "FOO": "1"})   # ✅
+```
+
+**第二个常见的坑**：找不到命令，报 `FileNotFoundError`。
+:::
+
+## `shell=True` 的注入风险
+
+:::danger[拼字符串 + `shell=True` = 命令注入]
+```python
+filename = user_input
+subprocess.run(f"rm {filename}", shell=True)
+```
+
+**用户输入 `x; rm -rf /` 就会执行两条命令。**
+
+**正确做法：传列表，不用 shell**
+```python
+subprocess.run(["rm", filename])      # ✅ 参数不会被 shell 解释
+```
+:::
+
+:::warning[什么时候确实需要 `shell=True`]
+- 用到 shell 特性（管道、通配符、重定向、变量展开）
+- 命令是内置的（`cd`、`ulimit`）
+
+**这时必须自己负责转义**，或者用 `shlex.quote()`：
+
+```python
+import shlex
+subprocess.run(f"ls {shlex.quote(user_dir)}", shell=True)
+```
+:::
+
+## 管道：`run(pipe)` vs `Popen`
+
+```python
+# 简单管道：一条命令的输出给下一条
+p1 = subprocess.Popen(["ls"], stdout=subprocess.PIPE)
+p2 = subprocess.Popen(["wc", "-l"], stdin=p1.stdout, stdout=subprocess.PIPE)
+p1.stdout.close()          # 让 p1 收到 SIGPIPE
+out, _ = p2.communicate()
+```
+
+:::danger[手动 write 到 stdin 容易死锁]
+```python
+p = subprocess.Popen(["cat"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+p.stdin.write(b"x" * 100000)     # ❌ 输出缓冲满了 → 互相等 → 死锁
+```
+
+**永远用 `communicate()`**：
+
+```python
+out, err = p.communicate(input=b"x" * 100000)      # ✅ 内部用线程/select
+```
+:::
+
+## 超时与信号
+
+```python
+try:
+    r = subprocess.run(cmd, timeout=10, capture_output=True)
+except subprocess.TimeoutExpired:
+    print("超时了")
+```
+
+:::danger[`timeout` 之后子进程**已经死了**吗]
+**`run(timeout=)` 会先发 SIGKILL 再抛异常** —— 但**只杀直接子进程，不杀它启动的孙子进程**。
+
+**要杀整个进程组**：
+
+```python
+p = subprocess.Popen(cmd, start_new_session=True)
+try:
+    p.wait(timeout=10)
+except subprocess.TimeoutExpired:
+    os.killpg(os.getpgid(p.pid), signal.SIGTERM)     # ✅ 杀整组
+    p.wait()
+```
+:::
+
+## 返回值与编码
+
+:::warning[不加 `text=True` 拿到的是 `bytes`]
+```python
+r = subprocess.run(["echo", "hi"], capture_output=True)
+r.stdout          # b"hi\n"      ← bytes
+```
+
+**加 `text=True` 或手动 `.decode()`。**
+:::
+
+:::danger[编码不是 UTF-8 时会报 `UnicodeDecodeError`]
+```python
+subprocess.run(cmd, capture_output=True, text=True, encoding="gbk")
+```
+
+**或者用 `errors="replace"` 保证不崩**（但会丢字符）。
+:::
+
+## 五个实用模式
+
+```python
+# ① 只看成功与否
+ok = subprocess.run(cmd, capture_output=True).returncode == 0
+
+# ② 拿一行输出
+out = subprocess.check_output(["hostname"], text=True).strip()
+
+# ③ 流式读输出（大输出必须这样）
+with subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True) as p:
+    for line in p.stdout:
+        print(">>", line, end="")
+
+# ④ 同时读 stdout 和 stderr（避免死锁）
+p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                     stderr=subprocess.STDOUT, text=True)
+
+# ⑤ 后台跑不等待
+subprocess.Popen(cmd, start_new_session=True)
+```
+
+:::tip[流式读必须 `for line in p.stdout`]
+**不要用 `p.stdout.read()`** —— 它会等进程结束才返回，大输出会缓冲爆内存。
+
+**`for line in` 是逐行阻塞读，内存恒定。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 命令注入 | 拼字符串 + `shell=True` | 传列表或 `shlex.quote` |
+| `FileNotFoundError` | 命令不在 PATH | 用绝对路径 |
+| 死锁卡住 | 手动 write 到 stdin | 用 `communicate()` |
+| 拿到 bytes | 没 `text=True` | 加上 |
+| `UnicodeDecodeError` | 编码不符 | 指定 `encoding` |
+| 超时后孙子进程还在 | 只杀了直接子进程 | `start_new_session` + `killpg` |
+| `check=True` 抛异常 | 退出码非 0（预期内） | 不要用 check，自己判 returncode |
+| 环境变量丢了 | `env=` 覆盖而非合并 | `{**os.environ, ...}` |
+
+:::warning[`subprocess` 不会自动继承 shell 的别名和函数]
+```bash
+# 你在 shell 里 `ll` 是 `ls -l` 的别名
+subprocess.run(["ll"])        # ❌ 找不到 ll
+```
+
+**别名是 shell 的特性，不是可执行文件。**
+:::
+
+## 本课自检
+
+- [ ] 会用 `run` 的主要参数（`capture_output`/`text`/`check`/`timeout`/`cwd`/`env`）
+- [ ] **知道 `env=` 是替换不是合并**
+- [ ] **知道拼字符串 + `shell=True` 有命令注入风险**
+- [ ] 会用 `shlex.quote()` 处理确实需要 shell 的场景
+- [ ] **知道手动 write stdin 会死锁，要用 `communicate()`**
+- [ ] **知道 `timeout` 只杀直接子进程，孙子进程要 `start_new_session` + `killpg`**
+- [ ] 知道 `text=True` 决定返回 `str` 还是 `bytes`
+- [ ] 会处理非 UTF-8 输出
+- [ ] **知道流式读要用 `for line in p.stdout`**
+- [ ] 知道 `subprocess` 不继承 shell 别名
+
+## 下一步
+
+[文件与路径处理](./files) 或 [logging 模块](./logging)。

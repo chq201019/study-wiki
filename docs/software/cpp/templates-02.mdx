@@ -1,0 +1,226 @@
+---
+id: templates-02
+title: "02 模板特化"
+sidebar_position: 3
+description: "模板 第 2 部分：模板特化"
+---
+
+# 02 模板特化
+### 全特化（full specialization）
+
+为某个**具体类型**提供完全不同的实现：
+
+```cpp
+// specialize.cpp
+#include <cstdio>
+#include <type_traits>
+#include <cstring>
+
+// 主模板
+template<typename T>
+struct TypeName {
+    static const char* get() { return "unknown"; }
+};
+
+// 全特化
+template<> struct TypeName<int>    { static const char* get() { return "int"; } };
+template<> struct TypeName<double> { static const char* get() { return "double"; } };
+template<> struct TypeName<bool>   { static const char* get() { return "bool"; } };
+
+int main() {
+    std::printf("int    -> %s\n", TypeName<int>::get());
+    std::printf("double -> %s\n", TypeName<double>::get());
+    std::printf("bool   -> %s\n", TypeName<bool>::get());
+    std::printf("float  -> %s\n", TypeName<float>::get());    // 走主模板
+}
+```
+
+**实测输出：**
+
+```text
+int    -> int
+double -> double
+bool   -> bool
+float  -> unknown
+```
+
+### 偏特化（partial specialization）
+
+为**一类**类型提供特化（只对类模板有效，**函数模板不能偏特化**）：
+
+```cpp
+// partial_spec.cpp
+#include <cstdio>
+#include <vector>
+
+template<typename T> struct IsPointer       { static constexpr bool value = false; };
+template<typename T> struct IsPointer<T*>   { static constexpr bool value = true;  };  // 偏特化
+template<typename T> struct IsPointer<T* const> { static constexpr bool value = true; };
+
+template<typename T> struct IsVector { static constexpr bool value = false; };
+template<typename T> struct IsVector<std::vector<T>> { static constexpr bool value = true; };  // 偏特化
+
+int main() {
+    std::printf("IsPointer<int>          = %d\n", IsPointer<int>::value);
+    std::printf("IsPointer<int*>         = %d\n", IsPointer<int*>::value);
+    std::printf("IsPointer<const char*>  = %d\n", IsPointer<const char*>::value);
+    std::printf("IsVector<int>           = %d\n", IsVector<int>::value);
+    std::printf("IsVector<vector<int>>   = %d\n", IsVector<std::vector<int>>::value);
+}
+```
+
+**实测输出：**
+
+```text
+IsPointer<int>          = 0
+IsPointer<int*>         = 1
+IsPointer<const char*>  = 1
+IsVector<int>           = 0
+IsVector<vector<int>>   = 1
+```
+
+:::warning[函数模板不能偏特化]
+只能**全特化**函数模板。想对"一类类型"做不同处理，用**重载**：
+
+```cpp
+template<typename T> void f(T);          // 通用
+template<typename T> void f(T*);         // 指针版本（用重载，不是偏特化）
+```
+
+更现代的做法：用 `if constexpr`（C++17）在函数内部做编译期分支。
+:::
+
+### C++17 的 if constexpr：特化的替代者
+
+```cpp
+// if_constexpr.cpp
+#include <cstdio>
+#include <string>
+#include <type_traits>
+#include <vector>
+
+template<typename T>
+void print_it(const T& v) {
+    if constexpr (std::is_pointer_v<T>) {
+        std::printf("  pointer -> %p\n", (const void*)v);
+    } else if constexpr (std::is_integral_v<T>) {
+        std::printf("  integer -> %lld\n", (long long)v);
+    } else if constexpr (std::is_floating_point_v<T>) {
+        std::printf("  float   -> %.3f\n", (double)v);
+    } else {
+        std::printf("  other   -> size %zu\n", sizeof(v));
+    }
+}
+
+int main() {
+    int x = 5;
+    print_it(x);
+    print_it(&x);
+    print_it(3.14);
+    print_it(std::string("hello"));
+}
+```
+
+**实测输出：**
+
+```text
+  integer -> 5
+  pointer -> 00000071189ff77c
+  float   -> 3.140
+  other   -> size 32
+```
+
+`if constexpr` 的条件必须是**编译期常量**，且**不满足的分支不会被实例化**——这是它和普通 `if` 的本质区别（普通 `if` 的两个分支都要能编译）。
+
+这一个特性消灭了 C++11/14 时代大量的标签分发（tag dispatch）和 SFINAE 样板代码。
+
+## 4. 可变参数模板
+
+### 语法
+
+```cpp
+template<typename... Ts>   // 模板参数包
+void f(Ts... args);        // 函数参数包
+```
+
+### C++11/14 的递归展开
+
+```cpp
+// variadic_old.cpp
+#include <cstdio>
+
+// 终止条件
+void print_all() { std::printf("\n"); }
+
+// 递归展开
+template<typename T, typename... Rest>
+void print_all(T first, Rest... rest) {
+    std::printf("%d ", first);
+    print_all(rest...);
+}
+
+int main() {
+    print_all(1, 2, 3);
+    print_all(1, 2, 3, 4, 5);
+}
+```
+
+**实测输出：**
+
+```text
+1 2 3
+1 2 3 4 5
+```
+
+### C++17 折叠表达式：干净得多
+
+```cpp
+// fold.cpp
+#include <cstdio>
+
+template<typename... Ts>
+auto sum_all(Ts... ts) {
+    return (ts + ...);        // 一元右折叠：((a+b)+c)+d
+}
+
+template<typename... Ts>
+void print_all(Ts... ts) {
+    ((std::printf("%d ", ts), ...), std::printf("\n"));   // 逗号折叠
+}
+
+template<typename... Ts>
+int count_args(Ts... ts) { return sizeof...(ts); }        // sizeof... 运算符
+
+int main() {
+    std::printf("sum_all(1,2,3)     = %d\n", sum_all(1, 2, 3));
+    std::printf("sum_all(1,2,3,4,5) = %d\n", sum_all(1, 2, 3, 4, 5));
+    std::printf("sum_all(1.5, 2.5)  = %.2f\n", sum_all(1.5, 2.5));
+    print_all(1, 2, 3);
+    std::printf("count_args(1,2,3,4) = %d\n", count_args(1, 2, 3, 4));
+}
+```
+
+**实测输出：**
+
+```text
+sum_all(1,2,3)     = 6
+sum_all(1,2,3,4,5) = 15
+sum_all(1.5, 2.5)  = 4.00
+1 2 3
+count_args(1,2,3,4) = 4
+```
+
+**四种折叠形式（C++17）：**
+
+| 形式 | 写法 | 展开结果 |
+| --- | --- | --- |
+| 一元右折叠 | `(pack op ...)` | `a op (b op (c op d))` |
+| 一元左折叠 | `(... op pack)` | `((a op b) op c) op d` |
+| 二元右折叠 | `(pack op ... op init)` | `a op (b op (c op init))` |
+| 二元左折叠 | `(init op ... op pack)` | `((init op a) op b) op c` |
+
+空参数包时，一元折叠中只有 `&&`（true）、`||`（false）、`,`（void）有默认值，其它运算符会**编译错误**。
+
+---
+
+**翻页**：[← 上一页](./templates-01) · [下一页 →](./templates-03) · [返回目录](./)

@@ -1,0 +1,193 @@
+---
+id: c-lang-07-struct
+title: 07 结构体与四个关键字
+sidebar_position: 8
+description: 把相关数据打包成结构体，以及 const/static/extern/volatile 各自解决什么问题。
+---
+
+# 07 结构体与四个关键字
+
+## 9. 结构体：把相关数据打包
+
+传感器读数往往不止一个数：温度、湿度、时间戳、状态码。零散四个变量，传参要传四次还容易搞混顺序。**结构体（Struct）**把几个变量**捆成一个整体**——一个"包裹"，里面分格装着不同类型的数据：
+
+```c
+#include <stdio.h>
+
+typedef struct {              // 造一个新类型
+    uint32_t timestamp;       //   里面有哪些字段
+    float    temperature;
+    float    humidity;
+    uint8_t  status;
+} sensor_data_t;              //   新类型叫 sensor_data_t
+
+void print_sensor(sensor_data_t *d) {     // 传指针（不复印整包）
+    printf("时间 %u 温度 %.1f 湿度 %.1f 状态 %u\n",
+           d->timestamp, d->temperature, d->humidity, d->status);
+}
+
+int main(void) {
+    sensor_data_t data = {        // 指定初始化器：.字段 = 值（嵌入式标配写法）
+        .timestamp = 1000,
+        .temperature = 25.5f,
+        .humidity = 60.0f,
+        .status = 0,
+    };
+
+    data.temperature = 26.2f;     // 用 点号 改字段
+    print_sensor(&data);          // 用 & 把房间号递给函数
+    return 0;
+}
+```
+
+输出：
+
+```text
+时间 1000 温度 26.2 湿度 60.0 状态 0
+```
+
+### 逐块解剖
+
+**`typedef struct {...} sensor_data_t;` 的读法**："定义一个新类型（typedef），它是一个结构体（struct），内部含这四个字段，新类型名叫 sensor_data_t"。**typedef 的作用是给类型起名字**——没有它你每次都要写 `struct {...}` 整套，有它就能像 `int` 一样随手用 `sensor_data_t`。`_t` 后缀是"这是个类型"的行业惯例（uint32_t 同款）。
+
+**指定初始化器 `.字段 = 值`**：按名字填空，顺序随意、漏填自动为 0。它比"按位置填"（`{1000, 25.5f, 60.0f, 0}`）强在两点：一眼看出哪个值给了哪个字段；以后结构体加字段，老代码不用跟着改。**你在后面所有章节的配置代码里会反复见到它**（`gpio_config_t`、`wifi_config_t`……全是这个写法）。
+
+**点号与箭头的分工**：
+
+- `data.temperature` —— **变量本身**访问字段，用**点**
+- `d->temperature` —— **指针**访问字段，用**箭头**（等价 `(*d).temperature`）
+
+这对符号在 IDF 源码里出现频率不亚于分号。以后看到 `config->url`、`evt->data`，读法都是"顺指针找包裹，取字段"。
+
+**传结构体用指针而非值传递**：值传递整包复印（本例 16 字节，乘上每秒几百次调用就是不小的开销），指针只递 4 字节房号。
+
+### 结构体数组：一排包裹
+
+结构体和数组可以叠加——"一排包裹"，练习册第 6 题的主角：
+
+```c
+sensor_data_t logs[3];        // 3 个包裹
+logs[0].temperature = 25.0f;  // 第 0 个包裹的温度字段
+logs[2] = data;               // 整包赋值也行（同类型包裹可以整包抄）
+```
+
+**试着改一改**：
+
+1. 给 `sensor_data_t` 加一个 `float voltage;` 字段，初始化器里补上值，打印出来
+2. 写函数 `void set_status(sensor_data_t *d, uint8_t s)`，用箭头改包裹里的 status 字段
+
+## 10. 四个高频关键字：const / static / extern / volatile
+
+这四个词在 ESP32 代码里出现极多，逐个讲清楚。
+
+### const：只读贴纸
+
+```c
+const int MAX_RETRY = 5;      // 贴"只读"贴纸
+MAX_RETRY = 10;               // ✗ 编译器直接报错——贴纸起作用了
+```
+
+好处：把"不许变的数"写死，编译器帮你把关，还可能把它放进 Flash 省内存。
+
+**API 参数里的 `const` 是承诺"我不改你的数据"**：
+
+```c
+void print_name(const char *name);   // 承诺：我只读 name，绝不动它
+```
+
+看到 `const` 参数就放心传——函数保证只读不写。
+
+进阶一题（面试经典，读懂即可）：`const char *p` 和 `char * const p` 的区别——
+
+| 写法 | 读法 | 什么不能改 |
+| --- | --- | --- |
+| `const char *p` | 指向"只读字符"的指针 | **房间里的值**不能改（`*p = 'x'` 报错），房卡可以换房间（`p = &other` 可以） |
+| `char * const p` | "指针本身"是常量 | 房卡不能换房间，房间里的值可以改 |
+
+记忆：**`const` 紧挨着谁，谁就不能改**。实战中 99% 见到的是第一种（指向只读数据的指针）。
+
+### static：两副面孔
+
+**面孔一：函数内的 static——"有记忆的局部变量"**
+
+```c
+void counter_tick(void) {
+    static int count = 0;     // 只在第一次进来时初始化为 0
+    count++;                  // 之后每次调用都接着上次的值数下去
+    printf("%d\n", count);
+}
+// 连续调三次输出 1 2 3；换成普通 int 则每次都是 1
+```
+
+普通局部变量：函数一进来新造盒子、函数一退出销毁——每次都是全新的。**static 局部变量：盒子造一次就永生**，值跨调用保留。
+
+**面孔二：函数/全局变量前的 static——"本文件私有"**
+
+```c
+static void helper(void) {
+    // 其他 .c 文件看不见这个函数，别处声明了同名函数也不冲突
+}
+```
+
+C 的全局函数和变量默认"全世界可见"（链接时所有文件共享名字空间）。加 `static` 缩小为"只在本文件内可见"——**工程上几乎所有内部辅助函数都该加 static**，避免和大项目里别人家的同名函数撞车。
+
+记忆：**局部 static = 有记忆；全局/函数 static = 文件私有**。
+
+### extern：别处有，这里借用
+
+C 的项目按文件拆分后，变量定义在 A 文件、B 文件也要用——B 文件里写：
+
+```c
+extern uint32_t g_boot_count;   // 声明："这个变量在别的文件里定义了，本文件要用"
+```
+
+分清两个词：
+
+- **定义（Definition）**：真正造盒子。**全工程只能有一处**
+- **声明（Declaration）**：告诉编译器"有这么个东西存在，别慌"。可以到处有
+
+```c
+// counter.c
+uint32_t g_boot_count = 0;      // 定义在这里（造盒子）
+
+// main.c
+extern uint32_t g_boot_count;   // 声明（借用），然后随便用
+g_boot_count++;
+```
+
+头文件里放的就是声明——所以 A 文件定义、A 的头文件里写 `extern` 声明，所有 include 它的文件都借到同一个变量。
+
+### volatile：别自作聪明
+
+编译器有个优化习惯：如果它认为"这个变量没被任何人改"，就把重复读取优化掉——第一次读进寄存器，之后直接用寄存器里的值，不再碰内存。平时这是好事（快），但嵌入式里有个致命例外：**变量的值会被硬件或中断悄悄改掉**，编译器看不见！
+
+```c
+volatile bool button_pressed = false;   // 中断服务函数会改它
+
+void IRAM_ATTR on_button(void) {        // 中断里改（IRAM_ATTR 见下一页）
+    button_pressed = true;
+}
+
+// 主循环里读：
+while (!button_pressed) { }   // 加了 volatile：每次都真读内存，按键后循环正常退出
+                              // 不加：编译器认为它永远是 false，第一次读完就不再读了
+                              //       → 优化成 while(true) 死循环，按键永远无效
+```
+
+`volatile` 的字面意思就是"易变的"，喊话对象是编译器："**这个变量随时被看不见的手改，每次都老实去内存重读！**"
+
+**一句话规则：中断里写、主循环里读（或反过来）的变量，必须 `volatile`。**
+
+### 存储期速查
+
+| 关键字 | 生存范围 | 典型用途 |
+| --- | --- | --- |
+| `static`（局部） | 函数静态变量，跨调用保留 | 保存状态，避免传参 |
+| `static`（全局/函数） | 仅本文件可见 | 文件私有 helper |
+| `extern` | 声明外部变量 | 访问其他文件定义的变量 |
+| `const` | 只读 | 放在 Flash 里的常量表 |
+| `volatile` | 每次访问都真的访问内存 | **硬件寄存器、中断共享变量** |
+
+---
+
+**翻页**：[← 06 字符串与指针](./c-lang-06-pointer) · [08 位运算与函数指针 →](./c-lang-08-bit) · [返回目录](./)

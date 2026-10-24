@@ -1,0 +1,327 @@
+---
+id: 15-shared-ptr
+title: 15 智能指针 shared_ptr
+sidebar_position: 15
+description: 共享所有权与引用计数、循环引用导致的泄漏、weak_ptr 如何打破循环，以及 shared_ptr 的开销。
+---
+
+# 15 智能指针 shared_ptr
+
+**本课目标**：会在需要共享时正确使用 `shared_ptr`，并避开循环引用。
+
+## 什么时候需要共享
+
+`unique_ptr` 只有一个所有者——但有些场景**多个对象要共同拥有同一个资源**：
+
+```text
+图结构：多个节点指向同一个节点
+缓存：多个使用者共享同一个对象
+观察者模式：多个观察者看同一个主题
+```
+
+这时用 `shared_ptr`。
+
+## 基本用法
+
+```cpp
+#include <memory>
+
+auto a = std::make_shared<int>(42);
+
+std::cout << a.use_count();       /* 1，引用计数 */
+std::cout << *a;                  /* 42 */
+
+auto b = a;                        /* 拷贝：计数变成 2 */
+std::cout << a.use_count();       /* 2 */
+```
+
+本机实测：
+
+```text
+  计数=1
+  拷贝后计数=2
+  reset 后计数=1
+  释放 shared
+```
+
+:::tip[引用计数怎么工作]
+每个 `shared_ptr` 都指向同一块**控制块**（存着计数）。
+
+- **拷贝**：计数 +1
+- **销毁/reset**：计数 -1
+- **计数归零**：自动 `delete` 对象
+
+这就是"共享所有权"——最后一个用户离开时才释放。
+:::
+
+## 和 `unique_ptr` 的对比
+
+| | `unique_ptr` | `shared_ptr` |
+| --- | --- | --- |
+| 所有权 | 独占 | 共享 |
+| 能拷贝 | ❌ | ✅ |
+| 大小 | **8 字节** | **16 字节**（指针 + 控制块指针） |
+| 开销 | 零 | 引用计数（原子操作） |
+| 移动 | ✅ | ✅（不增加计数） |
+
+:::danger[`shared_ptr` 有明显开销]
+1. **大小翻倍**（8 → 16 字节）
+2. **拷贝/销毁要做原子操作**（线程安全，但有成本）
+3. **控制块额外分配**（`make_shared` 能合并成一次分配）
+
+**所以别到处用 `shared_ptr`。** 只在真的需要共享时用。
+:::
+
+## 循环引用：shared_ptr 最大的坑
+
+:::danger[两个对象互相持有时，永远不释放]
+本机实测：
+
+```cpp
+struct Node {
+    std::shared_ptr<Node> next;
+    ~Node() { std::cout << "  ~Node\n"; }
+};
+
+auto a = std::make_shared<Node>();
+auto b = std::make_shared<Node>();
+a->next = b;
+b->next = a;              /* 循环引用 */
+```
+
+输出：
+
+```text
+  a.use_count=2 b.use_count=2
+  (上面没有 ~Node 输出 = 泄漏)
+```
+
+**两个对象都没有被释放——内存泄漏。**
+:::
+
+### 为什么会泄漏
+
+```text
+a ──→ Node1 ──next──→ Node2
+               ↑         │
+               └──next───┘
+
+Node1 的计数 = 1（被 a 持有）+ 1（被 Node2.next 持有）= 2
+Node2 的计数 = 1（被 b 持有）+ 1（被 Node1.next 持有）= 2
+```
+
+**离开作用域时**：`a` 和 `b` 各自减 1，但计数仍是 1（因为对方还持有）。
+
+**结果谁都不释放，形成孤岛。**
+
+### 解决：`weak_ptr`
+
+```cpp
+struct GoodNode {
+    std::weak_ptr<GoodNode> next;      /* 用 weak_ptr */
+    ~GoodNode() { std::cout << "  ~GoodNode\n"; }
+};
+
+auto a = std::make_shared<GoodNode>();
+auto b = std::make_shared<GoodNode>();
+a->next = b;
+b->next = a;
+```
+
+本机实测输出：
+
+```text
+  ~GoodNode B
+  ~GoodNode A
+```
+
+**正常释放了。**
+
+:::tip[`weak_ptr` 是什么]
+**`weak_ptr` 观察对象但不拥有它**——它**不增加引用计数**。
+
+所以循环被打断了：一端的引用不计入，计数能归零。
+
+**用法**：用 `lock()` 尝试拿到 `shared_ptr`：
+
+```cpp
+if (auto sp = node->next.lock()) {
+    /* 对象还活着，可以用 sp */
+    sp->do_something();
+} else {
+    /* 对象已经销毁 */
+}
+```
+
+`lock()` 返回 `shared_ptr`（对象存在）或空（已销毁）。
+:::
+
+### 循环引用的常见场景
+
+| 场景 | 谁该用 `weak_ptr` |
+| --- | --- |
+| 双向链表 / 树（父子） | **子指向父**的那一边 |
+| 图结构 | 按逻辑选一个方向 |
+| 观察者模式 | 观察者持有主题的 `weak_ptr` |
+| 缓存 | 缓存持有对象的 `weak_ptr` |
+
+**规则：明确"谁是主人"，非主人那一方用 `weak_ptr`。**
+
+## `make_shared` 优于 `new`
+
+```cpp
+auto p = std::make_shared<Widget>(args);          /* ✅ 推荐 */
+
+std::shared_ptr<Widget> p(new Widget(args));      /* ⚠️ 两次分配 */
+```
+
+:::tip[为什么要 `make_shared`]
+`shared_ptr` 需要两块内存：**对象本身** + **控制块**（存计数）。
+
+- `new` 版本：**两次分配**（`new Widget` + `new 控制块`）
+- `make_shared`：**一次分配**（把两者放在连续内存里）
+
+**更快、更省内存、且异常安全。**
+:::
+
+## 完整示例：树结构
+
+```cpp
+#include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
+
+class Node : public std::enable_shared_from_this<Node> {
+public:
+    explicit Node(std::string name) : name_(std::move(name)) {
+        std::cout << "  创建 " << name_ << "\n";
+    }
+    ~Node() {
+        std::cout << "  销毁 " << name_ << "\n";
+    }
+
+    void add_child(std::shared_ptr<Node> child) {
+        child->parent_ = shared_from_this();      /* weak_ptr，不增加计数 */
+        children_.push_back(std::move(child));
+    }
+
+    void print_path() const {
+        /* 用 lock() 安全地访问父节点 */
+        if (auto p = parent_.lock()) {
+            p->print_path();
+            std::cout << " -> ";
+        }
+        std::cout << name_;
+    }
+
+    const std::string &name() const { return name_; }
+
+private:
+    std::string name_;
+    std::weak_ptr<Node> parent_;                  /* 父用 weak_ptr，打破循环 */
+    std::vector<std::shared_ptr<Node>> children_; /* 子用 shared_ptr（拥有） */
+};
+
+int main() {
+    auto root = std::make_shared<Node>("root");
+    auto a = std::make_shared<Node>("A");
+    auto b = std::make_shared<Node>("B");
+
+    root->add_child(a);
+    a->add_child(b);
+
+    std::cout << "路径：";
+    b->print_path();
+    std::cout << "\n";
+
+    std::cout << "root 计数：" << root.use_count() << "\n";
+
+    /* 出作用域，全部正确释放 */
+    return 0;
+}
+```
+
+输出：
+
+```text
+  创建 root
+  创建 A
+  创建 B
+路径：root -> A -> B
+root 计数：1
+  销毁 root
+  销毁 A
+  销毁 B
+```
+
+:::warning[`shared_from_this()` 要求对象已由 shared_ptr 管理]
+```cpp
+Node n;                        /* 栈上对象 */
+n.shared_from_this();          /* ❌ 抛 std::bad_weak_ptr */
+```
+
+只能在**已经被 `shared_ptr` 管理**的对象上调用。
+
+而且类必须继承 `std::enable_shared_from_this<T>`（上面例子里已经写进 `class Node` 的继承列表）。
+:::
+
+## 什么时候用 shared_ptr
+
+:::danger[不要默认用 shared_ptr]
+```cpp
+/* ❌ 过度设计：这个对象只在一个地方用 */
+auto config = std::make_shared<Config>();
+
+/* ✅ 用 unique_ptr 或栈对象 */
+Config config;
+```
+
+**判断标准**：
+
+- **只有一个所有者** → `unique_ptr`（或栈对象）
+- **真的需要共享**（多个对象共同拥有，谁最后走谁释放）→ `shared_ptr`
+- **只是观察** → `T*` / `T&` / `weak_ptr`
+
+**大部分代码里 `unique_ptr` 和栈对象就够了。**
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 循环引用 | 内存泄漏，无析构输出 | 互相持有 | 一边改 `weak_ptr` |
+| 到处用 `shared_ptr` | 性能下降 | 开销大 | 默认用 `unique_ptr` |
+| `shared_ptr(new T)` | 两次分配 | 没合并 | 用 `make_shared` |
+| 对同一裸指针建两个 shared_ptr | double free | 各自独立计数 | 只用一次 |
+| 用 `get()` 后 delete | double free | 所有权还在 | 不要 delete |
+| 栈对象调 `shared_from_this` | `bad_weak_ptr` | 未被 shared_ptr 管理 | 用 `make_shared` 创建 |
+
+:::danger[绝不要用同一个裸指针构造两个 shared_ptr]
+```cpp
+Widget *raw = new Widget();
+std::shared_ptr<Widget> a(raw);
+std::shared_ptr<Widget> b(raw);      /* ❌ 两个独立的控制块 */
+```
+
+两个 `shared_ptr` 各有一套计数，都会 `delete raw` → **double free**。
+
+**要么 `make_shared`，要么只构造一个 shared_ptr。**
+:::
+
+## 本课自检
+
+- [ ] 会用 `make_shared`，知道计数怎么变
+- [ ] 知道 `shared_ptr` 是 16 字节（比 unique_ptr 多一倍）
+- [ ] 知道拷贝会增加引用计数
+- [ ] **理解循环引用为什么泄漏**
+- [ ] **会用 `weak_ptr` 打破循环**
+- [ ] 会用 `weak_ptr::lock()` 安全访问
+- [ ] 知道双向结构中"谁是主人"
+- [ ] 知道 `make_shared` 只分配一次
+- [ ] **知道默认该用 `unique_ptr`，不是 `shared_ptr`**
+- [ ] 知道不能对同一裸指针建两个 shared_ptr
+
+## 下一步
+
+[16 移动语义入门](./16-move) —— `std::move` 到底做了什么，为什么它不移动任何东西。

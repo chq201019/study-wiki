@@ -1,0 +1,240 @@
+---
+id: stdlib-03
+title: "03 datetime：时间处理"
+sidebar_position: 4
+description: "标准库精讲 第 3 部分：datetime：时间处理"
+---
+
+# 03 datetime：时间处理
+```python
+from datetime import datetime, date, timedelta, timezone
+
+now = datetime.now()
+print("当前:", now.isoformat(timespec="seconds"))
+print("UTC:", datetime.now(timezone.utc).isoformat(timespec="seconds"))
+
+d1 = datetime(2024, 3, 1, 12, 0)
+d2 = datetime(2024, 3, 5, 14, 30)
+print("相差:", d2 - d1)
+print("换成秒:", (d2 - d1).total_seconds())
+print("加一周:", d1 + timedelta(days=7))
+print("格式化:", d1.strftime("%Y/%m/%d %H:%M"))
+print("解析:", datetime.strptime("2024-03-01", "%Y-%m-%d"))
+print("改字段:", d1.replace(year=2025))
+```
+
+```text
+当前: 2026-10-18T01:02:06
+UTC: 2026-10-17T17:02:06+00:00
+相差: 4 days, 2:30:00
+换成秒: 354600.0
+加一周: 2024-03-08 12:00:00
+格式化: 2024/03/01 12:00
+解析: 2024-03-01 00:00:00
+改字段: 2025-03-01 12:00:00
+```
+
+### naive 与 aware：时区陷阱
+
+`datetime` 分两种：
+
+- **naive**（朴素）：`tzinfo` 是 `None`，不知道自己在哪个时区
+- **aware**（感知）：带 `tzinfo`
+
+```python
+naive = datetime(2024, 3, 1, 12, 0)
+aware = datetime(2024, 3, 1, 12, 0, tzinfo=timezone.utc)
+print("naive 的 tzinfo:", naive.tzinfo)
+print("aware 的 tzinfo:", aware.tzinfo)
+```
+
+```text
+naive 的 tzinfo: None
+aware 的 tzinfo: UTC
+```
+
+:::danger[naive 和 aware 不能相互比较]
+```python
+naive = datetime(2024, 3, 1)
+aware = datetime(2024, 3, 1, tzinfo=timezone.utc)
+try:
+    naive < aware
+except TypeError as e:
+    print("->", e)
+```
+
+```text
+-> can't compare offset-naive and offset-aware datetimes
+```
+
+**规则**：存储和时间计算一律用 **UTC aware**，只在**展示给人类时**才转本地时区。混用是生产事故的经典来源。
+:::
+
+:::warning[Windows 上 zoneinfo 需要装 tzdata]
+```python
+import zoneinfo
+try:
+    zoneinfo.ZoneInfo("Asia/Shanghai")
+except Exception as e:
+    print("->", type(e).__name__, str(e)[:50])
+```
+
+本机实测（没装 tzdata）：
+
+```text
+-> ZoneInfoNotFoundError 'No time zone found with key Asia/Shanghai'
+```
+
+`zoneinfo`（3.9+）在 Linux/macOS 上读系统的时区数据库，但 **Windows 没有系统 tzdata**，需要 `pip install tzdata`。这是个跨平台部署时的经典坑。
+
+**跨平台项目里，时区依赖要么显式声明 `tzdata` 依赖，要么只用 `timezone.utc`。**
+:::
+
+## 8. logging：日志
+
+**不要用 `print` 调试生产代码**，用 `logging`。
+
+```python
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+)
+
+log = logging.getLogger("app")
+log.debug("调试信息（被级别过滤掉）")
+log.info("处理了 %d 条记录", 42)
+log.warning("磁盘剩余不足")
+log.error("连接失败")
+```
+
+```text
+2026-10-18 01:02:06 INFO     app: 处理了 42 条记录
+2026-10-18 01:02:06 WARNING  app: 磁盘剩余不足
+2026-10-18 01:02:06 ERROR    app: 连接失败
+```
+
+五个级别：
+
+| 级别 | 数值 | 用途 |
+| --- | --- | --- |
+| `DEBUG` | 10 | 调试细节，生产关闭 |
+| `INFO` | 20 | 正常运行状态 |
+| `WARNING` | 30 | 有问题但还能跑 |
+| `ERROR` | 40 | 某个功能失败 |
+| `CRITICAL` | 50 | 系统级故障 |
+
+:::caution[用 `%s` 占位符，不要用 f-string]
+```python
+log.info(f"处理了 {n} 条")      # 不好：即使日志被过滤，字符串也已拼接
+log.info("处理了 %d 条", n)     # 好：延迟格式化，被过滤时零成本
+```
+
+`logging` 的占位符是**惰性**的——只有真的要输出时才做格式化。在高频调用的循环里这个差别很明显（第 10 页会再讲日志规范）。
+:::
+
+:::info[每个模块用自己的 logger]
+```python
+import logging
+log = logging.getLogger(__name__)     # 用模块名，logger 天然分层
+```
+
+这样你能按模块单独调整级别：
+
+```python
+logging.getLogger("app.network").setLevel(logging.DEBUG)
+```
+
+只让网络模块出详细日志，其他模块保持 INFO——排查问题时非常有用。
+:::
+
+## 9. typing：类型注解
+
+注解运行时不检查（第 5 页），供 mypy 和 IDE 使用。3.11 上可用的：
+
+```python
+import typing
+
+for name in ("Any", "Optional", "Union", "Callable", "TypeVar", "Generic",
+             "Protocol", "Literal", "Final", "TypedDict", "NamedTuple",
+             "Self", "TypeAlias", "ParamSpec", "TypeVarTuple", "NotRequired",
+             "Required", "assert_never", "dataclass_transform", "LiteralString",
+             "TypeGuard", "NewType", "override"):
+    print(f"  {name}: {hasattr(typing, name)}")
+```
+
+```text
+  Any: True
+  Optional: True
+  Union: True
+  Callable: True
+  TypeVar: True
+  Generic: True
+  Protocol: True
+  Literal: True
+  Final: True
+  TypedDict: True
+  NamedTuple: True
+  Self: True
+  TypeAlias: True
+  ParamSpec: True
+  TypeVarTuple: True
+  NotRequired: True
+  Required: True
+  assert_never: True
+  dataclass_transform: True
+  LiteralString: True
+  TypeGuard: True
+  NewType: True
+  override: False        ← 3.12 才有
+```
+
+### 常用写法
+
+```python
+from typing import Optional, Union, Any, Callable, TypeVar, Literal
+
+# 3.10+ 用 | 代替 Optional / Union
+def f1(x: int | None) -> str: ...          # 等价于 Optional[int]
+def f2(x: int | str) -> str: ...           # 等价于 Union[int, str]
+
+# 容器要写里面的类型
+def f3(items: list[int], mapping: dict[str, float]) -> set[str]: ...
+
+# 字面量类型：只允许这几个值
+def f4(mode: Literal["r", "w", "a"]) -> None: ...
+
+# 回调类型
+def f5(on_done: Callable[[int], None]) -> None: ...
+
+# 泛型
+T = TypeVar("T")
+def first(items: list[T]) -> T: ...
+```
+
+### 何时用 `Any`
+
+`Any` 等于「放弃检查」——它和任何类型都兼容，会**关掉** mypy 对该处的所有检查。
+
+**渐进式采用策略**：
+
+1. 新代码全写注解
+2. 老代码先只给**公共接口**加注解，内部留空
+3. 用 `Any` 标注确实动态的部分，但要**写注释说明为什么**
+
+`Protocol`（3.8+）实现「结构化类型」——不用继承就能表达「只要有这个方法就行」：
+
+```python
+from typing import Protocol
+
+class Drawable(Protocol):
+    def draw(self) -> None: ...
+
+def render(shape: Drawable) -> None:
+    shape.draw()        # 任何有 draw() 的对象都能传进来
+```
+
+---
+
+**翻页**：[← 上一页](./stdlib-02) · [下一页 →](./stdlib-04) · [返回目录](./)

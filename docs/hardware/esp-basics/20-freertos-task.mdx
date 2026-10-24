@@ -1,0 +1,279 @@
+---
+id: 20-freertos-task
+title: 20 FreeRTOS 任务
+sidebar_position: 20
+description: 任务和函数的区别、xTaskCreate 的四个参数、优先级与栈大小怎么定，以及为什么 app_main 本身就是一个任务。
+---
+
+# 20 FreeRTOS 任务
+
+**本课目标**：理解任务，会创建多个任务让它们"同时"干活。
+
+## 任务 vs 函数
+
+| | 普通函数 | 任务 |
+| --- | --- | --- |
+| 执行 | 调用时执行，返回就结束 | **独立跑，不返回** |
+| 结束 | 自然返回 | 必须 `vTaskDelete(NULL)` 或死循环 |
+| 调度 | 无 | **由 FreeRTOS 调度** |
+| 栈 | 用调用者的栈 | **自己的独立栈** |
+
+:::danger[任务函数不能返回]
+```c
+void my_task(void *arg)
+{
+    printf("hello\n");
+    /* 函数结束 → 返回 → 崩溃 */
+}
+```
+
+**任务函数必须以死循环结尾，或显式删除自己**：
+
+```c
+void my_task(void *arg)
+{
+    while (1) {
+        /* 干活 */
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    /* 或者最后调 vTaskDelete(NULL); */
+}
+```
+:::
+
+## `app_main` 本身就是一个任务
+
+:::info[所以 `app_main` 可以返回]
+```c
+void app_main(void)
+{
+    /* 创建完其他任务，直接返回也没问题 */
+    xTaskCreate(other_task, "other", 4096, NULL, 5, NULL);
+}
+```
+
+**`app_main` 返回后，它这个任务被销毁，但你创建的其他任务继续跑。**
+
+**这和普通 C 程序的 `main` 完全不同**——单片机没有"程序退出"这回事。
+:::
+
+## 创建任务
+
+```c
+xTaskCreate(
+    task_func,      /* ① 函数指针 */
+    "my_task",      /* ② 任务名（调试用，最长 16 字节） */
+    4096,           /* ③ 栈大小（字节） */
+    NULL,           /* ④ 传给任务的参数 */
+    5,              /* ⑤ 优先级（数字大 = 优先级高） */
+    NULL            /* ⑥ 任务句柄（不需要就 NULL） */
+);
+```
+
+:::danger[栈大小单位是「字节」，但写法容易错]
+```c
+xTaskCreate(func, "t", 4096, NULL, 5, NULL);      /* ESP-IDF: 4096 字节 */
+```
+
+**在原生 FreeRTOS 里这个参数是「字」而不是「字节」**（4096 字 = 16KB）。
+
+**ESP-IDF 改成了字节单位**——这是移植时的经典坑。
+
+**4096 字节是常用起点**，做 WiFi/HTTP 的任务建议 4096~8192。
+:::
+
+## 完整示例：两个任务闪灯 + 打印
+
+```c
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+
+static const char *TAG = "tasks";
+#define LED_GPIO  4
+
+/* 任务一：每 500ms 翻转 LED */
+static void blink_task(void *arg)
+{
+    bool on = false;
+    while (1) {
+        on = !on;
+        gpio_set_level(LED_GPIO, on);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+/* 任务二：每 2 秒打印一次运行时间 */
+static void log_task(void *arg)
+{
+    while (1) {
+        ESP_LOGI(TAG, "运行 %lu 秒", (unsigned long)(xTaskGetTickCount() / configTICK_RATE_HZ));
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
+void app_main(void)
+{
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+
+    xTaskCreate(blink_task, "blink", 2048, NULL, 5, NULL);
+    xTaskCreate(log_task,   "log",   3072, NULL, 3, NULL);
+
+    ESP_LOGI(TAG, "两个任务已创建");
+    /* app_main 返回，两个任务继续跑 */
+}
+```
+
+:::tip[现象：灯闪和打印"同时"发生]
+**因为 FreeRTOS 在两者之间快速切换**（通常每 1 ms 一次 tick）。
+
+单核 CPU 上这不是真并行，是**分时复用**——但视觉上就是同时。
+
+（ESP32 是双核，真的能让两个任务在不同核上跑。）
+:::
+
+## 优先级怎么定
+
+```text
+数字越大 = 优先级越高
+```
+
+| 优先级 | 适合 |
+| --- | --- |
+| 0 | 空闲任务（系统占） |
+| 1~4 | 后台任务（日志、慢速采集） |
+| **5（默认）** | 普通业务任务 |
+| 6~10 | 实时性要求高的（按键响应） |
+| 20+ | 系统任务（WiFi、TCP/IP） |
+
+:::danger[优先级设太高会"饿死"其他任务]
+```c
+xTaskCreate(func, "t", 4096, NULL, 20, NULL);   /* ❌ 比 WiFi 任务还高 */
+```
+
+**如果这个任务是死循环且没有 `vTaskDelay`**，低优先级任务永远得不到 CPU。
+
+**表现**：WiFi 断开、看门狗复位、系统卡死。
+
+**规矩：业务任务用 5 左右，别超过系统任务（20+）。**
+:::
+
+## 栈大小怎么定
+
+:::danger[栈溢出是嵌入式最常见的崩溃]
+```c
+xTaskCreate(func, "t", 1024, NULL, 5, NULL);    /* 太小！ */
+```
+
+**任务里用 `printf` / 局部数组 / 调用深层函数，都很吃栈。**
+
+**ESP-IDF 会在栈溢出时打印**：
+
+```text
+***ERROR*** A stack overflow in task t has been detected.
+```
+:::
+
+| 任务类型 | 建议栈 |
+| --- | --- |
+| 纯 GPIO 操作 | 2048 |
+| 带 `ESP_LOGI` 打印 | 3072 |
+| 用 `printf`/`sprintf` | 4096 |
+| HTTP 客户端 | 6144~8192 |
+| TLS/HTTPS | 8192+ |
+
+:::tip[怎么查实际用了多少栈]
+```c
+UBaseType_t left = uxTaskGetStackHighWaterMark(NULL);
+ESP_LOGI(TAG, "剩余栈 %d 字节", left * sizeof(StackType_t));
+```
+
+**返回"历史最小剩余量"**——剩得越少说明当时越接近溢出。
+
+**开发期定期打印一下，剩不到 25% 就该调大。**
+:::
+
+## 查看所有任务
+
+```c
+/* 需要 menuconfig 打开 FreeRTOS stats */
+vTaskList(buf);       /* 表格形式列出所有任务和栈使用 */
+```
+
+或者命令行：
+
+```bash
+idf.py monitor
+# 按 Ctrl+T 然后 Ctrl+T 有菜单，可以查看任务列表
+```
+
+## 常用任务 API
+
+| API | 作用 |
+| --- | --- |
+| `vTaskDelay(ticks)` | 延时并让出 CPU |
+| `vTaskDelayUntil(&last, ticks)` | **固定周期**延时（不累积误差） |
+| `xTaskGetTickCount()` | 当前 tick 数 |
+| `vTaskDelete(NULL)` | 删除自己 |
+| `uxTaskGetStackHighWaterMark(NULL)` | 剩余栈 |
+| `vTaskSuspend(NULL)` | 挂起自己 |
+
+:::tip[固定周期用 `vTaskDelayUntil`]
+```c
+TickType_t last = xTaskGetTickCount();
+while (1) {
+    do_work();                          /* 假设耗时 50ms */
+    vTaskDelayUntil(&last, pdMS_TO_TICKS(100));
+    /* 每 100ms 精确执行一次，不受 do_work 耗时影响 */
+}
+```
+
+**`vTaskDelay(100)` 会变成"50ms 干活 + 100ms 等待 = 150ms 周期"**（漂移）。
+
+做采样、控制循环要用 `vTaskDelayUntil`。
+:::
+
+## `vTaskDelay(0)` 的坑
+
+:::danger[延时 0 不是"不延时"]
+```c
+while (1) {
+    /* 忙等 */
+    vTaskDelay(0);        /* ⚠️ 只是让出 CPU 一次，立刻又回来 */
+}
+```
+
+**在最高优先级任务里这样写，低优先级任务几乎拿不到 CPU。**
+
+**要短延时用 `vTaskDelay(1)`**（1 tick ≈ 1 ms）。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 任务函数返回 | 崩溃 | 任务不能 return | 死循环或 `vTaskDelete` |
+| 栈太小 | stack overflow | 打印/局部数组吃栈 | 加大到 4096+ |
+| 优先级过高无延时 | 饿死其他任务 | 独占 CPU | 加 `vTaskDelay` |
+| 用 `vTaskDelay` 做周期 | 周期漂移 | 累积执行时间 | `vTaskDelayUntil` |
+| 任务名超 16 字节 | 被截断 | 名字字段长度 | 用短名 |
+| 在任务里 `return` | 崩溃 | 同上 | 见第一条 |
+
+## 本课自检
+
+- [ ] **知道任务函数不能返回**
+- [ ] 知道 `app_main` 本身是一个任务
+- [ ] 会用 `xTaskCreate` 的六个参数
+- [ ] **知道 ESP-IDF 的栈单位是字节**（原生 FreeRTOS 是字）
+- [ ] 知道不同任务的栈大小建议
+- [ ] **会用 `uxTaskGetStackHighWaterMark` 查剩余栈**
+- [ ] **知道优先级不能太高，否则饿死其他任务**
+- [ ] 知道任务里必须有 `vTaskDelay` 让出 CPU
+- [ ] **知道固定周期要用 `vTaskDelayUntil`**
+- [ ] 知道 `vTaskDelay(0)` 不等于不延时
+
+## 下一步
+
+[21 队列与信号量](./21-queue) —— 多个任务之间怎么安全地传数据。

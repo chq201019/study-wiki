@@ -1,0 +1,328 @@
+---
+id: 19-project-students
+title: 19 阶段实战：学生管理系统
+sidebar_position: 19
+description: 用 vector + 类 + STL 算法 + 异常做一个完整系统，涵盖封装、排序、查找、统计与错误处理。
+---
+
+# 19 阶段实战：学生管理系统
+
+**本课目标**：把**类封装、`vector`、STL 算法、异常**串成一个完整程序。
+
+## 要做什么
+
+- 添加学生（分数非法时抛异常）
+- 按分数排序
+- 按姓名查找
+- 统计平均分
+- 处理各种错误情况（空容器、越界）
+
+## 第一步：`Student` 类
+
+```cpp
+class Student {
+public:
+    Student(std::string n, int s) : name_(std::move(n)), score_(s) {
+        if (s < 0 || s > 100) {
+            throw std::invalid_argument("分数超出 0-100: " + std::to_string(s));
+        }
+    }
+
+    const std::string &name() const { return name_; }
+    int score() const { return score_; }
+
+private:
+    std::string name_;
+    int score_;
+};
+```
+
+:::tip[为什么校验放在构造函数里]
+```cpp
+Student("Alice", 150);        /* 直接抛异常，对象根本创建不出来 */
+```
+
+**这保证了"不可能存在非法分数"**——一旦对象存在，`score_` 一定在 0~100 之间。
+
+**比"创建后再检查"可靠得多**——后者忘检查就漏了。
+:::
+
+## 第二步：`GradeBook` 管理类
+
+```cpp
+class GradeBook {
+public:
+    void add(const std::string &n, int s) {
+        students_.emplace_back(n, s);       /* 直接构造，避免临时对象 */
+    }
+
+    Student &at(size_t i) { return students_.at(i); }    /* at 会检查越界 */
+    size_t size() const { return students_.size(); }
+
+    void sort_by_score_desc() {
+        std::sort(students_.begin(), students_.end(),
+                  [](const Student &a, const Student &b) {
+                      return a.score() > b.score();
+                  });
+    }
+
+    double average() const {
+        if (students_.empty()) {
+            throw std::logic_error("没有学生，无法计算平均分");
+        }
+        int total = 0;
+        for (const auto &s : students_) total += s.score();
+        return static_cast<double>(total) / students_.size();
+    }
+
+    const Student *find(const std::string &n) const {
+        auto it = std::find_if(students_.begin(), students_.end(),
+                               [&](const Student &s) { return s.name() == n; });
+        return it == students_.end() ? nullptr : &*it;
+    }
+
+private:
+    std::vector<Student> students_;
+};
+```
+
+:::tip[三个设计要点]
+**① `emplace_back` 优于 `push_back(Student(...))`**
+
+```cpp
+students_.push_back(Student(n, s));      /* 构造临时对象再移动 */
+students_.emplace_back(n, s);            /* 直接在容器里构造 */
+```
+
+**少一次移动。**
+
+**② `at()` 而不是 `[]`**
+
+`at()` 会抛 `std::out_of_range`，`[]` 越界是未定义行为。
+
+**③ `find` 返回指针而不是引用**
+
+```cpp
+const Student *find(...)          /* ✅ 找不到返回 nullptr */
+const Student &find(...)          /* ❌ 找不到怎么办？不能返回空引用 */
+```
+
+**"可能不存在"用指针，"一定存在"才用引用。**
+:::
+
+## 完整程序
+
+```cpp
+#include <algorithm>
+#include <iomanip>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+class Student {
+public:
+    Student(std::string n, int s) : name_(std::move(n)), score_(s) {
+        if (s < 0 || s > 100) {
+            throw std::invalid_argument("分数超出 0-100: " + std::to_string(s));
+        }
+    }
+    const std::string &name() const { return name_; }
+    int score() const { return score_; }
+
+private:
+    std::string name_;
+    int score_;
+};
+
+class GradeBook {
+public:
+    void add(const std::string &n, int s) {
+        students_.emplace_back(n, s);
+    }
+
+    Student &at(size_t i) { return students_.at(i); }
+    size_t size() const { return students_.size(); }
+
+    void sort_by_score_desc() {
+        std::sort(students_.begin(), students_.end(),
+                  [](const Student &a, const Student &b) {
+                      return a.score() > b.score();
+                  });
+    }
+
+    double average() const {
+        if (students_.empty()) {
+            throw std::logic_error("没有学生，无法计算平均分");
+        }
+        int total = 0;
+        for (const auto &s : students_) total += s.score();
+        return static_cast<double>(total) / students_.size();
+    }
+
+    const Student *find(const std::string &n) const {
+        auto it = std::find_if(students_.begin(), students_.end(),
+                               [&](const Student &s) { return s.name() == n; });
+        return it == students_.end() ? nullptr : &*it;
+    }
+
+    void print() const {
+        std::cout << "  " << std::left << std::setw(10) << "姓名"
+                  << std::right << std::setw(6) << "分数" << "\n";
+        std::cout << "  " << std::string(18, '-') << "\n";
+        for (const auto &s : students_) {
+            std::cout << "  " << std::left << std::setw(10) << s.name()
+                      << std::right << std::setw(6) << s.score() << "\n";
+        }
+    }
+
+private:
+    std::vector<Student> students_;
+};
+
+int main() {
+    GradeBook book;
+
+    /* 添加正常数据 */
+    book.add("Alice", 88);
+    book.add("Bob", 92);
+    book.add("Carol", 75);
+
+    std::cout << "--- 添加非法分数 ---\n";
+    try {
+        book.add("Bad", 150);
+    } catch (const std::exception &e) {
+        std::cout << "  捕获：" << e.what() << "\n";
+    }
+
+    std::cout << "\n--- 越界访问 ---\n";
+    try {
+        book.at(99);
+    } catch (const std::exception &e) {
+        std::cout << "  捕获：" << e.what() << "\n";
+    }
+
+    std::cout << "\n--- 按分数降序 ---\n";
+    book.sort_by_score_desc();
+    book.print();
+
+    std::cout << "\n平均分：" << std::fixed << std::setprecision(2)
+              << book.average() << "\n";
+
+    std::cout << "\n--- 查找 ---\n";
+    if (auto p = book.find("Bob")) {
+        std::cout << "  找到 " << p->name() << "，分数 " << p->score() << "\n";
+    }
+    if (!book.find("Nobody")) {
+        std::cout << "  Nobody 不存在\n";
+    }
+
+    std::cout << "\n--- 空容器计算 ---\n";
+    GradeBook empty;
+    try {
+        empty.average();
+    } catch (const std::exception &e) {
+        std::cout << "  捕获：" << e.what() << "\n";
+    }
+
+    return 0;
+}
+```
+
+### 运行输出
+
+```text
+--- 添加非法分数 ---
+  捕获：分数超出 0-100: 150
+
+--- 越界访问 ---
+  捕获：vector::_M_range_check: __n (which is 99) >= this->size() (which is 3)
+
+--- 按分数降序 ---
+  姓名          分数
+  ------------------
+  Bob            92
+  Alice          88
+  Carol          75
+
+平均分：85.00
+
+--- 查找 ---
+  找到 Bob，分数 92
+  Nobody 不存在
+
+--- 空容器计算 ---
+  捕获：没有学生，无法计算平均分
+```
+
+:::warning[越界异常的 `what()` 内容依实现而定]
+上面的输出是 GCC 的实现细节（`vector::_M_range_check`）。换编译器可能不同。
+
+**所以不要依赖 `what()` 的具体文本**——只该用它来"给人看"，逻辑判断应该用异常类型。
+:::
+
+## 这个程序覆盖了什么
+
+| 技术 | 用在哪 | 出自 |
+| --- | --- | --- |
+| 类封装 | `Student`、`GradeBook` | [06](./06-class) |
+| 构造函数校验 | 分数范围检查 | [07](./07-ctor-dtor) |
+| `std::move` | `name_(std::move(n))` | [16](./16-move) |
+| `std::vector` | 存学生列表 | [13](./13-string-vector) |
+| `emplace_back` | 避免临时对象 | [13](./13-string-vector) |
+| `at()` | 检查越界 | [13](./13-string-vector) |
+| `std::sort` + lambda | 按分数排序 | [18](./18-algorithms) |
+| `std::find_if` + lambda | 按姓名查找 | [18](./18-algorithms) |
+| 异常 | 非法输入保护 | [21](./21-exceptions) |
+| `setw` / `setprecision` | 表格输出 | [02](./02-first-program) |
+
+## 想自己加的功能
+
+| 挑战 | 提示 |
+| --- | --- |
+| 删除某个学生 | `std::erase_if`（C++20）或 `erase-remove` |
+| 修改分数 | 先 `find` 再改，但要重新校验（加 setter） |
+| 按姓名排序 | 换一个比较 lambda |
+| 保存到文件 | `std::ofstream` 逐行写 |
+| 统计各分数段人数 | `count_if` 配合区间判断 |
+| 支持多个科目 | `Student` 里放 `std::map<std::string, int>` |
+| 用 `std::optional` 返回查找结果 | C++17，比指针更明确 |
+
+:::tip[一个值得做的练习：把 `find` 改成返回 `std::optional<Student>`]
+```cpp
+#include <optional>
+
+std::optional<Student> find(const std::string &n) const;
+```
+
+返回值语义更清楚（"可能没有"），比裸指针安全。
+
+（`optional` 的用法是进阶内容，可以先了解。）
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 用 `[]` 访问 | 越界 UB | 不检查 | 用 `at()` |
+| `find` 返回引用 | 找不到无法表示 | 引用不能为空 | 返回指针/optional |
+| 构造后不校验 | 非法状态存在 | 校验缺失 | 构造函数里检查 |
+| `push_back(Student(...))` | 多一次移动 | 构造了临时对象 | `emplace_back` |
+| `average` 不判空 | 除零 | 空容器 | 抛异常或返回 0 |
+| 异常文本当逻辑用 | 换编译器就错 | `what()` 依实现 | 用异常类型判断 |
+
+## 第三阶段小结
+
+你现在掌握了现代 C++ 的核心武器：
+
+- **RAII**：资源自动管理
+- **`std::string` / `std::vector`**：不再手管内存
+- **智能指针**：`unique_ptr`（默认）和 `shared_ptr`（共享）
+- **移动语义**：避免不必要的深拷贝
+- **STL 容器与算法**：用标准组件而不是手写循环
+
+**这些让 C++ 代码既安全又高效。**
+
+## 下一步
+
+[20 模板入门](./20-templates) —— 写一份代码，适配所有类型。

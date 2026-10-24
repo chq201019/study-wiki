@@ -1,0 +1,201 @@
+---
+id: 36-ble
+title: 23 BLE 入门
+sidebar_position: 36
+description: BLE 与经典蓝牙的区别、GATT 的角色与层次、广播与连接、MTU 与吞吐、以及用 ESP32 做 BLE 服务端的最小例子。
+---
+
+# 23 BLE 入门
+
+**本课目标**：搞清 GATT 模型，能自己定义一个 BLE 服务。
+
+## BLE 与经典蓝牙
+
+| 维度 | 经典蓝牙（BR/EDR） | **BLE** |
+| --- | --- | --- |
+| 典型用途 | 音频、串口（SPP） | **传感器、可穿戴、IoT** |
+| 功耗 | 高 | **低（休眠占空比）** |
+| 吞吐 | 高（2 Mbps） | 较低（实际几十 KB/s） |
+| 连接建立 | 快 | **较慢（要广播+扫描）** |
+| 大文件 | 可以 | 不适合 |
+
+:::warning[ESP32 不能同时用经典蓝牙和 WiFi]
+**ESP32 的射频是共享的。**
+
+- **BLE + WiFi**：可以共存（分时）
+- **经典蓝牙 + WiFi**：会严重互相干扰
+
+**产品设计时要注意这个约束。**
+:::
+
+## 三个角色
+
+| 角色 | 含义 |
+| --- | --- |
+| **Central（中心）** | 主动扫描、发起连接（手机通常这个） |
+| **Peripheral（外设）** | **广播、等待被连接（ESP32 通常这个）** |
+| Observer / Broadcaster | 只扫描 / 只广播 |
+
+**所以"ESP32 做 BLE 设备"就是 ESP32 当 Peripheral。**
+
+## GATT：数据的组织方式
+
+![BLE 的 GATT 四层结构 Profile/Service/Characteristic/Descriptor，以及心率传感器的实际例子](/img/diagrams/esp32-ble-gatt.svg)
+
+
+:::info[四层结构]
+```text
+Profile（规范，如心率、HID）
+  └─ Service（服务，一组相关特征）
+       └─ Characteristic（特征，一个数据点）
+            └─ Descriptor（描述符，如单位、格式）
+```
+
+**每个 Service / Characteristic 都有一个 16 位或 128 位的 UUID。**
+:::
+
+**标准 UUID**（蓝牙联盟定义）：16 位，如 0x180F（电池服务）、0x2A19（电池电量）。
+
+**自定义 UUID**：128 位，自己生成。
+
+:::danger[UUID 是 BLE 里最容易搞错的东西]
+**同一个 128 位 UUID 在不同字节序下的表示不同** —— ESP-IDF 用**小端**排列字节数组。
+
+**典型错误**：手机端看不到你的服务，因为 UUID 字节序不匹配。
+
+**建议**：用 ESP_UUID128_INIT() 宏按字面顺序写，别手动拼字节。
+:::
+
+## 三种操作方式
+
+| 方式 | 方向 | 需要连接 |
+| --- | --- | --- |
+| **Read** | 客户端读服务端 | 是 |
+| **Write** | 客户端写服务端 | 是 |
+| **Notify** | **服务端主动推给客户端** | 是（需客户端先订阅） |
+| 广播里的厂商数据 | 服务端发，无需连接 | 否 |
+
+:::tip[传感器数据该用 Notify]
+**Read 是"客户端来问"，Notify 是"有变化就推"。**
+
+**周期上报的传感器用 Notify** 更省电、延迟也更低。
+
+**注意**：客户端必须先写 CCCD（0x2902）订阅，否则收不到。
+:::
+
+## 广播数据
+
+:::warning[广播包只有 31 字节]
+**里面要放**：设备名、UUID、厂商自定义数据。
+
+**常见做法**：
+
+- **广播包里只放"服务 UUID"**（让手机知道该连谁）
+- 真实数据连接后用 GATT 传
+- 或者用 BLE 5.0 的广播扩展（255 字节）
+:::
+
+```c
+/* ESP-IDF 设置广播内容 */
+esp_ble_adv_data_t adv = {
+    .set_scan_rsp = false,
+    .include_name = true,
+    .include_txpower = true,
+    .min_interval = 0x0006,
+    .max_interval = 0x0010,
+    .appearance = 0x00,
+    .manufacturer_len = 0,
+    .p_service_uuid = my_uuid,
+    .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
+};
+esp_ble_gap_config_adv_data(&adv);
+```
+
+## MTU 与吞吐
+
+:::info[默认 MTU 是 23 字节]
+**ATT 头占 3 字节，所以每个包只能带 20 字节有效载荷。**
+
+**BLE 4.2+ 支持 MTU 协商**，可以到 247 甚至 517。
+
+```c
+/* ESP-IDF 里设置本端 MTU */
+esp_ble_gatt_set_local_mtu(500);
+```
+:::
+
+:::danger[大 MTU 不一定更快]
+**实际吞吐受**：
+
+- 连接间隔（最小 7.5ms）
+- 每个间隔能传几个包
+- 手机端的 MTU 协商结果
+
+**典型实际吞吐**：几十 KB/s（BLE 4.2）、几百 KB/s（BLE 5.0 2M PHY）。
+
+**传固件请用 WiFi，不要用 BLE。**
+:::
+
+## 最小服务端骨架（ESP-IDF）
+
+```c
+static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
+                                        esp_gatt_if_t iface,
+                                        esp_ble_gatts_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_GATTS_REG_EVT:
+        esp_ble_gatts_create_attr_tab(gatts_attr_db, iface, ATTR_NUM, 0);
+        break;
+
+    case ESP_GATTS_WRITE_EVT:
+        /* 客户端写了值（比如订阅通知） */
+        if (param->write.handle == char_handle) {
+            /* 处理 */
+        }
+        break;
+
+    case ESP_GATTS_CONNECT_EVT:
+        ESP_LOGI(TAG, "client connected");
+        break;
+    }
+}
+```
+
+**属性表用 esp_gatts_attr_db_t 数组静态定义**，每个条目描述一个 handle 的权限与初值。
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 手机搜不到设备 | 没开广播 / 广播包超 31 字节 | 检查 adv 配置 |
+| 连上但看不到服务 | UUID 字节序错 | 用 ESP_UUID128_INIT() |
+| 收不到 Notify | 客户端没订阅 CCCD | 检查写 CCCD 的处理 |
+| 传输很慢 | MTU 太小 / 连接间隔大 | 协商 MTU、请求小间隔 |
+| 连接频繁断 | 连接参数不被接受 | 用手机端推荐参数 |
+| Android 正常 iOS 异常 | iOS 对广播格式更严格 | 按规范填 flag |
+| WiFi 和 BLE 同时用不稳定 | 射频共享 | 降低 WiFi 占空比 |
+
+:::danger[iOS 对广播数据有额外限制]
+**iOS 只扫描"符合规范"的广播包** —— 比如必须有正确的 flags、服务 UUID 要放在指定位置。
+
+**很多"Android 能搜到、iOS 搜不到"的问题都出在这里。**
+:::
+
+## 本课自检
+
+- [ ] 能区分 BLE 与经典蓝牙的适用场景
+- [ ] **知道 ESP32 的 BLE 与 WiFi 可共存但经典蓝牙不行**
+- [ ] **知道 ESP32 通常当 Peripheral（广播方）**
+- [ ] **能说出 GATT 的四层结构**
+- [ ] **知道 UUID 字节序容易搞错，要用宏**
+- [ ] **知道传感器周期数据该用 Notify**
+- [ ] 知道客户端必须先订阅 CCCD 才能收到 Notify
+- [ ] **知道广播包只有 31 字节**
+- [ ] **知道默认 MTU 23（有效载荷 20 字节）**
+- [ ] 知道大 MTU 不一定更快，实际吞吐只有几十 KB/s
+- [ ] **知道 iOS 对广播格式比 Android 严格**
+
+## 下一步
+
+回到 [ESP32 零基础导读](../esp-basics/)。

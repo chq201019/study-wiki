@@ -1,0 +1,261 @@
+---
+id: shell-04
+title: "04 管道与重定向"
+sidebar_position: 5
+description: "Shell 与命令行 第 4 部分：管道与重定向"
+---
+
+# 04 管道与重定向
+### 4.1 三个标准流
+
+每个进程启动时都自带三个打开的文件描述符：
+
+| fd | 名字 | 默认去向 |
+| --- | --- | --- |
+| 0 | stdin | 键盘 |
+| 1 | stdout | 终端 |
+| 2 | stderr | 终端 |
+
+**为什么 stderr 要单独一个？** 因为错误信息不该被管道吞掉。实测：
+
+```bash
+$ ls -1 /nonexistentdir >out.txt 2>err.txt; echo "exit=$?"
+exit=2
+$ echo "stdout: [$(cat out.txt)]"
+stdout: []
+$ echo "stderr: [$(head -c 60 err.txt)]"
+stderr: [ls: cannot access '/nonexistentdir': No such file or directo]
+```
+
+错误信息进了 `err.txt`，**没有混进** `out.txt`。这就是为什么脚本里能"只拿结果不拿报错"。
+
+### 4.2 重定向操作符
+
+| 写法 | 含义 |
+| --- | --- |
+| `> file` | stdout 覆盖写入 file |
+| `>> file` | stdout **追加**写入 file |
+| `< file` | stdin 从 file 读 |
+| `2> file` | stderr 写入 file |
+| `2>&1` | **stderr 指向 stdout 当前的目标** |
+| `>&2` | stdout 指向 stderr 当前的目标 |
+| `&> file` | stdout 和 stderr 都写 file（bash 简写） |
+| `\| cmd` | stdout 接管道给 cmd |
+| `\|& cmd` | stdout **和 stderr** 都接管道（bash 4+） |
+| `/dev/null` | 黑洞，丢弃 |
+
+实测追加与覆盖的区别：
+
+```bash
+$ printf 'first\n' > t.txt; printf 'second\n' >> t.txt; cat t.txt
+first
+second
+```
+
+### 4.3 重点：`2>&1` 的顺序陷阱
+
+**这是本节最容易踩的坑**。看实测：
+
+```bash
+$ { echo "to-stdout"; echo "to-stderr" >&2; } 2>&1 | sed 's/^/merged: /'
+merged: to-stdout
+merged: to-stderr
+```
+
+两条都进了管道，符合预期。但如果**顺序写反了**：
+
+```bash
+$ { echo "to-stdout"; echo "to-stderr" >&2; } > file 2>&1    # 正确：都进 file
+$ { echo "to-stdout"; echo "to-stderr" >&2; } 2>&1 > file    # 错误！
+```
+
+实测两种写法的区别：
+
+```bash
+$ { echo out; echo err >&2; } >/tmp/o.txt 2>&1; cat /tmp/o.txt
+out
+err                                    # 两条都进了文件 ✓
+
+$ { echo out; echo err >&2; } 2>&1 >/tmp/o2.txt; echo "file has:"; cat /tmp/o2.txt
+err                                    # err 留在了终端
+file has:
+out                                    # 文件里只有 out ✗
+```
+
+第二条为什么错？因为 **`2>&1` 里的"1"是"此刻 fd 1 指向哪里"，不是"fd 1 最终指向哪里"**：
+
+- `> file 2>&1`：先让 fd1 → file，再让 fd2 → **fd1 现在的地方（即 file）** ✓
+- `2>&1 > file`：先让 fd2 → **fd1 现在的地方（终端）**，再让 fd1 → file。结果 stderr 仍走终端 ✗
+
+:::danger[记忆口诀]
+**"重定向从左到右执行，`2>&1` 是快照，不是引用。"** 想让 stderr 跟 stdout 走同一个地方，就把 `2>&1` 写在 `>` 的**后面**。
+:::
+
+### 4.4 tee：一分为二
+
+```bash
+$ printf 'x\n' | tee copy.txt | sed 's/^/tee: /'
+tee: x
+$ cat copy.txt
+x
+```
+
+`tee` 把数据**同时**写文件和继续往管道送。典型用途：
+
+```bash
+make 2>&1 | tee build.log      # 既在屏幕上看，又留一份日志
+```
+
+### 4.5 here-doc：在脚本里嵌入多行文本
+
+```bash
+$ cat <<'HD'
+here doc line1
+HD
+here doc line1
+```
+
+- `<<'HD'`：引号包裹的定界符，内容**不做变量替换**
+- `<<HD`：不加引号，内容里的 `$VAR` **会被展开**
+- `<<-HD`：忽略行首的 TAB（用于缩进对齐）
+
+:::tip[在嵌入式脚本里写配置文件]
+```bash
+cat > /etc/network/interfaces <<EOF
+auto eth0
+iface eth0 inet static
+    address 192.168.1.100
+EOF
+```
+不带引号的 `EOF` 让 `$IP` 之类能被替换，方便脚本生成配置。
+:::
+
+## 5. 环境变量
+
+### 5.1 作用域：为什么需要 export
+
+环境变量存在每个进程的**独立副本**里，子进程会**继承**父进程的环境。但**普通 shell 变量不会自动传给子进程**——这正是 `export` 存在的意义。实测：
+
+```bash
+$ MYVAR=hello
+$ sh -c 'echo "not exported -> [$MYVAR]"'
+not exported -> []
+$ export MYVAR=hello
+$ sh -c 'echo "exported     -> [$MYVAR]"'
+exported     -> [hello]
+```
+
+第一段 `MYVAR=hello` 只是当前 shell 的一个普通变量，子进程 `sh` **看不到**；`export` 之后它进了环境表，子进程就继承到了。
+
+:::tip[还有一种"只对一条命令生效"的写法]
+```bash
+$ MYVAR=hello sh -c 'echo "[$MYVAR]"'
+[hello]
+```
+
+`VAR=val cmd` 这种**前缀赋值**语法只对紧跟着的那一条命令生效（它是 shell 的特殊语法，不是 export）。适合"临时改一次"的场景，比如交叉编译时：
+
+```bash
+CROSS_COMPILE=arm-linux-gnueabihf- make
+```
+:::
+
+### 5.2 常用环境变量
+
+```bash
+$ echo "HOME=$HOME SHELL=$SHELL PWD=$PWD"
+HOME=/root SHELL=/bin/bash PWD=/tmp/labI
+```
+
+| 变量 | 含义 |
+| --- | --- |
+| `PATH` | 命令搜索路径（冒号分隔） |
+| `HOME` | 家目录 |
+| `SHELL` | 当前 shell |
+| `PWD` / `OLDPWD` | 当前/上一个目录 |
+| `USER` / `LOGNAME` | 用户名 |
+| `LD_LIBRARY_PATH` | **动态库额外搜索路径**（交叉编译时高频用到） |
+| `CROSS_COMPILE` | 交叉编译工具链前缀 |
+| `ARCH` | 内核编译的目标架构 |
+| `PKG_CONFIG_PATH` | pkg-config 的 .pc 文件搜索路径 |
+| `TERM` | 终端类型（影响 vim/clear 等行为） |
+
+### 5.3 env -i：清空环境
+
+```bash
+$ env -i /bin/sh -c 'echo "env -i PATH=[$PATH]"'
+env -i PATH=[/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin]
+```
+
+:::info[上面的 PATH 为什么不是空的]
+`env -i` 清空了环境，但 `/bin/sh` 启动时会给 `PATH` 设一个**默认值**（因为 POSIX 要求 shell 有默认 PATH）。这解释了为什么你在 `crontab` 里（环境极简）有时仍能跑通命令，但**很多环境变量依赖的命令会失败**——cron 环境里没有 `TERM`、没有 `DISPLAY`，这排查问题时要考虑。
+:::
+
+`env` 的其他用法：
+
+```bash
+env                      # 列出所有环境变量
+env -i cmd               # 清空环境跑 cmd（排查"在我机器上能跑"的神器）
+env VAR=val cmd          # 只给这一次命令加变量
+```
+
+### 5.4 PATH 的查找顺序
+
+shell 按 `PATH` 里目录的**先后顺序**查找，**找到第一个就停**。这意味着：
+
+- 想"覆盖"系统命令，把自己的目录放**前面**：`export PATH=/my/bin:$PATH`
+- 放后面（`PATH=$PATH:/my/bin`）则系统命令优先
+
+:::danger[不要在 PATH 里放 `.`（当前目录）]
+攻击者可以在共享目录放一个名为 `ls` 的恶意程序，你 `cd` 进去敲 `ls` 就中招了。要执行当前目录的程序，老老实实写 `./program`。
+:::
+
+## 6. 引号：单引号、双引号、反引号
+
+实测对比：
+
+```bash
+$ V='hello world'
+$ echo "double: [$V]"
+double: [hello world]
+$ echo 'single: [$V]'
+single: [$V]
+```
+
+| 引号 | 变量 `$VAR` | 命令替换 | 反斜杠转义 | 通配符 `*` |
+| --- | --- | --- | --- | --- |
+| 无引号 | 展开 | 展开 | 生效 | **展开** |
+| 双引号 `"` | **展开** | 展开 | 部分生效 | 不展开 |
+| 单引号 `'` | **不展开** | 不展开 | 不生效 | 不展开 |
+
+经验法则：
+
+- **默认用双引号**包裹变量：`"$VAR"` —— 防止值里有空格时被拆成多个参数
+- **要字面量**（正则、awk 程序、密码）用单引号
+- 命令替换用 `$(cmd)`，**不要用反引号** `` `cmd` ``（嵌套困难、易与单引号混淆）
+
+:::warning[不加引号的经典 bug，以及为什么上面的 `wc -w` 测不出来]
+```bash
+$ FILE="my data.txt"
+$ cat $FILE        # 错！被拆成 cat 'my' 'data.txt'，报找不到两个文件
+$ cat "$FILE"      # 对
+```
+
+注意一个**容易误判**的地方：用 `echo $V | wc -w` 是测不出这个 bug 的，因为 `echo` 会把收到的多个参数**再用空格拼回来**输出：
+
+```bash
+$ V='hello world'
+$ echo "unquoted count: $(echo $V | wc -w)"
+unquoted count: 2
+$ echo "quoted   count: $(echo "$V" | wc -w)"
+quoted   count: 2
+```
+
+两次都是 2，看起来没差别——但那是因为 `echo` 抹平了差异。**真正能暴露问题的命令是那些对参数个数敏感的**（`cat`、`ls`、`cp`、`test`），它们会把 `my` 和 `data.txt` 当成两个独立的文件名。
+
+在 shell 脚本里，**所有变量引用都应该加双引号**，这是编写健壮脚本的第一条纪律。
+:::
+
+---
+
+**翻页**：[← 上一页](./shell-03) · [下一页 →](./shell-05) · [返回目录](./)

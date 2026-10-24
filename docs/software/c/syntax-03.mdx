@@ -1,0 +1,105 @@
+---
+id: syntax-03
+title: "03 `_Static_assert`：编译期断言"
+sidebar_position: 4
+description: "语法基础 第 3 部分：`_Static_assert`：编译期断言"
+---
+
+# 03 `_Static_assert`：编译期断言
+C11 引入（**注意下划线**）。本机在 `-std=c17` 下实测通过：
+
+```c
+_Static_assert(sizeof(int) == 4, "int must be 4 bytes");
+```
+
+```text
+_Static_assert passed (C11, __STDC_VERSION__=201710)
+```
+
+`__STDC_VERSION__` 的值：`199901L`(C99) / `201112L`(C11) / `201710L`(C17)。可以用它做条件编译。
+
+:::caution[`_Static_assert` vs `static_assert`]
+- **`_Static_assert`** 是 **C11** 引入的关键字
+- **`static_assert`**（不带下划线）是 **C23** 才成为关键字的；在 C11/C17 里它只是 `<assert.h>` 提供的一个宏
+
+写代码时用 `_Static_assert` 最稳妥，在所有 C11+ 工具链都能用。
+:::
+
+典型用途——**守住你对平台的假设**：
+
+```c
+_Static_assert(sizeof(int) == 4, "this driver assumes 32-bit int");
+_Static_assert(CHAR_BIT == 8, "byte must be 8 bits");
+_Static_assert(sizeof(void *) == 4, "32-bit MCU only");
+```
+
+这是把"我以为"变成"编译期证明"的最有效手段，**在嵌入式里应该大量使用**。
+
+## 九、常量与字面量后缀
+
+| 后缀 | 含义 | 例子 |
+| --- | --- | --- |
+| `u` / `U` | unsigned | `42u` |
+| `l` / `L` | long | `42L` |
+| `ll` / `LL` | long long | `42LL` |
+| `ul` / `UL` | unsigned long | `42UL` |
+| `ull` | unsigned long long | `42ULL` |
+| `f` / `F` | float（默认是 double） | `3.14f` |
+| 无 | double | `3.14` |
+
+整数前缀：`0x` 十六进制、`0` 八进制、`0b` 二进制（**C23 标准；gcc/clang 作为扩展早已支持**）。
+
+:::tip[十六进制常量默认是"能装下的最小有符号类型"链的起点]
+`0x80000000` 在 32 位 `int` 平台上会尝试 `int` → 装不下 → `unsigned int` → `long` → `unsigned long`。所以它的类型可能不是你以为的那个。加 `u` 后缀明确意图。
+
+嵌入式里写寄存器掩码**一律加 `u`**：`0x80000000u`。
+:::
+
+## 常见坑
+
+| 陷阱 | 现象 | 原因 | 正确做法 |
+| --- | --- | --- | --- |
+| 用 `long` 表示 64 位 | Windows 上溢出 | LLP64 vs LP64 | 用 `int64_t` / `uint64_t` |
+| `char` 当数值用 | 200 变成 -56 | `char` 符号性实现定义 | 显式 `signed char` / `unsigned char` / `uint8_t` |
+| `-1 < 1u` 为假 | 比较结果反直觉 | 有符号被转成无符号 | 避免混用；需要时显式转换并先验证非负 |
+| `sizeof(x) > n`（n 为负）| 恒为假 | `n` 转成 `size_t` | 保证 `n` 非负，或显式转换 |
+| `flags & MASK == MASK` | 判断恒错 | `==` 优先级高于 `&` | 写 `(flags & MASK) == MASK` |
+| `1 << 31` | UB / 负数 | 有符号左移溢出 | 用 `1u << 31` |
+| 右移负数 | 得到负值 | 算术右移（实现定义） | 先转无符号再右移 |
+| `i++ + i++` | 结果不可预测 | 序列点违规 UB | 拆成多条语句 |
+| `printf("%d %d", i++, i++)` | 输出顺序奇怪 | 实参求值顺序未指定 + UB | 拆开写 |
+| `switch` 忘 `break` | 多个 case 都执行 | fallthrough | 每个 case 加 `break` |
+| `case` 后直接声明变量 | 编译错误 | 跳过初始化 | 加 `{}` |
+| `if (x = 5)` | 赋值当比较，恒真 | 手误 | 写 `if (x == 5)`，开 `-Wparentheses` |
+| 悬空 `else` | 绑定到错误的 if | 最近未配对原则 | 永远加花括号 |
+| `uint8_t a = 200 + 100;` | 得 44 不是 300 | 整数提升后截断 | 用足够宽的类型接收结果 |
+| 以为 `sizeof` 是函数 | 语法困惑 | 它是运算符 | `sizeof x` 合法，`sizeof(int)` 的括号属于类型名 |
+
+## 自检清单
+
+- [ ] 知道 C 标准唯一保证的绝对大小是 `sizeof(char) == 1` 吗？
+- [ ] 本机 `long` 是几字节？Linux 上是几字节？为什么不同？
+- [ ] 能说出 `int32_t`、`int_least32_t`、`int_fast32_t` 三者的区别吗？
+- [ ] 知道 `char` 的符号性是实现定义的吗？处理字节流该用什么类型？
+- [ ] C 里 `sizeof('a')` 是几？为什么和 C++ 不同？
+- [ ] 整数提升会把 `uint8_t + uint8_t` 变成什么类型的运算？
+- [ ] 能解释为什么 `-1 < 1u` 是 false 吗？
+- [ ] 无符号回绕是定义的还是有符号溢出是定义的？分别是什么？
+- [ ] 能背出 `&` 和 `==` 的优先级关系吗？
+- [ ] 位移运算中哪些情况是 UB？右移负数属于哪一类？
+- [ ] 知道什么是序列点吗？能举出一个违反序列点的例子吗？
+- [ ] `switch` 的四个陷阱分别是什么？
+- [ ] `_Static_assert` 是哪个标准引入的？用在什么场景？
+- [ ] 知道 `__STDC_VERSION__` 在 C99/C11/C17 下的值吗？
+
+## 下一步
+
+- [指针专章](./pointers) —— 类型系统讲完，正好讲"类型如何与地址绑定"
+- [内存模型](./memory) —— 这些类型在运行时存在哪里
+- [位运算与寄存器](./bitops) —— 位移和掩码的实战
+- [未定义行为与陷阱](./pitfalls) —— 本页所有 UB 的系统化总结
+- [回到导读](./)
+
+---
+
+**翻页**：[← 上一页](./syntax-02) · [返回目录](./)

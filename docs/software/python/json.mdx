@@ -1,0 +1,316 @@
+---
+id: json
+title: JSON / YAML / CSV
+sidebar_position: 22
+description: json 的四个必会参数、浮点与大整数的精度陷阱、YAML 的语法雷区、CSV 的引号与换行处理、以及三种格式怎么选。
+---
+
+# JSON / YAML / CSV
+
+**本课目标**：会正确读写三种数据格式，不被它们的坑绊住。
+
+## JSON：`json` 模块
+
+```python
+import json
+
+data = json.loads('{"a": 1, "b": [2, 3]}')        # 字符串 → 对象
+text = json.dumps(data, ensure_ascii=False, indent=2)
+
+with open("cfg.json", encoding="utf-8") as f:
+    data = json.load(f)                            # 文件 → 对象
+with open("cfg.json", "w", encoding="utf-8") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+```
+
+:::danger[`ensure_ascii=False` 不加就是一堆 `\uXXXX`]
+```python
+json.dumps({"name": "张三"})
+# '{"name": "\\u5f20\\u4e09"}'      ← 默认转义非 ASCII
+
+json.dumps({"name": "张三"}, ensure_ascii=False)
+# '{"name": "张三"}'
+```
+
+**给人看的输出必须加 `ensure_ascii=False`**（配合 `encoding="utf-8"` 写文件）。
+:::
+
+:::warning[`indent` 会显著增大文件]
+```python
+json.dumps(data)                 # 紧凑
+json.dumps(data, indent=2)       # 可读，但体积可能翻倍
+```
+
+**配置文件用 `indent=2`；网络传输/存储用紧凑格式。**
+
+**`separators=(",", ":")` 能进一步压缩**（去掉空格）。
+:::
+
+### 精度陷阱
+
+:::danger[`json` 会把整数变成浮点吗？不会，但会被 float 精度限制]
+```python
+json.loads('1.0')          # 1.0（float）
+json.loads('1')            # 1（int）
+json.loads('123456789012345678901234567890')
+# 123456789012345678901234567890     ← Python 的 int 是任意精度，没问题
+```
+
+**但如果是别的语言生成的大整数（如 JavaScript 的 Number），可能已经丢精度了。**
+
+**反过来：Python 的 `float` 序列化再反序列化会保持，但 `0.1 + 0.2` 类问题依然存在。**
+:::
+
+```python
+# 需要精确小数：用 Decimal + parse_float
+import decimal, json
+
+json.loads('0.1', parse_float=decimal.Decimal)     # Decimal('0.1')
+json.dumps(decimal.Decimal('0.1'))                 # ❌ TypeError
+```
+
+:::tip[金额等精确数值不要用 JSON 的 float]
+**方案一**：整数存"分"（`1234` 表示 12.34 元）。
+
+**方案二**：字符串存（`"12.34"`），解析时转 `Decimal`。
+
+**绝对不要**直接 `json.loads` 得到 `float` 然后做加减。
+:::
+
+### 无法序列化的类型
+
+```python
+json.dumps({"t": datetime.now()})
+# TypeError: Object of type datetime is not JSON serializable
+```
+
+```python
+# 自定义 encoder
+class Encoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, datetime):
+            return o.isoformat()
+        if isinstance(o, set):
+            return sorted(o)
+        return super().default(o)
+
+json.dumps(data, cls=Encoder, ensure_ascii=False)
+```
+
+:::warning[`default=` 参数能省掉类]
+```python
+json.dumps(data, default=str)         # 简单粗暴：全部转字符串
+json.dumps(data, default=lambda o: o.isoformat() if hasattr(o, "isoformat") else str(o))
+```
+
+**`default=str` 很方便，但它会把 `datetime` 变成 `"2026-01-01 10:00:00"`**（空格分隔，不是 ISO 8601）—— 反序列化时可能解析不出来。
+:::
+
+### 安全提示
+
+:::danger[`json.loads` 本身是安全的，但 `eval` 不是]
+```python
+data = eval(text)          # ❌ 可以执行任意代码
+data = json.loads(text)    # ✅ 只解析数据
+```
+
+**永远不要用 `eval` 解析 JSON** —— 这是最经典的安全漏洞之一。
+:::
+
+## YAML：可读性最好，语法最坑
+
+```python
+import yaml          # pip install pyyaml
+
+with open("cfg.yaml", encoding="utf-8") as f:
+    data = yaml.safe_load(f)         # ✅ 永远用 safe_load
+
+yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+```
+
+:::danger[必须用 `safe_load`，不要用 `load`]
+```python
+yaml.load(text)                 # ❌ 旧版可执行任意 Python 对象
+yaml.load(text, Loader=yaml.SafeLoader)   # ✅ 等价 safe_load
+yaml.safe_load(text)            # ✅ 推荐
+```
+
+**`yaml.load` 在旧版 PyYAML 里能构造任意 Python 对象 → 远程代码执行。**
+:::
+
+:::warning[YAML 的语法雷区]
+**① `no` / `yes` / `on` / `off` 会被解析成布尔值（YAML 1.1）**
+
+```yaml
+country: NO        # → False ！不是字符串 "NO"
+```
+
+**改写成 `"NO"` 加引号。**
+
+**② 冒号后必须有空格**
+
+```yaml
+key:value          # ❌ 不是映射，是一个字符串 "key:value"
+key: value         # ✅
+```
+
+**③ 缩进必须用空格，不能用 tab**
+
+**④ 多行字符串的 `|` 与 `>`**
+
+```yaml
+literal: |         # 保留换行
+  line1
+  line2
+folded: >          # 折叠成一行
+  line1
+  line2
+```
+:::
+
+:::danger[YAML 的隐式类型转换是最大坑源]
+```yaml
+version: 1.10      # → 1.1（浮点！不是字符串 "1.10"）
+version: "1.10"    # ✅ 字符串
+```
+
+**版本号、电话号码、以 0 开头的编号，统统加引号。**
+
+**`08` 会被当八进制解析（YAML 1.1）→ 报错或变成 8。**
+:::
+
+## CSV：看似简单，实则复杂
+
+```python
+import csv
+
+# 读
+with open("data.csv", newline="", encoding="utf-8") as f:
+    for row in csv.reader(f):
+        print(row)              # 每行是 list
+
+# 用 DictReader 带表头
+with open("data.csv", newline="", encoding="utf-8") as f:
+    for row in csv.DictReader(f):
+        print(row["name"])
+
+# 写
+with open("out.csv", "w", newline="", encoding="utf-8") as f:
+    w = csv.writer(f)
+    w.writerow(["name", "age"])
+    w.writerow(["张三", 30])
+```
+
+:::danger[`newline=""` 不能漏]
+```python
+open("data.csv")              # ❌ Windows 上会多出空行
+open("data.csv", newline="")  # ✅
+```
+
+**CSV 模块自己处理换行，如果 Python 又做一次转换，就会多出空行** —— 这是 Windows 上写 CSV 最经典的 bug。
+:::
+
+:::warning[字段里含逗号/引号/换行是合法的]
+```csv
+name,note
+张三,"喜欢猫,狗"
+李四,"他说""你好"""
+王五,"第一行
+第二行"
+```
+
+**所以绝不能用 `line.split(",")` 解析 CSV** —— 必须用 `csv` 模块（它懂引号转义规则）。
+:::
+
+```python
+# 用别的分隔符
+csv.reader(f, delimiter="\t")          # TSV
+csv.reader(f, delimiter=";")
+
+# 自定义引号规则
+csv.reader(f, quoting=csv.QUOTE_ALL)
+```
+
+:::tip[CSV 的编码：Excel 需要 BOM]
+**Excel 打开 UTF-8 CSV 时如果不带 BOM 会乱码。**
+
+```python
+open("out.csv", "w", newline="", encoding="utf-8-sig")    # 带 BOM（给 Excel）
+open("out.csv", "w", newline="", encoding="utf-8")        # 不带（给程序）
+```
+:::
+
+:::warning[CSV 没有类型]
+```python
+row = ["张三", "30", "1.75"]
+```
+
+**全是字符串**，数字要自己转。**用 `DictReader` 配合 `csv.QUOTE_NONNUMERIC` 可以自动转浮点**（但整数还是字符串）。
+:::
+
+## 三种格式怎么选
+
+| 场景 | 推荐 |
+| --- | --- |
+| **API 传输、跨语言** | **JSON** |
+| **人手写的配置文件** | **YAML**（可加注释） |
+| **表格数据、Excel 交换** | **CSV** |
+| 需要注释的机器配置 | YAML 或 TOML（TOML 更严格） |
+| 极大数据 | JSON Lines（每行一个 JSON）或 Parquet |
+
+:::tip[JSON Lines 适合流式处理]
+```text
+{"id":1,"msg":"a"}
+{"id":2,"msg":"b"}
+```
+
+**每行一个独立 JSON 对象** —— 可以逐行处理，不需要一次读进内存。
+
+**日志、大数据导出常用这个格式。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 中文变成 `\uXXXX` | 没加 `ensure_ascii=False` | 加上 |
+| 金额算出小数误差 | 用了 float | 用整数分或 `Decimal` |
+| `json.dumps` 报 TypeError | 有 datetime/set | 自定义 encoder |
+| YAML 里 `NO` 变 False | YAML 1.1 布尔语义 | 加引号 |
+| YAML 版本号 `1.10` 变 1.1 | 隐式 float | 加引号 |
+| CSV 多出空行 | 没 `newline=""` | 加上 |
+| CSV 解析错列 | 用了 `split(",")` | 用 `csv` 模块 |
+| Excel 打开乱码 | UTF-8 无 BOM | `encoding="utf-8-sig"` |
+| YAML 加载执行代码 | 用了 `yaml.load` | `safe_load` |
+
+:::danger[配置文件的"类型漂移"问题]
+```yaml
+debug: "true"        # 字符串 "true"
+debug: true          # 布尔 True
+```
+
+**程序里 `if cfg["debug"]:` 对两者都为真**，但 `cfg["debug"] == True` 对前者为假。
+
+**这类 bug 极难查** —— 建议用 `pydantic` 等带类型校验的解析器。
+:::
+
+## 本课自检
+
+- [ ] 会用 `json.load/dump` 的四个组合
+- [ ] **知道中文输出要 `ensure_ascii=False`**
+- [ ] 知道 `indent` 会增大体积、`separators` 能压缩
+- [ ] **知道金额等精确数值不该用 JSON float**
+- [ ] 会自定义 `JSONEncoder` 处理 datetime/set
+- [ ] **知道不能用 `eval` 解析 JSON**
+- [ ] **知道 YAML 必须用 `safe_load`**
+- [ ] **知道 YAML 里 `no`/`yes`/`on`/`off` 是布尔值，版本号要加引号**
+- [ ] 知道 YAML 冒号后必须有空格、不能用 tab
+- [ ] 会用 `|` 与 `>` 的多行字符串
+- [ ] **知道 CSV 必须 `newline=""`，否则 Windows 多空行**
+- [ ] **知道不能用 `split(",")` 解析 CSV**
+- [ ] 知道 Excel 需要 `utf-8-sig`
+- [ ] 能按场景选择三种格式
+
+## 下一步
+
+[时间与日期](./datetime) 或 [文件与路径](./files)。

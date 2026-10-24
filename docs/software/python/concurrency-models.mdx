@@ -1,0 +1,297 @@
+---
+id: concurrency-models
+title: 并发模型对比
+sidebar_position: 25
+description: 线程/进程/asyncio 三种模型的开销与适用边界、GIL 的真实影响、实测数据、以及一个需求该选哪个的判断流程。
+---
+
+# 并发模型对比
+
+**本课目标**：面对并发需求能一次选对模型，不再"先写线程再说"。
+
+## 三种模型
+
+| 模型 | 并发单位 | 切换开销 | 内存 | 绕过 GIL |
+| --- | --- | --- | --- | --- |
+| **threading** | 线程 | 小（但仍是内核调度） | 每个线程 8MB 栈（虚拟） | ❌ |
+| **multiprocessing** | 进程 | **大**（fork/序列化） | 每进程独立解释器 | ✅ |
+| **asyncio** | 协程 | **极小**（纯用户态） | 每协程几 KB | ❌ |
+
+:::danger[先看清 GIL 到底限制了什么]
+**GIL 保证"同一时刻只有一个线程执行 Python 字节码"。**
+
+**所以**：
+
+- **纯 Python 的 CPU 密集计算** → 多线程**完全没有加速**（甚至更慢）
+- **IO 阻塞时线程会释放 GIL** → 多线程**有效**
+- **C 扩展（numpy 等）在计算时释放 GIL** → 多线程能加速
+:::
+
+:::tip[判断流程]
+```text
+任务主要是"等"还是"算"？
+├─ 等（网络、磁盘、数据库、sleep）
+│   ├─ 并发量很大（几千连接）→ asyncio
+│   └─ 并发量一般（几十）→ threading（更简单）
+└─ 算（纯 Python 计算）
+    ├─ 能用 numpy/C 扩展向量化 → 用它（比多进程还快）
+    └─ 不能 → multiprocessing
+```
+:::
+
+## 实测对比
+
+:::info[三个场景的真实差距]
+**场景 A：两个 0.2 秒的 IO 等待**
+
+| 方式 | 耗时 |
+| --- | --- |
+| 串行 | **0.403 s** |
+| `threading` | **0.203 s** |
+| `asyncio` | **0.202 s** |
+
+**都接近理论最优（0.2s），差异在微秒级。**
+:::
+
+:::warning[场景 B：混入一个阻塞调用]
+
+| 方式 | 耗时 |
+| --- | --- |
+| 两个 `asyncio.sleep` | **0.202 s** ✅ |
+| 一个 `time.sleep` + 一个 `asyncio.sleep` | **0.402 s** ❌ 退化成串行 |
+| `asyncio.to_thread(time.sleep)` + `asyncio.sleep` | **0.215 s** ✅ |
+
+**只要有同步阻塞调用，asyncio 的并发就完全失效。**
+:::
+
+:::danger[场景 C：纯 Python 的 CPU 密集（这就是 GIL 的代价）]
+```python
+def cpu_work(n):
+    s = 0
+    for i in range(n):
+        s += i * i
+    return s
+
+# 串行两次
+cpu_work(10_000_000); cpu_work(10_000_000)
+
+# 两个线程
+t1 = threading.Thread(target=cpu_work, args=(10_000_000,))
+t2 = threading.Thread(target=cpu_work, args=(10_000_000,))
+```
+
+**多线程版本通常和串行一样快，甚至更慢**（线程切换 + 抢 GIL 的开销）。
+
+**要用多进程才真正并行。**
+:::
+
+## threading：什么时候够用
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+with ThreadPoolExecutor(max_workers=8) as ex:
+    results = list(ex.map(fetch, urls))
+```
+
+:::tip[`ThreadPoolExecutor` 比手动管线程好]
+- **自动复用线程**（不用每次 `Thread()`）
+- **`ex.map` 保持结果顺序**
+- **`with` 块结束自动等待**
+- 异常会在取结果时抛出（不会静默丢失）
+:::
+
+:::danger[多线程共享状态的三个坑]
+**① `+=` 不是原子操作**
+
+```python
+counter += 1        # 读-改-写，可能丢更新
+```
+
+```python
+from threading import Lock
+lock = Lock()
+with lock:
+    counter += 1
+```
+
+**② 死锁**（两个锁反序获取）
+
+**③ 线程不退出导致进程挂住**（`daemon=True` 或显式 join）
+:::
+
+## multiprocessing：绕开 GIL
+
+```python
+from concurrent.futures import ProcessPoolExecutor
+
+if __name__ == "__main__":          # ← Windows/macOS 上必需
+    with ProcessPoolExecutor(max_workers=4) as ex:
+        results = list(ex.map(cpu_work, chunks))
+```
+
+:::danger[`if __name__ == "__main__":` 不能省]
+**Windows 和 macOS 用 `spawn` 启动方式**（不是 fork）—— 子进程会**重新导入主模块**。
+
+**没有这个保护 → 无限递归创建进程 → 系统卡死。**
+:::
+
+:::warning[进程池的三个真实开销]
+| 开销 | 说明 |
+| --- | --- |
+| **启动** | 每个进程要导入一遍模块（几百 ms） |
+| **序列化** | 参数和返回值都要 pickle |
+| **内存** | 每个进程独立解释器（几十 MB） |
+
+**所以"传一个 100MB 数组给 8 个进程"可能比计算本身还慢。**
+:::
+
+```python
+# 大数据用共享内存避免序列化
+from multiprocessing import shared_memory
+import numpy as np
+
+shm = shared_memory.SharedMemory(create=True, size=arr.nbytes)
+shared = np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf)
+shared[:] = arr            # 只拷一次
+# 子进程用 SharedMemory(name=shm.name) 打开
+```
+
+:::tip[`chunksize` 参数很重要]
+```python
+ex.map(cpu_work, items, chunksize=100)      # 每次给一个进程 100 个任务
+```
+
+**默认 `chunksize=1` 意味着每个任务都要一次进程间通信** —— 任务很小时开销占主导。
+
+**任务越多越小，`chunksize` 应该越大。**
+:::
+
+## asyncio：高并发 IO 的正解
+
+```python
+import asyncio, aiohttp
+
+async def fetch(session, url):
+    async with session.get(url) as r:
+        return await r.text()
+
+async def main(urls):
+    sem = asyncio.Semaphore(20)                # 限流
+
+    async def limited(u):
+        async with sem:
+            return await fetch(session, u)
+
+    async with aiohttp.ClientSession() as session:
+        return await asyncio.gather(*(limited(u) for u in urls))
+```
+
+:::danger[asyncio 的三条红线]
+**① 绝不能有同步阻塞调用**（`requests`、`time.sleep`、普通文件 IO、`psycopg2`）
+
+**② 忘了 `await` 就等于没执行**（只会得到一条 `RuntimeWarning`）
+
+**③ 不能"在已有事件循环里再 `run`"**（Jupyter / 某些框架里会报错）
+:::
+
+:::warning[什么时候 asyncio 反而更糟]
+**连接数只有几十个时，`threading` 更简单且性能相当。**
+
+**asyncio 的优势要到"上千并发连接"才明显** —— 因为协程的内存开销（几 KB）远小于线程栈。
+
+**为了 20 个并发请求引入整个 async 生态（aiohttp/asyncpg/anyio）通常不值得。**
+:::
+
+## 混合模式
+
+:::tip[CPU 密集 + IO 密集的组合]
+```python
+import asyncio
+from concurrent.futures import ProcessPoolExecutor
+
+async def process_batch(items):
+    loop = asyncio.get_running_loop()
+    with ProcessPoolExecutor() as pool:
+        # 把 CPU 活丢给进程池，await 时不阻塞事件循环
+        results = await loop.run_in_executor(pool, cpu_heavy, items)
+    return results
+```
+
+**这是 asyncio 主循环 + 进程池做 CPU 活的经典组合。**
+:::
+
+:::danger[不要在线程里创建事件循环搞混用]
+```python
+# ❌ 混乱且容易出错
+def worker():
+    asyncio.run(some_coro())        # 在新线程里跑新循环
+
+# ✅ 要么全 async，要么用 run_coroutine_threadsafe
+future = asyncio.run_coroutine_threadsafe(coro(), main_loop)
+future.result()
+```
+:::
+
+## 一张对照表
+
+| 维度 | threading | multiprocessing | asyncio |
+| --- | --- | --- | --- |
+| CPU 密集加速 | ❌（GIL） | ✅ 接近核数 | ❌ |
+| IO 密集加速 | ✅ | ✅（但重） | ✅✅ 最好 |
+| 并发上限 | 几百~几千 | 核数级 | **几万** |
+| 每单位内存 | 大（栈 8MB 虚拟） | 很大（独立解释器） | **几 KB** |
+| 代码复杂度 | 中（要加锁） | 中高（要序列化） | 高（全链路 async） |
+| 调试难度 | 中（死锁难查） | 中 | 中（忘 await） |
+| 跨平台 | ✅ | ⚠️ spawn 差异 | ✅ |
+
+:::tip[经验法则]
+- **IO 密集 + 并发量不大（`<100`）** → `ThreadPoolExecutor`（最省事）
+- **IO 密集 + 并发量极大** → `asyncio`
+- **CPU 密集且无法向量化** → `ProcessPoolExecutor`
+- **CPU 密集但能用 numpy/向量化** → **优先向量化**（比多进程快且简单）
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 多线程没加速 | GIL + CPU 密集 | 改多进程 |
+| 多线程反而更慢 | 抢 GIL + 切换 | 改多进程或串行 |
+| asyncio 并发失效 | 混了阻塞调用 | 换异步库或 `to_thread` |
+| 多进程在 Windows 卡死 | 没 `if __name__ == "__main__"` | 加上 |
+| 多进程传大数据很慢 | pickle 开销 | 用共享内存 |
+| 计数偶尔少 | `+=` 非原子 | 加锁 |
+| 进程池启动慢 | 每个进程要导入模块 | 减少导入、复用池 |
+| 死锁 | 两锁反序 | 规定全局顺序 |
+| `ThreadPoolExecutor` 任务丢失 | 没等 `with` 结束就退出 | 用 `with` 或用 `shutdown(wait=True)` |
+
+:::danger[daemon 线程在解释器退出时会被强杀]
+```python
+t = threading.Thread(target=work, daemon=True)
+```
+
+**主线程结束时它们被直接杀掉** —— 可能正在写文件、提交事务。
+
+**要么 join，要么确保任务可中断。**
+:::
+
+## 本课自检
+
+- [ ] **能说清 GIL 限制的是"纯 Python CPU 计算"**
+- [ ] **知道 IO 阻塞时线程释放 GIL，所以多线程对 IO 有效**
+- [ ] **知道纯 Python CPU 密集用多线程没有加速**
+- [ ] 会用 `ThreadPoolExecutor` 而不是手动管理线程
+- [ ] **知道 `+=` 不是原子操作，要加锁**
+- [ ] **知道多进程在 Windows/macOS 上必须 `if __name__ == "__main__"`**
+- [ ] **知道多进程的三大开销（启动/序列化/内存）**
+- [ ] 会用共享内存避免大数据序列化
+- [ ] **知道 `chunksize` 对进程池性能影响很大**
+- [ ] **知道 asyncio 的三条红线**
+- [ ] **知道连接数少时 threading 更简单且够用**
+- [ ] 会用"asyncio 主循环 + 进程池"做混合
+- [ ] 知道 daemon 线程会被强杀
+
+## 下一步
+
+[异步编程 asyncio](./asyncio) 或 [性能剖析](./perf)。

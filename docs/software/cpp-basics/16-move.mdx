@@ -1,0 +1,336 @@
+---
+id: 16-move
+title: 16 移动语义入门
+sidebar_position: 16
+description: std::move 其实不移动任何东西、右值引用、移动构造的写法，以及为什么它能避免深拷贝。
+---
+
+# 16 移动语义入门
+
+**本课目标**：理解 `std::move` 到底做了什么，会写移动构造。
+
+## 先破除一个误解
+
+:::danger[`std::move` 不移动任何东西]
+```cpp
+std::string a = "hello";
+std::string b = std::move(a);
+```
+
+**`std::move` 只做一件事：把左值转换成右值引用。** 它本身**不搬运任何数据**。
+
+真正干活的是**移动构造函数**——`std::move` 只是告诉编译器"允许调用移动版本"。
+:::
+
+## 为什么需要移动
+
+![移动语义对比深拷贝：拷贝要分配新内存并复制全部数据，移动只交换指针，代价是源对象被置空](/img/diagrams/cpp-move-semantics.svg)
+
+
+考虑深拷贝（[第 8 课](./08-copy)）：
+
+```cpp
+std::string a(1000000, 'x');      /* 100 万字符 */
+std::string b = a;                 /* 深拷贝：又分配 100 万字节 */
+```
+
+**如果 `a` 之后不再用，这次复制完全浪费。**
+
+移动语义允许："**把 `a` 内部的指针直接拿过来**，别复制数据"。
+
+## `std::move` 的实际效果
+
+本机实测：
+
+```cpp
+Tracker a("A");
+Tracker b = std::move(a);
+std::cout << (a.name.empty() ? "空" : "非空");
+```
+
+输出：
+
+```text
+  构造 A
+  移动 A (源变空:是)
+  移动后 a.name 空? 是
+```
+
+:::warning[移动后源对象处于"有效但未指定"状态]
+**标准只保证源对象还能安全析构和赋值**，不保证内容是什么。
+
+对 `std::string` 通常是空的，但**不要依赖这个具体行为**。
+
+**规矩：`std::move(x)` 之后不要再读 `x` 的值。**
+:::
+
+## 左值 / 右值
+
+| 概念 | 说明 | 例子 |
+| --- | --- | --- |
+| **左值**（lvalue） | 有名字、能取地址 | `int x;` 中的 `x` |
+| **右值**（rvalue） | 临时值、即将销毁 | `42`、`a + b`、函数返回值 |
+
+```cpp
+int x = 42;
+int &lref = x;             /* 左值引用，绑左值 */
+int &&rref = 42;           /* 右值引用，绑右值 */
+
+int &&r2 = std::move(x);   /* std::move 把左值转成右值引用 */
+```
+
+**移动构造的参数就是右值引用 `T&&`。**
+
+## 写移动构造函数
+
+```cpp
+class Buffer {
+public:
+    explicit Buffer(size_t n) : data_(new char[n]), size_(n) { }
+
+    /* 拷贝构造：深拷贝 */
+    Buffer(const Buffer &other) : size_(other.size_) {
+        data_ = new char[size_];
+        std::copy(other.data_, other.data_ + size_, data_);
+    }
+
+    /* 移动构造：直接偷指针 */
+    Buffer(Buffer &&other) noexcept
+        : data_(other.data_), size_(other.size_) {
+        other.data_ = nullptr;        /* 源放弃所有权 */
+        other.size_ = 0;
+    }
+
+    ~Buffer() { delete[] data_; }
+
+private:
+    char *data_ = nullptr;
+    size_t size_ = 0;
+};
+```
+
+:::tip[移动构造的两个关键点]
+**① 必须标 `noexcept`**
+
+```cpp
+Buffer(Buffer &&other) noexcept
+```
+
+**为什么**：`vector` 扩容时要在"移动"和"拷贝"之间选。如果移动**可能抛异常**，为保证异常安全，它宁可**用拷贝**（慢但安全）。
+
+标了 `noexcept`，`vector` 才会用移动。
+
+**② 必须把源对象置空**
+
+```cpp
+other.data_ = nullptr;
+```
+
+否则源对象析构时会 `delete` 已经被偷走的指针 → **double free**。
+:::
+
+## 什么时候移动会发生
+
+本机实测各种场景：
+
+```text
+--- std::move 只是类型转换 ---
+  构造 A
+  移动 A (源变空:是)
+
+--- 函数按值返回（RVO）---
+  构造 RVO                    ← 连移动都没有，直接构造在目标位置！
+
+--- 传参 ---
+  构造 C
+  按值传:
+  拷贝 C                       ← 按值传参是拷贝（除非传 std::move）
+  按引用:
+    (引用 C)                   ← 引用，没有复制
+
+--- vector 扩容时移动 ---
+  构造 V1
+  移动 V1 (源变空:是)
+  push 第二个（触发扩容）:
+  构造 V2
+  移动 V1 (源变空:是)          ← 扩容时移动已有元素
+```
+
+:::danger[`std::move` 用在 `const` 对象上无效]
+```cpp
+const std::string a = "hello";
+std::string b = std::move(a);      /* ⚠️ 这里会拷贝！ */
+```
+
+因为 `const` 右值引用 `const T&&` 匹配不上移动构造 `T&&`，只能退回复制。
+
+**注意**：如果 `a` 是 `const T`，移动会**静默变成拷贝**，没有编译错误。
+:::
+
+## 返回值的 RVO
+
+```cpp
+std::string make() {
+    return std::string("hello");       /* 不会拷贝也不会移动 */
+}
+
+std::string s = make();
+```
+
+**编译器直接在 `s` 的内存里构造对象**——这叫 RVO（返回值优化），C++17 起**保证发生**。
+
+:::tip[所以别写这些"优化"]
+```cpp
+/* ❌ 反而可能阻止优化 */
+return std::move(local_string);
+
+/* ✅ 直接返回 */
+return local_string;
+```
+
+**`return local_object;` 就是最优写法**，编译器比你会优化。
+:::
+
+## `std::move` 的正确用途
+
+```cpp
+/* ① 把对象所有权转进容器（避免拷贝） */
+std::vector<std::string> v;
+std::string s = "hello";
+v.push_back(std::move(s));       /* s 之后别再用 */
+
+/* ② 转移 unique_ptr（第 14 课） */
+auto p2 = std::move(p1);
+
+/* ③ 给成员赋值时转移参数 */
+class Widget {
+public:
+    explicit Widget(std::string name) : name_(std::move(name)) { }
+private:
+    std::string name_;
+};
+```
+
+:::tip[第 ③ 种是最常见的好用法]
+```cpp
+explicit Widget(std::string name) : name_(std::move(name)) { }
+```
+
+`name` 是**按值传参**（调用者的字符串会被拷贝或移动进来），然后**再移动进成员**。
+
+- 调用者传左值 → 拷贝进参数，再移动进成员（1 次拷贝 + 1 次移动）
+- 调用者传右值 → 移动进参数，再移动进成员（2 次移动）
+
+**比"传 const& 再拷贝进成员"更灵活。**
+:::
+
+## 完整示例
+
+```cpp
+#include <iostream>
+#include <string>
+#include <vector>
+
+class Buffer {
+public:
+    explicit Buffer(size_t n, char fill = 'x')
+        : data_(new char[n]), size_(n) {
+        std::fill(data_, data_ + n, fill);
+    }
+
+    ~Buffer() { delete[] data_; }
+
+    Buffer(const Buffer &o) : size_(o.size_) {
+        data_ = new char[size_];
+        std::copy(o.data_, o.data_ + size_, data_);
+        std::cout << "  [深拷贝 " << size_ << " 字节]\n";
+    }
+
+    Buffer(Buffer &&o) noexcept
+        : data_(o.data_), size_(o.size_) {
+        o.data_ = nullptr;
+        o.size_ = 0;
+        std::cout << "  [移动（偷指针，不复制数据）]\n";
+    }
+
+    size_t size() const { return size_; }
+
+private:
+    char *data_ = nullptr;
+    size_t size_ = 0;
+};
+
+int main() {
+    std::cout << "--- 拷贝 ---\n";
+    {
+        Buffer a(1000);
+        Buffer b = a;
+    }
+
+    std::cout << "--- 移动 ---\n";
+    {
+        Buffer a(1000);
+        Buffer b = std::move(a);
+        std::cout << "  a.size()=" << a.size()
+                  << " b.size()=" << b.size() << "\n";
+    }
+
+    std::cout << "--- 放进容器 ---\n";
+    {
+        std::vector<Buffer> v;
+        v.reserve(4);                  /* 预留，避免扩容时移动 */
+        v.push_back(Buffer(100));
+        v.push_back(Buffer(200));
+        std::cout << "  容器里有 " << v.size() << " 个\n";
+    }
+    return 0;
+}
+```
+
+输出：
+
+```text
+--- 拷贝 ---
+  [深拷贝 1000 字节]
+--- 移动 ---
+  [移动（偷指针，不复制数据）]
+  a.size()=0 b.size()=1000
+--- 放进容器 ---
+  [移动（偷指针，不复制数据）]
+  [移动（偷指针，不复制数据）]
+  容器里有 2 个
+```
+
+:::tip[注意 `a.size()=0`]
+移动后源对象被"掏空"了——这正是移动的代价：**源对象不能再用**。
+
+换来的好处：**没有复制 1000 字节**。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 移动后又用源对象 | 值不对/空 | 已掏空 | 别再用 |
+| 移动构造没标 `noexcept` | vector 扩容用拷贝 | 编译器不敢移动 | 加 `noexcept` |
+| 移动构造没置空源 | double free | 两个对象都 delete | 源指针设 `nullptr` |
+| `std::move` 用在 const 上 | 静默变成拷贝 | 匹配不上 `T&&` | 去掉 const |
+| `return std::move(x)` | 阻止 RVO | 反而更慢 | 直接 `return x` |
+| 以为 `std::move` 会搬运数据 | 误解 | 它只是类型转换 | 真正干活的是移动构造 |
+
+## 本课自检
+
+- [ ] **知道 `std::move` 只做类型转换，不移动数据**
+- [ ] 知道移动后源对象处于"有效但未指定"状态
+- [ ] 分清左值和右值
+- [ ] 会写移动构造函数
+- [ ] **知道移动构造必须标 `noexcept`**
+- [ ] **知道移动后要把源指针置空**
+- [ ] 知道 `std::move` 在 const 对象上无效
+- [ ] 知道 `return local_object` 是最优写法（RVO）
+- [ ] 知道 `name_(std::move(name))` 这个常见模式
+- [ ] 知道移动是"用可读性换性能"，源对象不能再用
+
+## 下一步
+
+[17 STL 容器选型](./17-containers) —— vector、list、map、set 到底该用哪个。

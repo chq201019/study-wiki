@@ -1,0 +1,334 @@
+---
+id: 07-understand-code
+title: 07 读懂生成的代码
+sidebar_position: 7
+description: main.c 的四个区块、HAL_Init/SystemClock_Config/MX_xxx_Init 各干什么、USER CODE 保留机制、中断处理函数在哪。
+---
+
+# 07 读懂生成的代码
+
+**本课目标**：不再怕 CubeMX 生成的那几百行，知道每块是干什么的。
+
+## 工程目录结构
+
+```text
+blink/
+├── Core/
+│   ├── Inc/                  ← 头文件
+│   │   ├── main.h
+│   │   ├── gpio.h
+│   │   └── stm32f1xx_hal_conf.h
+│   ├── Src/                  ← 源文件
+│   │   ├── main.c            ← 你的主战场
+│   │   ├── gpio.c            ← GPIO 初始化
+│   │   ├── stm32f1xx_it.c    ← 中断服务函数
+│   │   └── system_stm32f1xx.c
+│   └── Startup/
+│       └── startup_stm32f103xb.s   ← 启动汇编文件
+├── Drivers/
+│   ├── STM32F1xx_HAL_Driver/  ← HAL 库本体
+│   └── CMSIS/                 ← ARM 内核头文件
+├── blink.ioc                  ← CubeMX 配置文件（核心）
+└── STM32F103C8TX_FLASH.ld     ← 链接脚本
+```
+
+:::tip[你只需要关心三个文件]
+| 文件 | 你会改它吗 |
+| --- | --- |
+| **`Core/Src/main.c`** | ✅ **主要战场** |
+| `Core/Src/stm32f1xx_it.c` | ⚠️ 写中断时改 |
+| `Core/Inc/main.h` | ⚠️ 加函数声明时改 |
+| 其他 | ❌ 不用碰 |
+
+**`Drivers/` 是 HAL 库源码**，看懂了很有用，但一开始不用读。
+:::
+
+## `main.c` 的骨架
+
+简化后长这样：
+
+```c
+/* ① Includes */
+#include "main.h"
+#include "gpio.h"
+
+/* ② 私有变量和函数声明 */
+void SystemClock_Config(void);
+
+/* ③ main */
+int main(void)
+{
+  HAL_Init();                 /* HAL 库初始化 */
+  SystemClock_Config();       /* 时钟树 */
+  MX_GPIO_Init();             /* GPIO */
+
+  while (1)
+  {
+    /* 你的业务 */
+  }
+}
+
+/* ④ 时钟配置 */
+void SystemClock_Config(void) { /* 一大坨 */ }
+
+/* ⑤ 错误处理 */
+void Error_Handler(void) { while (1) { } }
+```
+
+## 逐行拆解
+
+![STM32 上电流程：启动文件做栈指针/段拷贝/bss 清零后跳 main，main 里依次 HAL_Init、SystemClock_Config、MX_xxx_Init、while(1)](/img/diagrams/stm32-init-flow.svg)
+
+
+### `HAL_Init()`
+
+```c
+HAL_Init();
+```
+
+做四件事：
+
+| 做什么 | 说明 |
+| --- | --- |
+| 配置 Flash 预取 | 提高取指令效率 |
+| 设置 **SysTick 为 1ms** | `HAL_Delay` 的基础 |
+| 设置 NVIC 优先级分组 | 中断优先级规则 |
+| 调用 `HAL_MspInit()` | 底层硬件初始化（时钟、调试口） |
+
+:::info[`HAL_Delay(1000)` 为什么是 1 秒]
+**因为 `HAL_Init()` 把 SysTick 配成了每 1ms 中断一次**。
+
+`HAL_Delay` 内部就是"数 SysTick 中断次数"。
+
+**如果时钟配错了（比如实际跑 8MHz 而不是 72MHz），SysTick 的 1ms 也不准，`HAL_Delay` 也会跟着不准。**
+
+**这是"延时不准确"的根因**（[第 10 课](./10-clock)细讲）。
+:::
+
+### `SystemClock_Config()`
+
+```c
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /* ① 使能 HSE（外部晶振 8MHz）并配 PLL ×9 = 72MHz */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;      /* ×9 */
+  HAL_RCC_OscConfig(&RCC_OscInitStruct);
+
+  /* ② 切换系统时钟到 PLL，并配各总线分频 */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                              | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;    /* 72MHz */
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;     /* 36MHz */
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;     /* 72MHz */
+  HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2);
+}
+```
+
+:::tip[这段不用背，但要能看懂]
+关键就三件事：
+
+1. **HSE 8MHz 开起来**
+2. **PLL ×9 = 72MHz**
+3. **切 SYSCLK 到 PLL，APB1 分频到 36MHz**
+
+**`FLASH_LATENCY_2` 是"72MHz 下 Flash 需要 2 个等待周期"**——速度越快等待越多，这个值配错了会跑飞。
+:::
+
+### `MX_GPIO_Init()`
+
+在 `Core/Src/gpio.c` 里：
+
+```c
+void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  /* ① 开 GPIO 时钟（关键！） */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+
+  /* ② 设初始电平 */
+  HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+
+  /* ③ 配置引脚模式 */
+  GPIO_InitStruct.Pin = LED_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;      /* 推挽输出 */
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LED_GPIO_Port, &GPIO_InitStruct);
+}
+```
+
+:::danger[`__HAL_RCC_GPIOC_CLK_ENABLE()` 是最容易忘的一行]
+**不开外设时钟，后面所有 GPIO 配置都无效**——而且**不报错**。
+
+```c
+/* 忘了开时钟 */
+HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);       /* 静默失败 */
+HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, RESET); /* 没反应 */
+```
+
+**CubeMX 会自动生成这行**——这就是"别手写初始化"的最强理由（[第 2 课](./02-vs-esp32)）。
+:::
+
+### `Error_Handler()`
+
+```c
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1) { }
+}
+```
+
+**任何初始化失败都会进这里**——关中断后死循环。
+
+:::warning[程序"卡死"时，先怀疑进了 `Error_Handler`]
+表现：**板子毫无反应，调试器暂停后发现停在 `Error_Handler` 里**。
+
+**原因**：HSE 起振失败（晶振坏了/没焊）、时钟配置非法等。
+
+**调试技巧**：在 `Error_Handler` 里打个断点，看谁跳进来的。
+:::
+
+## USER CODE 保留机制
+
+:::tip[CubeMX 只保留特定注释之间的内容]
+```c
+/* USER CODE BEGIN XXX */
+你的代码
+/* USER CODE END XXX */
+```
+
+**`XXX` 是区块编号**，常见的有：
+
+| 区块 | 位置 | 放什么 |
+| --- | --- | --- |
+| `Includes` | 文件头 | `#include` |
+| `0` | `main` 开头 | 变量定义 |
+| `2` | `while(1)` 前 | **外设初始化后的启动代码** |
+| `WHILE` | `while(1)` 内 | 主循环逻辑 |
+| `3` | `while(1)` 末尾 | 主循环补充 |
+| `4` | `main` 后 | 自定义函数 |
+| `PFP` | 函数原型区 | 函数声明 |
+:::
+
+:::danger[写在外面的代码每次生成都会丢]
+```c
+  /* USER CODE BEGIN 2 */
+  printf("启动\n");
+  /* USER CODE END 2 */
+
+  /* 这里写的会被删掉！ */
+  printf("这行会消失\n");
+
+  while (1) { }
+```
+
+**规矩：养成"只在 BEGIN/END 之间写"的肌肉记忆。**
+:::
+
+## 中断服务函数在哪
+
+CubeMX 生成的中断处理在 `Core/Src/stm32f1xx_it.c`：
+
+```c
+/* 外部中断 13 的处理（对应 EXTI13） */
+void EXTI15_10_IRQHandler(void)
+{
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_13);
+}
+```
+
+:::info[两层结构：IRQHandler 和 Callback]
+```text
+硬件中断
+  ↓
+EXTI15_10_IRQHandler()      ← stm32f1xx_it.c（CubeMX 生成，别改）
+  ↓ 调用
+HAL_GPIO_EXTI_Callback()    ← 你在 main.c 里自己实现
+```
+
+**你只实现 Callback，不动 IRQHandler。**
+
+```c
+/* 在 main.c 的 USER CODE 4 区写 */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == GPIO_PIN_13) {
+        /* 你的处理 */
+    }
+}
+```
+
+**这就是 HAL 库的"回调"设计**——底层帮你分发，你只关心业务。
+
+（[第 14 课](./14-interrupt)详细讲中断。）
+:::
+
+## 一个完整的可读版本
+
+去掉所有生成代码，实际"你的程序"就这么点：
+
+```c
+int main(void)
+{
+    HAL_Init();                 /* 系统就绪 */
+    SystemClock_Config();       /* 72MHz */
+    MX_GPIO_Init();             /* PC13 输出 */
+
+    while (1)
+    {
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+        HAL_Delay(500);
+    }
+}
+```
+
+:::tip[其他几百行都是"脚手架"]
+**你现在理解这 8 行，就理解了 80% 的程序。**
+
+剩下的是 HAL 库帮你做的初始化——**知道它在干什么就够了，不需要背下来**。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 代码写在 USER CODE 外 | 重新生成丢了 | 被覆盖 | 写进区块内 |
+| 手动删了 `MX_GPIO_Init` | GPIO 不工作 | 没初始化 | 别删生成的调用 |
+| 停在 `Error_Handler` | 板子没反应 | HSE/时钟配置失败 | 查晶振、查时钟树 |
+| 改 `stm32f1xx_it.c` | 重新生成被覆盖 | 那是生成的文件 | 用 Callback |
+| 忘了开外设时钟 | 外设无响应 | 手写了初始化 | 让 CubeMX 生成 |
+
+## 本课自检
+
+- [ ] 知道工程里哪三个文件是需要改的
+- [ ] **知道 `HAL_Init` 把 SysTick 配成 1ms（`HAL_Delay` 的基础）**
+- [ ] 能看懂 `SystemClock_Config` 的三件事（HSE/PLL/分频）
+- [ ] **知道 `__HAL_RCC_xxx_CLK_ENABLE` 不开就静默失效**
+- [ ] **知道 `Error_Handler` 是"卡死"的常见去处**
+- [ ] **知道自己的代码必须写在 `USER CODE BEGIN/END` 之间**
+- [ ] 知道中断是"IRQHandler（生成）+ Callback（你写）"两层
+- [ ] 能说出主程序的 8 行在干什么
+- [ ] 不再怕那几百行生成代码
+
+## 第二阶段进度
+
+到这里你已经：
+
+- 建了工程、配了时钟、点亮了灯
+- **读懂了生成代码的骨架**
+
+接下来开始逐个学外设。
+
+## 下一步
+
+[08 点灯：HAL_GPIO](./08-blink) —— GPIO 的完整用法，不只是翻转。

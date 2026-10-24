@@ -1,0 +1,361 @@
+---
+id: debug-advanced
+title: "18 调试进阶"
+sidebar_position: 18
+description: HardFault 的四种原因与栈回溯定位法、用 SWO/ITM 做不占串口的 printf、断点类型与实时变量观察、故障注入测试。
+---
+
+# 18 调试进阶
+
+**本课目标**：HardFault 不再是黑盒，能用 SWO 输出日志。
+
+## HardFault：先搞清是哪一类
+
+:::info[Cortex-M3 的四种故障]
+| 故障 | 触发原因 |
+| --- | --- |
+| **HardFault** | 下面三种升级而来，或直接触发 |
+| MemManage | 访问了 MPU 禁止的区域（F1 无 MPU，一般不会） |
+| BusFault | 访问了不存在的地址（如空指针、野指针） |
+| UsageFault | 未定义指令、非对齐访问、除零（除零默认不触发） |
+:::
+
+:::danger[最常见的三个真实原因]
+**① 空指针 / 野指针解引用**
+
+```c
+int *p = NULL;
+*p = 1;              /* → BusFault → HardFault */
+```
+
+**② 栈溢出**
+
+栈溢出会覆盖返回地址，函数返回时跳到野地址。**表现是"在完全无关的地方 HardFault"。**
+
+**③ 中断向量表错（Bootloader 场景）**
+
+`SCB->VTOR` 没设置对，中断跳到了错误的地方。
+:::
+
+## 定位 HardFault 的标准方法
+
+:::tip[在 HardFault 里打印关键寄存器]
+```c
+void HardFault_Handler(void)
+{
+    __asm volatile (
+        "tst lr, #4        \n"    /* 检查 EXC_RETURN 的 bit2 */
+        "ite eq            \n"
+        "mrseq r0, msp     \n"    /* 从 MSP 取栈帧 */
+        "mrsne r0, psp     \n"    /* 从 PSP 取栈帧（任务里出错用这个） */
+        "b hardfault_report\n"
+    );
+}
+
+/* r0 传入的就是出错时刻的栈指针 */
+void hardfault_report(uint32_t *sp)
+{
+    volatile uint32_t r0  = sp[0];
+    volatile uint32_t r1  = sp[1];
+    volatile uint32_t r2  = sp[2];
+    volatile uint32_t r3  = sp[3];
+    volatile uint32_t r12 = sp[4];
+    volatile uint32_t lr  = sp[5];
+    volatile uint32_t pc  = sp[6];       /* ← 出错的那条指令地址 */
+    volatile uint32_t psr = sp[7];
+
+    printf("HardFault!\r\n");
+    printf("PC = 0x%08lX  ← 出错指令地址\r\n", pc);
+    printf("LR = 0x%08lX  ← 调用者的返回地址\r\n", lr);
+    printf("R0 = 0x%08lX\r\n", r0);
+
+    /* 停在这里，方便调试器查看 */
+    while (1) { }
+}
+```
+
+**`PC` 的值就是罪魁祸首的地址。**
+:::
+
+:::warning[为什么 `PC` 有时是"下一条指令"]
+Cortex-M 的栈帧里保存的 `PC` 是**出错指令的地址**（不是下一条），但有些情况下（如未定义指令）可能有偏差。
+
+**实用做法**：拿 `PC - 2`、`PC - 4` 也都查一下反汇编，通常是这三者之一。
+:::
+
+### 用 addr2line 找到源码行
+
+```bash
+# 拿到 PC 值后
+arm-none-eabi-addr2line -e build/app.elf -f -C 0x08001234
+# 输出：
+#   main
+#   src/main.c:42
+```
+
+:::tip[更省事的办法：用 `.map` 文件和反汇编]
+```bash
+# 反汇编到文件，搜索地址
+arm-none-eabi-objdump -d build/app.elf > app.dis
+# 在 app.dis 里搜 8001234
+```
+
+**或者直接用 GDB**：
+
+```gdb
+(gdb) info line *0x08001234
+(gdb) list *0x08001234
+```
+:::
+
+### 用调试器直接看
+
+:::tip[J-Link / ST-Link 的实用技巧]
+**在调试器里打断点放在 `HardFault_Handler`，然后看调用栈（Call Stack）窗口。**
+
+**但注意**：HardFault 是异常，调用栈通常显示不正常。**更可靠的是直接读寄存器窗口的 `PC` 和 `LR`。**
+:::
+
+## SWO / ITM：不占串口的 printf
+
+:::info[SWO 是一根线，能把 printf 送出来]
+```text
+普通串口调试：   占用一个 UART 外设 + 2 个引脚
+SWO 调试：      只占用 SWO 一根线（复用调试口）
+```
+
+**速度**：可达 2 Mbps 以上。**不占用任何外设**。
+:::
+
+**配置步骤**：
+
+1. 硬件：把 **PB3（SWO）** 引到调试口
+2. 调试器：SWD 连接时**勾选 SWO 引脚**
+3. 串口工具：打开"SWO Viewer"（STM32CubeIDE 内置，或 J-Link SWO Viewer）
+
+```c
+/* 重定向 printf 到 ITM */
+int _write(int fd, char *ptr, int len)
+{
+    for (int i = 0; i < len; i++) {
+        ITM_SendChar(ptr[i]);
+    }
+    return len;
+}
+
+/* 需要先使能 ITM 的端口 0 */
+void itm_init(void)
+{
+    /* 调试器连接时通常自动使能，也可手动 */
+    ITM->LAR = 0xC5ACCE55;          /* 解锁 */
+    ITM->TER = 0x01;                /* 使能端口 0 */
+}
+```
+
+:::danger[SWO 只在接了调试器时才工作]
+**拔掉调试器后 `ITM_SendChar` 会阻塞或超时。**
+
+**产品里要让日志能被编译掉**：
+
+```c
+#ifdef DEBUG_LOG
+    #define LOG(...)  printf(__VA_ARGS__)
+#else
+    #define LOG(...)  ((void)0)
+#endif
+```
+:::
+
+## 断点的三种类型
+
+| 类型 | 数量 | 特点 |
+| --- | --- | --- |
+| **硬件断点** | **4~6 个**（芯片固定） | 不修改代码，可在 Flash 中打断点 |
+| **软件断点** | 无限 | 把指令替换成 `BKPT`，**会修改 Flash/RAM** |
+| **数据观察点** | 2 个 | **变量被读写时停下**（超有用） |
+
+:::tip[数据观察点：抓"变量莫名被改"]
+```c
+uint8_t state = 0;
+/* 某处莫名其妙变成了 5，不知道谁改的 */
+```
+
+**在调试器里对这个变量设"数据观察点（Watchpoint）"** → **谁写的它，立刻就停在那里**。
+
+**这是排查"内存被意外改写"最强的手段**，比加打印快一百倍。
+:::
+
+:::warning[断点太多会打不上]
+硬件断点只有 4~6 个。**超了之后调试器会静默失败或改用软件断点**（在 Flash 里改不了，于是断点无效）。
+
+**现象**：明明设了断点，程序却跑过去了。
+
+**解决**：删掉不用的断点。
+:::
+
+## 实时变量观察（不用停程序）
+
+:::tip[Live Watch / 实时表达式]
+STM32CubeIDE 的 **Live Expressions**，或 J-Link 的 **Live Watch**：
+
+- 程序全速运行
+- 变量值实时刷新（靠后台读内存）
+
+**适合观察**：计数器、状态机当前状态、缓冲区索引。
+
+**代价**：需要周期性暂停读内存，会略微影响实时性（一般可接受）。
+:::
+
+:::danger[优化会让变量"看不到"]
+`-O2` 下变量的值可能：
+- 只存在寄存器里（内存里是旧值）
+- 被完全优化掉（`<optimized out>`）
+
+**调试时用 `-O0` 或 `-Og`**，发布时再换回 `-O2`。
+:::
+
+## printf 调试的正确姿势
+
+:::warning[不要在中断里 printf]
+```c
+void TIM2_IRQHandler(void)
+{
+    printf("tick\r\n");      /* ❌ 可能阻塞几毫秒 */
+}
+```
+
+**`printf` 要等串口发送完成，在 115200 下打 10 个字符约 0.9ms。**
+
+**中断里这么干会：**
+
+- 严重拉长中断响应时间
+- 如果是高优先级中断，可能让低优先级中断永远得不到响应
+- 某些情况下直接死锁
+
+**要记录就置标志，在主循环里打。**
+:::
+
+:::tip[更好的调试输出设计]
+```c
+/* 环形缓冲 + 主循环发送：不阻塞任何地方 */
+#define LOG_BUF_SZ 512
+static char s_logbuf[LOG_BUF_SZ];
+static volatile uint16_t s_head = 0, s_tail = 0;
+
+/* 任何地方都能调（不阻塞） */
+void log_put(const char *s)
+{
+    while (*s) {
+        uint16_t next = (s_head + 1) % LOG_BUF_SZ;
+        if (next == s_tail) break;          /* 满了就丢 */
+        s_logbuf[s_head] = *s++;
+        s_head = next;
+    }
+}
+
+/* 主循环里调 */
+void log_flush(void)
+{
+    while (s_tail != s_head) {
+        uart_putc(s_logbuf[s_tail]);
+        s_tail = (s_tail + 1) % LOG_BUF_SZ;
+    }
+}
+```
+
+**这样中断里也能安全记录，不会阻塞。**
+:::
+
+## 故障注入：主动测试错误处理
+
+:::tip[别等故障发生才验证错误处理]
+**主动制造故障，验证你的代码能不能正确处理**：
+
+| 注入什么 | 怎么注入 | 预期行为 |
+| --- | --- | --- |
+| 栈溢出 | 故意开一个大局部数组 | 触发 `vApplicationStackOverflowHook` |
+| 死循环 | 加 `while(1);` | 看门狗复位 |
+| 空指针 | 故意写 `*(int*)0 = 1` | 进 HardFault，能看到 PC |
+| 串口断线 | 拔掉线 | 发送超时后恢复，不卡死 |
+| 电源掉电 | 突然断电 | 重启后参数完好（CRC 通过） |
+
+**这些测试做完，你才敢说"我的错误处理是有效的"。**
+:::
+
+:::danger[最怕的是"看门狗喂了但系统已经不对了"]
+**验证看门狗的完整性**：
+
+```c
+/* 只喂狗不干活 —— 看门狗应该复位，但如果你在主循环里无条件喂，它就不会 */
+```
+
+**正确验证**：让某个任务永久阻塞（`vTaskSuspend(NULL)`），看系统是否正确复位。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| HardFault 后不知道在哪 | 没读栈帧 | 实现 `hardfault_report` |
+| addr2line 找不到行 | 用了 `-O2`，行号错乱 | 用 `-O0` 或 `-Og` 复现 |
+| 断点打不上 | 硬件断点用完了 | 删掉不用的 |
+| 变量显示 `<optimized out>` | 被优化了 | `-O0` 调试 |
+| SWO 没输出 | PB3 没接或没使能 ITM | 检查硬件和 `ITM->TER` |
+| printf 卡死 | 中断里调用 | 改环形缓冲 |
+| 调试器连不上 | SWD 引脚被复用 | BOOT0 拉高救砖 |
+| 变量莫名变了但断点抓不到 | 不知道谁写的 | 用**数据观察点** |
+
+:::tip[调试器连不上时的救砖流程]
+```text
+① 把 BOOT0 拉高（跳到系统存储器）
+② 复位
+③ 用 STM32CubeProgrammer 或 FlyMcu 通过串口连接
+④ 执行"全片擦除"
+⑤ BOOT0 拉回低，复位
+```
+
+**只要芯片没物理损坏，这一步总能救回来。**
+:::
+
+## 本课自检
+
+- [ ] 能说出 HardFault 的四种来源
+- [ ] **知道 HardFault 的三大常见原因：空指针、栈溢出、VTOR 错**
+- [ ] **会写 `HardFault_Handler` 读栈帧拿到 `PC`**
+- [ ] 知道 `tst lr, #4` 是在判断用 MSP 还是 PSP
+- [ ] 会用 `addr2line` / `objdump` / GDB 把地址转成源码行
+- [ ] **知道 SWO 只占一根线，不占用串口外设**
+- [ ] 知道 SWO 拔掉调试器后会失效，日志要能被编译掉
+- [ ] **知道硬件断点只有 4~6 个**
+- [ ] **会用数据观察点抓"变量莫名被改"**
+- [ ] 知道 `-O2` 会让变量看不到或行号错乱
+- [ ] **知道中断里不能 `printf`，要用环形缓冲**
+- [ ] 会主动做故障注入测试
+- [ ] **知道 BOOT0 拉高 + 全片擦除是万能救砖流程**
+
+## 全线小结
+
+18 课走完，你现在具备：
+
+| 能力 | 对应课程 |
+| --- | --- |
+| 知道每一行代码走的是哪一层、代价多少 | 01 |
+| 能自己算任意时钟配置 | 02 |
+| 能设计中断优先级、写正确的临界区 | 03 |
+| 会用 DMA 双缓冲做无缝数据流 | 04 |
+| 会测频率/占空比、会算死区时间 | 05 |
+| 能把 ADC 精度从 9 位提到 11 位 | 06 |
+| 能把待机电流压到几十 µA | 07 |
+| 会让系统在卡死时自己恢复 | 08 |
+| 能改链接脚本、理解启动流程 | 09 |
+| **能自己实现固件在线升级** | 10 |
+| 能可靠地在 Flash 里存参数 | 11 |
+| 能用 DWT 测量并针对性优化 | 12 |
+| 能配 CAN 并排查总线故障 | 13 |
+| 能做免驱 USB 串口 | 14 |
+| 知道 RTOS 调度与内存的真实行为 | 15 |
+| 能选对同步机制、避开死锁 | 16 |
+| 能自查一块最小系统板 | 17 |
+| **能在 HardFault 里找到罪魁祸首** | 18 |
+
+**回到 [进阶导读](./advanced-index) 查看全部目录。**

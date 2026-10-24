@@ -1,0 +1,299 @@
+---
+id: 06-view
+title: 06 查看文件内容
+sidebar_position: 6
+description: cat/less/head/tail/less 的使用场景、less 的操作键、以及看日志的正确姿势。
+---
+
+# 06 查看文件内容
+
+**本课目标**：会按场景选择正确的查看命令。
+
+## 先看文件多大
+
+:::tip[看之前先确认大小]
+```bash
+ls -lh bigfile.log
+```
+
+**如果是 2 GB 的日志，用 `cat` 会刷屏到卡死。**
+
+先看大小，再选命令。
+:::
+
+## `cat`：一次全打印（小文件）
+
+```bash
+cat file.txt                # 打印全部内容
+cat -n file.txt             # 带行号
+cat a.txt b.txt             # 连续打印多个文件
+```
+
+:::danger[`cat` 不适合大文件]
+```bash
+cat hugefile.log            # ❌ 几万行刷过去，什么都看不清
+```
+
+**只适合几百行以内的小文件。**
+
+另外网上常说"`cat` 是 concatenate 所以只能拼接"——**其实 Linux 里它就是用来打印内容的**，`cat file` 是最常见用法。
+:::
+
+## `less`：分页查看（推荐）
+
+```bash
+less bigfile.log
+```
+
+**`less` 是查看大文件的标准工具**——它不会一次读完，只加载需要的部分。
+
+### 操作键
+
+| 按键 | 作用 |
+| --- | --- |
+| `空格` / `f` | 下一页 |
+| `b` | 上一页 |
+| `g` | 跳到开头 |
+| `G` | **跳到末尾**（看日志最新内容） |
+| `/关键词` | **向下搜索** |
+| `?关键词` | 向上搜索 |
+| `n` / `N` | 下一个 / 上一个匹配 |
+| `q` | 退出 |
+
+:::tip[为什么叫 less]
+有个更老的命令叫 `more`（只能往下翻）。`less` 功能更多——**"less is more"**（少即是多）。
+
+**现在基本不用 `more`，直接用 `less`。**
+:::
+
+### 常用选项
+
+```bash
+less -N file.log            # 显示行号
+less +F file.log            # 类似 tail -f，实时跟踪
+less -R file.log            # 正确显示颜色转义
+```
+
+:::tip[`less +F` 是看日志的神器]
+```bash
+less +F /var/log/syslog
+```
+
+它会**持续显示新内容**（像 `tail -f`），但你可以按 `Ctrl+C` 暂停，然后用普通 `less` 的方式上下翻找历史。
+
+**比 `tail -f` 更灵活**——既跟新又能翻旧。
+:::
+
+## `head`：看开头
+
+```bash
+head file.txt               # 前 10 行
+head -n 20 file.txt         # 前 20 行
+head -20 file.txt           # 简写
+```
+
+## `tail`：看结尾（最常用于日志）
+
+```bash
+tail file.txt               # 后 10 行
+tail -n 50 file.txt         # 后 50 行
+tail -f /var/log/syslog     # **实时跟踪新增内容**
+tail -F /var/log/syslog     # 同上，但文件被轮转后能重新打开
+```
+
+:::tip[`-f` 和 `-F` 的区别]
+- `-f` = follow：跟着文件描述符
+- `-F` = follow=name：**跟着文件名**
+
+**日志被轮转（rotate）后，旧的 `-f` 就失效了，`-F` 还能继续跟。**
+
+**看长期日志用 `-F`。**
+:::
+
+### 组合：看最近几行并持续跟踪
+
+```bash
+tail -n 100 -F /var/log/nginx/error.log
+```
+
+**先显示最后 100 行，然后持续追加**——查问题时的标准姿势。
+
+## `grep`：搜索内容
+
+```bash
+grep "error" file.log           # 找含 error 的行
+grep -i "error" file.log        # 忽略大小写
+grep -n "error" file.log        # 显示行号
+grep -c "error" file.log        # 只输出匹配行数
+grep -v "error" file.log        # 反向：不含 error 的行
+grep -r "error" /var/log/       # 递归搜索目录
+```
+
+:::tip[`grep` 和 `less` 的分工]
+- **`grep`**：已知要找什么，直接筛出来
+- **`less`**：不知道要找什么，先浏览再搜
+
+```bash
+# 日志太大，先筛出错误
+grep "ERROR" app.log | less
+
+# 只看错误行，并显示行号
+grep -n "ERROR" app.log | head -50
+```
+:::
+
+### 只看匹配的部分
+
+```bash
+grep -o "error[0-9]*" file.log      # 只输出匹配到的片段
+```
+
+## `wc`：统计行数/字数
+
+```bash
+wc -l file.txt              # 行数（最常用）
+wc -w file.txt              # 单词数
+wc -c file.txt              # 字节数
+```
+
+**`wc -l` 是快速统计日志条目的利器**：
+
+```bash
+wc -l /var/log/syslog
+grep -c "ERROR" app.log
+```
+
+## `sort` 和 `uniq`：排序去重
+
+```bash
+sort file.txt               # 按行排序
+sort -n file.txt            # 按数字排序
+sort -r file.txt            # 倒序
+sort -u file.txt            # 排序并去重
+
+uniq file.txt               # 去掉相邻重复行
+uniq -c file.txt            # 统计每行出现次数
+```
+
+:::danger[`uniq` 只能去"相邻"的重复]
+```bash
+echo -e "a\nb\na" | uniq        # a b a —— 没去掉！
+echo -e "a\nb\na" | sort | uniq # a b   —— 先排序才有效
+```
+
+**`uniq` 必须配合 `sort` 用**。
+:::
+
+### 实战：统计访问最多的 IP
+
+```bash
+awk '{print $1}' access.log | sort | uniq -c | sort -rn | head -10
+```
+
+**这是日志分析的经典管道**（[第 16 课](./16-grep-sed-awk)细讲）。
+
+## 管道的概念
+
+```bash
+命令1 | 命令2
+```
+
+**把命令1 的输出，作为命令2 的输入。**
+
+```bash
+cat file.log | grep "error" | head -5
+```
+
+```mermaid
+flowchart LR
+  A["cat file.log"] -->|输出| B["grep error"]
+  B -->|输出| C["head -5"]
+  C --> D["屏幕"]
+```
+
+:::tip[其实是 `|` 把输出接到下一个的输入]
+`|` 创建了一个"管道"，前一个命令的**标准输出**直接流进了后一个的**标准输入**——不经过屏幕，也不落磁盘。
+
+**所以管道可以串很长**，每个命令只做一件事。
+:::
+
+### 更简洁的写法
+
+```bash
+# 不用 cat（"无用的 cat"）
+cat file.log | grep error       # ⚠️ 多余
+grep error file.log             # ✅ 直接给文件参数
+
+# 但管道在其他场景很有用
+grep error file.log | wc -l     # 统计错误行数
+```
+
+## 完整示例：排查一个日志
+
+```bash
+# ① 先看文件多大
+ls -lh /var/log/syslog
+
+# ② 看最后 50 行（最新动态）
+tail -n 50 /var/log/syslog
+
+# ③ 找错误
+grep -i "error\|fail" /var/log/syslog | tail -20
+
+# ④ 统计错误数量
+grep -ci "error" /var/log/syslog
+
+# ⑤ 分页细看
+grep -i "error" /var/log/syslog | less
+
+# ⑥ 实时跟踪
+tail -F /var/log/syslog
+```
+
+## 特殊文件：`/dev/null`
+
+```bash
+command > /dev/null            # 丢弃标准输出
+command > /dev/null 2>&1       # 丢弃所有输出
+```
+
+:::info[`2>&1` 是什么]
+- `1` = 标准输出（stdout）
+- `2` = 标准错误（stderr）
+
+`2>&1` 意思是"把标准错误重定向到标准输出的位置"。
+
+```bash
+command > /dev/null 2>&1        # 输出和错误都丢弃
+```
+
+**注意顺序**：`2>&1` 必须在 `> /dev/null` **之后**，否则不生效。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `cat` 大文件 | 刷屏卡死 | 一次全打印 | 用 `less` |
+| `uniq` 不去重 | 还是有重复 | 只处理相邻的 | 先 `sort` |
+| `tail -f` 日志轮转后失效 | 不再更新 | 跟的是 inode | 用 `-F` |
+| `grep` 找不到但文件里有 | 大小写/编码 | 区分大小写 | `-i` 或查编码 |
+| `\|` 前后没空格 | 可能被当参数 | 某些场景歧义 | 加空格 |
+| `2>&1` 顺序写反 | 错误没被重定向 | 重定向顺序有效 | `> file 2>&1` |
+
+## 本课自检
+
+- [ ] 会用 `cat` 看小文件（知道不能用于大文件）
+- [ ] **会用 `less`，掌握 `G` `/` `q` 等操作键**
+- [ ] 知道 `less +F` 既能跟踪又能翻历史
+- [ ] 会用 `head` / `tail -n`
+- [ ] **知道 `tail -f` 和 `-F` 的区别**
+- [ ] 会用 `grep` 的 `-i` `-n` `-c` `-v` `-r`
+- [ ] 会用 `wc -l` 统计行数
+- [ ] **知道 `uniq` 必须先 `sort`**
+- [ ] 理解管道 `|` 的作用
+- [ ] 知道 `2>&1` 的作用和顺序
+
+## 下一步
+
+[07 权限与属主](./07-permissions) —— `rwx` 到底是什么意思，`chmod` 怎么用。

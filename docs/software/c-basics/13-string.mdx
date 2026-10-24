@@ -1,0 +1,392 @@
+---
+id: 13-string
+title: 13 字符串
+sidebar_position: 13
+description: C 的字符串是"以 \0 结尾的字符数组"，这个设计决定了一切；以及 strcpy/strcat 的缓冲区溢出风险。
+---
+
+# 13 字符串
+
+**本课目标**：理解 C 字符串的本质，会用常用字符串函数，并且知道哪些函数是危险的。
+
+## C 字符串的本质
+
+:::tip[一句话：字符串就是"以 `\0` 结尾的字符数组"]
+```c
+char s[] = "hello";
+```
+
+这段声明在内存里实际是：
+
+```text
+'h' 'e' 'l' 'l' 'o' '\0'
+104 101 108 108 111   0
+```
+
+**末尾自动加了一个 `\0`**（数值 0 的字符，叫"空字符"）。
+
+C 靠**这个 `\0` 判断字符串到哪结束**，而不是记录长度。
+:::
+
+### 验证一下
+
+```c
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char s[] = "hello";
+
+    printf("sizeof(s) = %zu\n", sizeof(s));   /* 6，含 \0 */
+    printf("strlen(s) = %zu\n", strlen(s));   /* 5，不含 \0 */
+
+    printf("各字符的 ASCII：");
+    for (int i = 0; i <= 5; i++) {
+        printf("[%d]", s[i]);
+    }
+    printf("\n");
+    return 0;
+}
+```
+
+本机实测输出：
+
+```text
+sizeof(s) = 6
+strlen(s) = 5
+各字符的 ASCII：[104][101][108][108][111][0]
+```
+
+**注意最后那个 `[0]`** —— 这就是 `\0`。
+
+:::danger[`sizeof` 和 `strlen` 的区别必须分清]
+| | `sizeof("hello")` | `strlen("hello")` |
+| --- | --- | --- |
+| 结果 | **6** | **5** |
+| 含义 | 数组占多少字节 | 字符串有多长 |
+| 是否含 `\0` | 含 | 不含 |
+| 何时确定 | 编译期 | 运行时（要遍历） |
+:::
+
+## 三种声明方式
+
+```c
+char a[] = "hello";           /* 数组，大小 6（自动含 \0） */
+char b[10] = "hello";         /* 数组，大小 10，后 4 字节是 0 */
+char *c = "hello";            /* 指针，指向只读的字符串字面量 */
+```
+
+### 数组 vs 指针的关键区别
+
+```c
+char a[] = "hello";
+a[0] = 'H';          /* ✅ 可以改，数组在栈上 */
+
+char *c = "hello";
+c[0] = 'H';          /* ❌ 崩溃！字面量在只读区 */
+```
+
+:::danger[修改字符串字面量会段错误]
+```c
+char *s = "hello";
+s[0] = 'H';              /* 运行时崩溃 (Segmentation fault) */
+```
+
+**原因**：`"hello"` 这样的字面量存在**只读数据段**，操作系统禁止写入。
+
+**规矩**：需要修改的字符串用数组，只读的才用 `char *`。
+
+```c
+char s[] = "hello";      /* 要改就用数组 */
+s[0] = 'H';              /* ✅ */
+```
+:::
+
+## 常用字符串函数
+
+全部在 `<string.h>` 里。
+
+### strlen：求长度
+
+```c
+#include <string.h>
+
+printf("%zu\n", strlen("hello"));      /* 5 */
+printf("%zu\n", strlen(""));           /* 0 */
+```
+
+**注意**：`strlen` 要**从头遍历到 `\0`**，所以对长字符串是 O(n)，不要放在循环条件里：
+
+```c
+/* ❌ 每次都算一遍长度，很慢 */
+for (int i = 0; i < strlen(s); i++) { }
+
+/* ✅ 只算一次 */
+size_t len = strlen(s);
+for (size_t i = 0; i < len; i++) { }
+```
+
+### strcpy：复制
+
+```c
+char dst[20];
+strcpy(dst, "hello");
+printf("%s\n", dst);      /* hello */
+```
+
+:::danger[`strcpy` 不检查目标大小！]
+```c
+char dst[5];
+strcpy(dst, "hello, world");    /* ❌ 溢出！目标只有 5 字节 */
+```
+
+**这是最经典的安全漏洞来源。** 目标缓冲区不够大时，会覆盖后面的内存。
+
+**用 `strncpy` 或 `snprintf` 替代**（见下文）。
+:::
+
+### strcat：拼接
+
+```c
+char buf[20] = "hello";
+strcat(buf, " world");
+printf("%s\n", buf);      /* hello world */
+```
+
+同样**不检查目标大小**，有溢出风险。
+
+### strcmp：比较
+
+```c
+#include <string.h>
+
+if (strcmp(a, b) == 0) {
+    printf("相等\n");
+}
+```
+
+:::warning[`strcmp` 返回 0 才表示相等]
+本机实测：
+
+```c
+printf("%d\n", strcmp("abc", "abc"));    /* 0   相等 */
+printf("%d\n", strcmp("abc", "abd"));    /* -1  a < b */
+printf("%d\n", strcmp("abd", "abc"));    /* 1   a > b */
+printf("%d\n", strcmp("abc", "ab"));     /* 1   长的更大 */
+```
+
+| 返回值 | 含义 |
+| --- | --- |
+| `0` | 完全相同 |
+| `< 0` | 前者字典序在前 |
+| `> 0` | 前者字典序在后 |
+
+**常见错误**：写成 `if (strcmp(a, b))`，这表示"不相等"！要写 `== 0`。
+:::
+
+:::danger[不能用 `==` 比较字符串]
+```c
+char a[] = "hello";
+char b[] = "hello";
+
+if (a == b) { }        /* ❌ 比较的是地址，永远不等 */
+```
+
+**数组名会退化成指向首元素的指针**，所以 `a == b` 比的是两个地址。
+
+必须用 `strcmp`。
+:::
+
+### 其他常用函数
+
+```c
+strncpy(dst, src, n)        /* 最多复制 n 个字符 */
+strncat(dst, src, n)        /* 最多拼接 n 个字符 */
+strchr(s, 'c')              /* 找字符，返回指针 */
+strstr(s, "sub")            /* 找子串，返回指针 */
+strncmp(a, b, n)            /* 只比较前 n 个字符 */
+memset(p, 0, n)             /* 把 n 字节填成 0 */
+memcpy(dst, src, n)         /* 复制 n 字节 */
+```
+
+## 安全版本：strncpy 和 snprintf
+
+:::danger[`strncpy` 有个坑：不保证补 `\0`]
+```c
+char dst[6];
+strncpy(dst, "abcdefgh", 5);    /* 只复制 5 个字符 */
+/* dst 是 "abcde"，但没有 \0 结尾！ */
+```
+
+本机实测：复制后 `dst` 里是 `abcde` 后面还跟着原来的垃圾字节，**没有结束符**。
+
+**必须手动补**：
+
+```c
+char dst[6];
+strncpy(dst, "abcdefgh", sizeof(dst) - 1);
+dst[sizeof(dst) - 1] = '\0';      /* 手动补结束符 */
+```
+
+**`sizeof(dst) - 1` 是给 `\0` 预留位置。**
+:::
+
+### 更推荐：snprintf
+
+```c
+char buf[32];
+snprintf(buf, sizeof(buf), "%s-%d", "name", 42);
+```
+
+`snprintf` **总是保证 `\0` 结尾**（只要 size > 0），更安全。
+
+:::tip[`snprintf` 的返回值很有用]
+```c
+char small[8];
+int n = snprintf(small, sizeof(small), "%s", "verylongstring");
+```
+
+本机实测：
+
+```text
+截断结果: verylon, 返回需要长度=14
+```
+
+**返回 14 表示"完整输出需要 14 字节"**，虽然实际只写了 7 个字符 + `\0`。
+
+**用途：可以检测是否被截断**：
+
+```c
+int needed = snprintf(buf, sizeof(buf), "%s", long_str);
+if (needed >= (int)sizeof(buf)) {
+    printf("缓冲区不够，需要 %d 字节\n", needed + 1);
+}
+```
+:::
+
+## 字符串的遍历
+
+```c
+char s[] = "hello";
+
+/* 方法一：靠 \0 判断结束 */
+for (int i = 0; s[i] != '\0'; i++) {
+    printf("%c", s[i]);
+}
+
+/* 方法二：已知长度 */
+size_t len = strlen(s);
+for (size_t i = 0; i < len; i++) {
+    printf("%c", s[i]);
+}
+
+/* 方法三：指针遍历（第 17 课后会理解） */
+for (char *p = s; *p; p++) {
+    printf("%c", *p);
+}
+```
+
+**方法一最直观**，体现了"字符串以 `\0` 结尾"的本质。
+
+## 完整示例：统计与转换
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+
+int main(void) {
+    char text[] = "Hello World 2026";
+    int letters = 0, digits = 0, spaces = 0;
+
+    for (int i = 0; text[i] != '\0'; i++) {
+        if (isalpha((unsigned char)text[i])) letters++;
+        else if (isdigit((unsigned char)text[i])) digits++;
+        else if (isspace((unsigned char)text[i])) spaces++;
+    }
+
+    printf("原字符串：%s\n", text);
+    printf("长度：%zu\n", strlen(text));
+    printf("字母 %d 个，数字 %d 个，空白 %d 个\n", letters, digits, spaces);
+
+    /* 转大写 */
+    char upper[64];
+    snprintf(upper, sizeof(upper), "%s", text);
+    for (int i = 0; upper[i] != '\0'; i++) {
+        upper[i] = toupper((unsigned char)upper[i]);
+    }
+    printf("大写：%s\n", upper);
+
+    return 0;
+}
+```
+
+输出：
+
+```text
+原字符串：Hello World 2026
+长度：16
+字母 10 个，数字 4 个，空白 2 个
+大写：HELLO WORLD 2026
+```
+
+:::warning[`<ctype.h>` 函数的参数要转 `unsigned char`]
+```c
+isalpha(text[i])                        /* ⚠️ 字符是负时有风险 */
+isalpha((unsigned char)text[i])         /* ✅ */
+```
+
+因为 `char` 在某些平台是有符号的，中文字符会变成负数，传给 `isalpha` 是未定义行为。
+
+**规矩：`<ctype.h>` 的函数参数都转成 `unsigned char`。**
+
+（其实更准确说这些函数接受的是能表示所有 `unsigned char` 值和 EOF 的 `int`，直接转 `unsigned char` 是安全做法。）
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `a == b` 比较字符串 | 永远不等 | 比的是地址 | 用 `strcmp` |
+| `if (strcmp(a,b))` 当相等 | 逻辑反了 | 0 才是相等 | `== 0` |
+| `strcpy` 目标太小 | 溢出崩溃 | 不检查大小 | 用 `snprintf` |
+| `strncpy` 没补 `\0` | 打印出乱码 | 不保证补 0 | 手动补 |
+| 改字面量 | 段错误 | 只读区 | 用数组 |
+| `sizeof` 当 `strlen` | 多算 1 | 含 `\0` | 用 `strlen` |
+| 循环里反复 `strlen` | 慢 | O(n) 每次 | 先存长度 |
+| `isalpha(char)` | 中文出问题 | 负值 | 转 `unsigned char` |
+
+:::danger[缓冲区溢出是真实的安全漏洞]
+```c
+char name[10];
+strcpy(name, user_input);      /* 用户输入任意长度 → 溢出 */
+```
+
+攻击者可以精心构造超长输入，覆盖函数的返回地址，**执行任意代码**。
+
+历史上大量漏洞（如 1988 年的 Morris 蠕虫、各种 CVE）都源于此。
+
+**规矩**：
+
+1. 优先用 `snprintf(buf, sizeof(buf), ...)`
+2. 用 `strncpy` 并手动补 `\0`
+3. 永远不要对不可信输入用 `strcpy` / `strcat`
+:::
+
+## 本课自检
+
+- [ ] **知道 C 字符串是以 `\0` 结尾的字符数组**
+- [ ] 分清 `sizeof`（含 `\0`）和 `strlen`（不含）
+- [ ] 知道 `char s[]` 和 `char *s` 的区别
+- [ ] **知道不能修改字符串字面量**
+- [ ] 会用 `strlen` / `strcpy` / `strcat` / `strcmp`
+- [ ] **知道 `strcmp` 返回 0 才相等**
+- [ ] 知道字符串不能用 `==` 比较
+- [ ] **知道 `strcpy` / `strcat` 有溢出风险**
+- [ ] 知道 `strncpy` 不保证补 `\0`
+- [ ] 会用 `snprintf`，知道它返回"所需长度"
+- [ ] 知道 `<ctype.h>` 参数要转 `unsigned char`
+
+## 下一步
+
+[14 阶段实战：猜数字](./14-project-guess) —— 把前 9 课串成一个完整程序。

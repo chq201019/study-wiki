@@ -1,0 +1,247 @@
+---
+id: toolchain-02
+title: "02 `static` 与链接属性"
+sidebar_position: 3
+description: "从源码到可执行文件 第 2 部分：`static` 与链接属性"
+---
+
+# 02 `static` 与链接属性
+`static` 在 C 里有两个完全不同的含义，取决于它修饰什么：
+
+| 修饰对象 | 含义 | 存储期 |
+| --- | --- | --- |
+| 函数内部的局部变量 | 改变**存储期**：从自动变成静态（值在多次调用间保留） | 静态 |
+| 文件作用域的变量/函数 | 改变**链接属性**：从外部链接变成内部链接（只本文件可见） | 静态 |
+
+第二个用法是本节重点——它直接对应 `nm` 输出里字母的大小写。
+
+### 实测：`static` 的链接效果
+
+文件 `link_a.c`：
+
+```c
+#include <stdio.h>
+
+int public_var = 10;
+static int private_var = 20;
+extern int external_var;
+
+int public_func(void) { return 1; }
+static int private_func(void) { return 2; }
+
+void show(void) {
+    printf("public_var=%d private_var=%d\n", public_var, private_var);
+    printf("public_func=%d private_func=%d\n", public_func(), private_func());
+}
+```
+
+```bash
+gcc -c link_a.c -o link_a.o
+nm link_a.o
+```
+
+```text
+00000000 a @feat.00
+         U printf
+00000060 t private_func
+00000004 d private_var
+00000000 T public_func
+00000000 D public_var
+00000010 T show
+```
+
+对照表：
+
+| 源码声明 | `nm` 符号 | 结论 |
+| --- | --- | --- |
+| `int public_var = 10;` | `00000000 D public_var` | 大写 `D` → 全局可见 |
+| `static int private_var = 20;` | `00000004 d private_var` | 小写 `d` → 只本文件可见 |
+| `int public_func(void)` | `00000000 T public_func` | 大写 `T` → 全局可见 |
+| `static int private_func(void)` | `00000060 t private_func` | 小写 `t` → 只本文件可见 |
+| `extern int external_var;` | **不出现** | `extern` 只是声明，不定义，记入 `U` 欠账（本例未使用故被优化掉） |
+
+:::tip[嵌入式开发的实践准则]
+**文件作用域的一切，默认加 `static`。** 需要跨文件访问的才去掉。理由：
+
+1. 避免命名污染——`static` 后多个文件可以有同名的 `static int counter` 而不冲突
+2. 避免意外被外部修改——内部状态真正私有
+3. 给编译器更多优化空间——知道没人能外部引用，可能直接内联或消除
+
+这条在 ESP-IDF 源码里体现得非常明显。
+:::
+
+### 实测：重复定义的后果
+
+`link_b.c` 也定义了一次 `int public_var = 99;`，同时定义 `external_var`：
+
+```c
+#include <stdio.h>
+
+int external_var = 30;
+int public_var = 99;
+
+void show(void);
+
+int main(void) {
+    show();
+    printf("external_var=%d\n", external_var);
+    return 0;
+}
+```
+
+两个文件一起链接：
+
+```bash
+gcc link_a.c link_b.c -o link.exe
+```
+
+```text
+ld.lld: error: duplicate symbol: public_var
+>>> defined at .../link_a-5f3df2.o
+>>> defined at .../link_b-30807a.o
+clang-23: error: linker command failed with exit code 1 (use -v to see invocation)
+```
+
+**原因**：两个文件都提供了大写 `D` 符号 `public_var`，链接器不知道该用哪个。
+
+而如果 `link_a.c` 里写成 `static int public_var = 10;`（小写 `d`），冲突立刻消失——因为两个 `public_var` 变成了互不可见的两个独立符号。
+
+:::danger[头文件里绝对不要定义变量]
+这是最常见的 `duplicate symbol` 来源。如果头文件 `config.h` 里写了 `int threshold = 5;`，那么**每个**包含它的 `.c` 都会生成一个大写 `D` 符号，多文件链接必然冲突。
+
+正确做法：
+
+```c
+/* config.h —— 只声明 */
+extern int threshold;
+```
+
+```c
+/* config.c —— 只定义一次 */
+int threshold = 5;
+```
+
+**头文件放声明，源文件放定义。** 函数也一样：头文件放原型，源文件放实现。
+:::
+
+## 五、静态库与动态库
+
+当你要复用一批函数时，有两种打包方式。
+
+### 静态库（`.a` / `.lib`）
+
+本质就是**一堆 `.o` 打成一个包**，加个索引。链接时链接器**只抽取用到的那部分**复制进最终可执行文件。
+
+实测打包：
+
+```c
+/* libmath.c */
+int mul(int a, int b) { return a * b; }
+int sub(int a, int b) { return a - b; }
+```
+
+```bash
+gcc -c libmath.c -o libmath.o
+ar rcs libmymath.a libmath.o
+```
+
+退出码 0，产物 1198 字节。
+
+`ar` 的参数：`r` = 替换/插入成员，`c` = 创建（不警告），`s` = 写索引（**必须加**，否则链接器找不到符号）。
+
+看库里有什么：
+
+```bash
+nm libmymath.a
+```
+
+```text
+libmath.o:
+00000000 a @feat.00
+00000000 T mul
+00000020 T sub
+```
+
+使用方 `libmain.c`：
+
+```c
+#include <stdio.h>
+int mul(int a, int b);
+int sub(int a, int b);
+
+int main(void) {
+    printf("mul=%d sub=%d\n", mul(6, 7), sub(10, 4));
+    return 0;
+}
+```
+
+```bash
+gcc libmain.c -L . -lmymath -o libmain.exe
+./libmain.exe
+```
+
+```text
+mul=42 sub=6
+```
+
+:::caution[链接器参数顺序很重要]
+`-lmymath` 必须放在**引用它的文件之后**。链接器是按命令行从左到右扫描、维护一个"还欠着什么"的列表的：
+
+```bash
+gcc libmain.c -L . -lmymath -o out.exe   # 正确
+gcc -lmymath libmain.c -o out.exe        # 可能报 undefined reference
+```
+
+因为库是"按需抽取"的——扫到库时如果还没有任何欠账，库里的东西就被全部丢弃了。
+
+规则：**越基础的库越靠后。** 自己写的库放在系统库之前。
+:::
+
+`-L` 是**库搜索路径**，`-l` 是**库名**（`libmymath.a` 写成 `-lmymath`，前缀 `lib` 和后缀 `.a` 自动补全）。
+
+### 动态库（`.so` / `.dll`）
+
+不复制代码，只在可执行文件里记一句"运行时去找 `xxx.dll`"。
+
+Linux（ELF）下的典型命令：
+
+```bash
+gcc -fPIC -shared libmath.c -o libmymath.so
+gcc libmain.c -L . -lmymath -o libmain
+LD_LIBRARY_PATH=. ./libmain
+```
+
+Windows（MinGW，PE）下：
+
+```bash
+gcc -shared libmath.c -o libmymath.dll
+gcc libmain.c -L . -lmymath -o libmain.exe
+```
+
+:::warning[平台差异标注]
+上面 Linux 命令 `-fPIC -shared` 产出 `.so`，Windows/MinGW 产出 `.dll`。**本站实测环境是 Windows/MinGW**，教程中给出的实测结果都是 `.a` 静态库和 PE/COFF 目标文件。动态库的 Linux 命令是通用知识，未在本机逐条实测，请按你的平台验证。
+
+Windows 上动态库还涉及符号导出：默认 MinGW 会导出所有符号，也可以用 `__declspec(dllexport)` 显式控制，链接时生成 `.lib` 导入库。
+:::
+
+### 两者对比
+
+| 维度 | 静态库 | 动态库 |
+| --- | --- | --- |
+| 链接时机 | 编译期复制进可执行文件 | 运行时加载 |
+| 可执行文件体积 | 大（含库代码） | 小（只有引用） |
+| 运行时依赖 | 无，拷过去就能跑 | 必须有对应的 `.dll`/`.so` 在搜索路径里 |
+| 库更新 | 必须重新链接 | 替换库文件即可（ABI 兼容前提） |
+| 内存占用 | 每个进程一份副本 | 多个进程可共享一份代码页 |
+| 启动速度 | 略快 | 略慢（要加载解析） |
+| **嵌入式适用性** | **几乎总是用它** | 基本不用（没有 OS 加载器） |
+
+:::info[嵌入式为什么不用动态库]
+ESP32 / STM32 上通常**没有动态链接器**——固件是一整块二进制烧进 Flash 的，不存在"运行时加载 `.so`"这回事。所以 ESP-IDF 的组件编译产物全是 `.a` 静态库，最后由链接器拼成一个 `.elf` 再转成 `.bin`。
+
+理解这一点很重要：你在 ESP-IDF 里看到的 `libfreertos.a`、`libdriver.a`，就是本页讲的静态库，用 `ar` 打包的，可以直接 `nm` 查看。
+:::
+
+---
+
+**翻页**：[← 上一页](./toolchain-01) · [下一页 →](./toolchain-03) · [返回目录](./)

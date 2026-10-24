@@ -1,0 +1,253 @@
+---
+id: 16-spi
+title: 16 SPI 通信
+sidebar_position: 16
+description: SPI 四根线、CubeMX 配置、HAL_SPI_Transmit 用法、CS 片选要自己控制，以及 SPI 模式不匹配的症状。
+---
+
+# 16 SPI 通信
+
+**本课目标**：用 SPI 接屏幕或 Flash，理解它比 I2C 快在哪。
+
+## SPI 回顾
+
+![I2C 与 SPI 对比：I2C 两根线靠地址多设备，SPI 四根线加片选换带宽](/img/diagrams/i2c-vs-spi.svg)
+
+
+四根线，**全双工、高速**：
+
+| 线 | 作用 |
+| --- | --- |
+| **SCK** | 时钟（主机产生） |
+| **MOSI** | 主机发、从机收 |
+| **MISO** | 从机发、主机收 |
+| **CS**（NSS） | 片选，低电平有效 |
+
+（[ESP32 第 13 课](../esp-basics/13-spi)讲了原理对比。）
+
+:::danger[STM32 的 CS 通常要自己用 GPIO 控制]
+**CubeMX 里配 SPI 时，NSS 引脚通常选 `Disable`**——因为硬件 NSS 行为不灵活。
+
+**然后你手动指定一个 GPIO 做片选**：
+
+```c
+HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_RESET);   /* 选中 */
+HAL_SPI_Transmit(&hspi1, buf, len, 100);
+HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_SET);     /* 释放 */
+```
+
+**这是 STM32 用 SPI 的标准做法。**
+
+（HAL 也有 `HAL_SPI_TransmitReceive` 之类的硬件 NSS 用法，但不如手动灵活。）
+:::
+
+## CubeMX 配置
+
+以 **SPI1 接 ST7735 屏幕** 为例：
+
+1. **PA5 → SPI1_SCK**
+2. **PA7 → SPI1_MOSI**
+3. （屏幕不需要 MISO，可以不配）
+4. **PA4 → GPIO_Output**（做 CS，User Label 设 `CS`）
+5. 左侧 **Connectivity → SPI1**：
+
+| 参数 | 值 | 说明 |
+| --- | --- | --- |
+| Mode | **Full-Duplex Master** 或 Transmit Only Master | 单向用后者 |
+| **Prescaler** | 决定波特率 | 见下 |
+| **Clock Polarity (CPOL)** | **Low** | Mode 0 |
+| **Clock Phase (CPHA)** | **1 Edge** | Mode 0 |
+| Data Size | 8 Bits | |
+| First Bit | MSB First | 绝大多数设备 |
+
+:::danger[SPI 模式（CPOL/CPHA）不匹配 = 完全没数据]
+| Mode | CPOL | CPHA |
+| --- | --- | --- |
+| **0** | **Low** | **1 Edge** |
+| 1 | Low | 2 Edge |
+| 2 | High | 1 Edge |
+| 3 | High | 2 Edge |
+
+**大多数设备用 Mode 0。**
+
+**通信失败时，第一个要试的就是换成 Mode 3 或 Mode 1。**
+
+设备手册里一般写 "SPI Mode 0" 或分开写 `CPOL=0, CPHA=0`。
+:::
+
+### 波特率怎么算
+
+```text
+SPI 时钟 = APB2时钟 / Prescaler = 72 MHz / Prescaler
+```
+
+| Prescaler | 速率 |
+| --- | --- |
+| 2 | 36 MHz |
+| 4 | 18 MHz |
+| 8 | 9 MHz |
+| **16** | **4.5 MHz** |
+| 32 | 2.25 MHz |
+
+:::tip[新接设备先用 /32 或 /16 调通]
+**直接用最高速失败的话，你分不清是"接线错"还是"频率太高"。**
+
+**先用 4.5MHz 确认能通信，再逐步提速。**
+
+（和 ESP32 的规矩一样。）
+:::
+
+## 发数据
+
+```c
+#include "spi.h"
+
+uint8_t cmd[2] = { 0x01, 0x80 };
+
+HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_RESET);   /* 片选拉低 */
+HAL_SPI_Transmit(&hspi1, cmd, 2, 100);
+HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_SET);     /* 片选拉高 */
+```
+
+:::danger[忘了控制 CS 就发数据]
+```c
+HAL_SPI_Transmit(&hspi1, cmd, 2, 100);      /* ❌ 从机没被选中，什么都不发生 */
+```
+
+**必须先把 CS 拉低，发送完再拉高。**
+
+**如果设备一直没反应，先检查 CS 引脚有没有正确翻转**（用示波器或万用表量）。
+:::
+
+## 读数据
+
+```c
+uint8_t tx[4] = { 0x03, 0x00, 0x00, 0x00 };    /* 0x03 = 读命令 */
+uint8_t rx[4] = { 0 };
+
+HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_RESET);
+HAL_SPI_TransmitReceive(&hspi1, tx, rx, 4, 100);   /* 同时收和发 */
+HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_SET);
+
+/* rx[1] ~ rx[3] 是设备返回的数据 */
+```
+
+:::info[SPI 的"全双工"是什么意思]
+**每个时钟周期同时发一位、收一位。**
+
+所以读数据时**必须发出"哑元"字节**（通常是 `0x00` 或 `0xFF`）来产生时钟。
+
+**这就是为什么 `tx` 数组要填满**——即使你只想读。
+:::
+
+## 一个实际的例子：W25Q Flash 读 ID
+
+```c
+uint8_t tx[4] = { 0x9F, 0x00, 0x00, 0x00 };    /* 0x9F = 读 JEDEC ID */
+uint8_t rx[4] = { 0 };
+
+HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_RESET);
+HAL_SPI_TransmitReceive(&hspi1, tx, rx, 4, 100);
+HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_SET);
+
+printf("Flash ID: %02X %02X %02X\r\n", rx[1], rx[2], rx[3]);
+/* 正常应该输出类似：EF 40 18  (Winbond W25Q128) */
+```
+
+:::tip[读 ID 是验证 SPI 通不通的最好办法]
+**几乎每个 SPI 设备都有"读 ID"命令**：
+
+| 设备 | 命令 |
+| --- | --- |
+| W25Q Flash | `0x9F` |
+| ST7735 屏幕 | `0x04`（读 ID1） |
+| MPU9250 | `0x75`（WHO_AM_I） |
+
+**先读 ID，ID 对了再写业务代码。**
+:::
+
+## 用 ST7735 彩屏
+
+手写 ST7735 驱动很麻烦（要发几十条初始化命令 + 实现画点/画线/写字）。
+
+**建议用现成库**：
+
+- `afiskon/stm32-st7735`（配合 `stm32-ssd1306` 风格）
+- 或 Adafruit ST7735 库移植
+
+```c
+ST7735_Init();
+ST7735_FillScreen(ST7735_BLACK);
+ST7735_WriteString(0, 0, "Hello", Font_11x18, ST7735_WHITE, ST7735_BLACK);
+```
+
+:::warning[彩屏刷新很吃带宽]
+一块 128×160 的 16 位色屏，全屏刷新要：
+
+```text
+128 × 160 × 2 = 40960 字节 = 40 KB
+```
+
+在 **4.5 MHz SPI** 下约需 **73 ms**（约 14 帧/秒）。
+
+**要流畅刷屏必须**：
+
+1. 提高 SPI 频率（最高 36MHz）
+2. **用 DMA 发送**（[第 17 课](./17-dma)）
+
+**这就是为什么刷屏一定要用 DMA。**
+:::
+
+## SPI vs I2C 怎么选
+
+| | I2C | SPI |
+| --- | --- | --- |
+| 线数 | **2** | 4 + 每设备一根 CS |
+| 速度 | 100k~400k | **几 MHz ~ 36 MHz** |
+| 多设备 | 靠地址 | 靠 CS |
+| 上拉电阻 | 需要 | 不需要 |
+| 适合 | 传感器（慢速、多个） | **屏幕、Flash（要带宽）** |
+
+:::tip[实用选择]
+**接 OLED（小、刷新慢）** → I2C 就够（省引脚）
+
+**接彩屏（大、要刷帧）** → **SPI**
+
+**接很多传感器** → I2C（省引脚）
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 忘控制 CS | 没反应 | 从机没选中 | 发前拉低发后拉高 |
+| SPI 模式不对 | 收到 0x00/0xFF | CPOL/CPHA 错 | 试 Mode 0/3 |
+| 频率太高 | 偶发错误 | 超设备上限 | 先用 /32 降速 |
+| 读数据不填 tx | 数据错乱 | 没产生时钟 | tx 填 0x00/0xFF |
+| NSS 用硬件模式 | 时序异常 | 硬件 NSS 不灵活 | NSS=Disable，手动 GPIO |
+| MISO/MOSI 接反 | 读不到 | 接错 | 对调 |
+
+:::danger[STM32 的 SPI 引脚也是"复用"，别改回普通 GPIO]
+CubeMX 配 SPI 后引脚会自动设成 **Alternate Function Push Pull**。
+
+**改回 GPIO_Output 就没波形了。**
+
+（这点和 PWM 一样，[第 12 课](./12-timer-pwm)提过。）
+:::
+
+## 本课自检
+
+- [ ] 知道 SPI 四根线各管什么
+- [ ] **知道 CS 通常要自己用 GPIO 控制**
+- [ ] 会在 CubeMX 配 SPI（Mode 0，先降速）
+- [ ] **知道 SPI 模式（CPOL/CPHA）不匹配就完全没数据**
+- [ ] 会 `HAL_SPI_Transmit` / `TransmitReceive`
+- [ ] **知道读数据要填满 tx 数组（哑元字节）**
+- [ ] **知道"读 ID"是验证 SPI 通不通的最好方法**
+- [ ] 知道彩屏刷新要用 DMA 才流畅
+- [ ] 能判断什么时候用 I2C、什么时候用 SPI
+- [ ] 知道 SPI 引脚必须保持"复用"模式
+
+## 下一步
+
+[17 DMA：不占 CPU 的传输](./17-dma) —— 让数据自己搬运。

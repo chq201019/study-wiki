@@ -1,0 +1,323 @@
+---
+id: functions-02
+title: "02 作用域"
+sidebar_position: 3
+description: "函数 第 2 部分：作用域"
+---
+
+# 02 作用域
+C 有四种作用域：
+
+| 作用域 | 范围 | 例子 |
+| --- | --- | --- |
+| **文件** (file) | 从声明到文件结束 | 文件顶层的变量和函数 |
+| **块** (block) | 从声明到块结束 `}` | 函数内、复合语句内的变量 |
+| **函数原型** (function prototype) | 只在原型内 | `int f(int n)` 里的 `n` |
+| **函数** (function) | 整个函数体 | 只有 `goto` 的标签 |
+
+### 遮蔽（shadowing）
+
+内层作用域的同名变量会遮蔽外层：
+
+```c
+int x = 1;
+void f(void) {
+    int x = 2;        /* 遮蔽全局 x */
+    printf("%d\n", x);   /* 打印 2 */
+}
+```
+
+编译器警告：`-Wshadow`。**应该避免**——尤其在嵌入式里，`-Wshadow` 是常规选项，因为遮蔽会导致极难发现的 bug（你以为改的是全局，实际改的是局部）。
+
+### 块作用域的生命周期
+
+```c
+for (int i = 0; i < 3; i++) { }   /* C99 起，i 只在循环内 */
+/* i 在此不可见 */
+
+{
+    int tmp = 5;
+}   /* tmp 在此失效 */
+```
+
+块结束 → 自动存储期对象销毁 → **指向它的指针悬垂**。
+
+## 五、链接属性：`static` / `extern`
+
+链接属性决定"同一个名字在不同文件里是否指同一个实体"。
+
+| 链接属性 | 含义 | 怎么得到 |
+| --- | --- | --- |
+| **外部** (external) | 全程序唯一实体，跨文件可见 | 文件作用域默认（不加 `static`） |
+| **内部** (internal) | 只在**本翻译单元**内可见 | 文件作用域加 `static` |
+| **无** (none) | 不具名实体 | 块作用域变量、标签、`typedef` |
+
+### 实测：`static` 把符号变成局部
+
+[工具链页](./toolchain) 实测过，这里复述关键结果：
+
+```c
+/* link_a.c */
+int public_var = 10;
+static int private_var = 20;
+int public_func(void) { return 1; }
+static int private_func(void) { return 2; }
+```
+
+```bash
+gcc -c link_a.c -o link_a.o && nm link_a.o
+```
+
+```text
+00000000 a @feat.00
+         U printf
+00000060 t private_func
+00000004 d private_var
+00000000 T public_func
+00000000 D public_var
+00000010 T show
+```
+
+**小写 = 内部链接（`static`），大写 = 外部链接。**
+
+### `extern` 的三种用法
+
+#### 1. 声明（不定义）—— 用于访问别处的全局变量
+
+```c
+extern int g_counter;    /* 声明：别处有这个变量 */
+```
+
+:::caution[声明 vs 定义的区分]
+```c
+extern int x;        /* 声明，不分配内存 */
+extern int x = 5;    /* 定义！有初始化器就是定义（会警告） */
+int x;               /* 在文件作用域：这是"暂定定义"(tentative definition) */
+int x = 5;           /* 定义 */
+```
+
+**文件作用域的 `int x;`（无初始化器、无 extern）是 C 特有的"暂定定义"**：如果本翻译单元后面没有真正的定义，它就成为定义（初值 0）；如果别处已有定义，它就是声明。
+
+这个特性是 C 独有（C++ 没有），**但极易在多文件项目里引发混乱**。建议：
+- 头文件只写 `extern int x;`
+- 恰好一个 `.c` 里写 `int x = 5;`
+:::
+
+#### 2. 显式声明函数（可省略）
+
+```c
+extern void foo(void);   /* 等价于 void foo(void); */
+```
+函数声明默认就是 `extern`，写不写一样。
+
+#### 3. `extern "C"` —— 只在 C++ 里
+
+```c
+#ifdef __cplusplus
+extern "C" {
+#endif
+void c_function(void);
+#ifdef __cplusplus
+}
+#endif
+```
+
+这是**给 C++ 用的**，作用是禁止名字改编（name mangling），让 C++ 能调用 C 函数。写 C/C++ 混合项目的头文件时必须这么包。
+
+### 内部链接的实用价值
+
+:::tip[文件作用域默认加 `static`]
+ESP-IDF 源码里，所有不对外暴露的函数和变量都是 `static`。收益：
+
+1. **命名空间不污染**——多个文件可以有同名的 `static int s_buffer`
+2. **真正的封装**——外部代码无法访问
+3. **编译器能更好优化**——知道没有外部引用，可能内联、消除、或把变量放进寄存器
+
+例外：需要跨文件共享时才去掉 `static`，并在头文件里 `extern` 声明。
+:::
+
+## 六、`inline`
+
+`inline` 的历史是 C 语言里最混乱的部分之一。核心事实：
+
+:::danger[`inline` 只是**建议**，且 C99 的语义很不直观]
+1. **`inline` 不保证内联**——编译器可以忽略它（`-O0` 下基本都忽略）
+2. **`inline` 是给编译器的优化提示，不改变链接语义**（大部分情况）
+3. **C99 的 `inline` 语义和 C++ 不同**，且和 gcc 的传统行为不同——这是最大的坑
+:::
+
+### C99 的规则（标准语义）
+
+C99 规定：
+
+- 一个 `inline` 函数定义**不产生外部定义**（不生成独立的可执行代码实体），它只在**本翻译单元内**可见
+- 如果要在别处调用，必须在**某个**翻译单元里再写一个**不带 `inline`**（或带 `extern inline`）的定义
+
+这导致了一个反直觉的结果：
+
+```c
+/* header.h —— 所有文件都用这个 */
+inline int add(int a, int b) { return a + b; }
+
+/* 如果某个 .c 里调用 add 但编译器不内联（比如 -O0），
+   链接器找不到 add 的外部定义 → undefined reference! */
+```
+
+### 实测：三种写法的对比
+
+```c
+static inline int inline_add(int a, int b) { return a + b; }
+
+__attribute__((noinline)) int noinline_add(int a, int b) { return a + b; }
+```
+
+```text
+=== inline vs noinline ===
+inline_add(3,4)   = 7
+noinline_add(3,4) = 7
+```
+
+两者结果相同——因为 `inline` **只影响代码生成，不改变语义**（如果语义正确的话）。
+
+### 实践中的正确用法
+
+| 写法 | 适用场景 | 说明 |
+| --- | --- | --- |
+| **`static inline`（最常用）** | 头文件里的短小函数 | 每个用到的 TU 各自有一份，不内联也不报错。**推荐** |
+| `extern inline`（在 .c 里） | 需要"只此一份外部定义" | 配合头文件里的 `inline` 声明 |
+| 头文件 `inline` + 一个 .c 里 `extern inline` | 标准 C99 方式 | 繁琐，实际很少用 |
+| `__attribute__((always_inline))` | 强制内联 | gcc/clang 扩展，非标准 |
+| `__attribute__((noinline))` | 强制不内联 | 调试、基准测试用 |
+
+:::warning[头文件里写 `inline` 但忘了 `static` 是经典 bug]
+```c
+/* mylib.h */
+inline int helper(int x) { return x * 2; }   /* 危险！ */
+```
+
+在 `-O0` 下编译器不内联，链接时可能报 `undefined reference to 'helper'`（取决于编译器和版本）。
+
+**在头文件里定义函数，一律写 `static inline`。** 这是唯一安全的选择。
+
+gcc 5+ 默认用 C99 语义（之前默认是 gnu89 语义，行为不同）——这也是为什么"老代码换个编译器就链接失败"。
+:::
+
+### `inline` 和宏的对比
+
+| 维度 | `static inline` 函数 | 函数式宏 |
+| --- | --- | --- |
+| 类型检查 | **有** | 无 |
+| 参数求值次数 | 恰好一次 | 可能多次（`MAX(a++,b++)`） |
+| 调试 | 可以设断点 | 看不到（已展开） |
+| 递归 | 可以 | 不行 |
+| 泛型 | 不行（要写多份或用 `_Generic`） | "天然泛型" |
+| 生成代码 | 由编译器决定是否内联 | 一定展开 |
+
+**现代 C 里优先用 `static inline` 代替函数式宏**（除了确实需要泛型或字符串化/粘贴的场景）。详见 [预处理器页](./preprocessor) 里宏的陷阱。
+
+## 七、`_Noreturn` 与 `_Static_assert`
+
+### `_Noreturn`（C11）
+
+告诉编译器"这个函数不返回"：
+
+```c
+#include <stdnoreturn.h>
+_Noreturn void fatal(const char *msg) {
+    printf("FATAL: %s\n", msg);
+    abort();
+}
+```
+
+收益：编译器知道调用后代码不可达，能消除后续代码、不做返回值警告。嵌入式里的**错误处理/断言失败函数**通常用这个。
+
+C23 用 `[[noreturn]]` 属性。gcc/clang 也支持 `__attribute__((noreturn))`。
+
+### `_Static_assert` 在函数里
+
+```c
+void f(void) {
+    _Static_assert(sizeof(int) == 4, "int must be 4 bytes");
+}
+```
+
+实测（`-std=c17`）：
+
+```text
+_Static_assert passed (C11, __STDC_VERSION__=201710)
+```
+
+`_Static_assert` 的第一个参数必须是**常量表达式**（编译期可算），所以它可以用在块作用域，但不能依赖运行时变量。
+
+详见 [语法页](./syntax)。（再次提醒：`_Static_assert` 是 **C11**，`static_assert` 是 **C23**。）
+
+## 八、函数指针作为返回值与参数
+
+[指针页](./pointers)讲了函数指针基础，这里补充两个进阶形式：
+
+```c
+/* 返回函数指针的函数 */
+int (*get_handler(int id))(int, void *) {
+    return handlers[id];
+}
+/* 用 typedef 清晰得多 */
+typedef int (*handler_t)(int, void *);
+handler_t get_handler(int id) { return handlers[id]; }
+```
+
+```c
+/* 接受函数指针数组的参数 */
+void register_all(handler_t *table, size_t n);
+```
+
+**结论：涉及函数指针的复杂声明，一律用 `typedef` 拆解。**
+
+## 常见坑
+
+| 陷阱 | 现象 | 原因 | 正确做法 |
+| --- | --- | --- | --- |
+| 以为传指针能改指针本身 | 调用方的指针没变 | C 只有值传递 | 要改指针就传 `int **` |
+| 大结构体值传递 | 栈消耗大、慢 | 整个结构体拷贝 | 用 `const struct *` |
+| 返回局部变量地址 | 值随机 | 栈帧销毁 | `static`/堆/调用方缓冲区 |
+| 递归太深 | 栈溢出 | 每层消耗栈帧 | 改循环，或增大栈 |
+| 依赖尾递归优化 | 某些编译器下爆栈 | C 不保证 | 自己写成循环 |
+| `va_arg(ap, float)` | 值错，后续全乱 | float 提升为 double | 用 `double` |
+| `va_arg(ap, char)` | 同上 | char 提升为 int | 用 `int` |
+| `printf` 格式串不匹配 | 输出乱码或崩溃 | 无类型检查 | 开 `-Wformat -Werror=format` |
+| `va_start` 不配对 `va_end` | 未定义行为 | 标准要求配对 | 每个出口都要 `va_end` |
+| 头文件里定义变量 | 链接重复符号 | 每个 TU 一份定义 | 头文件 `extern`，`.c` 里定义 |
+| `int x;` 在头文件里 | 暂定定义混乱 | C 特有规则 | 明确写 `extern int x;` |
+| 头文件 `inline` 忘加 `static` | `undefined reference` | C99 不产生外部定义 | 用 `static inline` |
+| 以为 `inline` 一定内联 | `-O0` 下没内联 | 只是建议 | 用 `always_inline` 才保证 |
+| 变量遮蔽 | 改错变量 | 内外层同名 | 开 `-Wshadow` |
+| 块结束还用其指针 | 悬垂指针 | 自动对象销毁 | 注意生命周期 |
+
+## 自检清单
+
+- [ ] 能解释为什么 `by_value(x)` 改不了 `x` 而 `by_value(&y)` 能改 `y` 吗？
+- [ ] 知道"要改什么就传什么的地址"这条准则吗？
+- [ ] 能从递归的实测地址算出每层栈帧多大吗？
+- [ ] 知道 C 是否保证尾递归优化吗？
+- [ ] 可变参数部分会做哪两种默认提升？
+- [ ] `va_arg(ap, float)` 为什么是错的？
+- [ ] 能把 `va_list` 转发给 `vprintf` 吗？
+- [ ] 四种作用域分别是什么？
+- [ ] 三种链接属性分别是什么？怎么得到？
+- [ ] 文件作用域的 `int x;` 是声明还是定义？（暂定定义）
+- [ ] 知道 `nm` 输出里大小写字母对应什么链接属性吗？
+- [ ] 头文件里定义函数该怎么写？为什么不能只写 `inline`？
+- [ ] `static inline` 相比宏有什么优势？
+- [ ] 知道为什么建议文件作用域默认加 `static` 吗？
+- [ ] `_Noreturn` 有什么用？
+
+## 下一步
+
+- [指针专章](./pointers) —— 函数指针的完整讲解
+- [内存模型](./memory) —— 栈帧与栈溢出的细节
+- [预处理器](./preprocessor) —— 函数式宏 vs `static inline` 的对比
+- [嵌入式 C](./embedded) —— 中断服务程序、可重入性
+- [回到导读](./)
+
+---
+
+**翻页**：[← 上一页](./functions-01) · [返回目录](./)

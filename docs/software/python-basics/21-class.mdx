@@ -1,0 +1,359 @@
+---
+id: 21-class
+title: 21 面向对象：类与对象
+sidebar_position: 21
+description: 类是什么、__init__ 与 self 到底在做什么、实例属性与方法，以及什么时候该用类。
+---
+
+# 21 面向对象：类与对象
+
+**本课目标**：理解「类是模板、对象是实例」，会用类把数据和操作打包在一起。
+
+## 一个具体的问题
+
+假设要管理学生信息。用字典：
+
+```python
+s1 = {"name": "小明", "age": 18, "score": 95}
+s2 = {"name": "小红", "age": 17, "score": 92}
+
+# 计算等级
+def get_level(student):
+    if student["score"] >= 90:
+        return "A"
+    return "B"
+
+print(f"{s1['name']}: {get_level(s1)}")
+```
+
+能用，但有问题：
+
+- **数据和操作分开了**：`get_level` 是个游离的函数，必须手动传 `student`
+- **结构没有保证**：写错键名 `student["scroe"]` 要到运行时才报错
+- **加功能就加函数**，函数越堆越多
+
+用类：
+
+```python
+class Student:
+    def __init__(self, name, age, score):
+        self.name = name
+        self.age = age
+        self.score = score
+
+    def get_level(self):
+        if self.score >= 90:
+            return "A"
+        return "B"
+
+
+s = Student("小明", 18, 95)
+print(f"{s.name}: {s.get_level()}")
+```
+
+**数据和操作打包在一起了。**
+
+## 类与对象的关系
+
+```python
+class Dog:              # 类：图纸
+    ...
+
+wangcai = Dog()         # 对象：按图纸造出来的实物
+dahuang = Dog()         # 另一个对象，彼此独立
+```
+
+:::tip[类 = 饼干模具，对象 = 饼干]
+- **类**是模板，定义「有什么属性、能做什么动作」，本身不是具体的东西
+- **对象**是按模板造出来的实例，有自己独立的属性值
+
+`Dog` 这个类不叫「旺财」，只有具体的某条狗才叫旺财。
+:::
+
+## `__init__`：初始化方法
+
+```python
+class Dog:
+    def __init__(self, name, age):
+        self.name = name
+        self.age = age
+```
+
+`__init__` 在**创建对象时自动调用**：
+
+```python
+d = Dog("旺财", 3)
+# 相当于自动执行了 Dog.__init__(d, "旺财", 3)
+print(d.name)    # 旺财
+print(d.age)     # 3
+```
+
+:::warning[`__init__` 是「初始化」，不是「构造」]
+严格说，对象在 `__init__` 之前就已经被创建了，`__init__` 只是给它填初始数据。
+
+**实践上不用区分**，你只需记住：写在这里的代码，在创建对象时会执行。
+:::
+
+## self 到底是什么
+
+这是初学最困惑的点。
+
+```python
+class Dog:
+    def __init__(self, name):
+        self.name = name
+
+    def bark(self):
+        print(f"{self.name} 在叫")
+```
+
+调用时：
+
+```python
+d = Dog("旺财")
+d.bark()             # 只写了一个括号
+```
+
+**但 `bark` 定义时明明写了 `self` 参数**——为什么调用不用传？
+
+:::tip[self 就是「这个对象自己」]
+`d.bark()` 实际上等价于 `Dog.bark(d)`。**Python 自动把 `d` 作为第一个参数传进去了。**
+
+所以 `self` 不是关键字（叫 `this` 也行），它只是**约定俗成的第一个参数名**，代表「调用这个方法的那个对象」。
+
+```python
+class Dog:
+    def bark(this):        # 叫 this 也能跑，但别这么写
+        print(this.name)
+```
+
+**规矩：永远写 `self`**，这是全 Python 社区的共识。
+:::
+
+### 验证一下
+
+```python
+class Demo:
+    def show(self):
+        print(f"self 的 id 是 {id(self)}")
+
+d = Demo()
+print(f"d 的 id 是 {id(d)}")
+d.show()
+```
+
+输出（两个 id 相同）：
+
+```text
+d 的 id 是 2456192866000
+self 的 id 是 2456192866000
+```
+
+**证明 `self` 就是 `d` 本身。**
+
+## 实例属性：每个对象独立的
+
+```python
+class Dog:
+    def __init__(self, name):
+        self.name = name
+
+
+a = Dog("旺财")
+b = Dog("大黄")
+
+print(a.name)    # 旺财
+print(b.name)    # 大黄
+```
+
+两个对象的 `name` **互不影响**，各存各的。
+
+```python
+a.name = "改个名"
+print(a.name, b.name)     # 改个名 大黄
+```
+
+### 类的属性：所有对象共享
+
+```python
+class Dog:
+    species = "犬科"          # 类属性，写在方法外面
+
+    def __init__(self, name):
+        self.name = name        # 实例属性
+
+
+a = Dog("旺财")
+b = Dog("大黄")
+
+print(a.species, b.species)     # 犬科 犬科
+
+Dog.species = "Canis"           # 改类属性
+print(a.species, b.species)     # Canis Canis  ← 都变了
+```
+
+:::warning[类属性被所有实例共享，容易被误改]
+```python
+class Counter:
+    count = 0            # 类属性
+
+    def inc(self):
+        self.count += 1  # 危险！这实际创建了实例属性
+
+
+a = Counter()
+b = Counter()
+a.inc()
+a.inc()
+print(a.count, b.count, Counter.count)   # 2 0 0
+```
+
+`a.count += 1` **没有改类属性**，而是在 `a` 上新建了一个实例属性遮蔽了它。所以 `b.count` 和 `Counter.count` 都没变。
+
+**这类问题极难排查。规则：需要每个对象独立的数据，一律在 `__init__` 里用 `self.x = ...` 定义。**
+:::
+
+## 方法：对象能做的事
+
+```python
+class BankAccount:
+    def __init__(self, owner, balance=0):
+        self.owner = owner
+        self.balance = balance
+
+    def deposit(self, amount):
+        if amount <= 0:
+            raise ValueError("存款金额必须为正")
+        self.balance += amount
+        return self.balance
+
+    def withdraw(self, amount):
+        if amount > self.balance:
+            raise ValueError("余额不足")
+        self.balance -= amount
+        return self.balance
+
+
+acc = BankAccount("小明", 100)
+acc.deposit(50)
+acc.withdraw(30)
+print(f"{acc.owner} 余额 {acc.balance}")
+```
+
+输出：
+
+```text
+小明 余额 120
+```
+
+:::tip[把「校验」放进方法里，这是类的核心价值]
+注意 `deposit` 里的检查。这意味着**不可能有人绕过它把余额改成负数**。
+
+如果用字典 + 散函数，就得靠每个调用者自觉检查——迟早会漏。
+
+**封装的意义：让「非法状态」根本无法产生。**
+:::
+
+## `__str__`：让对象能漂亮地打印
+
+不定义的话，`print(obj)` 会显示丑陋的东西：
+
+```python
+class Dog:
+    def __init__(self, name):
+        self.name = name
+
+d = Dog("旺财")
+print(d)          # <__main__.Dog object at 0x7f8b1c2d3e50>
+```
+
+定义 `__str__`：
+
+```python
+class Dog:
+    def __init__(self, name, age):
+        self.name = name
+        self.age = age
+
+    def __str__(self):
+        return f"Dog(name={self.name}, age={self.age})"
+
+
+print(Dog("旺财", 3))
+print(f"信息：{Dog('大黄', 2)}")
+```
+
+输出：
+
+```text
+Dog(name=旺财, age=3)
+信息：Dog(name=大黄, age=2)
+```
+
+:::info[这类 `__xxx__` 方法叫「魔术方法」]
+它们让你自定义对象在特定操作下的行为：
+
+| 方法 | 什么时候调用 |
+| --- | --- |
+| `__init__` | 创建对象时 |
+| `__str__` | `print()` / `str()` / f-string |
+| `__repr__` | 交互模式下直接显示 |
+| `__len__` | `len(obj)` |
+| `__eq__` | `obj1 == obj2` |
+| `__lt__` | `obj1 < obj2` |
+
+进阶课程会深入讲，现在记住 `__init__` 和 `__str__` 就够用。
+:::
+
+## 什么时候该用类
+
+:::warning[不要为了用类而用类]
+初学者学会类之后，容易把所有东西都塞进类里。**这是过度设计。**
+
+**适合用类的信号**：
+
+- 有**多个相关的数据**要一起维护（姓名+年龄+分数）
+- 有**需要保证的约束**（余额不能为负、状态必须按顺序变化）
+- 有多份**结构相同但数据不同**的东西（3 个学生、10 个订单）
+
+**不适合用类的场景**：
+
+- 只是「一个函数算点东西」→ 用函数
+- 只用一个字典传数据、没有行为 → 用字典
+- 只有一个实例，且没有状态 → 用模块级函数
+:::
+
+一个判断方法：
+
+```text
+问自己：「这些东西需要一直捆在一起吗？」
+  是 → 用类
+  否 → 用函数或字典
+```
+
+## 常见错误
+
+| 错误 | 报错/现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 忘了写 `self` 参数 | TypeError | 方法定义少了 self | `def f(self, x)` |
+| 调用时多传了 self | TypeError | 以为要手动传 | 直接 `obj.f()` |
+| 忘写 `self.x = x` | AttributeError | 属性没存 | 在 `__init__` 里赋值 |
+| 类属性当计数器用 | 值不对 | 共享属性被遮蔽 | 用 `__init__` 定义实例属性 |
+| `print(obj)` 显示地址 | —— | 没定义 `__str__` | 定义它 |
+| 类名小写 | 能跑但不规范 | 命名惯例 | 类名用大驼峰 `ClassName` |
+
+## 本课自检
+
+- [ ] 能说出类和对象的区别（图纸 vs 实物）
+- [ ] 会用 `class` 定义类，会在 `__init__` 里设属性
+- [ ] **能解释 self 是什么**（就是对象自己）
+- [ ] 知道 `d.bark()` 等价于 `Dog.bark(d)`
+- [ ] 分清实例属性和类属性
+- [ ] 知道类属性被共享，误改会导致难查的 bug
+- [ ] 会写方法，会在方法里做校验
+- [ ] 会用 `__str__` 让对象能漂亮打印
+- [ ] 知道什么时候**不该**用类
+
+## 下一步
+
+[22 面向对象进阶：继承](./22-inherit) —— 学会复用已有类的代码，以及什么时候不该继承。

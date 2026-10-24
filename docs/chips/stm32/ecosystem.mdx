@@ -1,0 +1,138 @@
+---
+title: STM32 开发生态
+sidebar_position: 2
+description: CubeMX/CubeIDE/CubeProgrammer、HAL/LL/寄存器三层、烧录调试器选型——STM32 工具链全景与 ESP32 生态对照。
+---
+
+# STM32 开发生态
+
+第一次接触 STM32 的人最大的障碍不是芯片，是**工具链名字太多**：CubeMX、CubeIDE、CubeProgrammer、Keil、HAL、LL、标准库……这一页把它们全部认全，并且每个都告诉你"它相当于 ESP32 世界的什么东西"。
+
+## 1. 工具链全景：一张图
+
+```mermaid
+flowchart LR
+  C[CubeMX<br/>图形化配置+代码生成] -->|生成初始化代码| P[你的工程]
+  P --> I[IDE 编译<br/>CubeIDE / Keil / VSCode+GCC]
+  I --> F[固件 .elf/.hex/.bin]
+  F --> B[烧录<br/>ST-Link via CubeProgrammer / OpenOCD]
+  B --> D[调试<br/>SWD 打断点看变量]
+```
+
+对照 ESP32 生态：
+
+| 干什么 | ESP32 世界 | STM32 世界 |
+| --- | --- | --- |
+| 图形化配置外设 | menuconfig（文本菜单） | **CubeMX**（画芯片图点引脚） |
+| IDE | VSCode + ESP-IDF 插件 | **CubeIDE** / Keil MDK / VSCode+GCC |
+| 编译器 | GCC（xtensa/riscv 工具链） | GCC（arm-none-eabi）或 Keil 的 ArmCC |
+| 烧录工具 | `idf.py flash`（esptool，串口） | **STM32CubeProgrammer**（ST-Link 走 SWD，或串口） |
+| 在线调试 | JTAG / USB-Serial-JTAG + GDB | **SWD** + GDB（OpenOCD） |
+| 出厂库 | ESP-IDF | **HAL 库**（另有 LL 库、寄存器直写） |
+
+### CubeMX：STM32 的"配置生成器"
+
+[CubeMX](https://www.st.com/en/development-tools/stm32cubemx.html)（免费）是官方图形化工具：选中芯片型号 → 在芯片图上点引脚分配功能 → 点时钟树界面拖滑块配主频 → 勾选中间件（FreeRTOS、USB、LwIP）→ 一键生成**整个工程的初始化代码**。
+
+它解决的是 STM32 相对 ESP32 最大的新手痛点：**引脚不是自由路由的**。ESP32 里"串口想用哪个脚都行"，STM32 里每个外设的每个信号只能落在固定的候选引脚上（复用表决定），CubeMX 把"翻几百页数据手册查复用表"变成了"图上点点点"。
+
+### CubeIDE vs Keil：用哪个
+
+| | CubeIDE | Keil MDK |
+| --- | --- | --- |
+| 背景 | ST 官方，Eclipse 壳 + GCC | 第三方老牌，Arm 官方工具 |
+| 价格 | 免费 | 商用收费（社区版有限制） |
+| 整合 | **内置 CubeMX，无缝** | 国内教学视频大多用 Keil |
+| 建议 | **新手用这个** | 看招聘要求/学校课程时再适应 |
+
+两个 IDE 里的工程**互不兼容**，但源代码通用——代码归代码，工程文件归 IDE。此外进阶玩法是 VSCode + arm-none-eabi-gcc + CMake（IDF 用户会觉得无比熟悉）。
+
+## 2. 软件三层：寄存器 / HAL / LL
+
+同一个"把 PC13 拉高"，三种写法：
+
+```c
+// ① 寄存器直写——直接操作硬件地址，最底层
+GPIOC->BSRR = (1 << 13);
+
+// ② HAL 库——官方高层抽象，可读性最好
+HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+
+// ③ LL 库——轻量内联封装，性能接近寄存器
+LL_GPIO_SetOutputPin(GPIOC, LL_GPIO_PIN_13);
+```
+
+| 层 | 定位 | 优点 | 缺点 | 相当于 ESP32 的 |
+| --- | --- | --- | --- | --- |
+| **寄存器** | 直接读写芯片手册定义的地址 | 最快、最省、真懂硬件 | 换型号要重写，写错没提示 | 直接操作 `GPIO.out_w1ts` 寄存器 |
+| **HAL** | 官方高层 API，全家桶函数 | 跨型号通用、资料最多、CubeMX 默认生成 | 代码膨胀、多层检查慢、回调嵌套深 | IDF 驱动（`gpio_set_level`） |
+| **LL** | 薄内联层，每个函数几乎一行汇编 | 快且比寄存器可读 | 覆盖面不全，常和 HAL 混用 | IDF 的 `hal/gpio_ll.h` |
+
+**学习期建议用 HAL**（和全网教程对齐），**对性能敏感的段落换 LL 或寄存器**，寄存器直写留一两个外设练手（比如自己裸配一遍 UART 发一个字节）以理解本质。
+
+:::info[还有一个"标准库"，看到别懵]
+2010 年代 ST 的官方库叫"标准外设库（StdPeriph，SPL）"，网上大量老教程用它。**ST 已停止维护**，新项目一律 HAL。看到 `GPIO_SetBits()` 这种写法就是标准库，思路能看懂即可，不建议新学。
+:::
+
+### Arduino 也有 STM32 版
+
+[STM32duino](https://github.com/stm32duino/Arduino_Core_STM32)（Arduino IDE 里装 STM32 核心包）让你用 `digitalWrite()` 驱动 STM32——**从本站快速上手迁移过去零成本**。但它同样隐藏了时钟树、中断优先级这些 STM32 的核心知识，适合快速出活，不适合作为唯一通道。
+
+## 3. 烧录与调试：SWD 是灵魂
+
+ESP32 的烧录走串口引导程序（esptool），STM32 的主力方式完全不同——**SWD（Serial Wire Debug）**：
+
+| 方式 | 硬件 | 能烧录 | 能打断点调试 | 场景 |
+| --- | --- | --- | --- | --- |
+| **SWD**（推荐） | ST-Link / J-Link / DAP-Link，接 SWDIO(PA13)+SWCLK(PA14)+GND+3V3 | ✅ | ✅ **支持断点/单步/看变量** | 开发主力 |
+| 串口 ISP | USB 转串口，接 PA9/PA10，**BOOT0 拉高**复位 | ✅ | ❌ | 没有 ST-Link 时的备胎 |
+| DFU / USB | USB 线（需芯片支持 + 进入系统 bootloader） | ✅ | ❌ | 不想接线的成品升级 |
+
+SWD 用两根信号线就完成了"烧录 + 调试 + 读内存"，这就是为什么买板子建议直接带 ST-Link。**SWD 调试时能看到 C 变量的值、设断点单步执行**——你在 ESP32 上习惯的"靠串口 printf 定位问题"，在 STM32 上有更高级的姿势，值得专门学。
+
+:::caution[调试器克隆版照样能用，但注意电压]
+淘宝 10~20 元的 ST-Link V2 克隆版完全够学习用。接板子前确认：目标板供电是 3.3V（ST-Link 有 3.3V/5V 输出脚，别接 5V 到芯片引脚）；克隆版给不了大电流，别拿它直接给带屏幕的项目板供电。
+:::
+
+## 4. 工程结构：CubeMX 生成的工程长什么样
+
+CubeMX 生成 HAL 工程后，你需要改的代码**只出现在特定区域**（`USER CODE BEGIN/END` 注释对之间），其余文件是机器生成的，重新生成时会被覆盖：
+
+```c
+int main(void)
+{
+  HAL_Init();                       // HAL 库初始化（SysTick 心跳）
+  SystemClock_Config();             // CubeMX 生成的时钟树配置
+  MX_GPIO_Init();                   // CubeMX 生成的外设初始化
+  MX_USART1_UART_Init();
+
+  /* USER CODE BEGIN 2 */           // ← 你的代码写这里
+  printf("hello stm32\r\n");
+  /* USER CODE END 2 */
+
+  while (1)
+  {
+    /* USER CODE BEGIN 3 */         // ← 主循环写这里
+    HAL_Delay(500);
+    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+    /* USER CODE END 3 */
+  }
+}
+```
+
+这套"生成器 + 用户区标注"的模式和 IDF 的 `idf.py` 自动生成工程异曲同工——**分清"机器生成的"和"你写的"**，是避免"改了配置代码全没了"的关键。
+
+## 常见坑
+
+| 坑 | 说明 |
+| --- | --- |
+| 在 `USER CODE` 区外写代码 | 重新生成工程时代码被覆盖消失 |
+| 蓝板 HSE 晶振填 25MHz | 蓝板焊的是 **8MHz** 晶振，CubeMX 里 HSE 要填 8，否则串口波特率全错 |
+| Keil 工程没装器件包 | Keil 编译报缺 `stm32f1xx.h`——去 Keil 官网装对应 Device Family Pack |
+| 只装了 CubeMX 没装 CubeIDE | CubeMX 单独装只负责生成工程，编译还需要 IDE 或独立工具链 |
+| 串口看不到 printf | HAL 默认不重定向 printf，需重写 `fputc`（见[外设实战](./peripherals)） |
+
+## 下一步
+
+- [第一个工程](./first-project)——拿蓝板点灯走全流程
+- [ESP32↔STM32 迁移对照](./from-esp32)——概念层面更深的一层对照

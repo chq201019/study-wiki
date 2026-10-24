@@ -1,0 +1,168 @@
+---
+id: shell-tools
+title: Shell 文本处理速查
+sidebar_position: 36
+description: 命令行的胶水技巧：进程替换、heredoc、xargs、并行、以及十个能省掉写脚本的组合。
+---
+
+# Shell 文本处理速查
+
+**本课目标**：用命令行组合解决 80% 的临时任务，不用写脚本。
+
+## 进程替换
+
+![Shell 管道的三个进程与两个内核缓冲区，以及 pipefail/缓冲/子 shell 三个坑](/img/diagrams/linux-shell-pipeline.svg)
+
+
+:::tip[用命令的输出冒充文件]
+```bash
+# 比较两个命令的输出（不用临时文件）
+diff <(sort a.txt) <(sort b.txt)
+
+# 把 curl 的结果当文件给 jq
+jq . <(curl -s https://api/x)
+```
+
+**`<(cmd)` 会创建一个 /dev/fd/N 路径**，很多只接受文件路径的命令也能用。
+:::
+
+:::warning[进程替换是 bash 扩展]
+**POSIX sh（dash）不支持** —— 脚本要用 `#!/bin/bash`。
+:::
+
+## heredoc
+
+```bash
+cat <<EOF > config.txt
+host=$HOST
+port=8080
+EOF
+```
+
+:::danger[`<<EOF` 与 `<<'EOF'` 的区别]
+```bash
+cat <<EOF
+$HOME          # 会被展开
+EOF
+
+cat <<'EOF'
+$HOME          # 原样输出（写配置模板时用）
+EOF
+```
+
+**引号包住的定界符 = 关闭变量展开和命令替换。**
+:::
+
+```bash
+# 缩进写法（<<- 只去掉 tab）
+cat <<-EOF
+	line1
+	line2
+EOF
+```
+
+## xargs 的四个关键参数
+
+```bash
+# -0：NUL 分隔（处理带空格的文件名）
+find . -name '*.log' -print0 | xargs -0 rm
+
+# -n1：每次传 1 个参数
+ls | xargs -n1 echo
+
+# -P4：4 个并行
+find . -name '*.png' -print0 | xargs -0 -P4 -n1 optipng
+
+# -I{}：指定替换位置
+ls *.bak | xargs -I{} mv {} {}.old
+```
+
+:::danger[不带 `-0` 时文件名里的空格会分裂参数]
+```bash
+find . -name '*.txt' | xargs rm      # 错：my file.txt 被拆成两个参数
+```
+
+**而文件名里可以有换行符**（合法），只有 NUL 分隔才彻底安全。
+:::
+
+## 并行执行
+
+```bash
+# 后台跑三个任务，等全部完成
+task1 & task2 & task3 &
+wait
+
+# 限制并发数
+seq 100 | xargs -P8 -n1 ./process.sh
+```
+
+:::warning[`wait` 会等所有后台任务]
+**包括之前遗留的** —— 在脚本里要记录 PID 精确等待：
+
+```bash
+pids=()
+for f in *.csv; do
+    ./process "$f" & pids+=($!)
+done
+for p in "${pids[@]}"; do wait "$p"; done
+```
+:::
+
+## 十个省掉写脚本的组合
+
+| 目的 | 命令 |
+| --- | --- |
+| **统计代码行数** | `find . -name '*.py' -print0 \| xargs -0 wc -l \| tail -1` |
+| **找最大的文件** | `find . -type f -printf '%s %p\n' \| sort -rn \| head -10` |
+| **替换所有文件里的字符串** | `grep -rlZ old . \| xargs -0 sed -i 's/old/new/g'` |
+| **看某端口谁占用** | `ss -tlnp \| grep :8080` |
+| **监控文件变化** | `watch -n1 'ls -l file'` |
+| **实时看日志里的错误** | `tail -f app.log \| grep --line-buffered ERROR` |
+| **批量重命名** | `for f in *.jpeg; do mv "$f" "${f%.jpeg}.jpg"; done` |
+| **看目录大小排行** | `du -h -x --max-depth=1 / \| sort -rh \| head` |
+| **临时起 HTTP 服务** | `python3 -m http.server 8000` |
+| **生成随机密码** | `tr -dc 'A-Za-z0-9' < /dev/urandom \| head -c 20; echo` |
+
+:::danger[`grep -rl | xargs sed -i` 有隐患]
+**如果文件名有空格会被拆开。** 正确写法是用 `grep -rlZ`（输出 NUL 分隔）。
+:::
+
+## `--line-buffered` 与管道缓冲
+
+:::danger[管道会让输出变成全缓冲]
+```bash
+tail -f app.log | grep ERROR                    # 错：输出攒着不出来
+tail -f app.log | grep --line-buffered ERROR    # 对
+```
+
+**因为 grep 检测到 stdout 是管道，就用了全缓冲。**
+:::
+
+**同理**：`python script.py | tee log` 时 Python 的输出也会被缓冲（用 `-u` 或 `PYTHONUNBUFFERED=1`）。
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 命令不执行 | 用了 `<(cmd)` 但 shebang 是 sh | 改 bash |
+| 文件名被拆 | xargs 没 `-0` | 用 `-print0` + `-0` |
+| 日志不实时 | 管道全缓冲 | `--line-buffered` |
+| 等待时间过长 | `wait` 等了所有后台任务 | 记录 PID 精确等待 |
+| 变量没展开 | heredoc 用了 `'EOF'` | 去掉引号 |
+| 替换误伤二进制 | grep 扫了所有文件 | 加 `--include='*.py'` |
+
+## 本课自检
+
+- [ ] 会用 `<(cmd)` 进程替换
+- [ ] **知道进程替换是 bash 扩展，sh 不支持**
+- [ ] **知道 `<<'EOF'` 关闭变量展开**
+- [ ] 会用 `xargs -0` / `-n1` / `-P4` / `-I{}`
+- [ ] **知道不带 -0 时文件名空格会分裂参数**
+- [ ] 会用 `&` + `wait` 并行，知道要记录 PID
+- [ ] 掌握至少 6 个速查组合
+- [ ] **知道 `--line-buffered` 解决日志不实时**
+- [ ] 知道 `grep -rlZ` 输出 NUL 分隔
+
+## 下一步
+
+[Shell 脚本进阶](./shell-advanced) 或 [find 与 xargs](./tools-find)。

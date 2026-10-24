@@ -1,0 +1,234 @@
+---
+id: contextlib
+title: 上下文管理器进阶
+sidebar_position: 27
+description: with 到底做了什么、contextlib 的四种工具、生成器写法的异常处理、以及 ExitStack 管理动态资源。
+---
+
+# 上下文管理器进阶
+
+**本课目标**：会写自己的 `with`，知道异常在 `__exit__` 里的正确姿势。
+
+## `with` 到底做了什么
+
+```python
+with open("f") as f:
+    data = f.read()
+```
+
+**等价于**：
+
+```python
+f = open("f")
+try:
+    data = f.read()
+finally:
+    f.close()      # 无论是否异常都会执行
+```
+
+:::info[协议只有两个方法]
+```python
+class Ctx:
+    def __enter__(self):
+        return self          # ← as 拿到的就是这个返回值
+
+    def __exit__(self, exc_type, exc_val, tb):
+        return False         # ← False/None 表示异常继续传播
+```
+
+**`as` 后面拿到的不是 `Ctx()` 本身，而是 `__enter__` 的返回值。**
+:::
+
+## `__exit__` 的三个参数与返回值
+
+:::danger[返回值决定异常是否被吞掉]
+| `__exit__` 返回 | 效果 |
+| --- | --- |
+| `False` / `None` | **异常继续向外传播**（正确做法） |
+| `True` | **异常被吞掉**（危险） |
+
+```python
+def __exit__(self, exc_type, exc_val, tb):
+    if exc_type is not None:
+        logger.error("出错: %s", exc_val)
+    return False        # ✅ 记录但不吞
+```
+
+**吞异常是初学者最容易犯的错** —— 出了问题却没有任何报错。
+:::
+
+**三个参数在没异常时全是 `None`**：
+
+```python
+def __exit__(self, exc_type, exc_val, tb):
+    if exc_type is None:
+        print("正常结束")
+```
+
+## `contextlib` 的四个工具
+
+### `@contextmanager`：用生成器写
+
+```python
+from contextlib import contextmanager
+
+@contextmanager
+def timed(label):
+    t0 = time.perf_counter()
+    try:
+        yield               # ← with 块在这里执行
+    finally:
+        print(f"{label}: {time.perf_counter() - t0:.3f}s")
+```
+
+:::warning[必须用 `try/finally` 包住 `yield`]
+```python
+@contextmanager
+def bad():
+    acquire()
+    yield               # ❌ with 块抛异常时 release 不会执行
+    release()
+```
+
+**`yield` 之后如果异常传入生成器，后面的代码会被跳过** —— 必须 `try/finally`。
+:::
+
+:::danger[`@contextmanager` 只能 `yield` 一次]
+```python
+@contextmanager
+def bad():
+    yield 1
+    yield 2            # ❌ RuntimeError: generator didn't yield
+```
+
+**它是"一次性"的上下文管理器**（用完即废），不能重复进入。
+:::
+
+### `closing()`：给没有 `__enter__` 的对象
+```python
+from contextlib import closing
+import urllib.request
+
+with closing(urllib.request.urlopen(url)) as r:
+    data = r.read()        # 退出时自动 r.close()
+```
+
+**适合"有 `close()` 但没有 `__enter__`"的老式对象。**
+
+### `suppress()`：忽略特定异常
+
+```python
+from contextlib import suppress
+
+with suppress(FileNotFoundError):
+    os.remove("maybe_exists.txt")
+```
+
+:::warning[只在"确实预期会没有"的地方用]
+**`suppress(Exception)` 会吞掉一切** —— 包括你本该发现的 bug。
+
+**限定到具体的异常类型**，并加注释说明为什么可以忽略。
+:::
+
+### `nullcontext()`：可选地进入上下文
+
+```python
+from contextlib import nullcontext
+
+def process(path, lock=None):
+    ctx = lock if lock else nullcontext()
+    with ctx:
+        do_work(path)
+```
+
+**避免写两遍 `do_work`（有锁/无锁各一份）。**
+
+## `ExitStack`：动态数量的资源
+
+:::info[资源数量在运行时才确定时用]
+```python
+from contextlib import ExitStack
+
+with ExitStack() as stack:
+    files = [stack.enter_context(open(p)) for p in paths]
+    # 退出时按相反顺序关闭所有文件
+    for f in files:
+        process(f)
+```
+
+**任意多个资源，退出时全部正确释放（后进先出）。**
+:::
+
+```python
+# 也可以注册"退出时执行的回调"
+with ExitStack() as stack:
+    stack.callback(cleanup, arg)      # 退出时调用 cleanup(arg)
+    stack.callback(print, "second")   # 后注册的先执行
+```
+
+:::tip[`ExitStack` 能让"部分失败"也正确清理]
+```python
+def setup_many():
+    with ExitStack() as stack:
+        a = stack.enter_context(A())
+        b = stack.enter_context(B())     # 如果这里抛异常
+        return (a, b)                     # a 会自动被清理
+```
+
+**如果用手写 `try/finally`，你得为每个"第 N 步失败"写不同的清理逻辑** —— 组合爆炸。
+:::
+
+## 一个实用的例子：临时切换工作目录
+
+```python
+import os
+from contextlib import contextmanager
+
+@contextmanager
+def chdir(path):
+    old = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(old)        # 即使抛异常也切回来
+```
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 异常消失了 | `__exit__` 返回 `True` | 返回 `False` 并记录日志 |
+| 资源没释放 | `@contextmanager` 里没有 `try/finally` | 用 `try/finally` 包住 `yield` |
+| `RuntimeError: generator didn't yield` | 里面 `yield` 了两次 | 只 `yield` 一次 |
+| `as` 拿到 `None` | `__enter__` 没有 `return` | 加上 `return self` |
+| 上下文管理器不能重复用 | `@contextmanager` 是一次性的 | 每次都重新调用函数 |
+| 吞掉了不该吞的异常 | 用了 `suppress(Exception)` | 限定具体类型 |
+
+:::danger[`@contextmanager` 的函数"每次 `with` 都要重新调用"]
+```python
+ctx = timed("x")          # ❌ 只是一个生成器对象
+with ctx: ...             # ✅ 第一次可以
+with ctx: ...             # ❌ 第二次 RuntimeError
+
+# 正确：
+with timed("x"): ...
+with timed("x"): ...      # ✅ 每次新建
+```
+:::
+
+## 本课自检
+
+- [ ] 知道 `with` 展开成 `try/finally`
+- [ ] **知道 `as` 拿到的是 `__enter__` 的返回值**
+- [ ] **知道 `__exit__` 返回 `True` 会吞掉异常**
+- [ ] 会用 `@contextmanager` 写生成器版
+- [ ] **知道 `@contextmanager` 里必须 `try/finally` 包住 `yield`**
+- [ ] **知道 `@contextmanager` 是一次性的，只能 `yield` 一次**
+- [ ] 会用 `closing` / `suppress` / `nullcontext`
+- [ ] **会用 `ExitStack` 管理动态数量的资源**
+- [ ] 知道 `ExitStack` 的后进先出顺序
+
+## 下一步
+
+[迭代器协议与 itertools](./iterators) 或 [类型注解](./typing)。

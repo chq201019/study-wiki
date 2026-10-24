@@ -1,0 +1,227 @@
+---
+id: error-codes-deep
+title: 错误码设计
+sidebar_position: 27
+description: 为什么全用 -1 是灾难、分层错误码怎么划分、如何让错误可追溯、以及 C 与 C++ 的不同做法。
+---
+
+# 错误码设计
+
+**本课目标**：设计一套能定位问题、能向上传播的错误码。
+
+## 全用 -1 的灾难
+
+:::danger[`return -1` 让你无法区分任何情况]
+```c
+if (i2c_read(...) < 0) {
+    printf("failed\n");      /* 到底哪失败了？ */
+}
+```
+
+**可能的原因**：
+
+- 参数错
+- 总线忙
+- 从机没应答（NACK）
+- 超时
+- 硬件故障
+
+**它们需要完全不同的处理方式** —— 但 `-1` 让你只能一起处理。
+:::
+
+## 分层错误码
+
+:::tip[用"段"表示来源层]
+```c
+typedef enum {
+    ERR_OK           = 0,
+
+    /* 1xx：参数与调用错误 */
+    ERR_PARAM_NULL   = 101,
+    ERR_PARAM_RANGE  = 102,
+    ERR_PARAM_STATE  = 103,
+
+    /* 2xx：硬件与总线 */
+    ERR_HW_TIMEOUT   = 201,
+    ERR_HW_BUSY      = 202,
+    ERR_HW_NACK      = 203,
+    ERR_HW_CRC       = 204,
+
+    /* 3xx：协议与数据 */
+    ERR_PROTO_LEN    = 301,
+    ERR_PROTO_CRC    = 302,
+    ERR_PROTO_VERSION = 303,
+
+    /* 4xx：资源 */
+    ERR_NO_MEMORY    = 401,
+    ERR_QUEUE_FULL   = 402,
+} err_t;
+```
+
+**好处**：日志里看到 `203` 立刻知道是"总线 NACK"，不用查表。
+:::
+
+:::warning[段的划分要和团队约定]
+**上面的 1xx/2xx/3xx 只是示例** —— 关键是**整个项目统一**。
+
+**建议**：错误码头文件里用注释分段，并写清每一段的含义。
+:::
+
+## 让错误可追溯
+
+:::danger[错误码单独返回时丢失了上下文]
+```c
+err_t ret = sensor_read(&v);
+if (ret != ERR_OK) return ret;      /* 上层不知道是哪个传感器 */
+```
+
+**两种补充方式**：
+
+**① 返回结构体**
+```c
+typedef struct {
+    err_t  code;
+    int    line;
+    const char *file;
+} result_t;
+```
+
+**② 用错误日志 + 唯一错误码**（推荐，开销小）
+```c
+#define LOG_ERR(code, ...) \
+    log_write(__FILE__, __LINE__, code, __VA_ARGS__)
+```
+:::
+
+:::tip[`__FILE__` 与 `__LINE__` 让日志能定位到行]
+```c
+#define CHECK(call) do { \
+    err_t _e = (call); \
+    if (_e != ERR_OK) { \
+        log_write(__FILE__, __LINE__, _e, #call); \
+        return _e; \
+    } \
+} while (0)
+```
+
+**`#call` 会把出错的那行代码字符串化** —— 日志里直接看到是哪个调用失败。
+:::
+
+## 错误传播的两种风格
+
+:::info[C：手动检查每一层]
+```c
+err_t read_sensor(float *out) {
+    uint8_t raw[2];
+    err_t e = i2c_read(ADDR, REG, raw, sizeof(raw));
+    if (e != ERR_OK) return e;
+
+    e = convert(raw, out);
+    if (e != ERR_OK) return e;
+    return ERR_OK;
+}
+```
+
+**用 `CHECK` 宏能压缩成两行**。
+:::
+
+:::info[C++：expected 或异常]
+```cpp
+std::expected<float, err_t> read_sensor() {
+    auto raw = i2c_read(ADDR, REG, 2);
+    if (!raw) return std::unexpected(raw.error());
+    return convert(*raw);
+}
+```
+
+**C++23 的 `expected` 自带 `and_then`** —— 链式传播不用手动判空。
+:::
+
+## 错误处理的三条原则
+
+:::tip[① 错误必须被处理或向上传播，不能静默丢]
+```c
+i2c_read(...);           /* 错：返回值完全忽略 */
+```
+
+**用 `[[nodiscard]]` 让编译器帮你抓**：
+```c
+[[nodiscard]] err_t i2c_read(...);
+```
+:::
+
+:::tip[② 清理路径必须完整]
+```c
+err_t f(void) {
+    void *p = malloc(100);
+    err_t e = step1();
+    if (e != ERR_OK) return e;      /* 错：p 泄漏 */
+    free(p);
+    return ERR_OK;
+}
+```
+
+**改用单一出口或 `goto cleanup`**（C 里这是标准做法）。
+:::
+
+:::tip[③ 区分"可恢复"与"不可恢复"]
+**可恢复**：重试、换通道、降级
+
+**不可恢复**：配置错、硬件损坏 → **记录后进入安全状态**（或重启）
+
+**不要对不可恢复的错误无限重试** —— 会掩盖问题。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 只看到 "failed" | 全用 -1 | 分层错误码 |
+| 不知哪一行失败 | 没记录位置 | `__FILE__`/`__LINE__` |
+| 内存泄漏 | 错误路径没清理 | 单一出口或 goto cleanup |
+| 上层无法判断 | 错误码被合并 | 保留原始码向上传 |
+| 忽略了返回值 | 忘了检查 | `[[nodiscard]]` |
+| 无限重试 | 不区分可恢复性 | 分类处理 |
+
+:::danger[`goto cleanup` 在 C 里是正确的做法]
+**很多教材说"不要用 goto"** —— 那是针对"随意跳转"。
+
+**`goto cleanup` 是实现"单一出口 + 完整清理"的标准手法**，Linux 内核大量使用。
+
+```c
+err_t f(void) {
+    err_t e = ERR_OK;
+    void *a = NULL, *b = NULL;
+
+    a = malloc(100);
+    if (!a) { e = ERR_NO_MEMORY; goto out; }
+    b = malloc(200);
+    if (!b) { e = ERR_NO_MEMORY; goto out; }
+
+    e = do_work(a, b);
+out:
+    free(b);
+    free(a);
+    return e;
+}
+```
+:::
+
+## 本课自检
+
+- [ ] **知道全用 -1 无法区分失败原因**
+- [ ] 会按层划分错误码段（参数/硬件/协议/资源）
+- [ ] 知道段划分要和团队约定一致
+- [ ] **会用 `__FILE__`/`__LINE__` 让错误可定位**
+- [ ] 会用 `CHECK` 宏压缩错误传播
+- [ ] 知道用 `#call` 字符串化出错表达式
+- [ ] 知道 C++ 用 `expected` 链式传播
+- [ ] **知道错误必须被处理或向上传播**
+- [ ] **知道用 `[[nodiscard]]` 强制检查返回值**
+- [ ] **知道错误路径必须完整清理**
+- [ ] **知道 `goto cleanup` 在 C 里是正确做法**
+- [ ] 知道要区分可恢复与不可恢复错误
+
+## 下一步
+
+[C++ 错误处理](./../cpp/error-handling) 或 [动态内存管理](./memory)。

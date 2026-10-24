@@ -1,0 +1,333 @@
+---
+id: security
+title: Linux 安全加固
+sidebar_position: 30
+description: SSH 加固的六项、权限与 sudo 的正确配置、防火墙的默认策略、以及六个最常见的配置错误。
+---
+
+# Linux 安全加固
+
+**本课目标**：一台新装的服务器能在半小时内做到基本安全。
+
+## 清单：从高到低
+
+![安全加固的五层攻击面收窄：公网→防火墙→SSH→服务→数据，以及六个最常见错误](/img/diagrams/linux-security-boundary.svg)
+
+
+:::tip[按"被攻破的概率 × 影响"排序]
+1. **SSH 密码登录**（暴力破解的第一目标）
+2. **防火墙未开或全放行**
+3. **系统不打补丁**
+4. **服务以 root 运行**
+5. 弱 sudo 配置
+6. 无日志审计
+:::
+
+## SSH 加固
+
+```text
+# /etc/ssh/sshd_config
+
+# ① 禁用密码登录（只用密钥）
+PasswordAuthentication no
+PubkeyAuthentication yes
+
+# ② 禁止 root 直接登录
+PermitRootLogin prohibit-password      # 允许密钥，禁止密码
+# PermitRootLogin no                   # 更严格
+
+# ③ 限制可登录用户
+AllowUsers deploy admin
+
+# ④ 关闭不用的功能
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no                  # 除非确实要端口转发
+
+# ⑤ 限制尝试次数
+MaxAuthTries 3
+LoginGraceTime 20
+```
+
+:::danger[改 SSH 配置前先确认"还有另一条路进得去"]
+**禁用密码登录后如果密钥有问题，你就再也进不去了。**
+
+**安全流程**：
+
+1. **开一个新终端**，验证密钥能登录
+2. **保持那个终端不关**
+3. 再改配置、`systemctl reload sshd`
+4. **再开第三个终端**验证，成功后才关掉旧的
+:::
+
+:::warning[`reload` 而不是 `restart`]
+```bash
+systemctl reload sshd        # ✅ 不中断现有连接
+systemctl restart sshd       # ⚠️ 会断掉所有连接
+```
+
+**配置有语法错误时，reload 会失败但旧连接还在** —— 这给了你修正的机会。
+
+**改完先 `sshd -t` 检查语法**：
+
+```bash
+sshd -t && systemctl reload sshd
+```
+:::
+
+## 防火墙：默认拒绝
+
+:::danger[两种默认策略的差别]
+```bash
+# ❌ 默认允许，只拒绝特定
+# 一旦忘了加规则就全暴露
+```
+
+```bash
+# ✅ 默认拒绝，只允许明确需要的
+nft add rule inet filter input ct state established,related accept
+nft add rule inet filter input iif lo accept
+nft add rule inet filter input tcp dport { 22, 80, 443 } accept
+nft add rule inet filter input drop
+```
+:::
+
+```bash
+# nftables（现代）
+nft list ruleset
+
+# 或者用 ufw（更简单，适合单机）
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp
+ufw allow 80,443/tcp
+ufw enable
+ufw status verbose
+```
+
+:::warning[开防火墙前先放行 SSH]
+```bash
+ufw allow 22/tcp        # ← 必须先做这一步
+ufw enable
+```
+
+**顺序反了就会把自己锁在外面**（除非有控制台/VNC）。
+:::
+
+## 权限与 sudo
+
+:::danger[`chmod 777` 是"我不知道该怎么办"的信号]
+```bash
+chmod -R 777 /var/www        # ❌ 任何用户都能改网站内容
+```
+
+**正确做法**：
+
+```bash
+# 网站文件属主是部署用户，Web 服务器只读
+chown -R deploy:www-data /var/www
+find /var/www -type d -exec chmod 755 {} \;
+find /var/www -type f -exec chmod 644 {} \;
+```
+:::
+
+**sudo 的最小授权**：
+
+```text
+# /etc/sudoers.d/deploy   （用 visudo -f 编辑）
+deploy ALL=(root) NOPASSWD: /bin/systemctl restart myapp
+deploy ALL=(root) NOPASSWD: /usr/bin/journalctl -u myapp
+```
+
+:::danger[不要给 `ALL` 权限]
+```text
+deploy ALL=(ALL) NOPASSWD: ALL        # ❌ 等于给了 root
+```
+
+**更隐蔽的危险**：给了 `/bin/systemctl` 而不限定子命令 —— **`systemctl` 能通过编辑 unit 文件间接拿到 root**。
+
+**只授予"完整命令 + 固定参数"**。
+:::
+
+:::tip[用 `visudo` 编辑，别直接改文件]
+```bash
+visudo -f /etc/sudoers.d/deploy       # 会做语法检查
+```
+
+**语法错误的 sudoers 文件会让你彻底无法提权**（连修都修不了，除非进单用户模式）。
+:::
+
+## 补丁与更新
+
+```bash
+# Debian/Ubuntu
+apt update && apt upgrade -y
+apt list --upgradable
+
+# 只装安全更新
+unattended-upgrade --dry-run -d
+
+# 自动安全更新
+dpkg-reconfigure --priority=low unattended-upgrades
+```
+
+:::warning[生产环境不要无脑 `apt upgrade`]
+**内核升级需要重启，服务可能中断。**
+
+**建议**：
+
+- **安全补丁**：自动装（`unattended-upgrades` 只装 security 仓库）
+- **功能升级**：手动、有计划、有回滚方案
+- **升级前**：看 changelog，确认不需要手工迁移
+:::
+
+## 服务最小化
+
+```bash
+# 看哪些端口在监听
+ss -tlnp
+
+# 看哪些服务开机启动
+systemctl list-unit-files --state=enabled
+
+# 关掉不需要的
+systemctl disable --now avahi-daemon
+systemctl disable --now cups
+```
+
+:::danger[每个监听端口都是一次攻击面]
+**典型的多余服务**：`avahi-daemon`（mDNS）、`cups`（打印）、`rpcbind`。
+
+**服务器上这些通常完全不需要。**
+:::
+
+## 审计与监控
+
+```bash
+# 登录记录
+last -20
+lastb | head               # 失败的登录尝试
+
+# 谁现在在线
+w
+
+# 最近改过的配置文件
+find /etc -newer /etc/hostname -type f 2>/dev/null
+
+# 文件完整性（需要装 aide / tripwire）
+```
+
+:::tip[发现暴力破解的信号]
+```bash
+lastb | wc -l                              # 失败登录次数
+grep 'Failed password' /var/log/auth.log | wc -l
+journalctl -u ssh -p warning | tail
+```
+
+**几百次失败 → 已经被扫了。** 应该：
+
+- **禁用密码登录**（最有效）
+- 装 `fail2ban` 自动封 IP
+- 换非 22 端口（只减少噪音，不增加安全性）
+:::
+
+## 六个最常见的错误
+
+:::danger[① 把密钥和密码写在脚本里]
+```bash
+# ❌ 提交到 git 就泄露
+MYSQL_PASSWORD="hunter2"
+```
+
+**用环境变量 + 权限 600 的 env 文件**，或密钥管理服务。
+:::
+
+:::danger[② 数据库监听 0.0.0.0]
+```text
+# /etc/mysql/my.cnf
+bind-address = 0.0.0.0        # ❌ 全世界都能连
+bind-address = 127.0.0.1      # ✅ 只本机，走 SSH 隧道
+```
+:::
+
+:::danger[③ Redis 无密码 + 暴露公网]
+**Redis 未授权访问是最经典的入侵入口** —— 攻击者能写 SSH 公钥、写 crontab。
+
+```text
+bind 127.0.0.1
+requirepass <强密码>
+```
+:::
+
+:::danger[④ 用 root 跑 Web 应用]
+**应用一旦被 RCE，攻击者直接是 root。**
+
+**创建专用用户**：
+
+```bash
+useradd -r -s /usr/sbin/nologin -d /opt/myapp myapp
+```
+
+**systemd 里指定 `User=`**，并加沙箱选项（见 [systemd](./systemd)）。
+:::
+
+:::danger[⑤ 日志里打明文密码]
+```python
+logger.info(f"登录 user={u} pass={p}")     # ❌ 密码进了日志文件
+```
+:::
+
+:::danger[⑥ 不备份]
+**被攻破、被勒索、误删 —— 没有备份就是彻底丢失。**
+
+**3-2-1 原则**：3 份副本、2 种介质、1 份异地。
+:::
+
+## 应急响应顺序
+
+:::warning[怀疑被入侵时]
+```bash
+# ① 先隔离，别急着重启（会丢证据）
+# ② 记录现场
+ps auxf > /tmp/ps.txt
+ss -tanp > /tmp/net.txt
+last -50 > /tmp/last.txt
+cat /etc/passwd > /tmp/passwd.txt
+
+# ③ 查异常
+crontab -l ; ls -la /etc/cron.d/
+ls -la /tmp /var/tmp                    # 常见马场
+find / -name "*.py" -mtime -1 2>/dev/null | head
+
+# ④ 查异常登录
+last ; lastb | head -20
+
+# ⑤ 查异常网络
+ss -tanp | grep -v ESTAB
+```
+:::
+
+:::danger[**被入侵后最正确的做法往往是"重装"**]
+**rootkit 可以藏在任何地方**（内核模块、固件、systemd 服务、`.bashrc`）。
+
+**"清理干净"极难验证** —— **备份数据 → 重装系统 → 只恢复数据（不恢复配置和二进制）** 才是最可靠的。
+:::
+
+## 本课自检
+
+- [ ] 知道 SSH 加固的六项，**知道禁密码登录前要先验证密钥**
+- [ ] **知道改 sshd 要先 `sshd -t` 检查语法，用 `reload` 而非 `restart`**
+- [ ] **理解"默认拒绝"比"默认允许"安全**
+- [ ] **知道开防火墙前要先放行 SSH**
+- [ ] **知道 `chmod 777` 是反模式**
+- [ ] **知道 sudo 不能给 `ALL`，且命令要限定参数**
+- [ ] 知道 sudoers 要用 `visudo` 编辑
+- [ ] **知道生产环境不要无脑 `apt upgrade`**
+- [ ] 会 `ss -tlnp` + `systemctl list-unit-files` 找出多余服务
+- [ ] 会用 `lastb` 发现暴力破解
+- [ ] **知道六个最常见错误（明文密钥/db 监听 0.0.0.0/Redis 无密码/root 跑应用/日志打密码/无备份）**
+- [ ] **知道被入侵后"重装"比"清理"更可靠**
+
+## 下一步
+
+[系统故障排查](./troubleshoot) 或 [SSH 深入](./ssh)。

@@ -1,0 +1,372 @@
+---
+id: 09-operator
+title: 09 运算符重载
+sidebar_position: 9
+description: 让自定义类型支持算术、比较、下标与输出运算符，前置与后置自增的区别、友元函数，以及哪些运算符不该重载。
+---
+
+# 09 运算符重载
+
+**本课目标**：会让自己的类支持常用运算符，知道哪些该重载、哪些不该。
+
+## 为什么要重载
+
+```cpp
+Vec2 a(1, 2), b(3, 4);
+Vec2 c = a + b;              /* 直觉上就该能这么写 */
+```
+
+**运算符重载 = 给运算符定义"对自定义类型意味着什么"。**
+
+:::info[本质是函数调用]
+```cpp
+a + b        /* 等价于 */  a.operator+(b)
+a == b       /* 等价于 */  a.operator==(b)
+a[0]         /* 等价于 */  a.operator[](0)
+++a          /* 等价于 */  a.operator++()
+```
+
+**运算符重载就是起了个特殊名字的函数。** 理解了这点就不神秘了。
+:::
+
+## 基本写法
+
+![运算符重载的解析四步：收集候选、模板推导、筛出可行函数、选最佳匹配；同时提供成员与非成员版本会导致二义性](/img/diagrams/cpp-operator-resolution.svg)
+
+
+```cpp
+class Vec2 {
+public:
+    Vec2(double x = 0, double y = 0) : x_(x), y_(y) {}
+
+    /* 成员函数形式 */
+    Vec2 operator+(const Vec2 &other) const {
+        return Vec2(x_ + other.x_, y_ + other.y_);
+    }
+
+private:
+    double x_, y_;
+};
+
+Vec2 a(1, 2), b(3, 4);
+Vec2 c = a + b;              /* c = (4, 6) */
+```
+
+:::tip[几个要点]
+1. **参数用 `const &`**：不复制、不修改
+2. **返回新对象**（`+` 不该改变操作数）
+3. **函数加 `const`**：因为 `a + b` 不该修改 `a`
+:::
+
+## 常用运算符清单
+
+```cpp
+class Vec2 {
+public:
+    Vec2(double x = 0, double y = 0) : x_(x), y_(y) {}
+
+    /* 算术 */
+    Vec2 operator+(const Vec2 &o) const { return Vec2(x_+o.x_, y_+o.y_); }
+    Vec2 operator-(const Vec2 &o) const { return Vec2(x_-o.x_, y_-o.y_); }
+
+    /* 复合赋值：返回 *this 的引用，支持链式 */
+    Vec2 &operator+=(const Vec2 &o) {
+        x_ += o.x_; y_ += o.y_;
+        return *this;
+    }
+
+    /* 比较 */
+    bool operator==(const Vec2 &o) const { return x_ == o.x_ && y_ == o.y_; }
+    bool operator!=(const Vec2 &o) const { return !(*this == o); }
+
+    /* 下标 */
+    double operator[](int i) const { return i == 0 ? x_ : y_; }
+
+    /* 前置 ++ */
+    Vec2 &operator++() { ++x_; ++y_; return *this; }
+
+    /* 后置 ++（多一个 int 参数用于区分） */
+    Vec2 operator++(int) { Vec2 tmp = *this; ++(*this); return tmp; }
+
+private:
+    double x_, y_;
+};
+```
+
+本机实测：
+
+```text
+a+b = (4, 6)
+a==a ? 1  a!=b ? 1
+a[0]=1 a[1]=2
+c += b -> (4, 6)
+++a = (2, 3) 之后 a=(2, 3)
+d++ = (5, 5) 之后 d=(6, 6)
+```
+
+## `<<` 输出：必须用友元
+
+```cpp
+std::cout << v;              /* 想这样输出 */
+```
+
+:::danger[`<<` 不能写成成员函数]
+```cpp
+/* ❌ 这样写会变成 v << cout，方向反了 */
+std::ostream &operator<<(std::ostream &os) const;
+```
+
+`v << std::cout` 和 `std::cout << v` 完全不同。**必须写成非成员函数**。
+:::
+
+```cpp
+class Vec2 {
+public:
+    /* 声明为友元，才能访问 private 成员 */
+    friend std::ostream &operator<<(std::ostream &os, const Vec2 &v) {
+        return os << "(" << v.x_ << ", " << v.y_ << ")";
+    }
+
+private:
+    double x_, y_;
+};
+```
+
+输出：
+
+```cpp
+Vec2 v(1, 2);
+std::cout << v;              /* (1, 2) */
+```
+
+:::tip[为什么返回 `std::ostream &`]
+```cpp
+return os << "(" << ...;
+```
+
+**返回 `os` 的引用**，才能支持链式：
+
+```cpp
+std::cout << "v = " << v << "\n";
+```
+
+如果返回 `void`，后面就不能再接 `<<` 了。
+:::
+
+## 前置 ++ vs 后置 ++
+
+:::danger[两者签名不同，靠一个 `int` 参数区分]
+```cpp
+Vec2 &operator++();          /* 前置：++a */
+Vec2  operator++(int);       /* 后置：a++，那个 int 是占位符 */
+```
+
+**后置那个 `int` 参数永远用不到**，它只是让编译器区分两个版本。
+:::
+
+### 实现差异
+
+```cpp
+/* 前置：先改，返回引用 */
+Vec2 &operator++() {
+    ++x_; ++y_;
+    return *this;            /* 返回自己 */
+}
+
+/* 后置：先存副本，再改，返回副本 */
+Vec2 operator++(int) {
+    Vec2 tmp = *this;        /* 保存旧值 */
+    ++(*this);
+    return tmp;              /* 返回旧值（按值） */
+}
+```
+
+本机实测：
+
+```text
+++a = (2, 3) 之后 a=(2, 3)     ← 前置返回新值
+d++ = (5, 5) 之后 d=(6, 6)     ← 后置返回旧值
+```
+
+:::warning[后置版本有额外开销]
+后置要**拷贝一份旧对象**，所以比前置慢。
+
+**循环里优先用 `++i` 而不是 `i++`**——对内置类型无所谓，但对自定义类型（迭代器）有真实差别。
+:::
+
+## 哪些运算符能重载
+
+| 能重载 | 不能重载 |
+| --- | --- |
+| `+ - * / %` | `::`（作用域） |
+| `== != < > <= >=` | `.`（成员访问） |
+| `[] () ->` | `.*` |
+| `<< >>` | `?:`（三目） |
+| `++ -- += -=` | `sizeof` |
+| `new delete` | `#` `##`（预处理） |
+
+:::danger[不要重载的运算符]
+**`&&` `||` `,`（逗号）**
+
+因为它们**有短路求值 / 顺序保证语义**，重载后就失去了：
+
+```cpp
+/* 重载后，两边都会被求值，短路失效 */
+if (a && b) { ... }
+```
+
+**这会让代码行为变得难以预测。**
+:::
+
+## 重载的原则
+
+:::tip[三条原则]
+**① 语义要自然**
+
+```cpp
+Vec2 a + Vec2 b        ✅ 直觉上就该能加
+Date * 2               ⚠️ 日期乘 2 是什么意思？
+```
+
+**② 不要改变运算符的"直觉含义"**
+
+```cpp
+operator+ 却执行减法         ❌ 灾难
+```
+
+**③ 成对提供**
+
+```cpp
+提供了 == 就该提供 !=
+提供了 < 就该提供 > <= >=
+```
+:::
+
+## 重载 `==` 和 `<=>`（C++20）
+
+:::tip[C++20 的 `<=>` 能一次生成所有比较]
+```cpp
+#include <compare>
+
+class Vec2 {
+public:
+    auto operator<=>(const Vec2 &) const = default;    /* 自动生成全部比较 */
+};
+```
+
+这一行 = `==` `!=` `<` `>` `<=` `>=` 全部自动实现（按成员逐个比较）。
+
+**如果你用 C++20，这是最省事的写法。**
+:::
+
+## 完整示例
+
+```cpp
+#include <iostream>
+#include <string>
+
+class Money {
+public:
+    explicit Money(long long cents = 0) : cents_(cents) {}
+
+    /* 相加 */
+    Money operator+(const Money &o) const {
+        return Money(cents_ + o.cents_);
+    }
+
+    /* 复合赋值 */
+    Money &operator+=(const Money &o) {
+        cents_ += o.cents_;
+        return *this;
+    }
+
+    /* 比较 */
+    bool operator==(const Money &o) const { return cents_ == o.cents_; }
+    bool operator!=(const Money &o) const { return !(*this == o); }
+    bool operator<(const Money &o) const { return cents_ < o.cents_; }
+
+    /* 输出 */
+    friend std::ostream &operator<<(std::ostream &os, const Money &m) {
+        os << m.cents_ / 100 << "."
+           << (m.cents_ % 100 < 10 ? "0" : "")
+           << m.cents_ % 100;
+        return os;
+    }
+
+private:
+    long long cents_;        /* 用整数存"分"，避免浮点误差 */
+};
+
+int main() {
+    Money a(1999);           /* 19.99 */
+    Money b(500);            /* 5.00 */
+
+    std::cout << "a = " << a << "\n";
+    std::cout << "a + b = " << a + b << "\n";
+
+    a += b;
+    std::cout << "a += b 后 a = " << a << "\n";
+
+    std::cout << "a == b ? " << (a == b) << "\n";
+    std::cout << "b < a ? " << (b < a) << "\n";
+
+    return 0;
+}
+```
+
+输出：
+
+```text
+a = 19.99
+a + b = 24.99
+a += b 后 a = 24.99
+a == b ? 0
+b < a ? 1
+```
+
+:::tip[这个例子的两个设计要点]
+1. **内部用整数存"分"**（`long long cents_`）——避免浮点误差（[C 第 7 课](../c-basics/07-float)讲过原因）
+2. **重载 `<<` 负责格式化**——内部怎么存和外面怎么显示分开
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `operator<<` 写成成员 | 调用方向反了 | 第一个参数必须是流 | 用友元 |
+| 前置/后置签名写错 | 编译错或行为反了 | 后置要 `(int)` | `operator++(int)` |
+| `+` 修改了操作数 | 意外的副作用 | 应该返回新对象 | 加 `const`，返回新值 |
+| `+=` 返回 `void` | 不能链式 | 应返回引用 | `return *this;` |
+| 重载 `&&` | 短路失效 | 语义被破坏 | 不要重载 |
+| 只重载 `==` 不重载 `!=` | 用户困惑 | 不成对 | 两个都写 |
+| 运算符语义不自然 | 难读 | 违背直觉 | 用普通函数名 |
+
+:::danger[不要滥用运算符重载]
+```cpp
+/* ❌ 语义不清 */
+Matrix operator*(Matrix a, Matrix b);     /* 是矩阵乘还是逐元素乘？ */
+
+/* ✅ 明确 */
+Matrix multiply(Matrix a, Matrix b);
+Matrix elementwise_multiply(Matrix a, Matrix b);
+```
+
+**运算符重载只适合"语义显然"的场景**（数学运算、比较、输出）。否则用普通函数名更清晰。
+:::
+
+## 本课自检
+
+- [ ] 会重载 `+` `-` `==` `!=` `[]`
+- [ ] 知道运算符重载本质是函数调用
+- [ ] **知道 `<<` 必须用友元，不能写成成员**
+- [ ] 知道 `<<` 要返回 `std::ostream &`
+- [ ] 会写前置和后置 `++`，**知道靠 `int` 参数区分**
+- [ ] 知道后置版本有拷贝开销
+- [ ] 知道 `+=` 要返回 `*this` 引用
+- [ ] 知道哪些运算符不能重载
+- [ ] **知道不要重载 `&&` `||` `,`**
+- [ ] 知道运算符语义要自然，否则用普通函数名
+
+## 下一步
+
+[10 继承与多态](./10-inherit) —— 类之间的关系，以及虚函数怎么实现"同一个调用不同行为"。

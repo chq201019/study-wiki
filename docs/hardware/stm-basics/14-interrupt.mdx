@@ -1,0 +1,370 @@
+---
+id: 14-interrupt
+title: 14 中断与 NVIC
+sidebar_position: 14
+description: 外部中断怎么做、NVIC 优先级分组与抢占、中断服务函数的两层结构、ISR 红线，以及优先级配置错误的后果。
+---
+
+# 14 中断与 NVIC
+
+**本课目标**：会写外部中断，理解中断优先级。
+
+## 为什么需要中断
+
+**轮询的问题**：
+
+```c
+while (1) {
+    if (HAL_GPIO_ReadPin(...) == RESET) { /* 处理按键 */ }
+    HAL_Delay(100);          /* 如果这里有 100ms 延时... */
+}
+```
+
+:::danger[轮询会漏事件]
+按键只按了 50ms，而主循环 100ms 才检查一次——**这个按键就丢了**。
+
+**中断解决这个问题**：硬件事件发生时立刻打断当前代码去处理。
+:::
+
+## 外部中断（EXTI）
+
+STM32 的外部中断来自 **EXTI 控制器**：
+
+```text
+GPIO 引脚电平变化
+      ↓
+EXTI 线（EXTI0 ~ EXTI15，按引脚号 0~15 分组）
+      ↓
+NVIC（中断控制器）
+      ↓
+CPU 执行 EXTIx_IRQHandler
+```
+
+:::warning[EXTI 线是按"引脚号"映射的，会冲突]
+**EXTI0 只能是 PA0 或 PB0 或 PC0……（同一时刻只能选一个）。**
+
+```text
+PA0 → EXTI0
+PB0 → EXTI0    ← 不能和 PA0 同时用
+PC0 → EXTI0
+```
+
+**所以同一时刻最多 16 个外部中断（EXTI0~EXTI15）。**
+
+**不同端口但相同引脚号，会冲突。** 选引脚时要注意。
+:::
+
+## CubeMX 配置
+
+以 **PA0 下降沿触发** 为例：
+
+1. 引脚图上点 **PA0** → 选 **GPIO_EXTI0**
+2. 左侧 **System Core → GPIO** → 点 PA0 那行：
+
+| 参数 | 值 | 说明 |
+| --- | --- | --- |
+| GPIO mode | **External Interrupt Mode with Falling edge trigger detection** | 下降沿触发 |
+| GPIO Pull-up/Pull-down | **Pull-up** | 按键接 GND |
+| User Label | `BTN` | 生成 `BTN_Pin` 宏 |
+
+3. **NVIC 标签** → 勾选 **EXTI line0 interrupt** → **Enabled**
+
+:::danger[不勾 NVIC 的 Enabled，中断不会触发]
+**这是最容易漏的一步。**
+
+CubeMX 里配置了 GPIO_EXTI 只代表"信号能到 EXTI 控制器"，**还要在 NVIC 里使能，才能到 CPU**。
+
+**表现：** 触发条件满足了，但回调函数永远不执行。
+
+**查证方法**：
+
+```c
+HAL_NVIC_EnableIRQ(EXTI0_IRQn);      /* 代码里手动使能，验证是否这个问题 */
+```
+:::
+
+## 写中断处理：两层结构
+
+:::info[IRQHandler（生成的）+ Callback（你写的）]
+```text
+硬件中断
+  ↓
+EXTI0_IRQHandler()            ← stm32f1xx_it.c，CubeMX 生成，别改
+  ↓
+HAL_GPIO_EXTI_IRQHandler()    ← HAL 库清标志、分发
+  ↓
+HAL_GPIO_EXTI_Callback()      ← 你在 main.c 实现
+```
+:::
+
+**你在 `main.c` 的 `USER CODE 4` 区写**：
+
+```c
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == BTN_Pin) {
+        /* 按键中断处理 */
+    }
+}
+```
+
+:::danger[为什么不让改 IRQHandler]
+`stm32f1xx_it.c` 是 **CubeMX 生成的文件**，重新 Generate Code 会被覆盖。
+
+**而且 HAL 已经帮你做了重要的事**（清中断标志、判是哪个引脚触发）。
+
+**规矩：只实现 Callback，不动 IRQHandler。**
+:::
+
+## 中断里能做什么、不能做什么
+
+:::danger[ISR 里的红线]
+| 禁止 | 原因 |
+| --- | --- |
+| **`printf` / 串口发送** | 阻塞，耗时远超中断允许时间 |
+| **`HAL_Delay`** | 中断里不能阻塞 |
+| **`malloc` / `free`** | 非中断安全 |
+| 长循环 | 阻塞其他中断 |
+| 大数组/大结构体 | 中断栈很小 |
+
+**违反后果**：丢中断、卡死、随机崩溃——**而且极难排查**。
+:::
+
+:::tip[ISR 该做什么：只置标志位]
+```c
+volatile bool btn_flag = false;
+volatile uint32_t btn_tick = 0;
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == BTN_Pin) {
+        btn_flag = true;
+        btn_tick = HAL_GetTick();       /* 记录时刻，用于消抖 */
+    }
+}
+
+/* 主循环 */
+while (1) {
+    if (btn_flag) {
+        btn_flag = false;
+
+        /* 消抖：距上次中断太近就忽略 */
+        if (HAL_GetTick() - btn_tick > 20) {
+            printf("按键触发\r\n");      /* ✅ 打印放这里 */
+            HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+        }
+    }
+    HAL_Delay(10);
+}
+```
+
+**这就是"中断 + 主循环"的标准协作模式。**
+:::
+
+:::warning[共享变量必须 `volatile`]
+```c
+bool btn_flag = false;          /* ❌ 主循环的 while(!btn_flag) 可能被优化成死循环 */
+volatile bool btn_flag = false; /* ✅ */
+```
+
+**不加 `volatile`，编译器认为"这个变量在循环里没变"，直接把循环优化掉。**
+
+（这和 ESP32 的规矩完全一样。）
+:::
+
+## NVIC 优先级：抢占和子优先级
+
+:::danger[这是 STM32 中断最容易搞混的地方]
+STM32 的中断优先级由两部分组成：
+
+| 概念 | 含义 |
+| --- | --- |
+| **抢占优先级（Preemption）** | 数字越小越高，**能打断正在执行的低优先级中断** |
+| **子优先级（Sub）** | 数字越小越先，**但不能打断，只能排队** |
+
+**分组决定"几位给抢占，几位给子优先级"**：
+
+| 分组 | 抢占位数 | 子优先级位数 | 效果 |
+| --- | --- | --- | --- |
+| NVIC_PRIORITYGROUP_0 | 0 | 4 | **不能抢占**（全部排队） |
+| **NVIC_PRIORITYGROUP_4** | **4** | **0** | **全抢占**（HAL 默认） |
+| NVIC_PRIORITYGROUP_2 | 2 | 2 | 折中 |
+:::
+
+:::tip[HAL 默认用 Group 4（全抢占）]
+```c
+HAL_Init();      /* 内部调用 HAL_NVIC_SetPriorityGrouping(NVIC_PRIORITYGROUP_4) */
+```
+
+**所以优先级数字 0~15，越小越高，而且能互相抢占。**
+
+**例子**：
+
+```c
+/* 定时器中断：最高优先级 */
+HAL_NVIC_SetPriority(TIM3_IRQn, 0, 0);
+
+/* 按键中断：较低 */
+HAL_NVIC_SetPriority(EXTI0_IRQn, 5, 0);
+```
+
+**TIM3 中断能打断 EXTI0 的处理。**
+:::
+
+:::warning[优先级数字越小越高，别搞反]
+```c
+HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);      /* 最高 */
+HAL_NVIC_SetPriority(EXTI0_IRQn, 15, 0);     /* 最低 */
+```
+
+**和 FreeRTOS 的任务优先级相反**（任务里数字**越大**越高）。
+
+**这个反转很容易记混。**
+:::
+
+## 中断优先级配错的后果
+
+:::danger[场景：高优先级中断里调用依赖低优先级的东西]
+```c
+/* SysTick 优先级最低（默认） */
+/* 串口中断优先级较高 */
+
+void UART_IRQHandler(void) {
+    HAL_Delay(10);        /* ❌ 卡死：HAL_Delay 依赖 SysTick，但 SysTick 优先级更低，永远进不来 */
+}
+```
+
+**表现**：程序卡在这个中断里出不来。
+
+**规矩：中断里绝不能用 `HAL_Delay`。**
+:::
+
+## 完整示例：按键中断 + 消抖
+
+```c
+#include "main.h"
+#include "gpio.h"
+#include "usart.h"
+#include <stdio.h>
+
+volatile bool     btn_flag = false;
+volatile uint32_t btn_tick = 0;
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_USART1_UART_Init();
+
+    printf("\r\n中断测试\r\n");
+
+    bool led_on = false;
+
+    while (1)
+    {
+        if (btn_flag) {
+            btn_flag = false;
+
+            /* 软件消抖：20ms 内的重复中断忽略 */
+            static uint32_t last = 0;
+            uint32_t now = HAL_GetTick();
+            if (now - last > 20) {
+                last = now;
+
+                led_on = !led_on;
+                HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin,
+                                  led_on ? GPIO_PIN_RESET : GPIO_PIN_SET);
+                printf("LED %s\r\n", led_on ? "ON" : "OFF");
+            }
+        }
+
+        HAL_Delay(10);
+    }
+}
+
+/* USER CODE BEGIN 4 */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == BTN_Pin) {
+        btn_flag = true;
+        btn_tick = HAL_GetTick();
+    }
+}
+/* USER CODE END 4 */
+```
+
+:::tip[为什么中断也要消抖]
+**外部中断同样受机械抖动影响**——按一次可能触发 5~10 次中断。
+
+**所以中断里记录的 `btn_tick` 用来在主循环里做时间过滤。**
+
+（[第 11 课](./11-gpio-input)的轮询消抖思路在这里复用。）
+:::
+
+## 三种中断源的写法对照
+
+| 中断源 | 启动 | 回调 |
+| --- | --- | --- |
+| **GPIO 外部中断** | 自动（CubeMX 配好） | `HAL_GPIO_EXTI_Callback(pin)` |
+| **定时器中断** | `HAL_TIM_Base_Start_IT(&htim)` | `HAL_TIM_PeriodElapsedCallback(htim)` |
+| **串口接收中断** | `HAL_UART_Receive_IT(&huart, buf, len)` | `HAL_UART_RxCpltCallback(huart)` |
+
+:::warning[串口中断要"重新启动"才能收下一次]
+```c
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    /* 处理收到的数据... */
+
+    /* 必须重新启动接收，否则只能收一次 */
+    HAL_UART_Receive_IT(huart, buf, 1);
+}
+```
+
+**`HAL_UART_Receive_IT` 是"收一次"的语义**，不是持续的。
+
+**这是 HAL 串口中断最常见的坑。**
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| NVIC 没使能 | 回调不执行 | CubeMX 没勾 | NVIC 里 Enabled |
+| 两个端口同号引脚 | 冲突 | EXTI 线共享 | 换引脚 |
+| ISR 里 printf | 卡死 | 阻塞 | 只置标志位 |
+| 共享变量没 `volatile` | 主循环检测不到 | 编译器优化 | 加 `volatile` |
+| 优先级数字搞反 | 抢占关系错 | 数字越小越高 | 记住规则 |
+| 串口中断只收一次 | 后续无数据 | 没重新 `Receive_IT` | 回调里重启 |
+| 改了 `stm32f1xx_it.c` | 重新生成被覆盖 | 生成文件 | 只写 Callback |
+
+## 本课自检
+
+- [ ] 理解中断比轮询快在哪
+- [ ] 知道 EXTI 线按引脚号分组，同号引脚会冲突
+- [ ] **知道 CubeMX 里必须勾 NVIC 的 Enabled**
+- [ ] **知道中断是 IRQHandler（生成）+ Callback（你写）两层**
+- [ ] **知道 ISR 里不能 printf/HAL_Delay/malloc**
+- [ ] 会用"置标志位 + 主循环处理"的模式
+- [ ] **知道共享变量必须 `volatile`**
+- [ ] 理解抢占优先级和子优先级的区别
+- [ ] **知道 HAL 默认 Group 4（全抢占），数字越小优先级越高**
+- [ ] **知道 STM32 中断优先级和 FreeRTOS 任务优先级方向相反**
+- [ ] 知道串口中断要在回调里重新 `Receive_IT`
+
+## 第三阶段小结
+
+到这里你已经掌握了 STM32 的常用外设：
+
+| 外设 | 能力 |
+| --- | --- |
+| GPIO | 输出、输入、中断 |
+| 串口 | printf 调试、收发数据 |
+| 定时器 | 精确定时、PWM、中断 |
+| ADC | 模拟量采集、DMA 连续采样 |
+
+**这些能覆盖 80% 的实际项目需求。**
+
+## 下一步
+
+[15 I2C 接 OLED](./15-i2c) —— 给板子加一块屏幕。

@@ -1,0 +1,270 @@
+---
+id: 17-dma
+title: 17 DMA：不占 CPU 的传输
+sidebar_position: 17
+description: DMA 是什么、为什么串口/ADC/SPI 都需要它、CubeMX 怎么配、传输完成回调，以及 DMA 的三个坑。
+---
+
+# 17 DMA：不占 CPU 的传输
+
+**本课目标**：让数据搬运不占用 CPU。
+
+## DMA 是什么
+
+**DMA = Direct Memory Access（直接存储器访问）**
+
+:::tip[一句话理解]
+**DMA 是一个"专门搬数据的协处理器"。**
+
+你告诉它："把外设收到的 100 个字节搬到内存这个地址"——**然后 CPU 就自由了**，继续干别的。
+:::
+
+```text
+没有 DMA：
+  外设收到 1 字节 → 中断 → CPU 读走 → 存内存 → 返回
+  外设收到 1 字节 → 中断 → CPU 读走 → 存内存 → 返回
+  ...（100 次中断，CPU 累死）
+
+有 DMA：
+  外设收到字节 → DMA 自动搬到内存
+  外设收到字节 → DMA 自动搬到内存
+  ...（全程 CPU 不参与）
+  搬完 100 个 → 通知 CPU 一次
+```
+
+## 为什么需要 DMA
+
+| 场景 | 没 DMA | 有 DMA |
+| --- | --- | --- |
+| **串口收 100 字节** | 100 次中断 | **1 次中断** |
+| **ADC 连续采样 1000 次** | CPU 一直等 | **CPU 空闲** |
+| **SPI 刷屏 40KB** | CPU 卡 73ms | **CPU 空闲** |
+| **串口发长数据** | 阻塞等待 | **不阻塞** |
+
+:::danger[高频中断会拖垮系统]
+假设串口 115200 波特率，每秒收到 11520 字节。
+
+**用中断方式**：每秒 **11520 次中断**——CPU 几乎全部时间在处理中断，主逻辑跑不动。
+
+**用 DMA**：DMA 一次搬完，CPU 只被通知一次。
+
+**这就是 DMA 的价值。**
+:::
+
+## CubeMX 配置
+
+以 **USART1 接收用 DMA** 为例：
+
+1. 配好 USART1（[第 9 课](./09-uart)）
+2. 切到 **DMA Settings** 标签 → 点 **Add**
+3. 选 **USART1_RX**
+4. 配置：
+
+| 参数 | 值 | 说明 |
+| --- | --- | --- |
+| Direction | Peripheral To Memory | 收 |
+| Priority | Low / Medium | |
+| **Mode** | **Normal** 或 **Circular** | 见下 |
+| Data Width (Periph) | **Byte** | |
+| Data Width (Mem) | **Byte** | |
+| Increment Address (Mem) | ✅ **勾上** | 内存地址递增 |
+
+:::danger[内存地址递增必须勾]
+```text
+不勾：DMA 每次都写同一个地址 → 只保留最后一个字节
+勾上：DMA 依次写 buf[0]、buf[1]、buf[2]...
+```
+
+**这是最容易被忽略的设置**——不勾就永远只收到一个字节。
+:::
+
+### Normal 还是 Circular
+
+| 模式 | 行为 | 适合 |
+| --- | --- | --- |
+| **Normal** | 搬完指定数量就停 | 收一包完整数据 |
+| **Circular** | 搬完自动从头开始（环形缓冲） | **持续采样、音频** |
+
+:::tip[怎么选]
+**收不定长的命令** → Normal（收完再重新启动）
+
+**ADC 连续采样、音频流** → **Circular**（永不停止，永远有最新数据）
+:::
+
+## 串口 DMA 接收
+
+```c
+#define RX_SIZE  64
+uint8_t rx_buf[RX_SIZE];
+
+/* 启动一次接收（Normal 模式收完就停） */
+HAL_UART_Receive_DMA(&huart1, rx_buf, RX_SIZE);
+
+/* 接收完成回调 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1) {
+        /* rx_buf 里是收到的数据，注意：没有 \0 结尾！ */
+
+        /* 重新启动接收 */
+        HAL_UART_Receive_DMA(&huart1, rx_buf, RX_SIZE);
+    }
+}
+```
+
+:::danger[和 ESP32 一样的坑：数据没有 `\0`]
+```c
+printf("%s", rx_buf);        /* ❌ 越界读到垃圾 */
+```
+
+**`rx_buf` 是原始字节，不保证以 `\0` 结尾。**
+
+**要先自己加**：
+
+```c
+rx_buf[RX_SIZE - 1] = '\0';        /* 或者按实际长度处理 */
+```
+
+（[ESP32 第 15、16 课](../esp-basics/15-http)讲过同样的坑。）
+:::
+
+## 串口 DMA 发送
+
+```c
+uint8_t msg[] = "这是一段很长的数据...\r\n";
+
+/* 非阻塞启动，立刻返回 */
+HAL_UART_Transmit_DMA(&huart1, msg, sizeof(msg) - 1);
+
+/* CPU 继续干别的 */
+do_other_work();
+
+/* 发送完成回调 */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1) {
+        /* 发完了 */
+    }
+}
+```
+
+:::warning[DMA 发送期间不能改缓冲区]
+```c
+HAL_UART_Transmit_DMA(&huart1, msg, len);
+strcpy(msg, "新数据");          /* ❌ DMA 还在发旧数据，内容会被改坏 */
+```
+
+**必须等 `HAL_UART_TxCpltCallback` 回调之后，才能复用缓冲区。**
+
+**或者用 `HAL_UART_GetState()` 查状态**。
+:::
+
+## ADC + DMA（最有用的组合）
+
+```c
+#define ADC_BUF  128
+uint16_t adc_buf[ADC_BUF];       /* 注意是 uint16_t */
+
+/* Circular 模式：启动一次，永远在更新 */
+HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buf, ADC_BUF);
+
+while (1) {
+    /* 随时读 adc_buf，永远是最新的 N 个采样 */
+    uint32_t sum = 0;
+    for (int i = 0; i < ADC_BUF; i++) sum += adc_buf[i];
+
+    printf("平均 ADC = %lu\r\n", sum / ADC_BUF);
+    HAL_Delay(200);
+}
+```
+
+:::tip[这就是"零 CPU 占用"的采样]
+**ADC 硬件自动转换 → DMA 自动搬运 → 你随时读缓冲。**
+
+**CPU 从来没被打断过**——这是 DSP、音频、振动的标准做法。
+:::
+
+## SPI + DMA（刷屏必备）
+
+```c
+/* 刷一帧图像 */
+HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_RESET);
+HAL_SPI_Transmit_DMA(&hspi1, framebuffer, 40960);
+
+/* 等传输完成（或用回调） */
+while (HAL_SPI_GetState(&hspi1) != HAL_SPI_STATE_READY) { }
+HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_SET);
+```
+
+**40 KB 的帧缓冲从"CPU 卡 73ms"变成"CPU 空闲"**——这就是能否流畅刷屏的关键。
+
+## DMA 的三个坑
+
+:::danger[坑一：DMA 传输中改缓冲区]
+```c
+HAL_UART_Transmit_DMA(&huart1, buf, len);
+buf[0] = 'x';        /* ❌ 数据会被改坏 */
+```
+
+**必须等回调。**
+:::
+
+:::danger[坑二：忘了检查 DMA 是否可用]
+**同一路 DMA 通道被占用时，启动会失败。**
+
+```c
+if (HAL_UART_Receive_DMA(&huart1, buf, len) != HAL_OK) {
+    /* 启动失败——可能通道被别的外设占了 */
+}
+```
+
+**查 CubeMX 的 DMA 请求映射表**（不同外设映射到不同通道）。
+:::
+
+:::danger[坑三：Cache 一致性（F7/H7 才有）]
+**F1/F4 没有 D-Cache，可以忽略这个问题。**
+
+但 **F7/H7 有 D-Cache**，DMA 和 CPU 看到的内存可能不一致，需要 `SCB_CleanDCache_by_Addr()` 之类操作。
+
+**用 F1/F4 学习不会遇到，但要知道有这个坑。**
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 内存地址递增没勾 | 只收到一个字节 | DMA 写同一地址 | 勾上 |
+| DMA 中改缓冲区 | 数据错乱 | 竞争 | 等回调 |
+| Normal 模式不重启 | 只收一次 | 搬完就停 | 回调里重启 |
+| 数据当字符串用 | 越界/乱码 | 没有 `\0` | 手动加 |
+| DMA 通道冲突 | 启动失败 | 通道被占 | 查映射表 |
+| ADC 用 uint8_t 缓冲 | 数据错位 | ADC 是 16 位 | 用 `uint16_t` |
+
+:::warning[ADC 的 DMA 缓冲区必须是 16 位]
+```c
+uint8_t  buf[128];        /* ❌ ADC 结果是 12 位，要 16 位存 */
+uint16_t buf[128];        /* ✅ */
+```
+
+**但传给 `HAL_ADC_Start_DMA` 时要强制转换成 `uint32_t*`**（HAL 的函数签名要求）。
+
+**这个类型不一致是 HAL 的历史遗留，照它要求写就行。**
+:::
+
+## 本课自检
+
+- [ ] **理解 DMA 是"搬数据的协处理器"，不占 CPU**
+- [ ] 知道高频数据场景必须用 DMA
+- [ ] 会在 CubeMX 的 DMA Settings 里添加请求
+- [ ] **知道"内存地址递增"必须勾**
+- [ ] 知道 Normal 和 Circular 的区别与选择
+- [ ] 会用 `HAL_UART_Receive_DMA` / `Transmit_DMA`
+- [ ] **知道 DMA 期间不能改缓冲区，要等回调**
+- [ ] **知道收到的数据没有 `\0`**
+- [ ] 会用 ADC + DMA 做零占用采样
+- [ ] 知道 ADC 的 DMA 缓冲区要用 `uint16_t`
+- [ ] 知道 F7/H7 有 Cache 一致性问题（F1/F4 没有）
+
+## 下一步
+
+[18 FreeRTOS 入门](./18-freertos) —— 让多件事"同时"进行。

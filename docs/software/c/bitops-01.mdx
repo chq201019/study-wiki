@@ -1,0 +1,319 @@
+---
+id: bitops-01
+title: "01 位运算与寄存器操作"
+sidebar_position: 2
+description: "位运算与寄存器操作 第 1 部分：位运算与寄存器操作"
+---
+
+# 01 位运算与寄存器操作
+**本页学什么**
+
+- 六种位运算符的完整语义（含**实现定义**的部分）
+- 位掩码的构造与字段提取
+- 置位/清位/翻转/检查的标准惯用法
+- 为什么硬件寄存器不该用位域
+- **读改写（read-modify-write）** 及其在并发/中断下的风险
+- 字节序的实测判定与转换
+
+这是**本线最贴近实际工作的一页**——看完你应该能对着芯片手册自己算出任意寄存器的操作代码。
+
+## 一、六种位运算符
+
+| 运算符 | 名称 | 规则 |
+| --- | --- | --- |
+| `&` | 按位与 | 两位都为 1 才为 1 |
+| `\|` | 按位或 | 有一位为 1 就为 1 |
+| `^` | 按位异或 | 两位不同才为 1 |
+| `~` | 按位取反 | 0↔1 |
+| `<<` | 左移 | 低位补 0 |
+| `>>` | 右移 | **有符号数：实现定义**（算术/逻辑） |
+
+### 实测
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+uint8_t a = 0xB5, b = 0x3C;
+printf("a=0x%02X b=0x%02X\n", a, b);
+printf("a & b  = 0x%02X\n", (unsigned)(a & b));
+printf("a | b  = 0x%02X\n", (unsigned)(a | b));
+printf("a ^ b  = 0x%02X\n", (unsigned)(a ^ b));
+printf("~a     = 0x%02X  (promoted to int: 0x%08X)\n", (unsigned)(uint8_t)~a, (unsigned)~a);
+printf("a<<1   = 0x%02X\n", (unsigned)(uint8_t)(a << 1));
+printf("a>>1   = 0x%02X\n", (unsigned)(a >> 1));
+```
+
+```bash
+gcc -std=c17 -Wall bits.c -o bits.exe && ./bits.exe
+```
+
+```text
+=== bit operators ===
+a=0xB5 b=0x3C
+a & b  = 0x34
+a | b  = 0xBD
+a ^ b  = 0x89
+~a     = 0x4A  (promoted to int: 0xFFFFFF4A)
+a<<1   = 0x6A
+a>>1   = 0x5A
+```
+
+逐条验证（`a = 0xB5 = 1011 0101`，`b = 0x3C = 0011 1100`）：
+
+```text
+a & b : 1011 0101
+        0011 1100
+        ---------
+        0011 0100  = 0x34  ✓
+
+a | b : 1011 0101
+        0011 1100
+        ---------
+        1011 1101  = 0xBD  ✓
+
+a ^ b : 1011 0101
+        0011 1100
+        ---------
+        1000 1001  = 0x89  ✓
+```
+
+### `~` 的整数提升陷阱
+
+注意实测里这一行：
+
+```text
+~a     = 0x4A  (promoted to int: 0xFFFFFF4A)
+```
+
+`a` 是 `uint8_t`，但 `~a` 的结果是 **`0xFFFFFF4A`**（32 位）而不是 `0x4A`！
+
+**原因**：`~` 的操作数会先做**整数提升**，`uint8_t` 被提升为 `int`（32 位），取反后得到 `0xFFFFFF4A`。
+
+```c
+uint8_t a = 0xB5;
+uint8_t r = ~a;        /* r = 0x4A（赋值时截断，正确） */
+uint32_t r32 = ~a;     /* r32 = 0xFFFFFF4A —— 高 24 位全是 1！ */
+```
+
+:::danger[这是硬件编程的经典 bug]
+```c
+/* 想清掉低 4 位 */
+reg &= ~0x0F;          /* 0x0F 是 int，~0x0F = 0xFFFFFFF0 */
+                       /* 如果 reg 是 uint32_t，结果正确 */
+                       /* 如果 reg 是 uint8_t，也正确（截断） */
+
+/* 但这样写就有问题 */
+uint64_t big = 0;
+big &= ~0x0F;          /* ~0x0F 是 int 的 0xFFFFFFF0，提升到 uint64_t 后
+                          变成 0x00000000FFFFFFF0 —— 高 32 位被清掉了！ */
+```
+
+**准则：掩码一律加 `u` 后缀，并用与操作数匹配的定宽类型。**
+
+```c
+uint32_t reg = ...;
+reg &= ~0x0Fu;         /* 明确无符号 */
+```
+:::
+
+### `>>` 的实现定义行为
+
+实测：
+
+```c
+printf("(int8_t)-1 >> 1      = %d\n", (int)(neg >> 1));
+printf("(uint8_t)0xFF >> 1   = %u\n", (unsigned)((uint8_t)0xFF >> 1));
+```
+
+```text
+=== sign extension hazard ===
+(int8_t)-1 >> 1      = -1
+(uint8_t)0xFF >> 1   = 127
+(int)0x80000000 >> 1 = -1073741824
+(unsigned)0x80000000u >> 1 = 1073741824
+```
+
+- **有符号负数右移**：`-1 >> 1` 仍是 `-1`，`(int)0x80000000 >> 1` 得 `-1073741824`——**算术右移，补符号位**。这是 gcc/clang 的行为，属于**实现定义**（标准允许算术或逻辑）
+- **无符号右移**：`0xFF >> 1` = `127`，`0x80000000u >> 1` = `1073741824`——**逻辑右移，补 0**。这是标准保证的
+
+:::tip[要逻辑右移，先转无符号]
+```c
+uint32_t v = ...;
+v = v >> 1;                    /* 保证补 0（无符号） */
+int32_t s = ...;
+s = (int32_t)((uint32_t)s >> 1);  /* 强制逻辑右移 */
+```
+:::
+
+### 位移的 UB 边界
+
+```text
+1 << 30     = 1073741824
+1u << 31    = 2147483648
+1 << 31     = -2147483648
+```
+
+UBSan 抓到的越界位移：
+
+```text
+C:\cprobe\shift.c:2:43: runtime error: shift exponent 32 is too large for 32-bit type 'int'
+SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior C:\cprobe\shift.c:2:43
+```
+
+规则回顾（详见 [语法页](./syntax)）：
+
+| 情况 | 分类 |
+| --- | --- |
+| 移位数 >= 位宽 | **UB** |
+| 移位数为负 | **UB** |
+| 左移有符号数结果不可表示 | **UB** |
+| 右移负数 | **实现定义** |
+
+## 二、位掩码
+
+### 构造掩码
+
+```c
+/* 单个位 */
+#define BIT(n)      (1u << (n))
+
+/* 连续 n 位（从 0 开始） */
+#define MASK(n)     ((1u << (n)) - 1u)     /* n 位全 1，如 MASK(4) = 0xF */
+
+/* 从第 pos 位开始的 width 位 */
+#define FIELD_MASK(pos, width)  (MASK(width) << (pos))
+```
+
+### 实测：置位、清位、翻转、检查
+
+```c
+uint32_t reg = 0x00000000u;
+reg |= (1u << 3);
+printf("after set bit3    : 0x%08X\n", reg);
+reg &= ~(1u << 3);
+printf("after clear bit3  : 0x%08X\n", reg);
+reg = 0x0Fu;
+reg ^= (1u << 1);
+printf("after toggle bit1 : 0x%08X\n", reg);
+printf("bit2 is %s\n", (reg & (1u << 2)) ? "SET" : "CLEAR");
+```
+
+```text
+=== set / clear / toggle / check ===
+after set bit3    : 00000000 00000000 00000000 00001000  (0x00000008)
+after clear bit3  : 00000000 00000000 00000000 00000000  (0x00000000)
+after toggle bit1 : 00000000 00000000 00000000 00001101  (0x0000000D)
+bit2 is SET
+```
+
+### 四种标准惯用法
+
+| 操作 | 写法 | 说明 |
+| --- | --- | --- |
+| **置位** | `reg \|= (1u << n)` | 把第 n 位设为 1，其他不变 |
+| **清位** | `reg &= ~(1u << n)` | 把第 n 位设为 0，其他不变 |
+| **翻转** | `reg ^= (1u << n)` | 第 n 位取反，其他不变 |
+| **检查** | `(reg >> n) & 1u` 或 `reg & (1u << n)` | 取第 n 位的值 |
+
+:::info[为什么异或能翻转]
+`x ^ 1` 把位取反，`x ^ 0` 保持不变。所以 `reg ^ (1u << n)` 只在第 n 位是 1（翻转目标位），其他位都是 0（保持不变）。
+
+同理 `|`（置 1 后其他位 `|0` 不变）和 `&~`（清 0 后其他位 `&1` 不变）。
+:::
+
+### 实测：字段提取
+
+```c
+uint32_t v = 0xDEADBEEFu;
+printf("byte0=%02X byte1=%02X byte2=%02X byte3=%02X\n",
+       (unsigned)(v & 0xFFu),
+       (unsigned)((v >> 8) & 0xFFu),
+       (unsigned)((v >> 16) & 0xFFu),
+       (unsigned)((v >> 24) & 0xFFu));
+uint32_t field = (v >> 12) & 0x3Fu;
+printf("bits[17:12] = %u (0x%02X)\n", field, field);
+```
+
+```text
+=== mask field extract ===
+byte0=EF byte1=BE byte2=AD byte3=DE
+bits[17:12] = 27 (0x1B)
+```
+
+**通用公式：提取从第 `pos` 位开始的 `width` 位**
+
+```c
+value = (reg >> pos) & MASK(width);
+```
+
+验证 `bits[17:12]`：`(0xDEADBEEF >> 12) & 0x3F`。
+`0xDEADBEEF >> 12 = 0x000DEADB`，`& 0x3F = 0x1B = 27`。✓
+
+### 字段写入（读改写的特例）
+
+```c
+/* 把 field 写入第 pos 位开始的 width 位，其他位不变 */
+reg = (reg & ~FIELD_MASK(pos, width)) | ((field & MASK(width)) << pos);
+```
+
+实测（用一个封装函数）：
+
+```c
+static void set_pin_atomic_pseudo(int pin, uint32_t mask) {
+    uint32_t v = FAKE_OUT;
+    v = (v & ~mask) | ((1u << pin) & mask);
+    FAKE_OUT = v;
+}
+set_pin_atomic_pseudo(7, 0x000000F0u);
+```
+
+```text
+=== masked field write ===
+after masked write : 0x00000080
+```
+
+注意 `~0x000000F0u` = `0xFFFFFF0F`，清掉了 bit4~7，然后 `((1u<<7) & 0xF0)` = `0x80` 填进去。
+
+### 常用位技巧
+
+```c
+/* 判断是否为 2 的幂 */
+is_pow2 = (x != 0) && ((x & (x - 1)) == 0);
+
+/* 向上取整到 2 的幂 */
+x--; x |= x>>1; x |= x>>2; x |= x>>4; x |= x>>8; x |= x>>16; x++;
+
+/* 隔离最低位的 1 */
+lowest = x & (-x);        /* 或 x & (~x + 1) */
+
+/* 清除最低位的 1 */
+x = x & (x - 1);
+
+/* 计算 popcount（Kernighan 法） */
+int n = 0; while (x) { x &= (x - 1); n++; }
+```
+
+实测后两个：
+
+```text
+=== isolate lowest set bit ===
+w & -w = 0x00000040
+
+=== count bits (popcount) ===
+popcount(0xDEADBEEF) = 24
+builtin_popcount = 24
+```
+
+**Kernighan 法**每次清掉最低位的 1，循环次数 = 置位数。0xDEADBEEF 有 24 个置位位。
+
+`__builtin_popcount` 是编译器内建（gcc/clang），会编译成一条 `popcnt` 指令（如果 CPU 支持）。**嵌入式上用内建函数比手写循环快得多**，但要注意：它是编译器扩展，不是标准 C（C23 没有，但很多工具链有）。
+
+```c
+/* 对齐到 n 的倍数（n 必须是 2 的幂） */
+aligned = (x + n - 1) & ~(n - 1);
+```
+
+---
+
+**翻页**：[下一页 →](./bitops-02) · [返回目录](./)

@@ -1,0 +1,267 @@
+---
+id: 12-users
+title: 12 用户与组
+sidebar_position: 12
+description: 用户和组是什么、useradd/usermod/userdel 用法、su 和 sudo 的区别、以及 /etc/passwd 每段含义。
+---
+
+# 12 用户与组
+
+**本课目标**：会管理用户和组，理解 `sudo` 的机制。
+
+## 为什么需要多用户
+
+Linux 天生是多用户系统：
+
+| 好处 | 说明 |
+| --- | --- |
+| **隔离** | 用户 A 的文件用户 B 看不到（受权限限制） |
+| **审计** | 每件事都能追溯到具体用户 |
+| **服务隔离** | 每个服务用独立账户运行，被攻破影响有限 |
+
+:::tip[服务账户是安全设计]
+`nginx`、`mysql` 等都有专用的低权限账户（如 `www-data`）。
+
+**这样即使服务被攻破，攻击者也只有那个账户的权限**，不能直接拿到 root。
+:::
+
+## 看当前用户
+
+```bash
+whoami                  # 当前用户名
+id                      # 详细信息
+```
+
+本机实测（root 用户）：
+
+```text
+uid=0(root) gid=0(root) 组=0(root)
+```
+
+| 项 | 含义 |
+| --- | --- |
+| `uid` | 用户 ID（**root 固定是 0**） |
+| `gid` | 主组 ID |
+| `组=` | 附加组列表 |
+
+:::info[`uid` 才是真正的身份]
+系统内部**只认 uid，不认用户名**。
+
+`root` 就是 `uid=0`。如果创建另一个 uid=0 的账户，它也有 root 权限（这是常见的后门手法）。
+:::
+
+## `/etc/passwd`：用户信息
+
+```bash
+head -3 /etc/passwd
+```
+
+格式（7 段，用冒号分隔）：
+
+```text
+root:x:0:0:root:/root:/bin/bash
+ │  │ │ │  │     │      └─ 登录 shell
+ │  │ │ │  │     └─ 家目录
+ │  │ │ │  └─ 描述
+ │  │ └─ 主组 gid
+ │  └─ uid
+ └─ x 表示密码存在 /etc/shadow（不是真的 x）
+```
+
+:::danger[密码不在 `/etc/passwd` 里]
+`/etc/passwd` 第二段是 `x`，**真正的密码哈希在 `/etc/shadow`**。
+
+原因：`/etc/passwd` 需要所有人可读（很多程序要查用户名），密码哈希不能让人读到（可离线破解）。
+
+```bash
+sudo cat /etc/shadow
+# 只有 root 能读
+```
+:::
+
+## `/etc/group`：组信息
+
+```text
+sudo:x:27:alice,bob
+ │   │ │  └─ 组内成员
+ │   │ └─ gid
+ │   └─ x
+ └─ 组名
+```
+
+## 创建用户
+
+```bash
+sudo useradd -m -s /bin/bash alice
+sudo passwd alice                  # 设置密码
+```
+
+:::danger[`useradd` 不加 `-m` 不会建家目录]
+```bash
+sudo useradd alice          # ❌ 没有 /home/alice，登录后很尴尬
+sudo useradd -m alice       # ✅ 创建家目录
+```
+
+| 选项 | 作用 |
+| --- | --- |
+| `-m` | **创建家目录**（必加） |
+| `-s` | 指定 shell |
+| `-G` | 附加组 |
+| `-d` | 自定义家目录路径 |
+| `-e` | 过期日期 |
+
+**Debian/Ubuntu 上更推荐 `adduser`**（交互式，自动建家目录、设密码）：
+
+```bash
+sudo adduser alice
+```
+:::
+
+## 修改用户
+
+```bash
+sudo usermod -aG sudo alice        # 加入 sudo 组（给 sudo 权限）
+sudo usermod -aG docker alice      # 加入多个组就多写几个 -aG
+sudo usermod -s /bin/bash alice    # 改 shell
+sudo usermod -L alice              # 锁定账户
+sudo usermod -U alice              # 解锁
+```
+
+:::danger[`-aG` 的 `a` 不能漏]
+```bash
+sudo usermod -G docker alice       # ❌ 会"覆盖"原有附加组！
+sudo usermod -aG docker alice      # ✅ 追加
+```
+
+**漏了 `-a`，用户的其它组全被清除**——可能直接失去 sudo 权限。
+:::
+
+## 删除用户
+
+```bash
+sudo userdel alice                 # 删用户，保留家目录
+sudo userdel -r alice              # 连家目录一起删
+```
+
+## 组管理
+
+```bash
+sudo groupadd devteam              # 建组
+sudo groupdel devteam              # 删组
+sudo gpasswd -a alice devteam      # 加成员
+sudo gpasswd -d alice devteam      # 移出
+groups alice                       # 看某人的组
+```
+
+## `su` vs `sudo`
+
+| | `su` | `sudo` |
+| --- | --- | --- |
+| 要谁的密码 | **目标用户的密码** | **自己的密码** |
+| 切换方式 | 变成另一个用户 | 以某身份执行一条命令 |
+| 审计 | 难（都是 root） | **能记录谁做了什么** |
+| 推荐 | 少用 | **首选** |
+
+:::tip[`su` 和 `su -` 的区别]
+```bash
+su                  # 切到 root，但环境变量还是原用户的
+su -                # 切到 root，并加载 root 的完整环境（推荐）
+su - alice          # 切到 alice
+```
+
+**`-` 表示"模拟一次完整登录"**——会切换家目录、加载 `~/.bashrc`、重置 PATH。
+
+**不加 `-` 常见问题**：`PATH` 还是原用户的，导致某些命令找不到。
+:::
+
+### `sudo` 用法
+
+```bash
+sudo apt update                    # 以 root 执行一条命令
+sudo -i                            # 进入 root 的交互 shell
+sudo -u www-data ls /var/www       # 以指定用户执行
+sudo -l                            # 看自己能 sudo 什么
+```
+
+:::danger[`sudo` 权限来自 `/etc/sudoers`]
+```bash
+sudo visudo                        # 必须用 visudo 编辑！
+```
+
+**为什么不用 `nano /etc/sudoers`**：`visudo` 会**检查语法**。写错了 `sudoers` 文件，**所有人（包括你自己）都无法再用 sudo**，可能彻底锁死系统。
+
+**这是运维的经典事故。**
+:::
+
+常见 sudoers 配置：
+
+```text
+# 允许 wheel 组免密码 sudo
+%wheel ALL=(ALL) NOPASSWD: ALL
+
+# 允许 alice 只重启 nginx
+alice ALL=(root) /bin/systemctl restart nginx
+```
+
+:::warning[生产环境别给 `NOPASSWD: ALL`]
+免密码 + 全权限 = **任何能登进这个账户的人都是 root**。
+
+**最小权限原则**：只授权需要的那几条命令。
+:::
+
+## 完整示例
+
+```bash
+# ① 建用户
+sudo adduser --disabled-password --gecos "" deploy
+
+# ② 给它 sudo 权限（Debian/Ubuntu 是 sudo 组）
+sudo usermod -aG sudo deploy
+groups deploy
+
+# ③ 验证
+id deploy
+
+# ④ 以它身份执行一条命令
+sudo -u deploy whoami
+
+# ⑤ 看 uid
+grep deploy /etc/passwd
+
+# ⑥ 锁定（临时禁用）
+sudo usermod -L deploy
+
+# ⑦ 解锁
+sudo usermod -U deploy
+
+# ⑧ 删除
+sudo userdel -r deploy
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `useradd` 不加 `-m` | 没家目录 | 默认不创建 | 加 `-m` 或用 `adduser` |
+| `usermod -G` 漏 `-a` | 丢了其他组 | 覆盖而非追加 | `-aG` |
+| `su` 不加 `-` | 环境变量不对 | 没重新登录 | `su -` |
+| 用 `nano` 改 sudoers | sudo 全坏 | 语法错误没检查 | 用 `visudo` |
+| 给 `NOPASSWD: ALL` | 安全风险 | 权限过大 | 最小授权 |
+| 删用户后文件还在 | 家目录残留 | 没加 `-r` | `userdel -r` |
+
+## 本课自检
+
+- [ ] 知道 uid=0 是 root
+- [ ] 会用 `whoami` / `id` / `groups`
+- [ ] 能看懂 `/etc/passwd` 的 7 段
+- [ ] **知道密码哈希在 `/etc/shadow` 不在 passwd**
+- [ ] **知道 `useradd` 要加 `-m`（或用 `adduser`）**
+- [ ] **知道 `usermod -aG` 的 `a` 不能漏**
+- [ ] 分清 `su` 和 `sudo`（谁的密码、审计）
+- [ ] **知道 `su -` 和 `su` 的区别**
+- [ ] **知道改 sudoers 必须用 `visudo`**
+- [ ] 知道不该给 `NOPASSWD: ALL`
+
+## 下一步
+
+[13 磁盘与存储](./13-disk) —— `df` 和 `du`，以及磁盘满了怎么查。

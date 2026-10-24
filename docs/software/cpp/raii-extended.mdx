@@ -1,0 +1,273 @@
+---
+id: raii-extended
+title: RAII 与资源管理
+sidebar_position: 22
+description: RAII 的本质、构造失败怎么办、移动语义如何保持资源唯一、RAII 与 C 风格 API 的桥接、以及五个常见误用。
+---
+
+# RAII 与资源管理
+
+**本课目标**：让"忘记释放"从语言层面变得不可能。
+
+## RAII 只有两条规则
+
+![RAII 在异常路径下的保证：栈展开时析构仍会被调用，所以手写 lock/unlock 在提前 return 和抛异常时都会漏](/img/diagrams/cpp-raii-exception.svg)
+
+
+:::info[本质]
+1. **构造函数获取资源**
+2. **析构函数释放资源**
+
+对象的生命周期由作用域决定 —— **离开作用域必然调用析构**（包括异常路径）。
+:::
+
+```cpp
+class File {
+public:
+    explicit File(const char* path) : fp_(std::fopen(path, "r")) {
+        if (!fp_) throw std::runtime_error("open failed");
+    }
+    ~File() { if (fp_) std::fclose(fp_); }
+
+private:
+    std::FILE* fp_;
+};
+```
+
+:::danger[三条必须遵守的规则]
+**① 析构必须 `noexcept`**（默认就是）—— 析构里抛异常会导致 `std::terminate`
+
+**② 资源句柄必须只有一个所有者** —— 否则会重复释放
+
+**③ 禁用拷贝（或实现移动）** —— 否则两个对象析构时会释放两次
+:::
+
+```cpp
+File a("x.txt");
+File b = a;              /* ❌ 两个对象持有同一个 FILE* → 双重 fclose */
+```
+
+## 所有权：四种策略
+
+| 策略 | 写法 | 谁负责释放 |
+---
+| **独占** | `std::unique_ptr` | 持有者 |
+| **共享** | `std::shared_ptr` | 最后那个持有者 |
+| **不拥有** | 裸指针 / `T&` / `string_view` | **别人** |
+| **值语义** | 直接存 `T` | 对象自己 |
+
+:::tip[函数参数怎么表达所有权]
+```cpp
+void use(const Widget& w);           // 只是看，不涉及所有权
+void borrow(Widget* w);              // 可空，不涉及所有权
+void take(std::unique_ptr<Widget>);  // 接管所有权
+void share(std::shared_ptr<Widget>); // 共享所有权
+```
+
+**看到 `unique_ptr` 按值传参 = "这个对象以后归你了"** —— 这是最清晰的接口语义。
+:::
+
+## 禁用拷贝的两种方式
+
+```cpp
+class NonCopyable {
+public:
+    NonCopyable(const NonCopyable&) = delete;
+    NonCopyable& operator=(const NonCopyable&) = delete;
+    NonCopyable() = default;
+};
+```
+
+:::warning[禁用了拷贝，移动也不会自动生成]
+**声明了 `= delete` 的拷贝构造会阻止移动构造的隐式生成。**
+
+**要么显式写移动，要么接受"完全不可移动"**：
+
+```cpp
+NonCopyable(NonCopyable&&) = default;
+NonCopyable& operator=(NonCopyable&&) = default;
+```
+:::
+
+## 构造失败怎么办
+
+:::danger[构造函数没有返回值]
+```cpp
+class Conn {
+public:
+    Conn(const std::string& host) { /* 失败了怎么报告？ */ }
+};
+```
+
+**三种方案**：
+
+**① 抛异常**（最自然）
+**② 静态工厂返回 `expected`**（禁用异常时）
+**③ 两段式构造**（`init()`，但容易忘记调用）
+:::
+
+```cpp
+/* 方案② */
+class Conn {
+public:
+    static std::expected<Conn, std::string> create(const std::string& host);
+private:
+    Conn() = default;
+};
+```
+
+:::warning[构造函数抛异常时，已构造的成员会被正确析构]
+```cpp
+class A {
+    Resource r1_;
+    Resource r2_;       /* 如果 r2_ 构造抛异常 */
+public:
+    A() : r1_(), r2_() {}
+};
+/* r1_ 会被析构 —— 这是 C++ 保证的 */
+```
+
+**所以只要每个成员都是 RAII 的，部分构造失败也是安全的。**
+:::
+
+## 与 C 风格 API 的桥接
+
+```cpp
+/* 用 unique_ptr 的自定义删除器包装 C 资源 */
+std::unique_ptr<FILE, decltype(&std::fclose)>
+    f(std::fopen("x", "r"), &std::fclose);
+
+std::unique_ptr<SDL_Window, decltype(&SDL_DestroyWindow)>
+    win(SDL_CreateWindow(...), &SDL_DestroyWindow);
+```
+
+:::tip[更清晰的做法：写一个薄包装]
+```cpp
+using FilePtr = std::unique_ptr<std::FILE, int (*)(std::FILE*)>;
+
+FilePtr open_file(const char* path) {
+    return FilePtr(std::fopen(path, "r"), &std::fclose);
+}
+```
+
+**类型别名让调用处不用重复写删除器。**
+:::
+
+## `shared_ptr` 的循环引用
+
+:::danger[`shared_ptr` 互相指向 = 永不释放]
+```cpp
+struct A { std::shared_ptr<B> b; };
+struct B { std::shared_ptr<A> a; };
+
+auto x = std::make_shared<A>();
+auto y = std::make_shared<B>();
+x->b = y;
+y->a = x;              /* ❌ 引用计数都是 2，永远不归零 */
+```
+
+**解法：一边改成 `std::weak_ptr`**
+
+```cpp
+struct B { std::weak_ptr<A> a; };      /* ✅ */
+```
+:::
+
+:::warning[`weak_ptr` 用之前必须 `lock()`]
+```cpp
+if (auto sp = wp.lock()) {
+    sp->do_something();        /* ✅ 对象还活着 */
+} else {
+    /* 已经被释放 */
+}
+```
+
+**直接 `wp->` 是编译不过的** —— 必须先提升成 `shared_ptr`。
+:::
+
+## 五个常见误用
+
+:::danger[① 在构造函数里 `new` 但还没赋给智能指针]
+```cpp
+class A {
+    B* b_;
+    C* c_;
+public:
+    A() : b_(new B), c_(new C) {}       /* ❌ 如果 new C 抛异常，b_ 泄漏 */
+};
+```
+
+**用 `make_unique` 让每个成员自己管理**：
+
+```cpp
+    std::unique_ptr<B> b_ = std::make_unique<B>();
+```
+:::
+
+:::danger[② 从裸指针构造两个 `shared_ptr`]
+```cpp
+A* raw = new A;
+std::shared_ptr<A> p1(raw);
+std::shared_ptr<A> p2(raw);      /* ❌ 两个独立的控制块 → 双重释放 */
+```
+
+**正确做法是 `auto p = std::make_shared<A>()` 然后拷贝 `p`。**
+:::
+
+:::danger[③ 在析构函数里抛异常]
+```cpp
+~A() { throw std::runtime_error("x"); }    /* ❌ 触发 std::terminate */
+```
+
+**C++11 起析构默认 `noexcept`** —— 抛异常直接终止进程。
+:::
+
+:::danger[④ 用 `shared_ptr` 到处传（滥用共享所有权）]
+**默认应该用 `unique_ptr` + 传 `T&` 或 `T*`。**
+
+**`shared_ptr` 的开销**：控制块 + 原子引用计数（每次拷贝都有原子操作）。
+
+**只有在"确实无法确定谁最后死"时才用共享。**
+:::
+
+:::danger[⑤ 忘记 `unique_ptr` 也需要完整类型]
+```cpp
+class Foo;
+class Bar {
+    std::unique_ptr<Foo> f_;        /* 声明 OK */
+    ~Bar();                          /* 必须在 .cpp 里定义 */
+};
+```
+
+**如果析构在头文件里内联，`unique_ptr<Foo>` 的析构需要 `Foo` 完整定义** —— 否则编译失败。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 双重释放 | 两个对象持有同一资源 | 禁拷贝 + 移动语义 |
+| 内存泄漏 | 构造中途抛异常 | 每个成员用智能指针 |
+| `shared_ptr` 不释放 | 循环引用 | 一边改 `weak_ptr` |
+| 编译错 `incomplete type` | `unique_ptr` 析构需要完整类型 | 析构移到 .cpp |
+| 程序直接 terminate | 析构里抛异常 | 析构内 `catch` 掉 |
+| 性能差 | 频繁拷贝 `shared_ptr` | 传 `const T&` |
+
+## 本课自检
+
+- [ ] **知道 RAII 就是"构造获取、析构释放"**
+- [ ] **知道离开作用域必然析构（含异常路径）**
+- [ ] 知道析构必须 `noexcept`
+- [ ] **知道资源必须只有一个所有者**
+- [ ] 会用 `= delete` 禁用拷贝，知道它也会阻止移动
+- [ ] 知道构造函数失败的三种方案
+- [ ] **知道成员构造失败时已构造成员会被析构**
+- [ ] 会用 `unique_ptr` + 自定义删除器包装 C 资源
+- [ ] **知道 `shared_ptr` 循环引用要用 `weak_ptr` 打破**
+- [ ] 知道 `weak_ptr` 必须先 `lock()`
+- [ ] **知道"裸指针构造两个 `shared_ptr`"会双重释放**
+- [ ] 知道 `unique_ptr` 析构需要完整类型
+
+## 下一步
+
+[移动语义与完美转发](./move-semantics) 或 [C++ 错误处理](./error-handling)。

@@ -1,0 +1,293 @@
+---
+id: stdlib-02
+title: "02 functools：函数工具"
+sidebar_position: 3
+description: "标准库精讲 第 2 部分：functools：函数工具"
+---
+
+# 02 functools：函数工具
+```python
+import functools
+
+print("reduce:", functools.reduce(lambda a, b: a * b, [1, 2, 3, 4]))
+print("partial:", functools.partial(int, base=2)("101"))    # 固定 base=2
+```
+
+```text
+reduce: 24
+partial: 5
+```
+
+`partial` 冻结部分参数，常用于回调和 `sorted(key=...)`。
+
+### `cached_property`：只算一次的属性
+
+```python
+class Data:
+    def __init__(self, raw):
+        self.raw = raw
+
+    @functools.cached_property
+    def parsed(self):
+        print("    （执行昂贵计算...）")
+        return [int(x) for x in self.raw.split(",")]
+
+d = Data("1,2,3")
+print("第一次:", d.parsed)
+print("第二次:", d.parsed)      # 不再打印，直接返回缓存
+```
+
+```text
+    （执行昂贵计算...）
+第一次: [1, 2, 3]
+第二次: [1, 2, 3]
+```
+
+它把结果存进**实例 `__dict__`**，所以后续访问走普通属性查找，比 `property` 快。注意它要求类**有** `__dict__`（和 `__slots__` 冲突）。
+
+### `total_ordering`：只写两个比较方法
+
+```python
+@functools.total_ordering
+class Version:
+    def __init__(self, v):
+        self.v = v
+    def __eq__(self, other):
+        return self.v == other.v
+    def __lt__(self, other):
+        return self.v < other.v
+
+print(Version(1) <= Version(2), Version(2) > Version(1))
+```
+
+```text
+True True
+```
+
+只写了 `__eq__` 和 `__lt__`，`<=`、`>`、`>=` 自动补上。
+
+### `singledispatch`：按类型分派
+
+```python
+@functools.singledispatch
+def show(value):
+    return f"默认处理 {value}"
+
+@show.register
+def _(value: int):
+    return f"整数 {value}"
+
+@show.register
+def _(value: str):
+    return f"字符串 {value}"
+
+print(show(1), "|", show("a"), "|", show(1.5))
+```
+
+```text
+整数 1 | 字符串 a | 默认处理 1.5
+```
+
+比一长串 `isinstance` 判断优雅，且**支持在别的模块里继续注册新类型**。
+
+## 4. pathlib：面向对象的路径
+
+**忘掉 `os.path`，用 `pathlib`**——它是 3.4 引入的现代路径 API。
+
+```python
+from pathlib import Path
+
+p = Path("data/logs/app.log")
+print("拆分:", p.parts)
+print("文件名:", p.name, "| 主干:", p.stem, "| 后缀:", p.suffix)
+print("父目录:", p.parent)
+print("换后缀:", p.with_suffix(".txt"))
+print("换文件名:", p.with_name("other.md"))
+print("用 / 拼接:", Path("a") / "b" / "c")
+print("绝对路径:", Path(".").resolve().exists())
+```
+
+```text
+拆分: ('data', 'logs', 'app.log')
+文件名: app.log | 主干: app | 后缀: .log
+父目录: data\logs
+换后缀: data\logs\app.txt
+换文件名: data\logs\other.md
+用 / 拼接: a\b\c
+绝对路径: True
+```
+
+**`/` 运算符拼接路径**是它最优雅的地方——不用再写 `os.path.join`。
+
+常用方法：
+
+```python
+from pathlib import Path
+
+# 读写（自动处理编码和关闭）
+# Path("a.txt").write_text("内容", encoding="utf-8")
+# text = Path("a.txt").read_text(encoding="utf-8")
+
+# 遍历
+# for f in Path(".").glob("*.py"):      # 当前层
+# for f in Path(".").rglob("*.py"):     # 递归所有子目录
+# for f in Path(".").iterdir():         # 直接子项
+
+# 判断与创建
+# Path("a/b").exists(), .is_file(), .is_dir()
+# Path("a/b").mkdir(parents=True, exist_ok=True)
+
+print("Path.walk 可用吗（3.12+）:", hasattr(Path, "walk"))
+```
+
+```text
+Path.walk 可用吗（3.12+）: False
+```
+
+:::tip[函数参数请接收 `Path` 而不是 `str`]
+```python
+def process(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+```
+
+调用方传字符串时自动转换是不行的，但 `Path("x")` 能接受字符串——所以**在函数里写 `path = Path(path)`** 就两种都兼容了。这让你的函数对调用方更友好。
+
+另外注意 `Path` 在 Windows 上输出 `data\logs`，跨平台拼接请用 `PurePosixPath` 或明确处理分隔符。
+:::
+
+## 5. json：序列化
+
+```python
+import json
+
+data = {"name": "小明", "scores": [1, 2], "ok": True, "nil": None}
+
+print("默认:", json.dumps(data))
+print("不转义中文:", json.dumps(data, ensure_ascii=False))
+print("紧凑:", json.dumps(data, separators=(",", ":"), ensure_ascii=False))
+print("缩进:", json.dumps({"a": 1}, indent=2))
+print("解析回来:", json.loads(json.dumps(data)))
+```
+
+```text
+默认: {"name": "\u5c0f\u660e", "scores": [1, 2], "ok": true, "nil": null}
+不转义中文: {"name": "小明", "scores": [1, 2], "ok": true, "nil": null}
+紧凑: {"name":"小明","scores":[1,2],"ok":true,"nil":null}
+缩进: {
+  "a": 1
+}
+解析回来: {'name': '小明', 'scores': [1, 2], 'ok': True, 'nil': None}
+```
+
+### 类型映射表
+
+| Python | JSON | 反向（JSON → Python） |
+| --- | --- | --- |
+| `dict` | object | `dict` |
+| `list`, `tuple` | array | `list`（**tuple 会变成 list**） |
+| `str` | string | `str` |
+| `int`, `float` | number | `int` 或 `float`（按有无小数点） |
+| `True` / `False` | `true` / `false` | `bool` |
+| `None` | `null` | `None` |
+
+两个易错点：
+
+```python
+print(json.loads('{"a": 1, "b": 1.0}'))    # 1 是 int，1.0 是 float
+print(json.dumps(float("nan")))            # NaN 不是合法 JSON！
+```
+
+```text
+{'a': 1, 'b': 1.0}
+NaN
+```
+
+`NaN` / `Infinity` 会被输出，但**不是合法 JSON**，其他语言的解析器会拒绝。
+
+```python
+try:
+    json.dumps({1, 2})          # set 无法序列化
+except TypeError as e:
+    print("->", type(e).__name__, e)
+```
+
+```text
+-> TypeError Object of type set is not JSON serializable
+```
+
+:::caution[json 不能序列化自定义类]
+要序列化自己的类，三种办法：
+
+1. `json.dumps(obj.__dict__)` —— 最简单
+2. `json.dumps(obj, default=lambda o: o.__dict__)` —— 通过 `default` 回调
+3. 用 `dataclasses.asdict()`（第 6 页）先把 dataclass 转成字典
+
+反序列化时 json 只会给你 `dict`，**不会还原成你的类**——需要自己再构造。如果需要完整的对象序列化，用 `pydantic` 或 `attrs`。
+:::
+
+## 6. re：正则表达式
+
+```python
+import re
+
+print("search 取分组:", re.search(r"(\d+)-(\d+)", "tel 010-1234").groups())
+print("findall:", re.findall(r"\d+", "a1b22c333"))
+print("finditer:", [m.group() for m in re.finditer(r"\d", "a1b2")])
+print("sub 替换:", re.sub(r"\s+", " ", "a   b"))
+print("sub 用函数:", re.sub(r"\d+", lambda m: str(int(m.group()) * 2), "a1b2"))
+print("split 带捕获组:", re.split(r"(\W)", "a,b"))
+```
+
+```text
+search 取分组: ('010', '1234')
+findall: ['1', '22', '333']
+finditer: ['1', '2']
+sub 替换: a b
+sub 用函数: a2b4
+split 带捕获组: ['a', ',', 'b']
+```
+
+### `match` vs `search` vs `fullmatch`
+
+```python
+print("match（只从开头匹配）:", re.match(r"b", "ab"))
+print("search（任意位置）:", bool(re.search(r"b", "ab")))
+print("fullmatch 四位数字:", bool(re.fullmatch(r"\d{4}", "1234")),
+      bool(re.fullmatch(r"\d{4}", "12345")))
+```
+
+```text
+match（只从开头匹配）: None
+search（任意位置）: True
+fullmatch 四位数字: True False
+```
+
+**校验用 `fullmatch`**——用 `match` 校验会让 `"12345"` 通过 `\d{4}` 的检查，这是常见的安全隐患。
+
+### 命名分组与详细模式
+
+```python
+m = re.search(r"(?P<year>\d{4})-(?P<month>\d{2})", "2024-03")
+print("命名分组:", m.groupdict())
+
+pattern = re.compile(r"""
+    (\d{4})     # 年
+    -(\d{2})    # 月
+""", re.VERBOSE)
+print("详细模式:", pattern.search("2024-03").groups())
+```
+
+```text
+命名分组: {'year': '2024', 'month': '03'}
+详细模式: ('2024', '03')
+```
+
+:::tip[两条实用建议]
+1. **模式字符串一律用 raw 字符串** `r"..."`。否则 `\d` 会被 Python 先当成转义处理，写 `\\d` 才能生效——噩梦
+2. **重复使用的模式先 `compile`**：`pattern = re.compile(r"...")` 然后 `pattern.search(...)`。模块级的 `re.search` 有内部缓存，但显式 compile 更快也更清晰
+3. 需要按字面量匹配用户输入时，用 `re.escape()` 转义：`re.escape("a.b")` 得到 `a\.b`
+:::
+
+---
+
+**翻页**：[← 上一页](./stdlib-01) · [下一页 →](./stdlib-03) · [返回目录](./)

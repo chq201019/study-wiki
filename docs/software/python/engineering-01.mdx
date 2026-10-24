@@ -1,0 +1,268 @@
+---
+id: engineering-01
+title: "01 工程化"
+sidebar_position: 2
+description: "工程化 第 1 部分：工程化"
+---
+
+# 01 工程化
+**本页学什么**：前面九页教你「把代码写对」，这一页教你「把代码交付出去」——测试、类型检查、项目结构、依赖管理、日志规范、打包。
+
+这是 Python 主线的最后一页。学完它，你能从零建一个别人可以接手的项目。
+
+## 1. 项目结构：src 布局
+
+一个现代 Python 项目的标准骨架：
+
+```text
+my_project/
+├── pyproject.toml          # 项目元数据与依赖声明（唯一的配置入口）
+├── README.md
+├── .gitignore              # 必须忽略 .venv/ __pycache__/ dist/
+├── src/
+│   └── my_package/         # 源码放 src/ 下
+│       ├── __init__.py
+│       ├── core.py
+│       └── cli.py
+├── tests/
+│   ├── test_core.py
+│   └── test_cli.py
+└── .venv/                  # 虚拟环境（不提交）
+```
+
+:::info[为什么用 `src/` 布局]
+这是一个被低估的实践。如果包目录直接放在项目根目录（比如 `my_package/`），那么你在项目根目录跑 `pytest` 时，**导入的是源码目录里的包，而不是安装后的包**——测试通过了，但用户安装后可能因为打包配置漏文件而失败。
+
+`src/` 布局强制你必须**先安装**（`pip install -e .`）才能导入，于是测试的就是真实安装结果。这个差别能提前暴露打包错误。
+
+代价是开发时要先装一次 `pip install -e .`（可编辑安装），改动会实时生效，不需要重装。
+:::
+
+### `pyproject.toml`：唯一的配置文件
+
+3.11 时代，`pyproject.toml` 已经统一了所有工具的配置：
+
+```toml
+[project]
+name = "my-package"
+version = "0.1.0"
+description = "一句话说明这个包做什么"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Your Name", email = "you@example.com"}]
+dependencies = [
+    "requests>=2.31",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov",
+    "mypy>=1.8",
+    "ruff",
+]
+
+[project.scripts]
+mytool = "my_package.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+```
+
+一个文件搞定项目元数据、依赖、命令行入口、以及三个工具的配置。**不再需要 `setup.py`、`setup.cfg`、`pytest.ini`、`mypy.ini`、`.flake8`**。
+
+安装开发依赖：
+
+```bash
+python -m pip install -e ".[dev]"      # -e 可编辑模式，[dev] 开发依赖
+```
+
+## 2. pytest：写测试
+
+### 最基础的测试
+
+约定：文件名 `test_*.py` 或 `*_test.py`，函数名以 `test_` 开头。
+
+```python
+# tests/test_core.py
+from my_package.core import normalize
+
+
+def test_normalize_strips_whitespace():
+    assert normalize("  a  ") == "a"
+
+
+def test_normalize_lowercases():
+    assert normalize("ABC") == "abc"
+```
+
+运行：
+
+```bash
+python -m pytest                    # 自动发现并运行
+python -m pytest tests/test_core.py # 只跑一个文件
+python -m pytest -k "normalize"     # 只跑名字匹配的
+python -m pytest -v                 # 显示每个用例的名字
+```
+
+**用 `assert` 就行**——pytest 会在失败时展开表达式给你看，不需要记 `assertEqual` 之类的 API。
+
+### pytest 的失败信息有多好
+
+断言失败时 pytest 会重写 assert，显示每个子表达式的值：
+
+```text
+    def test_merge():
+        result = {"a": 1, "b": 2}
+>       assert result == {"a": 1, "b": 3}
+E       AssertionError: assert {'a': 1, 'b': 2} == {'a': 1, 'b': 3}
+E         Differing items:
+E         {'b': 2} != {'b': 3}
+```
+
+它直接告诉你是 `'b'` 这一项不同——这就是不用 `unittest` 那套 API 的原因。
+
+### fixture：复用测试资源
+
+```python
+import pytest
+
+
+@pytest.fixture
+def sample_data():
+    """每个测试函数调用一次，返回干净的数据。"""
+    return {"users": [{"id": 1, "name": "bob"}]}
+
+
+def test_count(sample_data):
+    assert len(sample_data["users"]) == 1
+
+
+def test_first_name(sample_data):
+    assert sample_data["users"][0]["name"] == "bob"
+```
+
+**fixture 的价值在于隔离**：每个测试拿到的是**新构造**的对象，测试之间不会互相污染。
+
+用 `tmp_path` 做文件测试（pytest 内置，自动清理）：
+
+```python
+def test_write_config(tmp_path):
+    config_file = tmp_path / "config.json"
+    config_file.write_text('{"debug": true}', encoding="utf-8")
+    assert config_file.exists()
+    # 测试结束后 tmp_path 自动删除
+```
+
+### 参数化：一份代码测多组数据
+
+```python
+import pytest
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("  a  ", "a"),
+        ("ABC", "abc"),
+        ("", ""),
+        ("a\tb", "a b"),
+    ],
+)
+def test_normalize_cases(raw, expected):
+    assert normalize(raw) == expected
+```
+
+四组数据跑四次，报告里分别显示。**比写四个几乎相同的测试函数好得多。**
+
+### 异常与 mock
+
+```python
+import pytest
+
+
+def test_divide_by_zero():
+    with pytest.raises(ZeroDivisionError):
+        1 / 0
+
+
+def test_error_message():
+    with pytest.raises(ValueError, match="must be positive"):
+        parse_count("-1")
+```
+
+`match` 用正则匹配异常消息——顺便验证错误消息本身。
+
+替换外部依赖用 `monkeypatch`（pytest 内置，不需要 `unittest.mock`）：
+
+```python
+def test_fetch_uses_cache(monkeypatch):
+    calls = []
+
+    def fake_get(url):
+        calls.append(url)
+        return "cached"
+
+    monkeypatch.setattr("my_package.core.requests.get", fake_get)
+
+    result = fetch("http://example.com")
+    assert result == "cached"
+    assert calls == ["http://example.com"]
+```
+
+`monkeypatch` 在测试结束后**自动还原**，比 `unittest.mock.patch` 的装饰器更安全。
+
+:::tip[测试要测行为，不要测实现]
+```python
+# 不好：测的是内部调用了哪个方法
+def test_bad(monkeypatch):
+    monkeypatch.setattr(obj, "_helper", lambda: 1)
+    assert obj.process() == 1
+
+# 好：只测输入输出
+def test_good():
+    assert obj.process() == expected_output
+```
+
+测实现细节的测试会在你重构时全部失效，**反而阻碍改进**。测行为（给定输入得到什么输出）的测试则能在重构后继续保护你。
+
+例外：外部 IO（网络、数据库）该 mock，因为它慢且不稳定。
+:::
+
+### 覆盖率
+
+```bash
+python -m pip install pytest-cov
+python -m pytest --cov=my_package --cov-report=term-missing
+```
+
+`term-missing` 会列出**没被覆盖的行号**，比一个笼统的百分比有用得多。
+
+:::caution[覆盖率 100% 不等于没 bug]
+覆盖率只告诉你「哪些行被执行过」，不告诉你「断言是否正确」。一个全是 `assert True` 的测试套件能有 100% 覆盖率但什么也没验证。
+
+**关注未覆盖的分支比追求数字更重要**。70～85% 且覆盖了关键路径，通常比 100% 但断言敷衍要好。
+:::
+
+---
+
+**翻页**：[下一页 →](./engineering-02) · [返回目录](./)

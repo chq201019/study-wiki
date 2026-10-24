@@ -1,0 +1,262 @@
+---
+id: syntax-03
+title: "03 控制流：缩进就是语法"
+sidebar_position: 4
+description: "语法基础 第 3 部分：控制流：缩进就是语法"
+---
+
+# 03 控制流：缩进就是语法
+Python 用缩进划分代码块，**没有花括号，也没有 `begin/end`**。
+
+```python
+x = 5
+if x > 0:
+    print("positive")
+elif x == 0:
+    print("zero")
+else:
+    print("negative")
+```
+
+```text
+positive
+```
+
+规则：
+
+- 冒号 `:` 开启一个代码块
+- 块内所有语句**必须缩进一致**（惯例是 4 个空格）
+- 缩进结束 = 块结束
+
+:::caution[不要混用 Tab 和空格]
+混用会导致 `TabError: inconsistent use of tabs and spaces in indentation`。这个错误在别人电脑上能跑、你电脑上跑不了的场景里特别常见。
+
+**解决**：编辑器里设置「Tab 自动转空格」。VS Code 加两行配置：
+
+```json
+"editor.insertSpaces": true,
+"editor.tabSize": 4
+```
+:::
+
+### 三元表达式
+
+```python
+x = 5
+label = "even" if x % 2 == 0 else "odd"
+print(label)
+```
+
+```text
+odd
+```
+
+注意顺序和 C 的三元相反：Python 是 `结果A if 条件 else 结果B`，读作「如果是这样取 A，否则取 B」，更符合自然语言。
+
+### `for` 循环：遍历的是「可迭代对象」
+
+Python 的 `for` **不是** C 那种 `for (i=0; i<n; i++)`，而是「依次取出可迭代对象里的元素」：
+
+```python
+for ch in "abc":
+    print(ch, end=" ")
+print()
+
+for i in range(3):
+    print(i, end=" ")
+print()
+```
+
+```text
+a b c
+0 1 2
+```
+
+需要下标时用 `enumerate`（永远不要写 `for i in range(len(items))`）：
+
+```python
+print(list(enumerate(["a", "b"], start=1)))
+```
+
+```text
+[(1, 'a'), (2, 'b')]
+```
+
+`range` 是**惰性**的——它不真的生成列表，只记录起止和步长。对比内存占用：
+
+```python
+import sys
+print("range(10**6) 占:", sys.getsizeof(range(10**6)), "字节")
+print("list(range(1000)) 占:", sys.getsizeof(list(range(1000))), "字节")
+```
+
+```text
+range(10**6) 占: 48 字节
+list(range(1000)) 占: 8056 字节
+```
+
+一百万个数的 `range` 只占 48 字节——这就是惰性求值的好处。
+
+### `zip` 与 `zip(strict=True)`（3.10+）
+
+```python
+print(list(zip([1, 2], ["a", "b"])))
+print("zip 以最短的为准:", list(zip([1, 2, 3], ["a"])))
+```
+
+```text
+[(1, 'a'), (2, 'b')]
+zip 以最短的为准: [(1, 'a')]
+```
+
+**静默截断是个隐患**——数据长度不匹配时你会悄悄丢掉数据。3.10 起加 `strict=True` 让它报错：
+
+```python
+try:
+    list(zip([1, 2, 3], ["a"], strict=True))
+except ValueError as e:
+    print("->", e)
+```
+
+```text
+-> zip() argument 2 is shorter than argument 1
+```
+
+### `while` 与 `break` / `continue`
+
+```python
+n = 0
+while n < 5:
+    n += 1
+    if n == 2:
+        continue      # 跳过本次循环剩下的部分
+    if n == 4:
+        break         # 直接跳出整个循环
+    print(n, end=" ")
+```
+
+```text
+1 3
+```
+
+### `for-else`：被误解最多的语法
+
+`else` 跟在 `for` 后面，**在循环正常走完（没有被 `break`）时执行**：
+
+```python
+for i in range(3):
+    if i == 99:
+        break
+else:
+    print("循环没被 break -> else 执行")
+```
+
+```text
+循环没被 break -> else 执行
+```
+
+如果被 `break` 了，`else` 不执行：
+
+```python
+for i in range(3):
+    if i == 1:
+        print("break at", i)
+        break
+else:
+    print("这行不会打印")
+```
+
+```text
+break at 1
+```
+
+**它的实际用途**：搜索场景，省掉一个标志变量。
+
+```python
+def find_first(items, target):
+    for i, v in enumerate(items):
+        if v == target:
+            return i
+    else:
+        return -1          # 等价于「整个循环走完都没找到」
+
+print(find_first(["a", "b"], "b"))
+print(find_first(["a", "b"], "z"))
+```
+
+```text
+1
+-1
+```
+
+`while-else` 同理。
+
+## 10. 异常处理：`try / except / else / finally`
+
+四个子句各有分工：
+
+```python
+def divide(v):
+    try:
+        r = 10 / v
+    except ZeroDivisionError:
+        return "div0"
+    else:
+        return f"ok {r}"        # 没抛异常才执行
+    finally:
+        print("  finally 总是执行")
+
+print(divide(2))
+print(divide(0))
+```
+
+```text
+  finally 总是执行
+ok 5.0
+  finally 总是执行
+div0
+```
+
+- `try`：可能出错的代码
+- `except`：捕获并处理
+- `else`：**没有异常**时执行（把「成功路径」和「可能出错的代码」分开，比全都塞进 `try` 更清晰）
+- `finally`：**无论如何**都执行，用于释放资源（关文件、解锁）
+
+:::danger[不要写裸露的 `except:`]
+```python
+try:
+    do_something()
+except:            # 灾难：连 Ctrl+C 和系统退出都拦
+    pass
+```
+
+裸 `except` 会捕获 `KeyboardInterrupt` 和 `SystemExit`，让你的程序 Ctrl+C 都停不下来。至少要写 `except Exception:`，更好的做法是**捕获具体类型**：
+
+```python
+try:
+    value = int(user_input)
+except ValueError:
+    value = 0
+```
+
+捕获具体类型还有一个好处：真正的 bug（比如 `NameError`）不会被悄悄吞掉，你会立刻看到它。
+:::
+
+### 异常也是对象
+
+```python
+try:
+    raise ValueError("参数不对")
+except ValueError as e:
+    print(type(e).__name__, "|", e, "|", e.args)
+```
+
+```text
+ValueError | 参数不对 | ('参数不对',)
+```
+
+`raise ... from e` 可以保留原始异常链（第 7 页会讲 `raise` 的各种用法）。
+
+---
+
+**翻页**：[← 上一页](./syntax-02) · [下一页 →](./syntax-04) · [返回目录](./)

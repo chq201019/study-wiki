@@ -1,0 +1,133 @@
+---
+id: error-codes
+title: 错误码速查
+sidebar_position: 4
+description: ESP-IDF 与 Arduino 常见错误码的含义、原因和排查步骤。
+---
+
+# 错误码速查
+
+遇到报错先查这里。每个错误码给三样东西：什么意思、为什么、怎么查。
+
+## ESP-IDF 基础错误
+
+| 错误码 | 值 | 含义 | 常见原因与排查 |
+| --- | --- | --- | --- |
+| `ESP_OK` | 0 | 成功 | —— |
+| `ESP_FAIL` | -1 | 通用失败 | 看日志上下文，`esp_err_to_name()` 打出来 |
+| `ESP_ERR_NO_MEM` | 0x101 | **内存不足** | 查 `heap_caps_get_free_size`；关掉 BLE/Big features；大数组移到 PSRAM |
+| `ESP_ERR_INVALID_ARG` | 0x102 | 参数非法 | 检查传参，多半是空指针或越界 |
+| `ESP_ERR_INVALID_STATE` | 0x103 | 状态不允许 | API 调用顺序错了（如 WiFi 未 init 就 start） |
+| `ESP_ERR_INVALID_SIZE` | 0x104 | 参数大小不对 | 结构体大小不匹配，SDK 版本变了 |
+| `ESP_ERR_NOT_FOUND` | 0x105 | 未找到 | 设备/文件/分区不存在 |
+| `ESP_ERR_TIMEOUT` | 0x107 | 超时 | 加超时时间；检查硬件是否响应 |
+| `ESP_ERR_INVALID_RESPONSE` | 0x108 | 响应异常 | 通信协议不匹配；波特率/模式错 |
+| `ESP_ERR_INVALID_CRC` | 0x109 | 校验失败 | 数据传输错误；接插件质量差 |
+| `ESP_ERR_INVALID_VERSION` | 0x10A | 版本不匹配 | 组件版本冲突，看 `dependencies.lock` |
+| `ESP_ERR_NOT_SUPPORTED` | 0x106 | 不支持 | 该芯片不支持这个功能（S3 无某些经典外设） |
+
+## 启动相关（看 `rst:0xX`）
+
+| `rst:` | 原因 | 排查 |
+| --- | --- | --- |
+| `0x1` | 上电复位 / 芯片级欠压 / 超级看门狗（三者同值） | 反重启优先查供电 |
+| `0x3` | 软件复位 | 搜代码里的 `esp_restart()` |
+| `0x5` | 深睡唤醒 | 正常（用过 deep sleep 才有） |
+| `0x7` / `0x8` | 主看门狗 0 / 1 复位 | 死循环、任务没喂狗 |
+| `0x9` | RTC 看门狗复位 | 同上，另看 RTC 相关任务 |
+| `0xb` | 主看门狗复位 CPU | 同上 |
+| `0xc` / `0xd` | 软件 / RTC 看门狗复位 CPU | 同上 |
+| `0xf` | **欠压复位** | **供电不足**，换线/换电源，别接扩展坞 |
+| `0x10` | RTC 看门狗复位（含 RTC 模块） | 同上 |
+| `0x12` | 超级看门狗复位 | 同上 |
+| `0x13` | 时钟毛刺 | 硬件干扰，查电源与晶振 |
+| `0x14` | eFuse CRC 错误 | 芯片 eFuse 异常 |
+| `0x15` | USB UART 复位 | 插拔 USB，或从 USB 串口口触发 |
+| `0x16` | USB JTAG 复位 | 用了 USB-JTAG 调试 |
+| `0x17` | **电源毛刺复位** | 电源不稳 |
+
+> **别把 `rst:0x15` 当成「进了下载模式」**。`rst:` 说的是这次复位由谁引起，`boot:` 才说明当前启动模式；进入下载模式看的是 `boot:` 后面是否显示 `DOWNLOAD_BOOT`。 
+
+其它启动期错误：
+
+| 报错 | 原因 | 排查 |
+| --- | --- | --- |
+| `Invalid partition table` | 分区表偏移不对 | 检查 partitions.csv 的 Offset |
+| `app partition is not bootable` | otadata 指向无效分区 | `erase_flash` 重烧 |
+| `Flash init failed` | Flash 配置不匹配 | menuconfig 里的 flash size 改对 |
+| `No bootable partition` | 没有有效 app 分区 | 同上 |
+| `checksum failed` | 固件损坏 | 重新烧录；检查供电 |
+
+## WiFi
+
+| 错误码 | 含义 | 排查 |
+| --- | --- | --- |
+| `ESP_ERR_WIFI_NOT_INIT` | WiFi 未初始化 | 先 `esp_wifi_init()` |
+| `ESP_ERR_WIFI_NOT_STARTED` | 未启动 | 先 `esp_wifi_start()` |
+| `ESP_ERR_WIFI_CONN` | 连接失败 | 密码错 / 信号弱 / 超时 |
+| `ESP_ERR_WIFI_NOT_FOUND` | 找不到 AP | SSID 不存在或隐藏 |
+| `ESP_ERR_WIFI_INTERNAL_ERROR` | 内部错误 | 重置或重启 |
+| `esp_wifi_connect` 返回 `0x101` | 内存不足 | 关掉别的功能释放内存 |
+
+**最常见的 WiFi 假故障**：连上了但立刻重启 → 供电不足（`rst:0xf`）。
+
+## BLE
+
+| 错误码 | 含义 |
+| --- | --- |
+| `ESP_ERR_NO_MEM` 初始化时 | 内存不足，换 NimBLE 或减少连接数 |
+| `ESP_ERR_INVALID_ARG` | 参数错，UUID/handle 不合法 |
+| `BLE_HS_EALREADY` | 已在连接中 |
+| `BLE_HS_EDOOM` | 资源耗尽（连接数满了） |
+| `BLE_HS_ENOMEM` | 内存不足 |
+
+## I2C / SPI
+
+| 现象 | 对应错误 | 排查 |
+| --- | --- | --- |
+| `ESP_ERR_TIMEOUT` | 从机不响应 | 检查接线、上拉电阻、地址 |
+| `ESP_ERR_INVALID_ARG` | 参数错 | 地址越界（7 位地址应 < 0x80） |
+| `ESP_ERR_INVALID_STATE` | 设备没添加 | 先 `i2c_master_bus_add_device()` |
+| `ESP_ERR_NOT_FOUND` | 设备无响应 | 跑地址扫描器确认 |
+
+## 其它高频报错
+
+| 报错 | 原因 | 排查 |
+| --- | --- | --- |
+| `undefined reference to xxx` | 库没链接 | `CMakeLists.txt` 的 `REQUIRES` 补上 |
+| `No such file or directory` | 头文件找不到 | 同上，或 `INCLUDE_DIRS` 路径错 |
+| `section .flash_ram overflowed` | 段溢出 | 检查数组大小、是否误放栈上 |
+| `undefined behavior` | 未定义行为 | 栈溢出 / 越界，看 backtrace |
+| `Stack overflow` | 任务栈太小 | 调大 `xTaskCreate` 的栈参数 |
+| `Guru Meditation Error` | 各种崩溃 | 看 `Last panic reason` + addr2line 解析栈 |
+| `assert failed: xTaskGetTickCount` | 断言失败 | 逻辑错误，看行号 |
+| `abort() was called` | 主动 abort | `ESP_ERROR_CHECK` 失败 |
+
+## `esp_err_to_name()` 用法
+
+```c
+ESP_LOGE(TAG, "失败: %s (0x%x)", esp_err_to_name(err), err);
+```
+
+看到陌生错误码时，第一时间用这个宏把名字打出来，比查表快。
+
+## 排查流程
+
+```mermaid
+flowchart TD
+  A[出现错误] --> B[打印 esp_err_to_name]
+  B --> C[查本页表格]
+  C --> D{找到对应条目?}
+  D -->|是| E[按"排查"列逐项试]
+  D -->|否| F[看 Last panic reason]
+  E --> G[二分法缩小范围]
+  F --> G
+  G --> H[最小可复现代码]
+```
+
+## 收集错误码的正确姿势
+
+```c
+// 遇到新错误就加到本页的表格里
+#define ERR_CHECK(x) do {     esp_err_t e = (x);     if (e != ESP_OK) {         ESP_LOGE(TAG, "[%s:%d] %s -> %s", __func__, __LINE__, #x, esp_err_to_name(e));     } } while (0)
+```

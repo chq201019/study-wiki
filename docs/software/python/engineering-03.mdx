@@ -1,0 +1,274 @@
+---
+id: engineering-03
+title: "03 完整例子：从零建一个项目"
+sidebar_position: 4
+description: "工程化 第 3 部分：完整例子：从零建一个项目"
+---
+
+# 03 完整例子：从零建一个项目
+把这一页全部串起来。用一个真实可跑的小项目演示。
+
+### 目录结构
+
+```text
+calc/
+├── pyproject.toml
+├── src/
+│   └── calc/
+│       ├── __init__.py
+│       └── core.py
+└── tests/
+    └── test_core.py
+```
+
+### `src/calc/core.py`
+
+```python
+"""一个简单的表达式计算器，演示工程化实践。"""
+from __future__ import annotations
+
+import logging
+from typing import Final
+
+log = logging.getLogger(__name__)
+
+VALID_OPS: Final = frozenset({"+", "-", "*", "/"})
+
+
+def calculate(left: float, op: str, right: float) -> float:
+    """执行二元运算。
+
+    Raises:
+        ValueError: 运算符不支持。
+        ZeroDivisionError: 除数为零。
+    """
+    if op not in VALID_OPS:
+        raise ValueError(f"不支持的运算符: {op!r}")
+
+    log.debug("计算 %s %s %s", left, op, right)
+
+    if op == "+":
+        return left + right
+    if op == "-":
+        return left - right
+    if op == "*":
+        return left * right
+    if right == 0:
+        raise ZeroDivisionError("除数不能为零")
+    return left / right
+
+
+def evaluate(tokens: list[str]) -> float:
+    """依次计算 token 列表，如 ['1', '+', '2', '*', '3']。"""
+    if len(tokens) < 3 or len(tokens) % 2 == 0:
+        raise ValueError(f"token 数量不对: {len(tokens)}")
+
+    result = float(tokens[0])
+    for i in range(1, len(tokens), 2):
+        op = tokens[i]
+        right = float(tokens[i + 1])
+        result = calculate(result, op, right)
+    return result
+```
+
+### `tests/test_core.py`
+
+```python
+import pytest
+
+from calc.core import calculate, evaluate
+
+
+@pytest.mark.parametrize(
+    "left,op,right,expected",
+    [
+        (1, "+", 2, 3),
+        (5, "-", 3, 2),
+        (4, "*", 2.5, 10.0),
+        (9, "/", 3, 3),
+    ],
+)
+def test_calculate_basic(left, op, right, expected):
+    assert calculate(left, op, right) == expected
+
+
+def test_unsupported_op():
+    with pytest.raises(ValueError, match="不支持的运算符"):
+        calculate(1, "%", 2)
+
+
+def test_divide_by_zero():
+    with pytest.raises(ZeroDivisionError, match="除数不能为零"):
+        calculate(1, "/", 0)
+
+
+def test_evaluate_chain():
+    assert evaluate(["1", "+", "2", "*", "3"]) == 9.0   # 从左到右，不是优先级
+
+
+def test_evaluate_bad_tokens():
+    with pytest.raises(ValueError, match="token 数量不对"):
+        evaluate(["1", "+"])
+```
+
+注意 `test_evaluate_chain` 断言的是 **9.0 而不是 7.0**——因为 `evaluate` 是从左到右依次计算（`(1+2)*3`），**没有**实现乘除优先。这个测试把「当前行为」固定下来，防止以后有人改动时意外破坏。
+
+### `pyproject.toml`
+
+```toml
+[project]
+name = "calc-demo"
+version = "0.1.0"
+description = "演示项目结构的计算器"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "pytest-cov", "mypy>=1.8", "ruff"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+```
+
+### 跑一遍
+
+```bash
+python -m venv .venv
+.venv\Scripts\Activate.ps1              # Windows
+python -m pip install -e ".[dev]"
+
+python -m pytest -v
+```
+
+预期输出（pytest 版本不同会略有差异）：
+
+```text
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.7.0
+rootdir: C:\...\calc
+configfile: pyproject.toml
+collected 8 items
+
+tests/test_core.py::test_calculate_basic[1-+-2-3] PASSED           [ 12%]
+tests/test_core.py::test_calculate_basic[5---3-2] PASSED           [ 25%]
+tests/test_core.py::test_calculate_basic[4-*-2.5-10.0] PASSED      [ 37%]
+tests/test_core.py::test_calculate_basic[9-/-3-3] PASSED           [ 50%]
+tests/test_core.py::test_unsupported_op PASSED                     [ 62%]
+tests/test_core.py::test_divide_by_zero PASSED                     [ 75%]
+tests/test_core.py::test_evaluate_chain PASSED                     [ 87%]
+tests/test_core.py::test_evaluate_bad_tokens PASSED                [100%]
+
+============================== 8 passed in 0.09s =============================
+```
+
+**8 个用例**：4 个来自参数化（4 组数据），加上 4 个独立测试。注意参数化的用例名里带上了具体的参数值（`[1-+-2-3]`），失败时能一眼看出是哪组数据。
+
+再跑类型检查和 lint：
+
+```bash
+python -m mypy src/
+python -m ruff check .
+```
+
+mypy 在 `strict = true` 下的实测输出：
+
+```text
+Success: no issues found in 2 source files
+```
+
+:::tip[把这个流程固化成脚本]
+在项目里放一个 `Makefile`（Linux/macOS）或 `scripts/check.ps1`（Windows）：
+
+```powershell
+# scripts/check.ps1
+$ErrorActionPreference = "Stop"
+python -m ruff check .
+python -m ruff format --check .
+python -m mypy src/
+python -m pytest --cov=calc --cov-report=term-missing
+Write-Host "全部检查通过" -ForegroundColor Green
+```
+
+一条命令跑完所有检查，提交前必跑。配合 pre-commit 更省心。
+:::
+
+## 9. 验证：检查你的项目
+
+对着这个清单自查：
+
+```bash
+# 1. 能在干净环境装上去吗？
+python -m venv /tmp/check && /tmp/check/Scripts/python.exe -m pip install -e .
+
+# 2. 测试通过吗？
+python -m pytest
+
+# 3. 类型没问题吗？
+python -m mypy src/
+
+# 4. 依赖锁定了吗？
+python -m pip freeze > requirements.txt
+
+# 5. 敏感信息没进版本库吗？
+git status        # 确认没有 .env / .pypirc / 密钥文件
+```
+
+## 常见坑
+
+| 现象 | 真实原因 | 解决 |
+| --- | --- | --- |
+| 测试通过但用户装了跑不起来 | 包直接放根目录，测试导入的是源码 | 用 `src/` 布局 |
+| `ModuleNotFoundError` | 没做可编辑安装 | `pip install -e .` |
+| pytest 找不到测试 | 文件名不是 `test_*.py` | 改名，或在 `pyproject.toml` 配 `python_files` |
+| mypy 报第三方库缺 stub | 库没类型注解 | 装 `types-xxx`，或加 `ignore_missing_imports` |
+| `requirements.txt` 几百行 | 忘激活虚拟环境 | 确认 `(.venv)` 前缀 |
+| 两个 Python 版本串了 | PATH 命中了错的 | Windows 用 `py -3.11`，看 `python -m pip --version` |
+| 上传到 PyPI 失败说版本已存在 | 版本号不能重用 | 升版本号 |
+| 日志没输出 | 库不该配 `basicConfig`，或没配 | 应用侧配置；加 `force=True` |
+| 覆盖率很高但仍有 bug | 覆盖率只说明执行过 | 关注断言质量和未覆盖分支 |
+| `pip install -e .` 报 build 失败 | 缺 `build-system` 段 | 在 `pyproject.toml` 里加 hatchling |
+
+## 自检清单
+
+- [ ] 能用 `src/` 布局从零搭一个项目
+- [ ] 会写 `pyproject.toml`（元数据 + 依赖 + 工具配置）
+- [ ] 能写 pytest 测试：参数化、fixture、`pytest.raises`、monkeypatch
+- [ ] 知道测试应该测行为而不是实现
+- [ ] 知道覆盖率数字不等于质量
+- [ ] 会配并运行 mypy，知道 `strict` 包含什么
+- [ ] 知道库和应用在依赖锁定上的策略差异
+- [ ] 知道 `uv.lock` / `requirements.txt` 的用途
+- [ ] 知道日志要用惰性 `%s`、异常要带堆栈、stdout 与 stderr 要分开
+- [ ] 知道库不应该配置 logging
+- [ ] 能构建 wheel 并在干净环境验证安装
+- [ ] 知道发布前先传 TestPyPI、token 不能进代码
+
+## 下一步
+
+十页主线到此结束。接下来可以：
+
+- 想搞懂底层 → [C 主线](../c/)，尤其是内存模型和指针
+- 想学现代 C++ → [C++ 主线](../cpp/)
+- 想把 Python 用到板子上 → [硬件开发](../../hardware/)，Python 适合写上位机工具
+- 想提高用 AI 写代码的水平 → [AI 辅助开发](../../ai-coding/)
+
+---
+
+**Python 主线导航**：[导读](./) · [环境](./environment) · [语法](./syntax) · [数据类型](./datatypes) · [函数](./functions) · [面向对象](./oop) · [进阶](./advanced) · [并发](./concurrency) · [标准库](./stdlib) · 工程化（本页）
+
+**参考链接**：[pytest 文档](https://docs.pytest.org/) · [mypy 文档](https://mypy.readthedocs.io/) · [打包用户指南](https://packaging.python.org/) · [pyproject.toml 规范](https://packaging.python.org/en/latest/specifications/pyproject-toml/) · [logging 指引](https://docs.python.org/zh-cn/3/howto/logging.html) · [Ruff](https://docs.astral.sh/ruff/)
+
+---
+
+**翻页**：[← 上一页](./engineering-02) · [返回目录](./)

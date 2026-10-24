@@ -1,0 +1,278 @@
+---
+id: datetime
+title: 时间与日期
+sidebar_position: 23
+description: naive 与 aware 的区别、为什么永远别用 datetime.now()、时区转换的正确姿势、时间戳的单位陷阱、以及 DST 的两个真实坑。
+---
+
+# 时间与日期
+
+**本课目标**：不再被时区和夏令时坑，写出的时间代码能跨地区正确。
+
+## naive 与 aware
+
+:::danger[Python 有两种 datetime，混用必炸]
+```python
+from datetime import datetime, timezone
+
+naive = datetime.now()                          # 没有时区信息
+aware = datetime.now(timezone.utc)              # 有时区信息
+
+naive == aware          # ❌ TypeError: can't compare offset-naive and offset-aware
+naive - aware           # ❌ 同样报错
+```
+
+**`naive` 不知道自己是哪个时区** —— 所以无法和其他 `aware` 比较或相减。
+:::
+
+:::tip[项目里的黄金规则]
+**① 内部一律用 `aware` + UTC 存储**
+
+**② 只在展示给用户时才转本地时区**
+
+```python
+from datetime import datetime, timezone
+
+# 存
+now = datetime.now(timezone.utc)
+db.save(now)
+
+# 显示
+local = now.astimezone()          # 转成系统本地时区
+print(local.strftime("%Y-%m-%d %H:%M:%S %Z"))
+```
+:::
+
+## 为什么别用 `datetime.now()` 和 `utcnow()`
+
+:::danger[`datetime.utcnow()` 返回的是 naive 对象]
+```python
+datetime.utcnow()          # datetime(2026, 1, 15, 2, 0)  ← 无 tzinfo！
+```
+
+**它是"UTC 时间但没有时区标记"** —— 一旦和 `aware` 对象运算就报错。
+
+**Python 3.12 起 `utcnow()` 已被标记为废弃。**
+:::
+
+```python
+# ✅ 正确写法
+datetime.now(timezone.utc)                 # 推荐
+datetime.now(timezone.utc).replace(tzinfo=None)   # 显式转 naive（确实需要时）
+```
+
+:::warning[`datetime.now()` 在服务器上就是"服务器时区"]
+**开发机在 UTC+8，服务器在 UTC → 同一份代码产生不同的"本地时间"。**
+
+**这就是"日志时间对不上"的根源。**
+:::
+
+## 时间戳：单位混乱是重灾区
+
+| 来源 | 单位 |
+| --- | --- |
+| Python `time.time()` | **秒**（float） |
+| `datetime.timestamp()` | **秒**（float） |
+| **JavaScript `Date.now()`** | **毫秒** |
+| **Java `System.currentTimeMillis()`** | **毫秒** |
+| **Go `time.Now().UnixNano()`** | **纳秒** |
+
+:::danger[秒 vs 毫秒混用会得到 1970 年或 5 万年后的日期]
+```python
+# 前端传了毫秒，后端当秒用
+ts = 1736899200000
+datetime.fromtimestamp(ts)         # ❌ 年份是 57006
+```
+
+**约定**：API 里传输时**明确写字段名**（`created_at_ms` / `created_at`），或用 ISO 8601 字符串。
+
+**判断方法**：13 位是毫秒，10 位是秒。
+:::
+
+```python
+# 转换
+dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)      # 毫秒 → datetime
+ts_ms = int(dt.timestamp() * 1000)                            # datetime → 毫秒
+```
+
+:::warning[`fromtimestamp` 不带 tz 会用本地时区]
+```python
+datetime.fromtimestamp(0)                    # 1970-01-01 08:00:00（UTC+8 下）
+datetime.fromtimestamp(0, tz=timezone.utc)    # 1970-01-01 00:00:00  ✅
+```
+:::
+
+## 时区转换
+
+:::tip[用标准库 `zoneinfo`（Python 3.9+）]
+```python
+from zoneinfo import ZoneInfo
+from datetime import datetime, timezone
+
+dt = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
+
+shanghai = dt.astimezone(ZoneInfo("Asia/Shanghai"))
+newyork  = dt.astimezone(ZoneInfo("America/New_York"))
+```
+
+**不要用 `pytz`** —— 它的 `localize()` API 和 `datetime` 的 `tzinfo` 协议不兼容，容易出错。
+
+**不要用固定偏移**（`timezone(timedelta(hours=8))`）—— 它处理不了夏令时。
+:::
+
+:::danger[`replace(tzinfo=...)` 不是"转换"，是"重新贴标签"]
+```python
+dt = datetime(2026, 1, 15, 12, 0)                # 假设它是 UTC
+wrong = dt.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+# 时间还是 12:00，但被标记成了上海时间 → 相当于凭空偏移 8 小时
+
+right = dt.replace(tzinfo=timezone.utc).astimezone(ZoneInfo("Asia/Shanghai"))
+# 先标 UTC，再转换 → 20:00  ✅
+```
+
+**转换只认 `astimezone()`，`replace` 只是改标记。**
+:::
+
+## 夏令时（DST）的两个真实坑
+
+:::danger[坑一：某一天只有 23 小时或 25 小时]
+```python
+# 美国 2026-03-08 02:00 跳到 03:00（这一天只有 23 小时）
+2026-03-08 02:30 这个本地时间根本不存在！
+```
+
+**如果代码里"把某个时间加 1 天"，结果可能不是"同一时刻"**：
+
+```python
+from datetime import timedelta
+
+# ❌ 加 24 小时 ≠ 加 1 天（跨 DST 时）
+tomorrow_same_time = dt + timedelta(hours=24)
+
+# ✅ 要"同一墙上时间"的第二天
+tomorrow = (dt + timedelta(days=1))
+```
+
+**做"每天 9 点执行"这类定时任务，必须用带时区的 cron 或专门库，不能靠 `+timedelta(days=1)`。**
+:::
+
+:::warning[坑二：模糊时间（fall back）]
+**秋季回拨时，01:30 会出现两次** —— 这两个 `01:30` 是不同的时刻。
+
+```python
+# zoneinfo 默认取第一次（fold=0）
+dt = datetime(2026, 11, 1, 1, 30, tzinfo=ZoneInfo("America/New_York"), fold=0)
+# fold=1 取第二次
+```
+
+**金融/日志场景要明确用 `fold` 指定**，否则可能差一小时。
+:::
+
+## 解析与格式化
+
+```python
+# 格式化
+dt.strftime("%Y-%m-%d %H:%M:%S")       # 2026-01-15 12:00:00
+dt.isoformat()                          # 2026-01-15T12:00:00+00:00
+
+# 解析
+datetime.strptime("2026-01-15", "%Y-%m-%d")
+datetime.fromisoformat("2026-01-15T12:00:00+08:00")     # 3.11+ 支持更多格式
+```
+
+| 常用格式符 | 含义 |
+| --- | --- |
+| `%Y` / `%m` / `%d` | 年 / 月 / 日 |
+| `%H` / `%M` / `%S` | 时 / 分 / 秒 |
+| `%f` | 微秒 |
+| **`%z`** | **时区偏移（+0800）** |
+| **`%Z`** | **时区名（CST）** |
+| `%A` / `%B` | 星期全名 / 月份全名 |
+
+:::danger[`strptime` 解析带时区的字符串需要 `%z`]
+```python
+datetime.strptime("2026-01-15 12:00 +0800", "%Y-%m-%d %H:%M %z")   # ✅
+datetime.strptime("2026-01-15T12:00+08:00", "%Y-%m-%dT%H:%M%z")    # ✅
+```
+
+**`%Z` 只认 UTC/GMT 等少数名字，不认 `CST`/`EST`** —— 会返回 `None` 的 tzinfo。
+
+**ISO 8601 格式优先用 `fromisoformat`**（更快更宽容）。
+:::
+
+## 时间差的计算
+
+```python
+from datetime import timedelta, datetime, timezone
+
+delta = timedelta(days=2, hours=3)
+delta.total_seconds()          # 183600.0
+str(delta)                     # '2 days, 3:00:00'
+
+# 两个 aware datetime 相减 → timedelta
+diff = dt2 - dt1
+diff.days                      # 只取"天数"部分（不是总天数！）
+diff.total_seconds() / 86400   # ✅ 总天数
+```
+
+:::danger[`timedelta.days` 是截断而不是总天数]
+```python
+td = timedelta(hours=25)
+td.days            # 1        （只是天数部分）
+td.seconds         # 3600     （余下的秒）
+td.total_seconds() # 90000.0  ✅
+```
+
+**想算"总共几天"必须用 `total_seconds()`**。
+:::
+
+## 性能：批量处理时注意
+
+```python
+# 需要处理百万条时间戳时，用 zoneinfo 逐条转换会慢
+# 可以先算一次偏移量，再批量加减（仅适用于不用跨 DST 的场景）
+```
+
+:::warning[`zoneinfo` 首次加载有 IO 开销]
+**它要读 `/usr/share/zoneinfo` 下的文件。**
+
+**高并发场景可以缓存 `ZoneInfo` 对象**（它内部已有缓存，但显式复用更清晰）。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `can't compare offset-naive and offset-aware` | naive/aware 混用 | 统一用 aware |
+| 时间差 8 小时 | `replace(tzinfo=)` 当成了转换 | 用 `astimezone` |
+| 年份 57006 | 秒当毫秒用 | 分清 10 位/13 位 |
+| 夏令时那天差一小时 | 用了固定偏移 | 用 `ZoneInfo` |
+| `timedelta.days` 不对 | 它是截断值 | 用 `total_seconds()` |
+| `strptime` 时区丢失 | 没用 `%z` | 加 `%z` 或 `fromisoformat` |
+| 服务器时间与本地不同 | `datetime.now()` 用服务器时区 | `now(timezone.utc)` |
+| 每天都少/多一小时 | `+timedelta(days=1)` 跨 DST | 用带时区的日期库 |
+
+:::danger[绝对不要用 `pytz` 的 `localize` 混搭 `datetime` 的 `tzinfo` 参数]
+**`pytz` 的时区对象不能直接传给 `datetime(..., tzinfo=pytz_tz)`** —— 会得到错误的偏移（LMT 偏移）。
+
+**Python 3.9+ 一律用 `zoneinfo`，不要用 `pytz`。**
+:::
+
+## 本课自检
+
+- [ ] **能区分 naive 与 aware，知道混用会 TypeError**
+- [ ] **知道内部一律用 aware + UTC 存储，展示时才转本地**
+- [ ] **知道 `datetime.utcnow()` 返回 naive，且 3.12 起废弃**
+- [ ] **知道 `datetime.now()` 用的是服务器时区**
+- [ ] **能分清秒与毫秒时间戳（10 位 vs 13 位）**
+- [ ] 知道 `fromtimestamp` 不带 tz 会用本地时区
+- [ ] **会用 `zoneinfo` 而不用 `pytz`**
+- [ ] **知道 `replace(tzinfo=)` 不是转换，转换要用 `astimezone()`**
+- [ ] **理解 DST 导致"某天不是 24 小时"和"模糊时间"**
+- [ ] 知道 `timedelta.days` 是截断值，总天数要用 `total_seconds()`
+- [ ] 知道 `strptime` 需要 `%z` 才能解析时区
+- [ ] 知道 `%Z` 不认 CST/EST 这类缩写
+
+## 下一步
+
+[JSON / YAML / CSV](./json) 或 [类型注解](./typing)。

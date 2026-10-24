@@ -1,0 +1,299 @@
+---
+id: lowpower-deep
+title: "07 低功耗模式深入"
+sidebar_position: 7
+description: Sleep/Stop/Standby 三种模式的电路级差异、实测电流量级、唤醒时间与唤醒后必须重配时钟、GPIO 状态对功耗的影响。
+---
+
+# 07 低功耗模式深入
+
+**本课目标**：知道三种模式各关了什么，能算出一个电池供电产品的续航。
+
+## 三种模式关掉了什么
+
+| 模式 | CPU | 外设时钟 | SRAM/寄存器 | 典型电流 | 唤醒源 |
+| --- | --- | --- | --- | --- | --- |
+| **运行** | 开 | 开 | 保持 | **mA ~ 几十 mA** | — |
+| **Sleep** | **停** | **开** | 保持 | **几 mA** | 任意中断 |
+| **Stop** | 停 | **全停** | **保持** | **约 10~20 µA** | EXTI 线 |
+| **Standby** | 停 | 全停 | **丢失** | **约 2 µA** | WKUP 引脚、RTC、IWDG 复位 |
+
+:::danger[电流数字是典型值，不是保证值]
+上面的量级来自 ST 数据手册的典型条件（3.3V、25°C、时钟关闭）。
+
+**实际情况会差很多**：
+
+- **温度每升高 10°C，漏电流大约翻倍**
+- 板上其他器件（LDO 静态电流、上拉电阻、LED）往往比 MCU 本身更耗电
+- 没关的外设时钟、浮空引脚都会增加电流
+:::
+
+:::tip[先算总账再优化 MCU]
+一块电池供电的产品，待机电流往往是这几项之和：
+
+```text
+MCU（Stop 模式）        约 15 µA
+LDO 静态电流            约 50 µA   ← 常常是最大项！
+上拉电阻（2 个 10k）     约 660 µA  ← 3.3V/10k×2
+电池自放电             约 20 µA
+──────────────────────────────
+合计                    约 745 µA
+```
+
+**你花一周把 MCU 从 15µA 优化到 2µA，总电流只少了 1.7%。**
+
+**先查 LDO 和上拉，再优化 MCU。**
+:::
+
+## Sleep 模式
+
+:::info[只停 CPU，其他全开]
+```c
+__WFI();      /* Wait For Interrupt：进 Sleep，任意中断唤醒 */
+```
+
+**唤醒后从 `__WFI()` 下一行继续，时钟不用重配。**
+
+**节能很有限**——外设时钟还全开着，几 mA 级别。
+:::
+
+## Stop 模式
+
+:::danger[唤醒后时钟会变回 HSI 8MHz]
+```c
+HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+
+/* 被唤醒后 —— 时钟已经是 HSI 8MHz 了！ */
+SystemClock_Config();      /* ← 必须重新配置！ */
+```
+
+**忘了重配的后果**：
+
+- 串口波特率全错（乱码）
+- 定时器周期全错
+- `HAL_Delay` 不准
+
+**这是 Stop 模式的头号坑。**
+:::
+
+```c
+/* 完整的 Stop 模式流程 */
+void enter_stop_and_wake(void)
+{
+    /* ① 关掉不用的外设时钟 */
+    __HAL_RCC_GPIOA_CLK_DISABLE();
+    __HAL_RCC_USART1_CLK_DISABLE();
+
+    /* ② 配置唤醒源（EXTI） */
+    HAL_PWR_EnableWakeUpPin(PWR_WAKEUP_PIN1);   /* 或配 EXTI 线 */
+
+    /* ③ 进 Stop */
+    HAL_SuspendTick();                          /* 关 SysTick，否则会被它唤醒 */
+    HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+    HAL_ResumeTick();
+
+    /* ④ 唤醒后第一件事：恢复时钟 */
+    SystemClock_Config();
+
+    /* ⑤ 重新初始化外设 */
+    MX_GPIO_Init();
+    MX_USART1_UART_Init();
+}
+```
+
+:::warning[`HAL_SuspendTick()` 不能漏]
+**SysTick 每秒中断 1000 次（1ms 一次）**。它是内部中断，**会立刻把 Stop 模式唤醒**。
+
+```c
+HAL_SuspendTick();     /* 进 Stop 前必须关掉 */
+```
+
+**不关的话，你根本进不了 Stop 模式**（进一次立刻被唤醒，看起来像"没进去"）。
+:::
+
+## Standby 模式
+
+:::danger[进 Standby 相当于"软关机"]
+- **SRAM 内容丢失**（变量全部复位）
+- **所有寄存器恢复默认值**
+- 唤醒后相当于**重新上电**（从 Reset_Handler 开始跑）
+- **只有几个特殊唤醒源**
+:::
+
+```c
+/* 进 Standby */
+HAL_PWR_EnableWakeUpPin(PWR_WAKEUP_PIN1);      /* PA0 上升沿唤醒 */
+HAL_PWR_ClearFlag(PWR_FLAG_WU | PWR_FLAG_SB);  /* 清标志 */
+HAL_PWR_EnterSTANDBYMode();                     /* 不返回！ */
+
+/* 唤醒后程序从头开始 —— 靠标志位判断是不是从 Standby 醒来的 */
+int main(void)
+{
+    HAL_Init();
+
+    if (__HAL_PWR_GET_FLAG(PWR_FLAG_SB)) {
+        /* 从 Standby 唤醒 */
+        __HAL_PWR_CLEAR_FLAG(PWR_FLAG_SB);
+        /* 处理：比如读 RTC 记录已睡了多久 */
+    }
+    /* 正常初始化流程 */
+}
+```
+
+:::tip[Standby 下怎么保存少量状态]
+**SRAM 全丢，但有两处能留数据**：
+
+**① RTC 备份寄存器（BKP_DR1~DR10）**
+
+```c
+HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR1, 0xA5A5);   /* 睡之前写 */
+uint32_t v = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR1); /* 醒后读 */
+```
+
+**条件**：需要 VBAT 供电（或保持 VDD 不断）。**掉电也会丢**。
+
+**② 直接写 Flash**
+能掉电保持，但有寿命限制（约 1 万次擦写），**不能频繁写**。
+:::
+
+## GPIO 状态对功耗的影响
+
+:::danger[浮空输入会持续耗电]
+```text
+引脚配置成浮空输入 + 外部电压不明
+  → 输入级 MOS 处于中间状态
+  → 两个管子同时半导通
+  → 持续消耗电流（可能几十 µA 每个引脚）
+```
+
+**这是低功耗调试中最容易被忽略的一项。**
+:::
+
+:::tip[低功耗时所有未用引脚这样配]
+```c
+/* 方法一：模拟输入（最省电，输入级完全关断） */
+GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+GPIO_InitStruct.Pin = GPIO_PIN_All;
+HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);   /* 对每个端口都做 */
+
+/* 方法二：输出固定电平（不能配成模拟的引脚用这个） */
+GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+GPIO_InitStruct.Pull = GPIO_NOPULL;
+```
+
+**推荐方法一**：模拟输入模式下输入缓冲器被关断，漏电流最小。
+:::
+
+:::warning[输出高电平但外部接地 → 大电流]
+```text
+引脚输出 3.3V，外部电路把它拉到地
+  → 灌电流可能达到几十 mA
+  → 不仅耗电，还可能烧引脚（单片引脚通常最大 20mA）
+```
+
+**检查方法**：低功耗时用万用表逐个量引脚电压，发现异常就查外部电路。
+:::
+
+## 唤醒时间
+
+| 模式 | 唤醒时间（典型） | 说明 |
+| --- | --- | --- |
+| Sleep | 几个周期 | 几乎瞬时 |
+| **Stop** | **约 10 µs** | 含 HSI 起振 + 时钟恢复 |
+| Standby | 约 50 µs ~ 几 ms | 相当于完整启动流程 |
+
+:::tip[唤醒时间决定你怎么分摊工作]
+假设每 10 秒要采一次数据、算一次、发一次，整个耗时 20ms：
+
+```text
+方案 A：一直 Sleep，定时器唤醒
+  清醒 20ms / 10000ms = 0.2% 时间在工作
+  平均电流 ≈ 运行电流 × 0.002 + Sleep 电流 × 0.998
+
+方案 B：一直 Stop，RTC 唤醒
+  每次唤醒要 10µs 恢复 + 重新初始化外设（约 1ms）
+  平均电流更低，但代码复杂
+```
+
+**唤醒越慢的模式越省电，但"每次醒来的固定开销"越大——要按你的唤醒频率权衡。**
+:::
+
+## 一个实际的续航估算
+
+:::info[假设：每 60 秒测一次温度并发一次 LoRa]
+| 阶段 | 电流 | 时长 | 电荷量 |
+| --- | --- | --- | --- |
+| 唤醒 + 初始化 | 20 mA | 2 ms | 40 µAh/1000 = 0.011 µAh |
+| 采温度 + 处理 | 10 mA | 5 ms | 0.014 µAh |
+| LoRa 发送 | 120 mA | 100 ms | 3.33 µAh |
+| **Stop 待机** | **15 µA** | 60 s | **0.25 µAh** |
+| 合计（每 60 秒） | | | **约 3.6 µAh** |
+
+**用 2000 mAh 电池**：
+
+```text
+2000 mAh / 3.6 µAh × 60 s ≈ 33,333,333 秒 ≈ 386 天
+```
+
+**理论一年多**——实际打三到五折（电池自放电、温度、LDO 损耗），**约 4~6 个月**。
+
+**注意：LoRa 发送一项就占了 92% 的电荷量。优化它的收益远大于优化待机电流。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 进 Stop 立刻被唤醒 | SysTick 在跑 | `HAL_SuspendTick()` |
+| 唤醒后串口乱码 | 时钟变回 HSI 8MHz | 重调 `SystemClock_Config()` |
+| 电流比预期大 100 倍 | 浮空引脚 / 上拉电阻 | 未用引脚配模拟输入 |
+| 电流比预期大 10 倍 | 外设时钟没关 | 逐个 `__HAL_RCC_xxx_CLK_DISABLE()` |
+| Standby 醒后变量全丢 | 正常行为（SRAM 掉电） | 用 BKP 寄存器存状态 |
+| 唤醒源不生效 | EXTI 线没配 | 配 EXTI + NVIC |
+| 调试器连不上 | 低功耗下 SWD 停了 | 开 DBGMCU 的调试保持位 |
+| 测不出真实电流 | 万用表内阻影响 | 用专门的功耗分析仪 |
+
+:::tip[低功耗下怎么保持调试器连接]
+```c
+/* 让调试模块在低功耗下继续工作 */
+__HAL_RCC_DBGMCU_CLK_ENABLE();
+HAL_DBGMCU_EnableDBGStopMode();       /* Stop 模式下保持调试 */
+HAL_DBGMCU_EnableDBGStandbyMode();    /* Standby 也保持（耗电会增加） */
+```
+
+**不配的话，一进低功耗调试器就断开**，你还以为是程序死了。
+:::
+
+:::danger[测量电流的正确方法]
+**万用表测不准低功耗电流**：
+
+- 表的内阻（电流档通常几十到几百 Ω）会产生压降
+- 平均电流档的采样率跟不上 mA↔µA 的快速切换
+
+**正确做法**：
+
+1. 串一个 **10Ω 采样电阻**，用示波器量电阻上的压降
+2. 或用专门的功耗分析仪（如 Nordic PPK2、Joulescope）
+
+**而且要关掉调试器**——SWD 连接本身会额外耗几百 µA。
+:::
+
+## 本课自检
+
+- [ ] 能说出三种模式各关了 CPU/外设时钟/SRAM 中的哪些
+- [ ] 知道 Sleep 几 mA、Stop 约 15µA、Standby 约 2µA
+- [ ] **知道这些是典型值，温度升高 10°C 漏电约翻倍**
+- [ ] **理解"先查 LDO 和上拉，再优化 MCU"**
+- [ ] **知道 Stop 唤醒后时钟变回 HSI 8MHz，必须重配**
+- [ ] **知道进 Stop 前必须 `HAL_SuspendTick()`**
+- [ ] 知道 Standby 唤醒等于重新上电，SRAM 全丢
+- [ ] 知道用 RTC 备份寄存器保存少量状态
+- [ ] **知道浮空引脚会持续耗电，未用引脚配模拟输入**
+- [ ] 知道引脚输出高但外部接地会灌电流
+- [ ] 知道三种模式的唤醒时间量级
+- [ ] 会做续航粗略估算
+- [ ] **知道万用表测不准低功耗电流**
+
+## 下一步
+
+[08 看门狗：IWDG 与 WWDG](./watchdog) —— 别让程序卡死了没人管。

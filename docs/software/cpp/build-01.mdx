@@ -1,0 +1,271 @@
+---
+id: build-01
+title: "01 构建与工具链"
+sidebar_position: 2
+description: "构建与工具链 第 1 部分：构建与工具链"
+---
+
+# 01 构建与工具链
+**这里解决一个问题：为什么"我这边能编译，他那边一堆 undefined reference"，以及怎么用 CMake 管理一个真正的工程。**
+
+C++ 的构建模型继承自 C，是 1970 年代的设计——**分离编译 + 文本包含**。这个模型有很多反直觉的地方（尤其 ODR 和头文件），理解它们能省下大量调试时间。
+
+## 本页学什么
+
+- 编译链接的四个阶段，以及每个阶段会出什么错
+- 头文件、`#include`、include guard 与 ODR
+- CMake：从三行到工程化
+- 包管理：vcpkg / Conan 怎么选
+- 静态分析与 sanitizer：让工具帮你找 bug
+
+## 1. 编译链接四阶段
+
+```mermaid
+flowchart LR
+  A["hello.cpp<br/>源码"] -->|"预处理<br/>preprocessing"| B["hello.i<br/>展开后的文本"]
+  B -->|"编译<br/>compilation"| C["hello.s<br/>汇编"]
+  C -->|"汇编<br/>assembly"| D["hello.o<br/>目标文件（机器码）"]
+  D -->|"链接<br/>linking"| E["hello.exe<br/>可执行"]
+  H["头文件"] -.->|"文本包含"| A
+  L["静态库 .a / .lib<br/>动态库 .so / .dll"] -.-> D
+```
+
+### 逐阶段实测
+
+```bash
+# 完整的四步
+g++ -E hello.cpp -o hello.i      # 1. 预处理：展开 #include、#define
+g++ -S hello.i   -o hello.s      # 2. 编译：生成汇编
+g++ -c hello.s   -o hello.o      # 3. 汇编：生成目标文件
+g++    hello.o   -o hello.exe    # 4. 链接：解析符号，生成可执行
+```
+
+**每步出错时的典型症状：**
+
+| 阶段 | 典型错误 | 例子 |
+| --- | --- | --- |
+| 预处理 | `fatal error: xxx.h: No such file or directory` | 头文件路径没给（`-I`） |
+| 编译 | `error: 'xxx' was not declared in this scope` | 语法/类型错误 |
+| 汇编 | 极少出错 | — |
+| 链接 | `undefined reference to 'xxx'` | **声明了但没定义**，或库没链（`-l`） |
+
+:::tip[90% 的初学者困惑是链接错误]
+`undefined reference` **不是**"代码写错了"，而是"**有声明，但链接器找不到定义**"。常见原因：
+
+1. 函数在头文件里声明了，但**忘了实现**（或者实现的 `.cpp` 没参与编译）
+2. 用了某个库但**没链接**（缺 `-lxxx`）
+3. 类的 `static` 成员**只声明没定义**
+4. 函数签名不一致（声明 `void f(int)`，定义 `void f(int, int)`）
+5. **模板定义放在 `.cpp` 里**（见 [模板](./templates)）
+:::
+
+### 实测：undefined reference 的几个来源
+
+```cpp
+// odr_demo.cpp  —— 故意制造链接错误
+#include <cstdio>
+
+void declared_but_not_defined(int x);     // 只有声明
+
+struct WithStatic {
+    static int counter;                   // 只声明，没定义
+};
+
+int main() {
+    declared_but_not_defined(5);
+    std::printf("%d\n", WithStatic::counter);
+}
+```
+
+编译（只编译不链接）：
+
+```bash
+g++ -std=c++17 -c odr_demo.cpp -o odr_demo.o     # 这一步成功！
+```
+
+链接：
+
+```bash
+g++ odr_demo.o -o odr_demo.exe
+```
+
+**真实链接错误：**
+
+```text
+odr_demo.o:odr_demo.cpp:(.text+0x13): undefined reference to 'declared_but_not_defined(int)'
+odr_demo.o:odr_demo.cpp:(.rdata$.refptr._ZN10WithStatic7counterE[.refptr._ZN10WithStatic7counterE]+0x0):
+  undefined reference to 'WithStatic::counter'
+```
+
+注意：**编译阶段完全成功，问题只在链接时暴露。** 这就是 C++ 分离编译模型的特点。
+
+### 符号表：看看目标文件里有什么
+
+```bash
+nm -C odr_demo.o | head -20
+```
+
+**真实输出：**
+
+```text
+                 U __main
+                 U __mingw_printf
+                 U declared_but_not_defined(int)
+                 U WithStatic::counter
+0000000000000000 T main
+```
+
+`U` 表示 **undefined**（需要外部提供），`T` 表示 **defined in text section**（已定义）。
+
+## 2. 头文件与 ODR
+
+### #include 就是文本复制
+
+`#include "foo.h"` 在预处理阶段把 `foo.h` 的**全部内容**插进来。没有智能，没有去重。
+
+**实测看看展开后有多大：**
+
+```bash
+echo '#include <vector>
+#include <string>
+#include <iostream>
+int main(){}' > inc.cpp
+g++ -E inc.cpp -o inc.i
+wc -l inc.cpp inc.i
+```
+
+**真实输出：**
+
+```text
+inc.cpp lines: 4
+inc.i lines:   40717
+```
+
+**一个 4 行的文件展开成两万多行**——这就是 C++ 编译慢的根本原因之一。C++20 的**模块（modules）**就是为了解决这个问题（但工具链支持仍在成熟中）。
+
+### include guard
+
+因为没有去重，多次包含同一个头文件会导致**重定义错误**：
+
+```cpp
+// header 没有 guard
+struct Config { int x; };
+
+// a.cpp
+#include "config.h"
+#include "other.h"    // other.h 里也 include 了 config.h
+// → Config 被定义了两次 → 编译错误
+```
+
+三种解法：
+
+```cpp
+// 1. 传统 guard（最通用）
+#ifndef MY_CONFIG_H
+#define MY_CONFIG_H
+struct Config { int x; };
+#endif
+
+// 2. #pragma once（非标准，但所有主流编译器都支持）
+#pragma once
+struct Config { int x; };
+
+// 3. C++20 modules（未来）
+export module config;
+export struct Config { int x; };
+```
+
+:::info[pragma once vs include guard]
+`#pragma once` 不是标准，但 GCC / Clang / MSVC 全支持。它更快（编译器直接跳过文件，不用读进来），且不会因宏名冲突出问题。
+
+**现代项目推荐 `#pragma once`**，除非需要支持非常老的编译器。
+:::
+
+### ODR：单一定义规则
+
+**ODR（One Definition Rule）** 是 C++ 里最重要的规则之一，也是最容易违反的：
+
+> 一个变量、函数、类类型、枚举、模板，**在整个程序里只能有一个定义**。
+
+具体说：
+
+| 实体 | 可以出现在 | 规则 |
+| --- | --- | --- |
+| 类/结构体定义 | 多个 `.cpp`（通过头文件） | **必须逐字符相同**，否则 UB |
+| 普通函数 | **只能一个 `.cpp`** | 重复定义 → 链接错误 |
+| `inline` 函数 | 多个 `.cpp`（通过头文件） | 必须定义完全相同 |
+| 模板 | 多个 `.cpp`（通过头文件） | 必须定义完全相同 |
+| 全局变量 | **只能一个 `.cpp`** | 头文件里要写 `extern` 声明 |
+| `constexpr` / `const` 变量 | 各 `.cpp` 一份 | **有内部链接**，不违反 ODR |
+| `inline` 变量（C++17） | 头文件 | 全程序一个实体 |
+
+### 头文件里定义全局变量的正确做法
+
+```cpp
+// config.h  —— 错误示范
+int g_counter = 0;      // 每个 include 它的 .cpp 都定义一份 → 链接错误
+
+// config.h  —— 正确
+extern int g_counter;   // 只是声明
+
+// config.cpp
+int g_counter = 0;      // 唯一的定义
+```
+
+**C++17 的干净做法：**
+
+```cpp
+// config.h
+inline int g_counter = 0;    // C++17 inline 变量，头文件里直接定义
+```
+
+**实测：违反 ODR 的错误**
+
+```cpp
+// a.cpp
+int shared = 1;
+int main() { return shared; }
+
+// b.cpp
+int shared = 2;     // 重复定义
+```
+
+```bash
+g++ a.cpp b.cpp -o test.exe
+```
+
+**真实错误：**
+
+```text
+b.cpp:(.data+0x0): multiple definition of 'shared';
+a.cpp:(.data+0x0): first defined here
+```
+
+### ODR 违反的隐蔽形式
+
+**最危险的是"不报错但行为错乱"的情况**——同一个类在两个 `.cpp` 里定义不一致：
+
+```cpp
+// wire.h（被两个 .cpp 包含）
+struct Packet {
+    int id;
+    int value;
+};
+
+// a.cpp —— 编译时加了某个宏
+#define COMPACT
+#include "wire.h"
+void send(Packet* p);
+
+// b.cpp —— 没加宏
+#include "wire.h"
+void recv(Packet* p);
+
+// 如果 wire.h 里有 #ifdef COMPACT 改变了成员布局 → 两个 .cpp 看到的 Packet 不一样 → UB
+```
+
+**这类 bug 极难查**（内存布局不一致，但链接器不知道）。教训：**不要在头文件里用会影响类布局的条件编译**，除非你能保证所有翻译单元的宏一致（通过构建系统统一传递 `-D`）。
+
+---
+
+**翻页**：[下一页 →](./build-02) · [返回目录](./)

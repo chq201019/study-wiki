@@ -1,0 +1,337 @@
+---
+id: 20-templates
+title: 20 模板入门
+sidebar_position: 20
+description: 函数模板、类模板、类型推导、为什么模板要写在头文件里，以及模板的代价。
+---
+
+# 20 模板入门
+
+**本课目标**：会写函数模板和类模板，理解"泛型编程"。
+
+## 要解决的问题
+
+C 里想对每种类型求最大值，得写很多份（或者用 `void*` 丢类型信息）：
+
+```c
+int    max_int(int a, int b);
+double max_double(double a, double b);
+char   max_char(char a, char b);
+/* ... 每种类型一份 ... */
+```
+
+函数重载能解决，但**逻辑完全重复**。
+
+**模板：写一份，编译器按类型生成多份。**
+
+```cpp
+template<typename T>
+T my_max(T a, T b) { return a > b ? a : b; }
+
+my_max(3, 7);                    /* T = int */
+my_max(2.5, 1.5);                /* T = double */
+my_max(std::string("a"), std::string("b"));   /* T = std::string */
+```
+
+本机实测：
+
+```text
+  my_max(3,7)=7
+  my_max(2.5,1.5)=2.5
+  my_max(string)=abd
+```
+
+:::info[模板是"编译期生成代码"]
+编译器看到 `my_max(3, 7)` 时，**自动生成**一个 `int` 版本；
+看到 `my_max(2.5, 1.5)` 时，生成 `double` 版本。
+
+**所以模板没有运行时开销**——这叫**零开销抽象**。
+:::
+
+## 函数模板语法
+
+```cpp
+template<typename T>
+T my_max(T a, T b) {
+    return a > b ? a : b;
+}
+```
+
+| 部分 | 含义 |
+| --- | --- |
+| `template<typename T>` | 声明一个类型参数 `T` |
+| `T` | 占位符，调用时被具体类型替换 |
+
+:::tip[`typename` 和 `class` 在模板里等价]
+```cpp
+template<typename T>      /* ✅ 现代写法，推荐 */
+template<class T>         /* ✅ 老写法，完全等价 */
+```
+
+**用 `typename`**——语义更准确（`T` 不一定是类，也可能是 `int`）。
+:::
+
+## 多类型参数
+
+```cpp
+template<typename K, typename V>
+void show_pair(const K &k, const V &v) {
+    std::cout << k << " = " << v << "\n";
+}
+
+show_pair(1, "one");        /* K=int, V=const char* */
+show_pair("pi", 3.14);      /* K=const char*, V=double */
+```
+
+本机实测：
+
+```text
+  1 = one
+  pi = 3.14
+```
+
+## 类模板
+
+```cpp
+template<typename T>
+class Box {
+public:
+    explicit Box(T v) : value_(std::move(v)) {}
+    const T &get() const { return value_; }
+
+private:
+    T value_;
+};
+
+Box<int> bi(42);                 /* 必须显式指定类型 */
+Box<std::string> bs("hello");
+```
+
+本机实测：`42 hello`
+
+:::warning[类模板不能自动推导类型（C++17 前）]
+```cpp
+Box b(42);              /* ❌ C++17 之前不能这样写 */
+Box<int> b(42);         /* ✅ 必须写 <int> */
+```
+
+C++17 加了 **CTAD**（类模板参数推导），`Box b(42);` 可以了，但**显式写类型更清楚**。
+:::
+
+## 标准库全是模板
+
+你其实早就在用模板了：
+
+| 你用的 | 实际是 |
+| --- | --- |
+| `std::vector<int>` | 类模板 `vector<T>` 的 `int` 版 |
+| `std::string` | `std::basic_string<char>` 的别名 |
+| `std::map<K, V>` | 类模板，两个类型参数 |
+| `std::sort` | 函数模板 |
+| `std::unique_ptr<T>` | 类模板 |
+
+```cpp
+std::vector<int>          v1;    /* 存 int */
+std::vector<std::string>  v2;    /* 存 string */
+std::vector<Student>      v3;    /* 存自定义类型 */
+```
+
+**同一份 `vector` 代码，适配所有类型**——这就是模板的威力。
+
+## 模板必须写在头文件里
+
+:::danger[这是模板最特殊的一点]
+普通函数：**声明放头文件，定义放源文件**（[C 第 27 课](../c-basics/27-multi-file)）。
+
+**模板：定义也必须放头文件。**
+
+```cpp
+/* my_template.h */
+template<typename T>
+T my_max(T a, T b) { return a > b ? a : b; }    /* 定义也在这里 */
+```
+:::
+
+### 为什么
+
+模板**不是真正的代码**，只是一个"生成代码的模板"。编译器需要看到**完整定义**才能为每个类型生成实例。
+
+如果定义放在 `.cpp` 里：
+
+```cpp
+/* a.cpp 里定义了模板 */        /* main.cpp 里看不到定义 */
+my_max(3, 7);                   /* ❌ 链接错误：找不到 my_max<int> */
+```
+
+编译器在 `main.cpp` 里只看到声明，无法生成 `int` 版本。
+
+:::warning[链接错误长什么样]
+```text
+undefined reference to `int my_max<int>(int, int)'
+```
+
+这类错误在模板代码里很常见——**通常就是定义没放头文件**。
+:::
+
+## 模板的代价
+
+:::danger[三个实际问题]
+**① 编译时间变长**
+
+每个类型都生成一份代码，用得多就编得慢。
+
+**② 错误信息极其冗长**
+
+模板出错时，编译器可能打印几百行。**要从最后往前找第一个"真正的原因"**。
+
+**③ 代码膨胀**
+
+`my_max` 用于 10 种类型 = 生成 10 份机器码。
+
+（简单模板通常会被内联优化掉，但复杂模板确实会让二进制变大。）
+:::
+
+## 模板的限制：需要类型支持的操作
+
+:::danger[模板参数必须支持模板里用到的操作]
+```cpp
+template<typename T>
+T my_max(T a, T b) { return a > b ? a : b; }
+
+struct NoCompare { };
+my_max(NoCompare{}, NoCompare{});      /* ❌ NoCompare 没有 operator> */
+```
+
+报错会非常长，但**根本原因就一句**：`NoCompare` 不支持 `>`。
+
+**读模板报错的技巧：直接找最后那段 `note:` 或 `error:`，通常是"某某类型缺少某某操作"。**
+:::
+
+## 完整示例
+
+```cpp
+#include <iostream>
+#include <string>
+#include <vector>
+
+/* 函数模板：找最大 */
+template<typename T>
+T my_max(const T &a, const T &b) {
+    return a > b ? a : b;
+}
+
+/* 类模板：简单栈 */
+template<typename T>
+class Stack {
+public:
+    void push(T v) { data_.push_back(std::move(v)); }
+
+    T pop() {
+        if (data_.empty()) {
+            throw std::runtime_error("栈为空");
+        }
+        T top = std::move(data_.back());
+        data_.pop_back();
+        return top;
+    }
+
+    bool empty() const { return data_.empty(); }
+    size_t size() const { return data_.size(); }
+
+private:
+    std::vector<T> data_;
+};
+
+int main() {
+    std::cout << "--- 函数模板 ---\n";
+    std::cout << "  max(3, 7) = " << my_max(3, 7) << "\n";
+    std::cout << "  max(2.5, 1.5) = " << my_max(2.5, 1.5) << "\n";
+    std::cout << "  max(abc, abd) = "
+              << my_max(std::string("abc"), std::string("abd")) << "\n";
+
+    std::cout << "\n--- 类模板：int 栈 ---\n";
+    Stack<int> si;
+    si.push(1);
+    si.push(2);
+    si.push(3);
+    std::cout << "  大小 " << si.size() << "，弹出 " << si.pop() << "\n";
+    std::cout << "  弹出 " << si.pop() << "，剩 " << si.size() << "\n";
+
+    std::cout << "\n--- 类模板：string 栈 ---\n";
+    Stack<std::string> ss;
+    ss.push("hello");
+    ss.push("world");
+    std::cout << "  弹出 " << ss.pop() << "\n";
+
+    std::cout << "\n--- 空栈异常 ---\n";
+    try {
+        Stack<int> empty;
+        empty.pop();
+    } catch (const std::exception &e) {
+        std::cout << "  捕获：" << e.what() << "\n";
+    }
+
+    return 0;
+}
+```
+
+输出：
+
+```text
+--- 函数模板 ---
+  max(3, 7) = 7
+  max(2.5, 1.5) = 2.5
+  max(abc, abd) = abd
+
+--- 类模板：int 栈 ---
+  大小 3，弹出 3
+  弹出 2，剩 1
+
+--- 类模板：string 栈 ---
+  弹出 world
+
+--- 空栈异常 ---
+  捕获：栈为空
+```
+
+:::tip[这个 `Stack` 就是模板的价值]
+**一份代码，`int` 和 `std::string` 都能用。**
+
+而且因为 `T` 在编译期就确定了，**没有运行时类型检查开销**——比用 `void*` 或基类指针的方案快得多。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 模板定义放 `.cpp` | `undefined reference` | 编译器看不到定义 | 定义放头文件 |
+| `Box b(42);`（C++17 前） | 编译错 | 类模板不推导 | `Box<int> b(42);` |
+| 类型不支持所需操作 | 超长报错 | 缺 `operator>` 等 | 检查类型是否有该操作 |
+| 模板参数用 `T&` 又传右值 | 编译错 | 不能绑临时值 | 用 `const T&` |
+| 编译时间暴涨 | 慢 | 实例化太多 | 减少模板组合 |
+| 读不懂报错 | —— | 信息冗长 | 看最后的 `error:` |
+
+:::tip[读模板报错的实用方法]
+1. **从输出最底部往前看**，找到第一个 `error:`（不是 `note:`）
+2. 找"某某类型缺少某某成员/操作"这类话
+3. 忽略前面几十行"实例化栈"
+
+**绝大部分模板错误，根本原因只有一句。**
+:::
+
+## 本课自检
+
+- [ ] 会写 `template<typename T>` 函数模板
+- [ ] 会写类模板，知道要显式 `Box<int>`
+- [ ] 知道模板是**编译期生成代码，无运行时开销**
+- [ ] 知道 `typename` 和 `class` 等价
+- [ ] 知道 `std::vector<T>` 本身就是类模板
+- [ ] **知道模板定义必须放头文件**
+- [ ] 能识别 `undefined reference to my_max<int>` 这类错误
+- [ ] 知道模板的三个代价（编译慢、报错长、代码膨胀）
+- [ ] 知道模板参数必须支持模板内用到的操作
+- [ ] 会从冗长的模板报错里找到真正原因
+
+## 下一步
+
+[21 异常处理](./21-exceptions) —— 出错时怎么优雅地报错和恢复。

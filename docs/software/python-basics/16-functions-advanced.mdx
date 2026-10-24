@@ -1,0 +1,404 @@
+---
+id: 16-functions-advanced
+title: 16 函数进阶：参数与返回值
+sidebar_position: 16
+description: 位置参数与关键字参数、默认值、可变默认参数这个大坑、*args 与 **kwargs、以及在定义时求值的规则。
+---
+
+# 16 函数进阶：参数与返回值
+
+**本课目标**：掌握所有参数写法，并彻底避开「可变默认参数」这个经典陷阱。
+
+## 两种传参方式
+
+```python
+def introduce(name, age, city):
+    print(f"{name}，{age}岁，来自{city}")
+```
+
+### 位置参数：按顺序对号入座
+
+```python
+introduce("小明", 18, "北京")
+```
+
+输出：
+
+```text
+小明，18岁，来自北京
+```
+
+### 关键字参数：指名道姓
+
+```python
+introduce(city="北京", name="小明", age=18)
+```
+
+输出：
+
+```text
+小明，18岁，来自北京
+```
+
+:::tip[关键字参数的价值]
+参数一多，位置参数就容易看晕：
+
+```python
+create_user("小明", True, False, None, 30)
+```
+
+每个参数是什么？看不出来。
+
+改成关键字就清楚了：
+
+```python
+create_user(name="小明", is_admin=True, is_active=False,
+            avatar=None, age=30)
+```
+
+**参数超过 3 个时，调用时建议用关键字**，可读性提升巨大。
+:::
+
+### 混合使用：位置参数必须在前面
+
+```python
+introduce("小明", age=18, city="北京")    # ✅ 合法
+introduce(name="小明", 18, "北京")        # ❌ 语法错误
+```
+
+## 默认值
+
+```python
+def greet(name, greeting="你好"):
+    print(f"{greeting}，{name}")
+
+greet("小明")
+greet("小红", "早上好")
+greet("小刚", greeting="晚上好")
+```
+
+输出：
+
+```text
+你好，小明
+早上好，小红
+晚上好，小刚
+```
+
+**有默认值的参数必须放在没默认值的参数后面**：
+
+```python
+def f(a, b=1, c):      # ❌ SyntaxError
+    ...
+```
+
+## 大坑：可变默认参数
+
+:::danger[这是 Python 最著名的陷阱，务必看完]
+```python
+def add_item(item, lst=[]):
+    lst.append(item)
+    return lst
+
+print(add_item("a"))
+print(add_item("b"))
+print(add_item("c"))
+```
+
+你期望：
+
+```text
+['a']
+['b']
+['c']
+```
+
+**实际输出**（本机实测）：
+
+```text
+['a']
+['a', 'b']
+['a', 'b', 'c']
+```
+
+列表在**不断累积**！三次调用的结果串在一起了。
+:::
+
+### 为什么
+
+:::tip[深入一点：默认值只在定义时算一次]
+`def add_item(item, lst=[])` 里的 `[]` **只在函数定义时创建一次**，之后所有调用共用这一个列表对象。
+
+这和[第 5 课](./05-variables)的「变量是标签」是同一件事：默认值那个列表一直被 `lst` 指着，每次 append 都改同一个对象。
+
+**验证一下**：
+
+```python
+def add_item(item, lst=[]):
+    print(f"开始前 lst = {lst}, id = {id(lst)}")
+    lst.append(item)
+    return lst
+
+add_item("a")
+add_item("b")
+```
+
+输出：
+
+```text
+开始前 lst = [], id = 2087654321096
+开始前 lst = ['a'], id = 2087654321096     ← 同一个 id！
+```
+
+`id()` 相同就证明是同一个对象。
+:::
+
+### 正确写法：用 None 做默认值
+
+```python
+def add_item(item, lst=None):
+    if lst is None:
+        lst = []
+    lst.append(item)
+    return lst
+
+print(add_item("a"))
+print(add_item("b"))
+print(add_item("c"))
+```
+
+输出（本机实测）：
+
+```text
+['a']
+['b']
+['c']
+```
+
+:::warning[为什么用 `is None` 而不是 `== None`]
+`x is None` 判断「是不是 None 这个对象本身」，永远可靠。
+
+`x == None` 调用的是 `==` 运算符，某些类型可能重载它导致意外结果。**判断 None 一律用 `is`。**
+:::
+
+这个坑不只出现在列表，字典、集合同样：
+
+```python
+def f(d={}):        # ❌ 同样有问题
+    d["count"] = d.get("count", 0) + 1
+    return d
+```
+
+## `*args`：接收任意个位置参数
+
+```python
+def total(*args):
+    print(f"args 是 {args}")
+    return sum(args)
+
+print(total(1, 2))
+print(total(1, 2, 3, 4, 5))
+```
+
+输出：
+
+```text
+args 是 (1, 2)
+3
+args 是 (1, 2, 3, 4, 5)
+15
+```
+
+**`*args` 把所有位置参数收成一个元组。**
+
+:::info[名字为什么叫 args]
+`args` 只是约定俗成的名字（arguments 的缩写），叫 `*nums` 也行。**关键是那个星号 `*`**。
+:::
+
+### 配合普通参数
+
+```python
+def greet(greeting, *names):
+    for n in names:
+        print(f"{greeting}，{n}")
+
+greet("你好", "小明", "小红", "小刚")
+```
+
+输出：
+
+```text
+你好，小明
+你好，小红
+你好，小刚
+```
+
+## `**kwargs`：接收任意个关键字参数
+
+```python
+def show_info(**kwargs):
+    print(f"kwargs 是 {kwargs}")
+    for k, v in kwargs.items():
+        print(f"  {k} = {v}")
+
+show_info(name="小明", age=18, city="北京")
+```
+
+输出：
+
+```text
+kwargs 是 {'name': '小明', 'age': 18, 'city': '北京'}
+  name = 小明
+  age = 18
+  city = 北京
+```
+
+**`**kwargs` 把所有关键字参数收成一个字典。**
+
+### 四种参数一起用
+
+```python
+def mixed(a, b=2, *args, **kwargs):
+    print(f"a={a} b={b} args={args} kwargs={kwargs}")
+
+mixed(1)
+mixed(1, 3)
+mixed(1, 3, 5, 7)
+mixed(1, 3, 5, name="x", city="y")
+```
+
+输出：
+
+```text
+a=1 b=2 args=() kwargs={}
+a=1 b=3 args=() kwargs={}
+a=1 b=3 args=(5, 7) kwargs={}
+a=1 b=3 args=(5,) kwargs={'name': 'x', 'city': 'y'}
+```
+
+:::tip[参数顺序固定]
+```
+def f(普通参数, 有默认值的, *args, **kwargs):
+        ↑           ↑           ↑       ↑
+      必须在前    其次        第三    最后
+```
+
+这个顺序不能变，否则语法错误。
+:::
+
+## 拆包：把列表/字典展开传参
+
+```python
+def add(a, b, c):
+    return a + b + c
+
+nums = [1, 2, 3]
+print(add(*nums))          # 用 * 把列表拆成位置参数
+```
+
+输出：
+
+```text
+6
+```
+
+字典用 `**`：
+
+```python
+def introduce(name, age):
+    print(f"{name}，{age}岁")
+
+info = {"name": "小明", "age": 18}
+introduce(**info)
+```
+
+输出：
+
+```text
+小明，18岁
+```
+
+:::tip[拆包的实用场景]
+最常见的是「把配置字典直接传给函数」：
+
+```python
+config = {"host": "localhost", "port": 8080, "timeout": 30}
+connect(**config)
+```
+
+不用一个个手动传。
+:::
+
+## 默认值在定义时求值
+
+这是个容易忽略的细节：
+
+```python
+import time
+
+def log(msg, timestamp=time.time()):
+    print(f"[{timestamp:.0f}] {msg}")
+
+a = log("第一条")
+time.sleep(0.1)
+log("第二条")
+```
+
+**两条的时间戳会完全相同**，因为默认值 `time.time()` 只在**定义函数时**算了一次。
+
+:::warning[想要「每次调用时取当前时间」怎么办]
+```python
+def log(msg, timestamp=None):
+    if timestamp is None:
+        timestamp = time.time()
+    print(f"[{timestamp:.0f}] {msg}")
+```
+
+**这和可变默认参数是同一类问题**：默认值只在定义时求值一次。
+
+规则：**默认值不要写「会变化的东西」**（时间、随机数、函数调用结果）。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `def f(a=[]):` | 数据累积 | 默认值只创建一次 | 用 `None` 占位 |
+| `x is None` 写成 `x == None` | 一般能用但不规范 | `==` 可能被重载 | 用 `is` |
+| 默认值放在无默认值前 | SyntaxError | 顺序错误 | 有默认值的往后放 |
+| `*args` 当列表用 | `args.append()` 报错 | 它是**元组** | 转成 list 或用 `+` |
+| 关键字参数写在位置参数前 | SyntaxError | 顺序错误 | 位置参数在前 |
+| 拆包时参数不匹配 | TypeError | 元素个数不对 | 检查参数数量 |
+
+:::danger[*args 是元组，不能 append]
+```python
+def f(*args):
+    args.append(1)      # AttributeError: 'tuple' object has no attribute 'append'
+```
+
+要修改就先转换：
+
+```python
+def f(*args):
+    lst = list(args)
+    lst.append(1)
+    return lst
+```
+:::
+
+## 本课自检
+
+- [ ] 分清位置参数和关键字参数
+- [ ] 会用默认值，知道默认参数要放后面
+- [ ] **能解释可变默认参数为什么会累积数据**
+- [ ] 知道正确写法是 `lst=None` + `if lst is None`
+- [ ] 知道判断 None 要用 `is`
+- [ ] 会用 `*args` 接收任意位置参数（知道它是元组）
+- [ ] 会用 `**kwargs` 接收任意关键字参数（知道它是字典）
+- [ ] 会按 `普通 → 默认 → *args → **kwargs` 的顺序写
+- [ ] 会用 `*` 和 `**` 拆包传参
+- [ ] 知道默认值在定义时求值一次
+
+## 下一步
+
+[17 作用域与全局变量](./17-scope) —— 搞清变量在哪能用，以及为什么尽量别用全局变量。

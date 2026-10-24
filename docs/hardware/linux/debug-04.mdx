@@ -1,0 +1,192 @@
+---
+id: debug-04
+title: "04 本主线常见坑全集"
+sidebar_position: 5
+description: "调试与优化 第 4 部分：本主线常见坑全集"
+---
+
+# 04 本主线常见坑全集
+把 11 页里最容易踩的坑汇总在这里。
+
+### 8.1 环境与命令
+
+| 症状 | 病根 | 详见 |
+| --- | --- | --- |
+| `Permission denied` 但看着有权限 | **父目录缺 `x`** | [shell](./shell) |
+| 文件删不掉 | 需要的是**目录的 w** 权限 | [shell](./shell) |
+| 改 umask 后已有文件权限没变 | umask 只对新建生效 | [shell](./shell) |
+| `find \| xargs` 删错文件 | 文件名含空格，用 `-print0`/`-0` | [shell](./shell) |
+| `2>&1 > file` stderr 仍在屏幕 | 顺序反了 | [shell](./shell) |
+| 变量被拆成两个参数 | 没加双引号 | [shell](./shell) |
+
+### 8.2 进程
+
+| 症状 | 病根 | 详见 |
+| --- | --- | --- |
+| fork 后输出重复 | 子进程用了 `exit()` 而非 `_exit()` | [process](./process) |
+| 僵尸 `kill -9` 杀不掉 | 僵尸已死，杀**父进程** | [process](./process) |
+| `kill -9` 也杀不掉进程 | **D 状态**（等 IO） | [process](./process) |
+| 退出码不对 | 退出码只有 8 位 | [process](./process) |
+| 后台程序串口断开后死了 | 收到 SIGHUP，用 `nohup` | [process](./process) |
+
+### 8.3 文件系统
+
+| 症状 | 病根 | 详见 |
+| --- | --- | --- |
+| 磁盘满但 `df -h` 有空间 | **inode 耗尽**，`df -i` | [filesystem](./filesystem) |
+| `rm` 了文件空间没释放 | 文件仍被进程打开 | [filesystem](./filesystem) |
+| Raw NAND 用 ext4 几个月变砖 | 必须 UBIFS | [filesystem](./filesystem) |
+| `mount` 报 device is busy | 有进程在用 | [filesystem](./filesystem) |
+
+### 8.4 编程与构建
+
+| 症状 | 病根 | 详见 |
+| --- | --- | --- |
+| 改了 `.h` 没重编 | 缺 `-MMD -MP` | [build-system](./build-system) |
+| `missing separator` | 用了空格不是 TAB | [build-system](./build-system) |
+| printf 输出在崩溃时丢失 | 全缓冲未 flush | [sysprog](./sysprog) |
+| ET 模式数据读不全 | 必须循环读到 `EAGAIN` | [sysprog](./sysprog) |
+
+### 8.5 交叉编译
+
+| 症状 | 病根 | 详见 |
+| --- | --- | --- |
+| `Exec format error` | 架构不对 | [cross-compile](./cross-compile) |
+| 文件存在却报 No such file | **ld.so 路径不对** | [cross-compile](./cross-compile) |
+| `GLIBC_2.xx not found` | 工具链 glibc 比 rootfs 新 | [cross-compile](./cross-compile) |
+| 浮点结果错但不报错 | `gnueabi`/`gnueabihf` 混用 | [cross-compile](./cross-compile) |
+| `LD_LIBRARY_PATH` 无效 | 程序用的是 RPATH | [cross-compile](./cross-compile) |
+
+### 8.6 内核与启动
+
+| 症状 | 病根 | 详见 |
+| --- | --- | --- |
+| 串口乱码 | 波特率不对 | [boot](./boot) |
+| 串口完全无输出 | 供电/接线/启动介质 | [boot](./boot) |
+| `VFS: Unable to mount root fs` | `root=` 错或存储驱动缺失 | [boot](./boot) |
+| `Starting kernel...` 后死寂 | `console=` 错，加 `earlyprintk` | [boot](./boot) |
+| 改了 U-Boot 变量重启丢失 | 忘了 `saveenv` | [boot](./boot) |
+
+### 8.7 rootfs
+
+| 症状 | 病根 | 详见 |
+| --- | --- | --- |
+| `unable to open an initial console` | 缺 `/dev/console` | [rootfs](./rootfs) |
+| 进了 shell 但命令不存在 | BusyBox 链接没建 | [rootfs](./rootfs) |
+| `error while loading shared libraries` | 库没拷进 rootfs | [rootfs](./rootfs) |
+| overlayfs 挂载失败 | workdir/upperdir 不同文件系统 | [rootfs](./rootfs) |
+
+## 9. 验证
+
+```bash
+# === 本机可做（实测）===
+
+# 1. gdb 批处理调试
+gcc -g -O0 -o /tmp/t /tmp/t.c
+gdb -q -batch -x /tmp/g.txt /tmp/t
+
+# 2. core dump 配置检查
+cat /proc/sys/kernel/core_pattern
+ulimit -c                      # 0 表示不生成，要改
+
+# 3. 看进程卡在哪
+cat /proc/1/wchan
+ps -eo pid,stat,wchan:30,comm --no-headers | head
+
+# 4. D 状态进程
+ps -eo stat,pid,comm --no-headers | awk '$1 ~ /D/'
+
+# 5. 内存
+grep -E 'MemTotal|MemAvailable|Cached' /proc/meminfo
+cat /proc/vmstat | grep oom_kill
+
+# 6. 内核日志
+dmesg -l err,warn | tail
+dmesg -n 8                     # 打开全部级别
+
+# 7. SysRq（谨慎！b 会重启）
+cat /proc/sys/kernel/sysrq
+echo t > /proc/sysrq-trigger   # 打印进程堆栈到 dmesg
+
+# 8. 资源与限制
+cat /proc/sys/fs/file-nr
+cat /proc/sys/fs/file-max
+cat /proc/loadavg
+
+# 9. Sanitizer
+gcc -fsanitize=address -g -o /tmp/as_test /tmp/t.c && /tmp/as_test
+```
+
+## 常见坑
+
+| 症状 | 病根 |
+| --- | --- |
+| 串口全是乱码 | 波特率错（115200 最常见，有 1500000 的板子） |
+| 串口无输出 | TX/RX 没交叉；没共地；电平不对（TTL vs RS232） |
+| `screen` 连上串口没反应 | 流控没关；或波特率错 |
+| gdb 里变量显示 `<optimized out>` | 编译时用了 `-O2`。调试用 `-O0 -g` |
+| gdb 提示 no debugging symbols | 没有 `-g`，或被 strip 了 |
+| core 文件没生成 | `ulimit -c` 是 0。改 `ulimit -c unlimited` |
+| core 文件生成了但 gdb 打不开 | gdb 加载的程序与产生 core 的程序不匹配 |
+| gdbserver 连不上 | 板子防火墙/网络；或端口被占；确认 IP |
+| 远程调试栈是乱的 | 两端程序版本不一致，或 sysroot 没设对 |
+| `dmesg` 报 Operation not permitted | `dmesg_restrict=1`，非 root 不能读 |
+| 内核日志看不到 `pr_info` | console_loglevel 太低，`dmesg -n 8` |
+| 系统卡死但 loadavg 很高 | 可能有 D 状态进程。查 `ps` 和 `wchan` |
+| `kill -9` 杀不掉 | D 状态。查存储/NFS |
+| 卡死但完全没线索 | 用 SysRq：`echo t > /proc/sysrq-trigger` |
+| 程序运行一段时间被杀，无日志 | **OOM killer**。查 `dmesg \| grep -i oom` |
+| 板子莫名重启 | 供电不足、过热、看门狗、或 `panic=N` 参数 |
+| 间歇性 IO error | 供电不足（SD 卡启动时电流峰值）；或劣质 SD 卡 |
+| perf 装不上 | 需要**与内核版本匹配**的 perf，且要有内核调试符号才能解析函数 |
+| strace 在板子上没有 | 用 gdb 的 `catch syscall` 替代 |
+| top 显示 CPU 100% 但 load 不高 | 单线程死循环；看 `%CPU` 定位进程 |
+
+## 自检清单
+
+- [ ] 说出串口接线的三条规则（TX/RX 交叉、共地、TTL 电平）
+- [ ] 说出最常见的串口波特率，以及一个例外值
+- [ ] 说出编译调试版程序的两个必要选项（`-g`、`-O0`）
+- [ ] 说出打开 core dump 的方法（`ulimit -c unlimited`）
+- [ ] 解释 gdbserver 远程调试的分工（板子跑什么、PC 跑什么）
+- [ ] 说出 `dmesg -n 8` 的作用
+- [ ] 说出 `/proc/sys/kernel/printk` 第一个数字的含义
+- [ ] 说出没有 `strace` 时追踪系统调用的替代方法
+- [ ] 说出没有 `iostat` 时查 IO 的替代方法
+- [ ] 区分内核 panic 与内核 hang
+- [ ] 说出排查卡死的六步顺序中至少四步
+- [ ] 解释 `/proc/<pid>/wchan` 的用途，并能判读 `futex_wait`、`__lock_page` 的含义
+- [ ] 说出 D 状态为什么杀不掉
+- [ ] 说出 SysRq 的 `t` 和 `b` 各做什么，以及无键盘时怎么触发
+- [ ] 说出嵌入式卡死最常见的三个硬件原因
+- [ ] 说出 PSI 相比 loadavg 的优势
+- [ ] 说出 ASan 能检测什么，以及它的代价
+
+## 下一步
+
+你已经走完了整条 Linux 主线。接下来：
+
+**继续深入**：
+- [内核与驱动入门](./kernel)——写一个真正的字符设备驱动
+- [根文件系统](./rootfs)——用 Buildroot 自动化生成完整系统
+
+**回到其他主线**：
+- [硬件总览](../../hardware/)——ESP32、STM32 与 Linux 的定位对比
+- [完整编程课程](../../course/)——补全 C 语言与嵌入式基础
+- [芯片选型](../../chips/)——挑选你的下一块板子
+
+**实践建议**：
+
+:::tip[学完之后做什么]
+1. **买一块板子**（树莓派、NanoPi、RK3566 开发板均可，几十到几百元）
+2. **用 Buildroot 构建一个最小系统**并烧录启动
+3. **写一个字符设备驱动**并 `insmod` 进去
+4. **交叉编译一个带第三方依赖的应用**跑到板子上
+5. 把每一页的"常见坑"当成 checklist，遇到问题时回来对照
+
+**没有板子，这套知识会一直停留在纸面。**
+:::
+
+---
+
+**翻页**：[← 上一页](./debug-03) · [返回目录](./)

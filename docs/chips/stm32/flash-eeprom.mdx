@@ -1,0 +1,300 @@
+---
+id: flash-eeprom
+title: "11 Flash 读写与 EEPROM 模拟"
+sidebar_position: 11
+description: F103 没有内部 EEPROM、Flash 的擦写规则与寿命、用两页乒乓做磨损均衡、什么时候该外挂 EEPROM 或 FRAM。
+---
+
+# 11 Flash 读写与 EEPROM 模拟
+
+**本课目标**：知道怎么可靠地在 Flash 里存参数。
+
+## 先说个坏消息
+
+:::danger[STM32F103 没有内部 EEPROM]
+**F103 全系列都没有 EEPROM**（F0/F3/L 系列部分型号有）。
+
+**能用的只有 Flash**，而 Flash 和 EEPROM 有三个关键区别：
+
+| 特性 | EEPROM | **STM32 Flash** |
+| --- | --- | --- |
+| 擦除粒度 | **字节** | **整页（1KB 或 2KB）** |
+| 写入粒度 | 字节 | **半字（16 位，F103）** |
+| 擦写寿命 | 100 万次 | **1 万次** |
+| 写入时的读取 | 可以 | **整个 Flash 停住**（程序会暂停） |
+
+**"改一个字节"这件事在 Flash 上做不到** —— 必须把整页 1KB 读出来、改一个字节、擦整页、再写回去。
+:::
+
+:::warning[寿命怎么估算]
+假设每秒存一次参数：
+
+```text
+1 万次 / 每秒 1 次 = 10000 秒 ≈ 2.8 小时
+```
+
+**不到三小时就把一页写坏了。**
+
+**所以"每次变化就存 Flash"是绝对不能接受的**，必须做优化（见下文）。
+:::
+
+## 基本操作
+
+```c
+/* ① 解锁 */
+HAL_FLASH_Unlock();
+
+/* ② 清标志（不清会导致后续操作失败） */
+__HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_PGERR | FLASH_FLAG_WRPRTERR);
+
+/* ③ 擦除一页（必须整页） */
+FLASH_EraseInitTypeDef er = {
+    .TypeErase   = FLASH_TYPEERASE_PAGES,
+    .PageAddress = 0x0800FC00,       /* 最后一页（1KB 页） */
+    .NbPages     = 1,
+};
+uint32_t page_err = 0;
+if (HAL_FLASHEx_Erase(&er, &page_err) != HAL_OK) { /* 失败 */ }
+
+/* ④ 写半字 */
+for (uint32_t i = 0; i < len; i += 2) {
+    uint16_t hw = data[i] | (data[i + 1] << 8);
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, addr + i, hw);
+}
+
+/* ⑤ 上锁 */
+HAL_FLASH_Lock();
+```
+
+:::danger[Flash 写入的三条铁律]
+**① 写之前必须擦**
+Flash 只能把 1 写成 0。要写新内容必须先把整页擦成 `0xFF`。
+
+**② 不能写到非 `0xFF` 的位置**
+对已经写过的位置再写一遍，结果会是"与"（只能变 0），不是覆盖。
+
+**③ 擦写期间 CPU 会停住**
+F103 的 Flash 没有双存储体，擦写时取指会暂停（**程序靠 RAM 里的代码继续跑**）。
+
+**实际影响**：擦一页约 20~40ms，期间**所有中断都被延迟**。串口可能丢字节。
+
+**解决**：擦写期间关掉非必要中断，或者把擦写放在"本来就没活干"的时刻。
+:::
+
+## 存在哪里
+
+:::info[F103C8T6（64KB Flash）的布局建议]
+```text
+0x08000000 ~ 0x0800FBFF   程序（63 KB）
+0x0800FC00 ~ 0x0800FFFF   参数区（1 页 1KB = 0x400）
+```
+
+**注意**：F103 中容量型号页大小 **1KB**，大容量型号（256KB 以上）是 **2KB**。
+
+**算错页大小，会误擦掉代码** —— 这是非常危险的操作。
+
+**确认方法**：查对应型号的参考手册（RM0008 的 Flash 章节）或看 CubeMX 的 Flash 视图。
+:::
+
+:::warning[把参数区放在最后一页的理由]
+- 链接脚本的 LENGTH 也要相应减掉这一页，避免代码长过去
+- 最后一页在地址上是"最高处"，改起来直观
+- 但要防止代码增长后越界覆盖 → 在链接脚本里把 LENGTH 减掉
+
+```ld
+FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 63K     /* 原来是 64K */
+```
+:::
+
+## EEPROM 模拟：两页乒乓
+
+:::tip[核心思想：不覆盖，只追加]
+```text
+第 A 页： [记录1][记录2][记录3][...][空][空]
+             ↓ 追加写，直到写满
+第 B 页： 把最后一条有效记录搬到 B 页开头，擦掉 A 页
+             ↓
+第 A 页： [空]（等 B 页写满再反过来）
+```
+
+**好处**：
+
+1. **擦除次数减半**（两页轮流，每页的擦除次数是总写入次数的一半）
+2. **每次只需写一小段**（不用读整页-改-写整页）
+3. 突然掉电只丢最后一条记录
+:::
+
+```c
+/* 简化版实现（📋 示例，未在硬件验证） */
+#define PAGE_A   0x0800F800U
+#define PAGE_B   0x0800FC00U
+#define PAGE_SZ  0x400U               /* 1KB */
+
+typedef struct {
+    uint16_t key;
+    uint16_t len;
+    uint32_t value;
+    uint32_t crc;
+} record_t;                            /* 12 字节 */
+
+static uint32_t cur_page = PAGE_A;
+
+/* 找到当前页里最后一条有效记录的位置 */
+static uint32_t find_write_pos(uint32_t page)
+{
+    uint32_t p = page;
+    while (p < page + PAGE_SZ) {
+        uint32_t k = *(volatile uint32_t *)p;
+        if (k == 0xFFFFFFFF) break;    /* 空位置 */
+        p += sizeof(record_t);
+    }
+    return p;
+}
+
+/* 写入一条 */
+int param_save(uint16_t key, uint32_t value)
+{
+    uint32_t pos = find_write_pos(cur_page);
+
+    if (pos + sizeof(record_t) > cur_page + PAGE_SZ) {
+        /* 当前页满了 → 切到另一页 */
+        uint32_t other = (cur_page == PAGE_A) ? PAGE_B : PAGE_A;
+
+        /* 把当前页最后一条有效记录搬到新页 */
+        /* ... 这里省略读-校验-搬的细节 ... */
+
+        HAL_FLASH_Unlock();
+        erase_page(other);
+        HAL_FLASH_Lock();
+
+        cur_page = other;
+        pos = cur_page;
+    }
+
+    record_t r = { key, sizeof(value), value, crc32_of(&r, 8) };
+
+    HAL_FLASH_Unlock();
+    write_record(pos, &r);
+    HAL_FLASH_Lock();
+
+    return 0;
+}
+```
+
+:::danger[掉电安全靠 CRC]
+每次读记录都要校验 CRC：
+
+```c
+if (record.crc != calc_crc(&record)) {
+    /* 这条记录是掉电写了一半的，跳过 */
+}
+```
+
+**没有 CRC 的话，掉电瞬间写坏的记录会被当作有效数据读出来**——可能是一个完全错误的参数值。
+:::
+
+## 减少写入次数的实用技巧
+
+:::tip[五个立竿见影的办法]
+**① 只在"真正变化"时写**
+```c
+if (new_value != old_value) save_to_flash(new_value);
+```
+
+**② 攒够一批再写**
+```c
+/* 分别记录，但每 5 分钟才落一次 Flash */
+if (now - last_save_ms > 300000) { save_all(); last_save_ms = now; }
+```
+
+**③ 掉电时才写**（需要电压检测）
+```c
+/* 检测到 3.3V 降到 3.0V（LVD 中断或 ADC 监测）→ 立刻保存 */
+void save_before_power_loss(void) { save_all(); }
+```
+
+**④ 关键参数放备份寄存器**（BKP，寿命无限）
+```c
+HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR1, checksum);
+```
+**前提**：有 VBAT 或 VDD 不断电。
+
+**⑤ 换器件**
+参数频繁变化的应用，**外挂 EEPROM 或 FRAM 才是正解**（见下节）。
+:::
+
+## 什么时候该换器件
+
+| 需求 | 推荐 |
+| --- | --- |
+| 参数几乎不变（校准值、出厂设置） | **内部 Flash 就够** |
+| 参数偶尔变（每天几十次） | Flash + 乒乓页 |
+| **参数频繁变（每秒级）** | **外挂 I2C EEPROM 或 FRAM** |
+| 关键数据不容许丢 | **FRAM**（写多少都行） |
+
+:::info[三种常见外挂方案对比]
+| 器件 | 接口 | 寿命 | 写速度 | 价格量级 |
+| --- | --- | --- | --- | --- |
+| **AT24C02**（EEPROM） | I2C | 100 万次 | 慢（5ms/字节页） | 很低 |
+| **AT24C256**（EEPROM） | I2C | 100 万次 | 较慢 | 很低 |
+| **FM24C02**（FRAM） | I2C | **10¹² 次以上** | **快（无等待）** | 中 |
+
+**FRAM 是"内存式的 EEPROM"**：写进去立刻生效，不需要等待，几乎不会磨损。
+
+**代价是贵一些**——但对"断电前必须存下最后一条数据"的场景，是最省心的选择。
+:::
+
+:::warning[EEPROM 写入必须等（不像 RAM）]
+```c
+/* AT24C 系列写完一页后需要 5ms 左右内部烧写时间 */
+i2c_write_page(addr, buf, len);
+HAL_Delay(5);                  /* 必须等，否则下次写会被 NAK */
+```
+
+**这叫"应答轮询"（Acknowledge Polling）**：写完立刻发地址，如果器件返回 NAK 就说明还在忙，重试直到 ACK。比固定延时不浪费时间。
+
+**FRAM 完全不需要等**——写进去就完成了。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 擦除把程序擦掉了 | 页地址算错 / 页大小搞错 | 查手册确认页大小 |
+| 写的数据读出来不对 | 没擦就写 | 先 `HAL_FLASHEx_Erase` |
+| 写了一次后改不了 | 对非 0xFF 位置重复写 | 必须整页擦 |
+| 偶尔参数变乱 | 掉电写一半 | 加 CRC 校验 |
+| 擦写时串口丢数据 | Flash 停住 CPU 20~40ms | 擦写时关中断或减少频率 |
+| 几个月就把 Flash 写坏 | 频繁写同一页 | 乒乓页 + 减少写入次数 |
+| 读参数读到旧值 | 没找最后一条 | 从头扫描找最后有效记录 |
+| 写返回 HAL_ERROR | 标志没清 | `__HAL_FLASH_CLEAR_FLAG` |
+
+:::danger[调试时不要把参数区擦到地址 0 附近]
+**误擦 `0x08000000` 会把向量表擦掉** → 一复位就死，只能重新烧。
+
+**保护措施**：
+
+```c
+/* 在擦除前加断言 */
+assert_param(page_addr >= 0x0800F000);
+```
+:::
+
+## 本课自检
+
+- [ ] **知道 F103 没有内部 EEPROM，只有 Flash**
+- [ ] **知道 Flash 擦除是整页、写入是半字**
+- [ ] **知道 F103 中容量型号页大小 1KB、大容量 2KB**
+- [ ] **知道 Flash 寿命约 1 万次，每秒写一次三小时就坏**
+- [ ] 记住三条铁律：先擦后写、不能重复写非 0xFF、擦写期间 CPU 停
+- [ ] 会算参数区在链接脚本里要减掉多少
+- [ ] **理解乒乓两页的磨损均衡原理**
+- [ ] **知道记录必须带 CRC 才能扛掉电**
+- [ ] 能说出五种减少写入次数的方法
+- [ ] **知道频繁写参数该换 EEPROM 或 FRAM**
+- [ ] 知道 FRAM 几乎无磨损且写入无等待
+- [ ] 知道 EEPROM 写完要等（应答轮询）
+
+## 下一步
+
+[12 性能优化与代码尺寸](./performance) —— 让代码跑得更快、塞得更小。

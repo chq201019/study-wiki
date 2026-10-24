@@ -1,0 +1,258 @@
+---
+id: memory-profiling
+title: Python 内存分析
+sidebar_position: 35
+description: tracemalloc 定位内存增长、objgraph 找引用链、weakref 验证回收、以及判断"真泄漏"还是"分配器池"的方法。
+---
+
+# Python 内存分析
+
+**本课目标**：能定位"进程内存一直涨"的根因，而不是靠猜。
+
+## 先排除假象
+
+:::danger[内存涨有三种情况不是泄漏]
+1. **启动预热**：加载数据、建索引，一次性上涨后稳定
+2. **分配器不归还**：`free` 了但留在 arena 里复用
+3. **缓存本意**：`lru_cache` 占的内存是该占的
+
+**判断方法**：让业务负载归零，观察还涨不涨。
+
+**不涨 → 不是泄漏。还涨 → 继续查。**
+:::
+
+```bash
+# 看 RSS 趋势（不是看一次快照）
+while true; do
+  ps -o rss= -p $PID
+  sleep 60
+done
+```
+
+## `tracemalloc`：Python 层的分配追踪
+
+```python
+import tracemalloc
+
+tracemalloc.start()
+
+# ... 跑一段时间 ...
+
+snapshot = tracemalloc.take_snapshot()
+for stat in snapshot.statistics("lineno")[:10]:
+    print(stat)
+```
+
+输出形如：
+
+```text
+/app/service.py:142: size=125 MiB, count=98000, average=1.3 KiB
+/app/cache.py:33: size=42 MiB, count=12000, average=3.6 KiB
+```
+
+:::tip[对比两个快照才能看出"增量"]
+```python
+snap1 = tracemalloc.take_snapshot()
+run_load()
+snap2 = tracemalloc.take_snapshot()
+
+for stat in snap2.compare_to(snap1, "lineno")[:10]:
+    print(stat)          # 只显示新增的分配
+```
+
+**只看单次快照会被"本来就有的大对象"淹没**，看 diff 才知道是谁在涨。
+:::
+
+:::warning[`tracemalloc` 有明显开销]
+**它会记录每次分配的调用栈** —— 大约 2~4 倍慢、额外内存占用。
+
+**只在排查时开**：
+
+```python
+# 只跟踪最近 25 帧，减少开销
+tracemalloc.start(25)
+```
+:::
+
+## 按对象类型统计：`gc` + `collections`
+
+```python
+import gc
+from collections import Counter
+
+c = Counter(type(o).__name__ for o in gc.get_objects())
+for name, n in c.most_common(15):
+    print(f"{name:20s} {n}")
+```
+
+**按类型看数量**能快速发现"某类对象异常多"（比如 10 万个 `dict`）。
+
+:::warning[`gc.get_objects()` 本身会占内存]
+**它会构造一个包含所有对象的列表** —— 对象很多时（几百 MB 级）可能直接 OOM。
+
+**生产环境慎用**，或用 `gc.get_count()` 先看总量。
+:::
+
+## `objgraph`：找引用链
+
+```python
+import objgraph
+
+# 数量增长最快的对象类型
+objgraph.show_growth(limit=10)
+
+# 谁引用着某个对象（向上找）
+objgraph.show_chain(
+    objgraph.find_backref_chain(obj, objgraph.is_proper_module),
+    filename="chain.png")
+```
+
+:::tip[`show_growth` 是定位泄漏的第一步]
+```text
+dict      50000  +49800
+list      12000  +11900
+MyObject   9000   +9000
+```
+
+**"+N" 就是这一轮新增的数量** —— 一眼看出该查哪个类型。
+:::
+
+## 常见泄漏模式
+
+:::danger[① 全局缓存无上限]
+```python
+_cache = {}
+
+def get(k):
+    if k not in _cache:
+        _cache[k] = build(k)      # 永远不清理
+    return _cache[k]
+```
+
+**改用 `functools.lru_cache(maxsize=N)` 或 `WeakValueDictionary`。**
+:::
+
+:::danger[② 注册了回调但从不注销]
+```python
+event_bus.subscribe(obj.on_event)      # obj 永远不会被回收
+```
+
+**事件总线持有 `obj` 的强引用 → `obj` 的引用计数永远 ≥1。**
+
+**改用 `weakref.WeakSet` 存订阅者。**
+:::
+
+:::danger[③ 异常对象持有 traceback]
+```python
+except Exception as e:
+    _last_error = e          # e 持有整个调用栈的帧
+```
+
+**`e.__traceback__` 引用着所有栈帧，帧里又有局部变量** —— 一个大对象就被这么留住了。
+
+**解法**：只存 `str(e)`，或用 `traceback.clear_frames(e.__traceback__)`。
+:::
+
+:::danger[④ 循环引用 + `__del__`]
+**有 `__del__` 的循环引用在 Python 3.4 之前无法被 GC 回收。**
+
+**现代 Python 能处理，但仍有边界情况**（比如对象在 `__del__` 里又复活自己）。
+
+**规则**：不要在 `__del__` 里做重要清理，用 `with` 或显式 `close()`。
+:::
+
+:::danger[⑤ 闭包捕获了大对象]
+```python
+def make_handler():
+    big = load_100mb()
+    return lambda: big.something()      # big 一直被闭包持有
+```
+
+**只要 handler 活着，`big` 就不会释放。**
+:::
+
+## 验证回收是否正常
+
+```python
+import gc, weakref
+
+obj = BigThing()
+r = weakref.ref(obj)
+
+del obj
+gc.collect()
+
+print(r())          # 应该是 None（已被回收）
+```
+
+:::tip[`weakref` 是验证"到底有没有释放"的最可靠手段]
+**不用猜，直接问"那个对象还在吗"。**
+
+**如果 `r()` 还返回对象** → 有别的东西持有它 → 去用 `objgraph.find_backref_chain` 找。
+:::
+
+## 一个完整的排查流程
+
+```python
+import gc, tracemalloc, weakref
+
+def diagnose(workload, rounds=5):
+    tracemalloc.start(10)
+    gc.collect()
+    base = tracemalloc.take_snapshot()
+
+    for i in range(rounds):
+        workload()
+        gc.collect()
+
+    snap = tracemalloc.take_snapshot()
+    print("=== 增长最快的分配点 ===")
+    for s in snap.compare_to(base, "lineno")[:8]:
+        print(s)
+
+    print("=== 对象总数 ===")
+    print(len(gc.get_objects()))
+    tracemalloc.stop()
+```
+
+**跑多轮再对比** —— 一轮可能只是缓存预热，多轮持续增长才是泄漏。
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| RSS 涨但 tracemalloc 看不到 | 是 C 扩展分配的内存 | 用 `malloc_stats` / valgrind |
+| 快照里全是自己写的大对象 | 只看单次快照 | 用 `compare_to` 看 diff |
+| `gc.get_objects()` 直接 OOM | 对象太多 | 改用 `objgraph.show_growth` |
+| 开 tracemalloc 后超时 | 开销 2~4 倍 | 缩短采样窗口 |
+| `del` 后对象还在 | 循环引用或有其他强引用 | `weakref` 验证 + 找 backref |
+| 内存不降但没泄漏 | glibc arena 不归还 | 看长期趋势，或调 `MALLOC_TRIM_THRESHOLD_` |
+
+:::danger[Python 层看到的和 OS 看到的可能差很多]
+**RSS 包含**：
+
+- Python 对象（tracemalloc 能看）
+- **C 扩展的分配**（numpy 数组、PIL 图像 —— tracemalloc 看不到）
+- 解释器本身、模块代码
+- **分配器的碎片**
+
+**所以 tracemalloc 显示平稳但 RSS 涨 → 是 C 扩展的问题**，要用 valgrind 或 `malloc_stats`。
+:::
+
+## 本课自检
+
+- [ ] **知道内存涨有三种非泄漏情况（预热/分配器/缓存）**
+- [ ] 会用"负载归零"判断是不是真泄漏
+- [ ] 会用 `tracemalloc` 并知道要看 `compare_to` 的 diff
+- [ ] **知道 `tracemalloc` 有 2~4 倍开销**
+- [ ] 会用 `gc.get_objects` + `Counter` 按类型统计
+- [ ] **知道 `gc.get_objects()` 本身可能 OOM**
+- [ ] 会用 `objgraph.show_growth` 找增长最快的类型
+- [ ] **能说出五种常见泄漏模式**
+- [ ] 知道异常对象持有 traceback 会连带整条栈帧
+- [ ] **会用 `weakref` 验证对象是否真的被回收**
+- [ ] **知道 tracemalloc 看不到 C 扩展的分配**
+
+## 下一步
+
+[性能剖析与优化](./perf) 或 [弱引用与对象生命周期](./weakref)。

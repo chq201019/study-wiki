@@ -1,0 +1,312 @@
+---
+id: 14-network
+title: 14 网络基础
+sidebar_position: 14
+description: 看 IP 和路由、ping 测连通、curl 调接口、ss 看端口，以及网络不通时怎么一步步排查。
+---
+
+# 14 网络基础
+
+**本课目标**：会查 IP、测连通、看端口，能排查常见网络问题。
+
+## 看自己的 IP
+
+```bash
+ip addr                 # 完整信息
+ip -brief addr          # 简洁
+ip a                    # 简写
+```
+
+本机实测：
+
+```text
+lo               UNKNOWN        127.0.0.1/8 ::1/128
+enp3s0           UP             192.168.1.100/24 240e:39f:3d0:.../64
+br-9b1ef3aab873  DOWN           172.23.0.1/16
+```
+
+| 网卡 | 说明 |
+| --- | --- |
+| `lo` | **回环**（loopback），永远是 `127.0.0.1` |
+| `enp3s0` / `eth0` | 物理网卡 |
+| `br-xxx` / `docker0` | Docker 创建的网桥 |
+| `UP` / `DOWN` | 是否启用 |
+
+:::info[`/24` 是什么意思]
+`192.168.1.100/24` 里的 `/24` 是**子网掩码长度**。
+
+- `/24` = `255.255.255.0` → 前 24 位是网络号
+- 所以这个网段是 `192.168.1.0 ~ 192.168.1.255`
+
+常见：`/24`（家庭/办公网）、`/16`（较大网络）。
+:::
+
+:::warning[`ifconfig` 已经过时]
+```bash
+ifconfig            # ⚠️ 老命令，新系统可能没装
+ip addr             # ✅ 现代标准
+```
+
+`ifconfig`、`route`、`netstat` 属于 `net-tools` 包（已废弃），对应的现代命令是 `ip`、`ip route`、`ss`。
+:::
+
+## 看路由
+
+```bash
+ip route
+```
+
+本机实测（前三行）：
+
+```text
+default via 192.168.1.1 dev enp3s0 proto dhcp src 192.168.1.100 metric 1002
+172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1
+172.18.0.0/16 dev br-90cf70a58ca9 proto kernel scope link src 172.18.0.1
+```
+
+:::tip[`default via ...` 就是默认网关]
+**访问不在本网段的地址时，数据包发给这个网关。**
+
+```text
+default via 192.168.1.1    ← 所有不知道往哪发的，都交给 192.168.1.1（路由器）
+```
+
+**网络不通时，先确认有没有 default 路由。**
+:::
+
+## `ping`：测连通
+
+```bash
+ping -c 4 8.8.8.8          # 发 4 个包就停
+ping -c 4 baidu.com        # 测域名（同时测 DNS）
+ping -i 0.2 -c 5 host      # 间隔 0.2 秒
+```
+
+本机实测：
+
+```text
+--- 127.0.0.1 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 1026ms
+rtt min/avg/max/mdev = 0.150/0.151/0.153/0.001 ms
+```
+
+| 指标 | 含义 |
+| --- | --- |
+| `packet loss` | **丢包率**（>0 说明网络不稳） |
+| `rtt min/avg/max` | 往返延迟 |
+
+:::warning[`ping` 不通不代表服务挂了]
+很多服务器/防火墙**禁 ping**（丢 ICMP 包）。
+
+**ping 不通但 `curl` 能通**是正常的——只说明对方不回 ICMP，不代表网络断了。
+
+**测端口通不通用 `curl` 或 `nc`**：
+
+```bash
+curl -I http://example.com
+nc -zv example.com 80
+```
+:::
+
+:::danger[很多系统默认限制 ping]
+```bash
+ping -c 4 8.8.8.8
+# ping: socket: Operation not permitted
+```
+
+容器/受限环境里 ping 需要 `CAP_NET_RAW` 权限。**不是网络坏了**。
+:::
+
+## `curl`：最常用的网络工具
+
+```bash
+curl https://example.com                # 输出网页内容
+curl -I https://example.com             # 只要响应头
+curl -o out.html https://example.com    # 存文件
+curl -L https://example.com             # 跟随重定向
+curl -s https://api.github.com          # 静默（不显示进度）
+```
+
+### 调 JSON 接口
+
+```bash
+# GET
+curl -s https://api.github.com/users/torvalds | head -5
+
+# POST JSON
+curl -X POST https://httpbin.org/post \
+     -H "Content-Type: application/json" \
+     -d '{"name":"test"}'
+```
+
+:::tip[排查时最常用的三个组合]
+```bash
+# ① 只看状态码和响应头（测服务活着没）
+curl -sI http://localhost
+
+# ② 看完整请求过程（排查握手、DNS、超时）
+curl -v http://localhost
+
+# ③ 只显示状态码
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost
+```
+:::
+
+## `ss`：看端口
+
+```bash
+ss -tln                 # TCP 监听
+ss -tlnp                # 带进程名（需要 root）
+ss -tunlp               # 含 UDP
+ss -tan                 # 所有 TCP 连接（含已建立）
+```
+
+| 选项 | 含义 |
+| --- | --- |
+| `-t` | TCP |
+| `-u` | UDP |
+| `-l` | **监听中**（listening） |
+| `-n` | 显示数字端口（不解析服务名） |
+| `-p` | 显示进程 |
+
+:::tip[`netstat` 已被 `ss` 取代]
+```bash
+netstat -tlnp           # ⚠️ 老命令
+ss -tlnp                # ✅ 现代，更快
+```
+:::
+
+### 找谁占了端口
+
+```bash
+ss -tlnp | grep :8080
+# 或者
+sudo lsof -i :8080
+```
+
+## 网络故障排查流程
+
+![TCP 三次握手与四次挥手：SYN/SYN+ACK/ACK 建立连接，FIN/ACK/FIN/ACK 双向关闭，以及为什么是 3 和 4](/img/diagrams/net-tcp-handshake.svg)
+
+
+:::tip[从下往上排查（OSI 思路）]
+```bash
+# ① 本机网卡有没有 IP
+ip -brief addr
+
+# ② 有没有默认路由
+ip route | grep default
+
+# ③ 能否到达网关
+ping -c 2 $(ip route | awk '/default/ {print $3; exit}')
+
+# ④ 能否到达外网 IP（测路由+连通，跳过 DNS）
+ping -c 2 8.8.8.8
+
+# ⑤ DNS 能不能解析
+getent hosts baidu.com       # 或 nslookup baidu.com
+
+# ⑥ 目标服务的端口通不通
+curl -I http://baidu.com
+nc -zv baidu.com 443
+
+# ⑦ 本机有没有在监听
+ss -tlnp
+```
+:::
+
+| 卡在哪 | 说明 |
+| --- | --- |
+| ① 没 IP | DHCP 失败 / 网卡没启用 |
+| ② 没 default 路由 | 网关配置问题 |
+| ③ ping 网关不通 | 局域网/网线问题 |
+| ④ ping 8.8.8.8 不通 | 出口/防火墙问题 |
+| ⑤ 域名解析失败 | **DNS 配置问题**（能 ping IP 但域名不行） |
+| ⑥ 端口不通 | 服务没起 / 防火墙拦 |
+| ⑦ 本机没监听 | 服务没启动或只监听 127.0.0.1 |
+
+:::danger[服务只监听 `127.0.0.1` 导致外部访问不了]
+```text
+LISTEN  0  128  127.0.0.1:8080  0.0.0.0:*
+                └─ 只能本机访问
+
+LISTEN  0  128  0.0.0.0:8080    0.0.0.0:*
+                └─ 所有网卡都能访问
+```
+
+**`ss -tlnp` 看到地址是 `127.0.0.1` 就说明外部连不上**——要改服务配置监听 `0.0.0.0`。
+
+**这是"服务在本机能 curl 通、外部访问不了"最常见的原因。**
+:::
+
+## DNS 相关
+
+```bash
+cat /etc/resolv.conf            # DNS 服务器
+cat /etc/hosts                  # 本地静态解析（优先于 DNS）
+getent hosts example.com        # 用系统方式解析（尊重 hosts）
+```
+
+:::tip[`/etc/hosts` 优先级高于 DNS]
+```text
+127.0.0.1   localhost
+127.0.0.1   myapp.local        ← 加这行，本地就能用 myapp.local
+```
+
+**改 hosts 能立刻生效，不用动 DNS 服务器**——调试和屏蔽常用。
+:::
+
+## 完整示例
+
+```bash
+# ① 看网络配置
+ip -brief addr
+ip route | head -3
+
+# ② 测本机回环
+ping -c 2 127.0.0.1
+
+# ③ 测外网
+ping -c 2 8.8.8.8
+
+# ④ 测 DNS
+getent hosts debian.org
+
+# ⑤ 测 HTTP
+curl -sI https://debian.org | head -3
+
+# ⑥ 看本机监听
+ss -tln | head -5
+
+# ⑦ 看 hosts
+cat /etc/hosts
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 用 `ifconfig` | 命令不存在 | net-tools 已废弃 | 用 `ip` |
+| ping 不通就断定网络坏 | —— | 对方禁 ICMP | 用 `curl`/`nc` 测端口 |
+| 能 ping IP 不能 ping 域名 | DNS 问题 | resolv.conf 错误 | 查 `/etc/resolv.conf` |
+| 本机能访问外部不能 | 监听 127.0.0.1 | 只绑回环 | 改监听 `0.0.0.0` |
+| 端口不通 | 服务没起/防火墙 | —— | `ss -tlnp` + 查防火墙 |
+| `ss -p` 看不到进程 | 权限不够 | 需要 root | `sudo ss -tlnp` |
+
+## 本课自检
+
+- [ ] 会用 `ip addr` / `ip -brief addr` 看 IP
+- [ ] **知道 `/24` 是子网掩码长度**
+- [ ] 会用 `ip route` 看默认网关
+- [ ] 会用 `ping -c` 测连通
+- [ ] **知道 ping 不通不代表服务挂了（可能禁 ICMP）**
+- [ ] 会用 `curl -I` / `-v` / `-o` / `-L`
+- [ ] **知道 `curl -s -o /dev/null -w "%{http_code}"` 只看状态码**
+- [ ] 会用 `ss -tlnp` 看监听端口
+- [ ] **知道监听 `127.0.0.1` 和 `0.0.0.0` 的区别**
+- [ ] 掌握从网卡到端口的排查顺序
+- [ ] 知道 `/etc/hosts` 优先于 DNS
+
+## 下一步
+
+[15 远程登录与传文件](./15-ssh) —— `ssh` 和密钥登录，服务器管理的基础。

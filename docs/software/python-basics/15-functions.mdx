@@ -1,0 +1,387 @@
+---
+id: 15-functions
+title: 15 函数入门
+sidebar_position: 15
+description: 为什么要把代码打包成函数、def 的写法、参数与返回值、以及返回 None 的含义。
+---
+
+# 15 函数入门
+
+**本课目标**：会把重复代码打包成函数，理解参数和返回值。
+
+## 为什么需要函数
+
+假设你要计算三个矩形的面积：
+
+```python
+w1, h1 = 5, 3
+area1 = w1 * h1
+print(f"矩形1 面积 {area1}")
+
+w2, h2 = 8, 4
+area2 = w2 * h2
+print(f"矩形2 面积 {area2}")
+
+w3, h3 = 2, 7
+area3 = w3 * h3
+print(f"矩形3 面积 {area3}")
+```
+
+能用，但问题很明显：**同样的逻辑重复写了三遍**。如果要改公式（比如改成带单位换算），得改三处，还容易漏。
+
+用函数：
+
+```python
+def rect_area(w, h):
+    return w * h
+
+print(f"矩形1 面积 {rect_area(5, 3)}")
+print(f"矩形2 面积 {rect_area(8, 4)}")
+print(f"矩形3 面积 {rect_area(2, 7)}")
+```
+
+输出：
+
+```text
+矩形1 面积 15
+矩形2 面积 20
+矩形3 面积 14
+```
+
+**改公式只需改一处。**
+
+:::tip[函数的三个价值]
+1. **复用**：写一次，到处调用
+2. **命名**：`rect_area(5, 3)` 比 `5 * 3` 更能表达意图
+3. **隔离**：函数内部的变化不会影响外面，改起来放心
+
+程序越大，这三点越重要。**超过 3 行且会重复的逻辑，就该抽成函数。**
+:::
+
+## 定义与调用
+
+```python
+def greet():
+    print("你好")
+
+greet()
+greet()
+```
+
+输出：
+
+```text
+你好
+你好
+```
+
+结构拆解：
+
+```text
+def 函数名():        ← def + 名字 + 括号 + 冒号
+    函数体           ← 缩进的代码
+```
+
+:::warning[定义 ≠ 执行]
+```python
+def greet():
+    print("你好")
+
+# 到这里什么都不会输出！
+greet()      # 只有「调用」时才真正执行
+```
+
+**`def` 只是「告诉 Python 有这么个函数」，不会运行它。** 必须写 `函数名()` 才会执行。
+
+新手常见困惑：「我定义了为什么没反应？」——因为没调用。
+:::
+
+## 带参数
+
+参数让函数能处理不同的数据：
+
+```python
+def greet(name):
+    print(f"你好，{name}")
+
+greet("小明")
+greet("小红")
+```
+
+输出：
+
+```text
+你好，小明
+你好，小红
+```
+
+### 多个参数
+
+```python
+def introduce(name, age, city):
+    print(f"{name}，{age}岁，来自{city}")
+
+introduce("小明", 18, "北京")
+```
+
+输出：
+
+```text
+小明，18岁，来自北京
+```
+
+## 返回值
+
+`return` 把结果交回给调用者：
+
+```python
+def add(a, b):
+    return a + b
+
+result = add(3, 5)
+print(result)
+print(add(10, 20) * 2)
+```
+
+输出：
+
+```text
+8
+60
+```
+
+:::tip[return 和 print 的区别，这是新手最常混的]
+```python
+def f1(a, b):
+    print(a + b)      # 只显示，不返回
+
+def f2(a, b):
+    return a + b      # 返回结果
+
+x = f1(1, 2)          # 屏幕上显示 3
+print(x)              # None  ← 没返回值！
+
+y = f2(1, 2)          # 屏幕上什么都不显示
+print(y)              # 3
+```
+
+**`print` 是给人看的，`return` 是给程序用的。**
+
+想让结果能继续参与计算、能被赋值，必须用 `return`。
+:::
+
+### return 会立刻结束函数
+
+```python
+def check(n):
+    if n < 0:
+        return "负数"
+    print("这行在负数时不会执行")
+    return "非负"
+
+print(check(-5))
+print(check(5))
+```
+
+输出：
+
+```text
+负数
+这行在负数时不会执行
+非负
+```
+
+`return` 一旦执行，**函数立刻结束**，后面的代码不再运行。
+
+## 没有 return 时返回 None
+
+```python
+def show(msg):
+    print(msg)
+
+r = show("测试")
+print(f"返回值是 {r}")
+```
+
+输出：
+
+```text
+测试
+返回值是 None
+```
+
+:::info[None 是什么]
+`None` 是 Python 的特殊值，表示「什么都没有」。
+
+**所有没有 `return` 的函数，都返回 `None`。** 这不是 bug，是规定。
+
+所以：
+
+```python
+result = [3, 1].sort()      # 返回 None
+print(result)               # None
+```
+
+这就是为什么 `sort()` 不能赋值——[第 11 课](./11-list)提过。
+
+**看到 `None` 就想想：是不是用了没有返回值的函数？**
+:::
+
+## 返回多个值
+
+```python
+def min_max(numbers):
+    return min(numbers), max(numbers)
+
+low, high = min_max([3, 1, 4, 1, 5])
+print(f"最小 {low}，最大 {high}")
+```
+
+输出：
+
+```text
+最小 1，最大 5
+```
+
+:::tip[原理：其实返回的是元组]
+```python
+def f():
+    return 1, 2
+
+r = f()
+print(r)          # (1, 2)
+print(type(r))    # <class 'tuple'>
+```
+
+`return 1, 2` 实际返回一个元组。外面用 `a, b = f()` 是**元组解包**（[第 13 课](./13-tuple-set)讲过）。
+
+所以本质上 Python 只能返回一个值，只是那个值可以是元组。
+:::
+
+## 文档字符串
+
+函数第一行的三引号字符串是**文档字符串**（docstring），说明函数干什么：
+
+```python
+def rect_area(width, height):
+    """计算矩形面积。
+
+    参数:
+        width: 宽（正数）
+        height: 高（正数）
+    返回:
+        面积，浮点数
+    """
+    return width * height
+
+help(rect_area)
+```
+
+可以用 `help()` 查看。**写 docstring 是好习惯**，编辑器鼠标悬停也能看到。
+
+## 函数命名规范
+
+```python
+# 好
+def calculate_total_price(items):
+    ...
+
+# 差
+def calc(items):
+    ...
+def f(x):
+    ...
+```
+
+| 规范 | 说明 |
+| --- | --- |
+| 全小写 + 下划线 | `get_user_name` |
+| 动词开头 | `get_`、`set_`、`calc_`、`is_`、`has_` |
+| 见名知意 | 不用缩写，除非通用（`num`、`msg`） |
+
+## 一个完整例子
+
+```python
+def format_price(amount, currency="元"):
+    """把数字格式化成带千分位的价格"""
+    return f"{amount:,.2f} {currency}"
+
+
+def apply_discount(price, rate):
+    """按折扣率计算折后价，rate 是 0~1 的小数"""
+    return price * rate
+
+
+def main():
+    original = 1299.9
+    rate = 0.85
+
+    final = apply_discount(original, rate)
+
+    print(f"原价：{format_price(original)}")
+    print(f"折扣：{rate:.0%}")
+    print(f"实付：{format_price(final)}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+输出：
+
+```text
+原价：1,299.90 元
+折扣：85%
+实付：1,104.92 元
+```
+
+:::tip[拆函数的一个实用标准]
+每个函数**只做一件事**。
+
+`apply_discount` 只算折扣，`format_price` 只做格式化。这样：
+
+- 单独测试容易
+- 单独复用容易
+- 出问题时定位快
+
+如果一个函数你没法用一句话说清它干什么，就该拆了。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 定义了没调用 | 没输出 | `def` 只定义不执行 | 写 `函数名()` |
+| 参数个数不对 | TypeError | 调用时参数数量不匹配 | 检查定义和调用 |
+| 用 print 代替 return | 得到 None | 没返回值 | 改 `return` |
+| `result = f()` 后是 None | 同上 | 函数没 return | 检查函数体 |
+| 函数名写成变量赋值 | 覆盖了函数 | `greet = 5` | 换个名字 |
+
+:::danger[参数名和外部变量同名会遮蔽]
+```python
+name = "外部"
+
+def greet(name):
+    print(name)      # 这里用的是参数 name，不是外面的
+
+greet("参数")
+print(name)          # 外部还是 "外部"
+```
+
+函数参数会**遮蔽**同名的外部变量。这是设计如此，但容易让人困惑——[第 17 课](./17-scope)会讲清作用域。
+:::
+
+## 本课自检
+
+- [ ] 能说出用函数的三个好处
+- [ ] 会写 `def 名字(参数):` 并调用
+- [ ] 知道定义函数不会执行，必须调用
+- [ ] 分清 `print` 和 `return`
+- [ ] 知道没 return 的函数返回 `None`
+- [ ] 知道 `return a, b` 实际返回元组
+- [ ] 会写单行 docstring
+- [ ] 知道函数应该「只做一件事」
+
+## 下一步
+
+[16 函数进阶：参数与返回值](./16-functions-advanced) —— 默认值、关键字参数、`*args`，以及一个非常隐蔽的坑。

@@ -1,0 +1,199 @@
+---
+id: syntax-02
+title: "02 运算符"
+sidebar_position: 3
+description: "语法基础 第 2 部分：运算符"
+---
+
+# 02 运算符
+### 算术
+
+```python
+print("7 / 2  =", 7 / 2)     # 真除法，永远返回 float
+print("7 // 2 =", 7 // 2)    # 地板除
+print("-7 // 2 =", -7 // 2)  # 注意向负无穷取整，不是截断
+print("7 % 2  =", 7 % 2)
+print("-7 % 2 =", -7 % 2)    # 结果符号跟随除数（正数）
+print("divmod(-7, 2) =", divmod(-7, 2))
+print("2 ** 10 =", 2 ** 10)
+print("2 ** 100 =", 2 ** 100)
+```
+
+```text
+7 / 2  = 3.5
+7 // 2 = 3
+-7 // 2 = -4
+7 % 2  = 1
+-7 % 2 = 1
+divmod(-7, 2) = (-4, 1)
+2 ** 10 = 1024
+2 ** 100 = 1267650600228229401496703205376
+```
+
+两个重点：
+
+1. **`/` 永远返回 float**，即使能整除（`4 / 2` 是 `2.0` 不是 `2`）。想要整数结果用 `//`
+2. **`//` 和 `%` 对负数的行为和 C 不同**：`-7 // 2 == -4`（向下取整，不是向零截断），`-7 % 2 == 1`（符号跟随除数）。这个设计保证了恒等式 `a == (a // b) * b + (a % b)` 恒成立
+
+`2 ** 100` 精确输出说明 `int` 是**任意精度**的，不会像 C 的 `int` 那样溢出。
+
+### 链式比较
+
+Python 独有的甜语法，写起来和数学一样：
+
+```python
+x = 5
+print(1 < x < 10)           # 等价于 (1 < x) and (x < 10)
+print(1 == 1 < 2)           # 等价于 (1 == 1) and (1 < 2)
+print(1 < 2 < 3 == 3)       # 任意长度
+```
+
+```text
+True
+True
+True
+```
+
+**它会自动展开成 `and` 链，且中间变量只求值一次**。所以 `if 0 <= i < len(items):` 是安全的，不会因为 `i` 越界而报错。
+
+### 海象运算符 `:=`（3.8+）
+
+在表达式内部赋值，避免「先算一次、再判断」的重复：
+
+```python
+if (n := len([1, 2, 3])) > 2:
+    print("n =", n)
+```
+
+```text
+n = 3
+```
+
+典型用法是「读取直到空」：
+
+```python
+buf = [1, 2, 3]
+while (item := buf.pop() if buf else None) is not None:
+    print("popped", item)
+```
+
+```text
+popped 3
+popped 2
+popped 1
+```
+
+## 7. 浮点数：必须知道的精度问题
+
+```python
+print(repr(0.1 + 0.2))
+print(0.1 + 0.2 == 0.3)
+import math
+print(math.isclose(0.1 + 0.2, 0.3))
+```
+
+```text
+0.30000000000000004
+False
+True
+```
+
+**这不是 Python 的 bug**，是 IEEE 754 二进制浮点数的固有性质——`0.1` 在二进制里是无限循环小数，就像十进制里的 `1/3`。所有用 IEEE 754 的语言（C、Java、JavaScript）都有同样的现象。
+
+:::danger[永远不要用 `==` 比较浮点数]
+用 `math.isclose()`：
+
+```python
+import math
+math.isclose(a, b)                     # 默认相对容差 1e-9
+math.isclose(a, b, abs_tol=1e-6)       # 绝对值容差，比较接近 0 的数时用
+```
+
+**涉及金额请用 `decimal.Decimal`**，不要用 `float`：
+
+```python
+from decimal import Decimal
+print(Decimal("0.1") + Decimal("0.2") == Decimal("0.3"))   # True
+```
+
+注意 `Decimal` 必须从**字符串**构造。写 `Decimal(0.1)` 会把那个不精确的二进制值原封不动地装进去，白忙一场。
+:::
+
+### `round` 是银行家舍入
+
+```python
+print(round(0.5), round(1.5), round(2.5), round(3.5))
+print(int(3.9))
+```
+
+```text
+0 2 2 4
+3
+```
+
+`round(2.5)` 得 `2` 而不是 `3`——这是**银行家舍入**（四舍六入五取偶），目的是让大量数据舍入时不产生系统性偏移。而 `int()` 是直接截断，不是四舍五入。
+
+## 8. 字符串：不可变与常用操作
+
+```python
+s = "python"
+print("s[0]:", s[0], "| s[-1]:", s[-1], "| s[-2]:", s[-2])
+print("切片 s[1:4]:", s[1:4])
+print("乘法:", "a" * 3)
+print("拼接:", "-".join(["a", "b"]))
+print("相邻字面量自动拼接:", "Py" "thon")
+print("成员判断:", "th" in s)
+```
+
+```text
+s[0]: p | s[-1]: n | s[-2]: o
+切片 s[1:4]: yth
+乘法: aaa
+拼接: a-b
+相邻字面量自动拼接: Python
+成员判断: True
+```
+
+几个要点：
+
+- **负索引**：`-1` 是最后一个元素，非常好用。`s[len(s)-1]` 这种写法在 Python 里是外行标志
+- **不可变**：`s[0] = "P"` 会报 `TypeError`。任何「修改」操作都是生成新字符串
+- **拼接用 `join` 不要用 `+=`**：`+=` 在循环里会反复创建新对象，是 O(n²)
+
+切片的完整规则在第 4 页，这里先记住 `[start:stop]` 是**左闭右开**。
+
+### 常用字符串方法
+
+```python
+print("a,b,,c".split(","))              # ['a', 'b', '', 'c']
+print("a,b,c".split(",", 1))            # ['a', 'b,c']   只切一刀
+print("a,b,c".rsplit(",", 1))           # ['a,b', 'c']   从右边切
+print("a=b".partition("="))             # ('a', '=', 'b')
+print("  hi  \n".strip())               # 'hi'
+print("Python".replace("P", "J"))       # 'Jython'
+print("abc".upper(), "ABC".lower())
+print("123".isdigit(), "abc".isalpha())
+print(",".join(["a", "b", "c"]))        # 'a,b,c'
+print("hello".startswith("he"), "hello".endswith("lo"))
+print("abc".find("b"), "abc".index("b"))
+```
+
+```text
+['a', 'b', '', 'c']
+['a', 'b,c']
+['a,b', 'c']
+('a', '=', 'b')
+hi
+Jython
+PYTHON abc
+True False
+a,b,c
+True True
+1 1
+```
+
+`find` 和 `index` 的区别：找不到时 `find` 返回 `-1`，`index` **抛异常**。
+
+---
+
+**翻页**：[← 上一页](./syntax-01) · [下一页 →](./syntax-03) · [返回目录](./)

@@ -1,0 +1,357 @@
+---
+id: 16-scope
+title: 16 作用域与存储期
+sidebar_position: 16
+description: 变量在哪能用（作用域）、活多久（存储期）、static 的两副面孔，以及为什么全局变量要少用。
+---
+
+# 16 作用域与存储期
+
+**本课目标**：搞清变量"在哪能用、活多久"，掌握 `static` 的两种用法。
+
+## 两个概念
+
+| 概念 | 回答的问题 |
+| --- | --- |
+| **作用域**（scope） | 这个变量在**代码的哪些地方**能被访问？ |
+| **存储期**（storage duration） | 这个变量**什么时候创建、什么时候销毁**？ |
+
+两者相关但不同：一个变量可能"活着"但当前作用域看不到。
+
+## 局部变量
+
+```c
+void f(void) {
+    int x = 10;          /* 局部变量 */
+    printf("%d\n", x);
+}
+
+int main(void) {
+    f();
+    printf("%d\n", x);   /* ❌ error: 'x' undeclared */
+    return 0;
+}
+```
+
+**局部变量**：
+
+- **作用域**：从声明处到所在花括号结束
+- **存储期**：函数被调用时创建，返回时销毁
+- **初值**：**垃圾值**（未初始化的话）
+
+## 块作用域
+
+任何花括号都创建一个作用域：
+
+```c
+int main(void) {
+    int a = 1;
+
+    {
+        int b = 2;
+        printf("%d %d\n", a, b);     /* ✅ 都能访问 */
+    }
+
+    printf("%d\n", a);               /* ✅ */
+    /* printf("%d\n", b);  ❌ b 已销毁 */
+    return 0;
+}
+```
+
+:::tip[块作用域的实际用途：限制变量生命周期]
+```c
+for (int i = 0; i < 10; i++) {
+    int temp = compute(i);      /* temp 每轮都重新创建 */
+    use(temp);
+}
+/* 这里 temp 已经不存在了 */
+```
+
+**把变量声明在尽量小的作用域里**，能减少"被意外修改"的风险。
+:::
+
+## 全局变量
+
+声明在所有函数外面：
+
+```c
+int g_count = 0;        /* 全局变量 */
+
+void increment(void) {
+    g_count++;
+}
+
+int main(void) {
+    increment();
+    increment();
+    printf("%d\n", g_count);    /* 2 */
+    return 0;
+}
+```
+
+**全局变量**：
+
+- **作用域**：整个文件（从声明处之后）
+- **存储期**：整个程序运行期间
+- **初值**：**自动为 0**（和局部变量不同！）
+
+:::danger[全局变量自动初始化为 0]
+```c
+int g;              /* 全局，自动是 0 */
+static int s;       /* 静态，自动是 0 */
+
+void f(void) {
+    int local;      /* 局部，垃圾值 */
+    static int ls;  /* 静态局部，自动是 0 */
+}
+```
+
+**规矩**：
+
+| 变量类型 | 未初始化时的值 |
+| --- | --- |
+| 局部变量 | **垃圾值** |
+| 全局变量 | 0 |
+| static 变量 | 0 |
+
+**但即使会自动清零，也建议显式初始化**——表达意图更清晰。
+:::
+
+## static：两种完全不同的含义
+
+:::warning[`static` 在不同位置意思完全不同]
+| 位置 | 含义 |
+| --- | --- |
+| **函数内部** | 变量只初始化一次，之后**保持值** |
+| **函数外部**（全局） | **只在当前文件可见**，别的文件访问不到 |
+:::
+
+### 用法一：函数内的 static（保持值）
+
+```c
+void counter(void) {
+    int local = 0;          /* 每次调用都重新初始化 */
+    static int stat = 0;    /* 只初始化一次，之后保持 */
+
+    local++;
+    stat++;
+    printf("local=%d  static=%d\n", local, stat);
+}
+
+int main(void) {
+    counter();
+    counter();
+    counter();
+    return 0;
+}
+```
+
+本机实测输出：
+
+```text
+local=1  static=1
+local=1  static=2
+local=1  static=3
+```
+
+**`local` 每次都是 1，`stat` 一路累加。**
+
+:::tip[static 局部变量的原理]
+`static` 局部变量**不在栈上**，而在静态存储区——和全局变量放在一起。
+
+所以它从程序启动就存在，程序结束才销毁，函数调用结束也不消失。
+
+**但它的作用域仍然只在这个函数内**——别的函数访问不到。
+
+**初始化只执行一次**（程序启动时），这是关键。
+:::
+
+### 用法二：文件级 static（限制可见性）
+
+```c
+/* a.c */
+static int helper(void) {      /* 只有 a.c 内部能用 */
+    return 42;
+}
+
+int public_func(void) {        /* 别的文件也能用 */
+    return helper();
+}
+```
+
+`static` 修饰全局函数/变量时，表示**只在当前文件可见**。
+
+:::tip[文件级 static 的价值：避免命名冲突]
+两个 `.c` 文件里都有 `static void init(void)` 不会冲突，因为它们各自私有。
+
+而不加 `static` 的话，两个同名全局函数在链接时会报 `multiple definition`。
+
+**规矩：只在一个文件里用到的函数/全局变量，一律加 `static`。**
+:::
+
+## 全局变量的问题
+
+:::danger[全局变量为什么被诟病]
+```c
+int status = 0;
+int data[100];
+int count = 0;
+
+void load(void) { status = 1; /* ... */ }
+void process(void) { if (status) { /* ... */ } }
+void save(void) { status = 2; /* ... */ }
+```
+
+问题：
+
+1. **谁都可能改它**，出了问题不知道是谁改的
+2. **测试困难**，每个测试都要重置全局状态
+3. **看不出依赖关系**，函数签名里看不出来它用了什么
+4. **多线程下是灾难**
+:::
+
+### 更好的做法：用参数和返回值
+
+```c
+/* 不好：靠全局传递 */
+int g_result;
+void compute(int input) {
+    g_result = input * 2;
+}
+
+/* 好：明确的输入输出 */
+int compute(int input) {
+    return input * 2;
+}
+```
+
+**所有依赖从参数进来，所有结果从返回值出去**——函数变成"纯"的，好测试、好理解。
+
+:::tip[全局变量的合理用途]
+确实有些场景适合：
+
+| 场景 | 例子 |
+| --- | --- |
+| **常量配置** | `const int MAX_SIZE = 100;` |
+| **只读的查找表** | 编码转换表、字符分类表 |
+| **单例资源** | 日志句柄、硬件外设句柄 |
+| **static 限定的文件内辅助** | 只在当前文件用的函数 |
+
+**判断标准：这个值是"只读的配置"还是"会变的状态"？** 前者可以全局，后者尽量避免。
+:::
+
+## `extern`：声明但不定义
+
+```c
+/* a.c 里定义 */
+int g_count = 0;
+
+/* b.c 里使用 */
+extern int g_count;      /* 告诉编译器：这个变量在别处定义了 */
+```
+
+`extern` 表示"这个变量存在于别处，我这里只是声明"。
+
+**多文件工程才需要**，第 27 课讲。
+
+## 完整示例
+
+```c
+#include <stdio.h>
+
+/* 全局常量 */
+const int MAX_SCORE = 100;
+
+/* 文件内私有函数（static） */
+static int is_valid(int score) {
+    return score >= 0 && score <= MAX_SCORE;
+}
+
+/* 带 static 局部变量的函数 */
+void log_call(void) {
+    static int calls = 0;
+    calls++;
+    printf("这是第 %d 次调用\n", calls);
+}
+
+/* 纯函数：输入靠参数，输出靠返回值 */
+int grade(int score) {
+    if (!is_valid(score)) return -1;
+    if (score >= 90) return 4;
+    if (score >= 80) return 3;
+    if (score >= 60) return 2;
+    return 1;
+}
+
+int main(void) {
+    log_call();
+    log_call();
+
+    int scores[] = {95, 85, 72, 50, 150};
+    int n = sizeof(scores) / sizeof(scores[0]);
+
+    for (int i = 0; i < n; i++) {
+        int g = grade(scores[i]);
+        if (g < 0) {
+            printf("%d 分：无效\n", scores[i]);
+        } else {
+            printf("%d 分：等级 %d\n", scores[i], g);
+        }
+    }
+
+    return 0;
+}
+```
+
+输出：
+
+```text
+这是第 1 次调用
+这是第 2 次调用
+95 分：等级 4
+85 分：等级 3
+72 分：等级 2
+50 分：等级 1
+150 分：无效
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 函数外访问局部变量 | `undeclared` | 已销毁 | 用返回值传出去 |
+| 以为局部变量会自动清零 | 垃圾值 | 局部不初始化 | 显式初始化 |
+| 全局变量重名 | `multiple definition` | 两个文件都定义了 | 用 `static` 或 `extern` |
+| 函数里 `static` 当"私有变量" | 值一直保留 | 用途搞错 | 想每次重置就别加 static |
+| 全局变量被意外修改 | 值变了 | 谁都可能改 | 减少使用，用参数传 |
+
+:::danger[两个文件定义同名全局变量会链接失败]
+```c
+/* a.c */  int count = 0;
+/* b.c */  int count = 0;
+```
+
+链接时报：
+
+```text
+multiple definition of `count'
+```
+
+**解决**：一个文件定义，其他文件用 `extern` 声明；或者都加 `static` 让它们各自私有。
+:::
+
+## 本课自检
+
+- [ ] 分清作用域（在哪能用）和存储期（活多久）
+- [ ] 知道局部变量作用域到花括号结束
+- [ ] **知道局部变量不初始化是垃圾值，全局/static 自动为 0**
+- [ ] 知道块作用域，会把变量声明在最小范围里
+- [ ] **知道 static 在函数内是"保持值"**
+- [ ] **知道 static 在文件级是"仅本文件可见"**
+- [ ] 能说出全局变量的四个问题
+- [ ] 知道该用参数和返回值代替全局变量
+- [ ] 会用 `extern` 声明别处定义的变量
+
+## 下一步
+
+[17 指针入门](./17-pointers) —— C 最难也最有价值的一课。别急，一步一步来。

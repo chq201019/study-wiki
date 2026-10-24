@@ -1,0 +1,279 @@
+---
+id: 08-blink
+title: 08 点灯：HAL_GPIO
+sidebar_position: 8
+description: GPIO 的四种输出模式、八个常用函数、端口与引脚的关系、推挽与开漏的区别，以及为什么 PC13 是低电平点亮。
+---
+
+# 08 点灯：HAL_GPIO
+
+**本课目标**：掌握 GPIO 输出的完整用法，不只是"翻转"。
+
+## 端口与引脚
+
+STM32 的 GPIO 按 **16 个一组**分成端口：
+
+```text
+GPIOA: PA0 ~ PA15
+GPIOB: PB0 ~ PB15
+GPIOC: PC0 ~ PC15   ← 蓝板 LED 在 PC13
+...
+```
+
+代码里要**同时给端口和引脚**：
+
+```c
+HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+/*             ↑端口    ↑引脚号         ↑电平 */
+```
+
+:::tip[为什么不像 ESP32 那样只给一个编号]
+**因为 STM32 引脚多**（48~144 个），16 个一组便于管理和内部布线。
+
+**`PA5` = 端口 A 的第 5 脚**，代码写 `GPIOA, GPIO_PIN_5`。
+
+（有些库提供了 `PA5` 这样的宏，但 HAL 原生用端口+引脚。）
+:::
+
+## 八个常用函数
+
+| 函数 | 作用 |
+| --- | --- |
+| `HAL_GPIO_WritePin(port, pin, state)` | **写电平** |
+| `HAL_GPIO_ReadPin(port, pin)` | **读电平** |
+| `HAL_GPIO_TogglePin(port, pin)` | **翻转电平** |
+| `HAL_GPIO_Init(port, &init)` | 初始化引脚 |
+| `HAL_GPIO_DeInit(port, pin)` | 恢复默认 |
+| `HAL_GPIO_LockPin(port, pin)` | 锁定配置（防误改） |
+| `__HAL_RCC_GPIOx_CLK_ENABLE()` | **开端口时钟** |
+| `HAL_GPIO_EXTI_Callback(pin)` | 中断回调（[第 14 课](./14-interrupt)） |
+
+### 写电平
+
+```c
+/* 两种写法都可以 */
+HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);      /* 高电平 */
+HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);    /* 低电平 */
+
+/* 或者用枚举 GPIO_PinState */
+HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_STATE_SET); /* 少见 */
+```
+
+**实际就用 `GPIO_PIN_SET` / `GPIO_PIN_RESET`。**
+
+### 读电平
+
+```c
+GPIO_PinState state = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0);
+if (state == GPIO_PIN_SET) {
+    /* 高电平 */
+}
+```
+
+### 翻转
+
+```c
+HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);      /* 高变低，低变高 */
+```
+
+:::tip[翻转不用先读再写]
+自己实现要两步：
+
+```c
+GPIO_PinState s = HAL_GPIO_ReadPin(...);      /* 读 */
+HAL_GPIO_WritePin(..., s == SET ? RESET : SET); /* 写 */
+```
+
+**`HAL_GPIO_TogglePin` 内部用 BSRR 寄存器一次完成**，更快也不会被打断出错。
+:::
+
+## 为什么 PC13 是低电平点亮
+
+:::danger[这是蓝板最常见的困惑]
+```c
+HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);      /* 灯灭了 */
+HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);    /* 灯亮了 */
+```
+
+**反了！**
+
+**原因**：蓝板的 LED 接法是：
+
+```text
+3.3V ──[电阻]── LED ──→ PC13
+                        （引脚拉低才有电流流过）
+```
+
+这叫**低电平有效（active-low）**。
+
+**另一大部分开发板是 `引脚 → 电阻 → LED → GND`（高电平点亮）。**
+
+**所以"写 1 亮还是写 0 亮"要看电路，不能死记。**
+:::
+
+| 接法 | 写 1 | 写 0 |
+| --- | --- | --- |
+| `引脚 → LED → GND`（常见开发板） | **亮** | 灭 |
+| `3.3V → LED → 引脚`（蓝板 PC13） | 灭 | **亮** |
+
+:::tip[用 `TogglePin` 就不用纠结]
+```c
+HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);      /* 不管接法，反正翻转 */
+```
+
+**做闪烁效果时用它最省心。**
+:::
+
+## 四种输出模式
+
+在 CubeMX 的 GPIO 配置里会看到这些选项：
+
+| 模式 | 说明 | 用途 |
+| --- | --- | --- |
+| **Output Push Pull**（推挽） | 能主动输出高和低 | **驱动 LED、一般数字信号** |
+| Output Open Drain（开漏） | 只能拉低，高电平靠外部上拉 | I2C、电平转换、多设备共享线 |
+| Output Push Pull + Pull-up | 推挽 + 内部上拉 | 少见 |
+| AF Push Pull / AF Open Drain | 复用功能（给外设用） | 串口、SPI、I2C 引脚 |
+
+:::danger[开漏和推挽的区别，接错会不工作]
+```text
+推挽：引脚内部有上下两个 MOS 管，能主动输出 3.3V 或 0V
+开漏：只有下拉管，输出 1 时是"悬空"，必须靠外部上拉电阻拉到 3.3V
+```
+
+| 场景 | 该用 |
+| --- | --- |
+| 普通 LED、继电器 | **推挽** |
+| **I2C 的 SDA/SCL** | **开漏**（必须） |
+| 多设备共享一根线 | 开漏 |
+| 5V 设备电平转换 | 开漏 + 上拉 |
+
+**I2C 必须开漏**——推挽会导致两个设备同时输出时短路。
+
+（CubeMX 配 I2C 时会自动设成 AF Open Drain。）
+:::
+
+## 输出速度要设吗
+
+```c
+GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;      /* 2 MHz */
+/* 可选：MEDIUM(10M) / HIGH(50M) */
+```
+
+:::tip[速度是"上升沿有多陡"，不是"能翻转多快"]
+| 速度 | 用途 |
+| --- | --- |
+| **LOW（2MHz）** | **LED、继电器、慢速信号（推荐默认）** |
+| MEDIUM（10MHz） | 一般数字信号 |
+| HIGH（50MHz） | SPI、高速时钟 |
+
+**速度越高，电磁干扰（EMI）越大、功耗也略高。**
+
+**点灯用 LOW 就够**——这就是 CubeMX 配置里建议设 Low 的原因。
+:::
+
+## 完整程序：三种灯效
+
+```c
+/* 在 main.c 的 USER CODE BEGIN 2 区 */
+/* （MX_GPIO_Init 之后） */
+
+void led_on(void)  { HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET); }
+void led_off(void) { HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET); }
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+
+    /* USER CODE BEGIN 2 */
+    uint8_t mode = 0;
+    /* USER CODE END 2 */
+
+    while (1)
+    {
+        /* USER CODE BEGIN WHILE */
+        switch (mode) {
+        case 0:   /* 慢闪 */
+            HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+            HAL_Delay(1000);
+            break;
+
+        case 1:   /* 快闪 */
+            HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+            HAL_Delay(100);
+            break;
+
+        case 2:   /* 呼吸灯（软件 PWM，粗糙版） */
+            for (int i = 0; i < 20; i++) {
+                led_on();
+                HAL_Delay(i);
+                led_off();
+                HAL_Delay(20 - i);
+            }
+            break;
+
+        case 3:   /* 常亮 */
+            led_on();
+            HAL_Delay(1000);   /* 注意：别写成 while(1) 死等 */
+            break;
+        }
+
+        mode = (mode + 1) % 4;    /* 每轮换一种 */
+        /* USER CODE END WHILE */
+    }
+}
+```
+
+:::warning[常亮状态也要有 `HAL_Delay`]
+```c
+case 3:
+    led_on();
+    while (1) { }          /* ❌ 卡在这里，切换不了模式 */
+```
+
+**每个分支都要"让出时间"**，否则模式切换逻辑永远轮不到。
+
+**这就是"裸机编程"的核心思维：一个 `while(1)` 里所有任务靠时间片轮流执行。**
+
+（真正的呼吸灯要用硬件 PWM，[第 12 课](./12-timer-pwm)讲。）
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 灯不亮 | 无反应 | 没开 GPIO 时钟 | `__HAL_RCC_GPIOC_CLK_ENABLE()` |
+| 逻辑反了 | 写 1 灭写 0 亮 | 低电平点亮 | 查电路或改用 Toggle |
+| 引脚号写错 | 没反应 | `GPIO_PIN_13` 写成 `13` | 用宏，别用数字 |
+| 端口写错 | 没反应 | `GPIOA` 和 `GPIOC` 混了 | 核对引脚图 |
+| 模式设成输入 | 写无效 | 方向错 | 设 `GPOIO_MODE_OUTPUT_PP` |
+| 速度设 HIGH | 干扰大 | 不必要 | 改 LOW |
+
+:::danger[`GPIO_PIN_13` 不是 13]
+```c
+HAL_GPIO_WritePin(GPIOC, 13, GPIO_PIN_SET);           /* ❌ 参数类型不对 */
+HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);  /* ✅ */
+```
+
+`GPIO_PIN_13` 是宏，实际值是 **`0x2000`**（第 13 位为 1 的位掩码）。
+
+**因为 HAL 支持一次操作多个引脚**（`GPIO_PIN_0 | GPIO_PIN_1`）。
+:::
+
+## 本课自检
+
+- [ ] 知道端口（GPIOA~）和引脚（GPIO_PIN_x）的关系
+- [ ] 会用 `WritePin` / `ReadPin` / `TogglePin`
+- [ ] **知道 `GPIO_PIN_13` 是位掩码不是数字 13**
+- [ ] **知道蓝板 PC13 是低电平点亮**
+- [ ] 知道推挽和开漏的区别，**知道 I2C 必须开漏**
+- [ ] 知道输出速度 LOW/HIGH 的含义和选择
+- [ ] **知道不开 GPIO 时钟就静默失效**
+- [ ] 会用三种灯效演示（慢闪/快闪/粗糙呼吸）
+- [ ] **知道裸机 `while(1)` 里每个分支都要让出时间**
+
+## 下一步
+
+[09 串口与 printf 重定向](./09-uart) —— 终于能打印调试信息了。

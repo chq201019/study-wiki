@@ -1,0 +1,260 @@
+---
+id: collections
+title: collections 容器工具箱
+sidebar_position: 19
+description: Counter/defaultdict/deque/namedtuple/ChainMap 各自解决什么问题、deque 为什么比 list 快、defaultdict 的工厂陷阱、以及什么时候该用普通 dict。
+---
+
+# collections 容器工具箱
+
+**本课目标**：遇到"计数、分组、双端操作"时知道用哪个现成工具。
+
+## `Counter`：计数
+
+```python
+from collections import Counter
+
+c = Counter("abracadabra")
+c.most_common(3)
+# [('a', 5), ('b', 2), ('r', 2)]
+```
+
+:::tip[`Counter` 的四个便利操作]
+```python
+c = Counter(a=3, b=1)
+
+c + Counter(a=1)          # 相加：Counter({'a': 4, 'b': 1})
+c - Counter(a=5)          # 相减（结果只保留正数）：Counter()
+c & Counter(a=1, b=5)     # 交集（取小的）：Counter({'a': 1, 'b': 1})
+c | Counter(a=1, b=5)     # 并集（取大的）：Counter({'b': 5, 'a': 3})
+```
+
+**注意 `-` 会丢掉 0 和负数**（不是普通减法）。
+:::
+
+```python
+# 计数不存在时不会 KeyError
+c = Counter()
+for word in words:
+    c[word] += 1          # ✅ 默认从 0 开始
+```
+
+:::warning[`Counter` 的 `most_common()` 排序稳定性]
+`most_common(n)` 按计数降序；**计数相同时按首次出现的顺序**（Python 3.7+ 字典有序）。
+
+**要可复现的排序，自己加 key**：
+
+```python
+sorted(c.items(), key=lambda kv: (-kv[1], kv[0]))
+```
+:::
+
+## `defaultdict`：自动建值
+
+```python
+from collections import defaultdict
+
+groups = defaultdict(list)
+for name, dept in records:
+    groups[dept].append(name)       # 不需要先判断 key 存在
+```
+
+:::danger[`defaultdict` 的工厂是"每次访问不存在就建一个"]
+```python
+d = defaultdict(list)
+_ = d["missing"]        # 这一次访问就创建了 [] 并写进字典！
+print(len(d))            # 1
+```
+
+**读操作会污染字典** —— 这是最容易出 bug 的地方：
+
+```python
+for k in d:
+    if d.get(k_count): ...      # 用 defaultdict 时要小心这种副作用
+```
+
+**只读检查应该用 `k in d` 或 `d.get(k)`。**
+:::
+
+```python
+# 正确姿势：只在"确实要写入"时用下标访问
+for k, v in items:
+    d[k].append(v)              # ✅ 这里就是要创建
+
+# 只读：用 get 或 in
+if "x" in d: ...
+val = d.get("x", default)
+```
+
+:::warning[`defaultdict(list)` vs `d.setdefault(k, [])`]
+```python
+d.setdefault(k, []).append(v)    # 普通 dict 的写法
+d[k].append(v)                   # defaultdict 的写法
+```
+
+**`setdefault` 每次都会构造那个默认值**（即使已存在）—— 默认值是 `list()` 这种便宜，但如果是 `heavy_compute()` 就浪费。
+
+**`defaultdict` 只在需要时构造，更快。**
+:::
+
+## `deque`：双端队列
+
+```python
+from collections import deque
+
+dq = deque(maxlen=3)        # 固定长度：满了自动从另一边丢
+dq.extend([1,2,3,4,5])
+list(dq)                     # [3, 4, 5]
+```
+
+:::info[为什么 `deque` 比 `list` 快]
+| 操作 | `list` | `deque` |
+| --- | --- | --- |
+| `append` / `pop`（尾部） | O(1) | O(1) |
+| **`insert(0, x)` / `pop(0)`** | **O(n)** | **O(1)** |
+| 按索引访问 | **O(1)** | O(n)（中间） |
+| 切片 | ✅ | **❌ 不支持** |
+
+**`list.pop(0)` 要把后面所有元素前移** —— 在循环里用就是 O(n²)。
+
+**`deque` 是双向链表 + 块，两端操作都是 O(1)。**
+:::
+
+```python
+# 典型的队列用法
+from collections import deque
+
+q = deque()
+q.append(item)       # 入队
+item = q.popleft()   # 出队（list 的 pop(0) 在这里是 O(n)）
+```
+
+:::tip[`deque` 的经典用途]
+- **BFS 的队列**（`popleft` 必须 O(1)）
+- **滑动窗口**（`maxlen` 自动丢弃旧数据）
+- **撤销栈 / 历史记录**（限制长度）
+- **生产者-消费者（单线程内）**
+
+**它不是线程安全的** —— 多线程要用 `queue.Queue`。
+:::
+
+## `namedtuple` 与 `dataclass`
+
+```python
+from collections import namedtuple
+
+Point = namedtuple("Point", "x y")
+p = Point(1, 2)
+p.x, p[0]            # 都能访问
+```
+
+:::danger[`namedtuple` 上改了属性不会报错（但没用）]
+```python
+p.x = 5              # AttributeError: can't set attribute
+```
+
+**它是不可变的，且支持解包、可哈希、能当 dict 键。**
+
+**但它不能有默认值以外的逻辑** —— 要方法/校验就用 `dataclass`。
+:::
+
+| 需求 | 选择 |
+| --- | --- |
+| 轻量只读元组 + 名字 | `namedtuple` |
+| 需要默认值、方法、校验 | **`dataclass`** |
+| 需要运行时类型校验 | `pydantic` |
+| 极简、要极致性能 | 裸 `tuple` |
+
+:::warning[`namedtuple` 的解包顺序依赖字段顺序]
+```python
+Point = namedtuple("Point", "x y")
+x, y = Point(1, 2)          # ✅
+```
+
+**但如果你后来改了字段顺序，所有解包的地方都会静默错位。**
+
+**长期演进的类型用 `dataclass` 更安全**（至少属性访问是具名的）。
+:::
+
+## `ChainMap`：多层配置查找
+
+```python
+from collections import ChainMap
+
+defaults = {"host": "localhost", "port": 80}
+user     = {"port": 8080}
+env      = {"host": "prod.example.com"}
+
+cfg = ChainMap(env, user, defaults)      # 前面的优先
+cfg["host"]        # 'prod.example.com'
+cfg["port"]        # 8080
+cfg["timeout"]     # KeyError（都没有）
+```
+
+:::tip[`ChainMap` 的写入只影响第一层]
+```python
+cfg["timeout"] = 30
+# 写进了 env，不会污染 defaults
+```
+
+**这正好符合"配置覆盖"的语义** —— 用户设置写在最上层，默认值保持干净。
+:::
+
+## 别过度使用
+
+:::danger[三个"不需要 collections"的场景]
+**① 只是要一个空 dict 做缓存** → `{}` 就够了，`defaultdict` 反而会因为误读而污染。
+
+**② 队列只在尾部进出** → `list.append` / `list.pop()` 已经是 O(1)，不需要 `deque`。
+
+**③ 两三个字段的临时结构** → 直接 `dict` 或 `tuple` 更轻。
+:::
+
+:::warning[`OrderedDict` 基本不需要了]
+**Python 3.7 起普通 `dict` 保持插入顺序**，`OrderedDict` 只在需要它的特有方法（`move_to_end`、`popitem(last=False)`）时才用。
+
+```python
+d = {}                    # ✅ 已经有序
+d = OrderedDict()         # 只在需要 move_to_end 时
+```
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 字典里多出空 key | `defaultdict` 读操作污染 | 用 `in` / `get` 检查 |
+| 循环里 `pop(0)` 很慢 | `list` 头删是 O(n) | 用 `deque.popleft` |
+| `deque` 不能切片 | 它是链式结构 | 转 `list` 再切 |
+| `Counter` 相减丢数据 | `-` 只保留正数 | 用 `subtract` |
+| `most_common` 顺序不稳 | 计数相同时 | 自己加排序 key |
+| `namedtuple` 解包错位 | 字段顺序变了 | 用属性访问或改 dataclass |
+| 多线程用 `deque` 丢数据 | 它不是线程安全的 | `queue.Queue` |
+
+:::tip[`Counter.subtract` 会保留负数和 0]
+```python
+c = Counter(a=3)
+c.subtract(Counter(a=5))     # Counter({'a': -2})
+```
+
+**需要保留差值（包括负数）时用它，而不是 `-` 运算符。**
+:::
+
+## 本课自检
+
+- [ ] 会用 `Counter` 计数与 `most_common`
+- [ ] **知道 `Counter` 的 `-` 会丢掉非正数，需要保留差值用 `subtract`**
+- [ ] **知道 `defaultdict` 的读操作会创建并污染字典**
+- [ ] **知道只读检查要用 `in` / `get`**
+- [ ] 知道 `setdefault` 与 `defaultdict` 的性能差异
+- [ ] **知道 `list.pop(0)` 是 O(n)，`deque.popleft()` 是 O(1)**
+- [ ] 知道 `deque` 支持 `maxlen` 自动丢弃、不支持切片
+- [ ] 知道 `deque` 不是线程安全的
+- [ ] 能区分 `namedtuple` / `dataclass` / `pydantic` 的适用场景
+- [ ] **知道 `namedtuple` 解包依赖字段顺序，长期演进用 dataclass**
+- [ ] 会用 `ChainMap` 做多层配置覆盖
+- [ ] **知道 Python 3.7+ 普通 dict 已有序，`OrderedDict` 基本不需要**
+
+## 下一步
+
+[文件与路径处理](./files) 或 [迭代器与 itertools](./iterators)。

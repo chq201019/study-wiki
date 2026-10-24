@@ -1,0 +1,321 @@
+---
+id: timer-advanced
+title: "05 定时器高级用法"
+sidebar_position: 5
+description: 输入捕获测频率与占空比、编码器模式、互补输出与死区时间的原理、单脉冲模式与从模式，以及定时器选型的硬约束。
+---
+
+# 05 定时器高级用法
+
+**本课目标**：会用输入捕获测信号，会算死区时间。
+
+## 先分清三类定时器
+
+:::warning[STM32F103 的定时器不是都一样]
+| 定时器 | 类型 | 位数 | 通道 | 特殊能力 |
+| --- | --- | --- | --- | --- |
+| **TIM1 / TIM8** | **高级** | 16 | 4 | **互补输出、死区、刹车输入** |
+| TIM2 / TIM3 / TIM4 / TIM5 | 通用 | 16 | 4 | 输入捕获、PWM、编码器 |
+| TIM6 / TIM7 | 基本 | 16 | **0** | 只有定时中断，**无引脚输出** |
+| TIM9~TIM14 | 通用（小） | 16 | 1~2 | 通道少 |
+
+**做电机控制必须用 TIM1/TIM8**（只有它们有互补输出和死区）。
+**想只用定时中断，TIM6/TIM7 最省事**（不占引脚）。
+:::
+
+## 时基计算：先算对再谈别的
+
+![定时器时基链：时钟经 PSC 分频到计数频率，CNT 计数到 ARR 归零，更新频率为两者乘积的倒数](/img/diagrams/stm32-timer-base.svg)
+
+
+```text
+更新频率 = 定时器时钟 / ((PSC+1) × (ARR+1))
+```
+
+:::tip[举个实际的例子]
+需求：**1 kHz 中断，72MHz 定时器时钟**
+
+```text
+72000000 / (1000) = 72000
+选 PSC = 71（72MHz / 72 = 1MHz 计数频率）
+选 ARR = 999（1000 个计数溢出一次）
+→ 72000000 / (72 × 1000) = 1000 Hz  ✅
+```
+
+**记住 `PSC` 和 `ARR` 都要 +1**——寄存器里存的是"减一后的值"。
+
+**忘了 +1 会让频率差一点点**，累积起来很可观。
+:::
+
+:::danger[定时器时钟不一定是你以为的那个]
+APB1 分频 ≠ 1 时，**APB1 上的定时器时钟自动 ×2**。
+
+```text
+PCLK1 = 36 MHz（APB1 分频 = 2）
+TIM2~TIM7 实际时钟 = 36 × 2 = 72 MHz
+```
+
+**算周期时用 72MHz，不是 36MHz**（[第 02 课](./clock-deep)细讲）。
+:::
+
+## 输入捕获：测量外部信号
+
+:::info[原理：信号跳变时把当前计数值"抓"进寄存器]
+```text
+计数器 CNT 一直在跑（0 → ARR → 0）
+   ↓
+引脚出现上升沿
+   ↓
+硬件立刻把 CNT 的值复制到 CCR 寄存器
+   ↓
+你读 CCR 就知道"跳变发生在计数的哪个位置"
+```
+
+**两次捕获的差值 = 一个周期的时间。**
+:::
+
+```c
+/* 测频率：上升沿捕获两次，算差值 */
+static uint32_t last_capture = 0;
+static uint32_t period = 0;
+
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+    uint32_t now = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+
+    if (last_capture != 0) {
+        /* 差值可能跨越溢出，用无符号减法自动处理回绕 */
+        period = now - last_capture;
+    }
+    last_capture = now;
+}
+
+/* 频率 = 定时器时钟 / 分频 / period */
+float freq = (float)tim_clk / (PSC + 1) / period;
+```
+
+:::danger[为什么用无符号减法能自动处理回绕]
+```c
+uint32_t period = now - last_capture;    /* 即使 now < last_capture 也对 */
+```
+
+**无符号数的减法在模 2³² 下是正确的结果**：
+
+```text
+now = 100, last = 40000（ARR = 65535）
+100 - 40000 = -39900
+在 uint32 下 = 4294927396  ← 错！
+```
+
+**所以 ARR 必须设为 0xFFFF（16 位满量程）**，让回绕发生在 2¹⁶ 的整数倍上：
+
+```text
+如果用 uint16_t 变量：
+100 - 40000（uint16）= 25636   ✅ 正确
+```
+
+**规矩：捕获用满量程 ARR=65535，变量用 `uint16_t`，或手工处理溢出计数。**
+:::
+
+### 同时测频率和占空比
+
+```c
+/* 用 PWM 输入模式（PWM Input），一个通道测周期，另一通道测高电平时间 */
+HAL_TIM_IC_ConfigChannel(&htim3, &sConfigIC_PWM, TIM_CHANNEL_1);
+HAL_TIM_IC_ConfigChannel(&htim3, &sConfigIC_PWM, TIM_CHANNEL_2);
+
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1) {
+        /* CH1 上升沿：周期 */
+        period = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+    } else {
+        /* CH2 上升沿：高电平时间 */
+        high = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
+    }
+}
+
+float duty = (float)high / period * 100.0f;      /* 占空比 % */
+```
+
+:::tip[PWM 输入模式是硬件自动配好的]
+它内部把 CH1 配成上升沿、CH2 配成下降沿（或反相），**两个通道用同一个输入引脚**。
+
+**CubeMX 里选 `PWM Input on CH1` 就自动配好**，不用自己算边沿。
+:::
+
+## 编码器模式
+
+:::info[不用写中断就能读编码器]
+正交编码器输出 A、B 两路相位差 90° 的方波。STM32 的编码器模式**由硬件自动计加减**：
+
+```text
+A 上升沿时 B 为低 → 加 1
+A 上升沿时 B 为高 → 减 1
+```
+
+**你只需要定期读 CNT，不用管中断。**
+:::
+
+```c
+/* CubeMX：Combined Channels = Encoder Mode TI1 and TI2 */
+HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
+
+int16_t get_encoder_count(void)
+{
+    int16_t cnt = (int16_t)__HAL_TIM_GET_COUNTER(&htim2);
+    __HAL_TIM_SET_COUNTER(&htim2, 0);      /* 读完清零，得到增量 */
+    return cnt;
+}
+```
+
+:::warning[编码器模式的三个坑]
+**① 计数范围**：默认 ARR = 65535，用 `int16_t` 接才能正确反映正反转。
+
+**② 别用 `HAL_TIM_Encoder_Start` 的返回值判断启动成功**——它总是返回 `HAL_OK`。
+
+**③ 慢速转动时可能有抖动**：CubeMX 里可以开输入滤波（`IC Filter`），一般设 4~15。
+:::
+
+## 互补输出与死区时间
+
+![互补 PWM 与死区：无死区时上下管导通区重叠会短路，加死区后两管都为低](/img/diagrams/stm32-deadtime.svg)
+
+
+:::danger[这是驱动 H 桥必须懂的部分]
+驱动电机 H 桥时，**同一桥臂的上下两个 MOS 绝不能同时导通**（会直接短路烧管）。
+
+但开关有延迟，**关断比开通慢**。如果同时发互补信号：
+
+```text
+上管信号 ─┐________
+          ↓ 上管还没完全关断
+下管信号 ────┐____
+          ↓ 下管已经开通
+          → 短路！ 瞬间大电流烧管
+```
+
+**解决办法：在两路信号之间插一段"都为低"的时间——这就是死区（dead time）。**
+:::
+
+:::tip[死区时间怎么算]
+TIM1 的死区由 `BDTR` 寄存器的 `DTG[7:0]` 控制，**不是一个直接的时间值**，而是一套分段编码：
+
+| DTG[7:5] | 死区计算 | 范围（tDTS = 1/72MHz ≈ 13.9ns） |
+| --- | --- | --- |
+| 0xx | `DTG[7:0] × tDTS` | 0 ~ 127 × 13.9ns ≈ **1.76 µs** |
+| 10x | `(64 + DTG[5:0]) × 2 × tDTS` | 1.78 ~ 3.56 µs |
+| 110 | `(32 + DTG[4:0]) × 8 × tDTS` | 3.56 ~ 7.1 µs |
+| 111 | `(32 + DTG[4:0]) × 16 × tDTS` | 7.1 ~ 14.2 µs |
+
+**好消息：CubeMX 里直接填纳秒数，它帮你算编码值。**
+:::
+
+```c
+/* CubeMX 生成的结构体里 */
+sBreakDeadTimeConfig.DeadTime = 72;        /* 编码值，不是 ns */
+sBreakDeadTimeConfig.BreakState = TIM_BREAK_ENABLE;
+sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_ENABLE;
+HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig);
+```
+
+:::warning[必须开 `AutomaticOutput`]
+不开它时，**MOE（主输出使能）位默认是 0，互补输出根本不工作**——波形一点都没有，而且没有任何报错。
+
+**这是"配好了但没输出"的常见原因。**
+:::
+
+### 刹车输入（Break）
+
+:::info[TIM1/TIM8 独有的安全功能]
+`BKIN` 引脚检测到有效电平时，**硬件立刻把所有输出强制拉低**（或拉到配置的空闲电平），并可以触发中断。
+
+**用途**：过流保护、急停按钮。响应是硬件级的（纳秒级），比软件快得多。
+
+```c
+/* 触发后可以读到标志位 */
+if (__HAL_TIM_GET_FLAG(&htim1, TIM_FLAG_BREAK)) {
+    /* 发生了刹车事件 */
+    __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_BREAK);
+}
+```
+:::
+
+## 单脉冲模式与从模式
+
+:::tip[单脉冲模式：来一个触发，输出一个固定宽度的脉冲]
+```c
+HAL_TIM_OnePulse_Start(&htim1, TIM_CHANNEL_ALL);
+```
+
+**用于**：精确定时的一次性动作、超声波模块的触发脉冲。
+
+**从模式（Slave Mode）**则可以让一个定时器被外部信号或另一个定时器启动/复位：
+
+| 从模式 | 行为 |
+| --- | --- |
+| Reset Mode | 外部信号到来时计数器清零重来 |
+| Gated Mode | 外部信号为高时才计数 |
+| Trigger Mode | 外部信号启动计数 |
+:::
+
+## 定时器选型速查
+
+| 需求 | 选哪个 |
+| --- | --- |
+| 只要定时中断 | **TIM6 / TIM7**（不占引脚） |
+| PWM 输出 | TIM2~TIM5（通用） |
+| **互补 PWM + 死区** | **TIM1 / TIM8**（唯一选择） |
+| 输入捕获测频率 | TIM2~TIM5 |
+| 编码器接口 | TIM2~TIM5 |
+| 需要最多通道 | TIM1/TIM2/TIM3/TIM4（各 4 通道） |
+
+:::warning[通道引脚是固定的]
+**TIM3_CH1 只能在 PA6 / PB4 / PC6 等几个固定引脚上**（看芯片数据手册的复用功能表）。
+
+**CubeMX 会自动帮你选可用引脚**，但你换引脚时要注意有些组合会冲突（比如 TIM3 部分重映射会占用 TIM4 的引脚）。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| PWM 没输出 | 没调 `HAL_TIM_PWM_Start` | 启动通道 |
+| 互补输出全无 | 没开 `AutomaticOutput` | 配 BDTR |
+| 频率差一倍 | 忘了 APB1 的 ×2 | 用 72MHz 算 |
+| 频率差 0.1% | PSC/ARR 忘了 +1 | 注意减一存储 |
+| 捕获值乱跳 | 没开输入滤波 | 配 `ICFilter` |
+| 捕获算出的周期是负的 | 用 `int` 且回绕 | 用 `uint16_t` + ARR=0xFFFF |
+| 编码器方向反了 | A/B 接反 | 交换引脚或取负 |
+| 改占空比没生效 | 忘调 `HAL_TIM_PWM_Start` 后再改 | 改 CCR 后无需重启 |
+
+:::danger[改占空比的正确方法]
+```c
+__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, new_ccr);
+```
+
+**这一句就够了，不需要重新 Start。**
+
+**但如果 CCR 改成了 0 或 ARR（极端值），有些系列会出现毛刺**——需要的话用 `TIM_CCMR` 的预装载（`OCxPE`）来同步更新。
+:::
+
+## 本课自检
+
+- [ ] 知道 F103 三类定时器的区别（高级/通用/基本）
+- [ ] **知道只有 TIM1/TIM8 有互补输出和死区**
+- [ ] 知道 TIM6/TIM7 没有引脚输出
+- [ ] **会算时基：`f = clk / ((PSC+1) × (ARR+1))`**
+- [ ] **记住 PSC 和 ARR 在寄存器里是减一后的值**
+- [ ] 理解输入捕获的原理（硬件复制 CNT 到 CCR）
+- [ ] **知道用 `uint16_t` + ARR=0xFFFF 自动处理回绕**
+- [ ] 知道 PWM 输入模式能同时测周期和占空比
+- [ ] 知道编码器模式由硬件自动计加减，不用中断
+- [ ] **理解死区为什么必须有（上下管同时导通会烧）**
+- [ ] **知道不开 `AutomaticOutput` 会完全没有输出**
+- [ ] 知道刹车输入是 TIM1/TIM8 独有的硬件保护
+- [ ] 知道定时器通道引脚是固定的，可能冲突
+
+## 下一步
+
+[06 ADC 精度与高级模式](./adc-deep) —— 12 位 ADC 为什么测不准。

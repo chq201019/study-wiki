@@ -1,0 +1,320 @@
+---
+id: 13-disk
+title: 13 磁盘与存储
+sidebar_position: 13
+description: df 和 du 的区别、磁盘满了怎么一步步查、挂载的概念，以及 inode 耗尽这种少见故障。
+---
+
+# 13 磁盘与存储
+
+**本课目标**：会查磁盘使用，能定位"磁盘满了"的原因。
+
+## `df`：看整体用量
+
+```bash
+df -h                   # 人类可读
+df -h /                 # 只看根分区
+df -i                   # 看 inode 用量
+```
+
+本机实测：
+
+```text
+/dev/sda1        56G   21G   33G   39% /
+```
+
+| 列 | 含义 |
+| --- | --- |
+| `Filesystem` | `/dev/sda1` = 第一块盘的第一个分区 |
+| `Size` | 总容量 |
+| `Used` | 已用 |
+| `Avail` | **可用**（注意不等于 Size - Used） |
+| `Use%` | 使用率 |
+| `Mounted on` | 挂载点 |
+
+:::danger[`Available` 比 `Size - Used` 小，是正常的]
+因为 **ext4 默认给 root 预留 5% 空间**（防止普通用户把盘写满导致系统无法运行）。
+
+```bash
+df -h /                 # 看到 Avail 比 Size-Used 少一点
+sudo tune2fs -m 1 /dev/sda1    # 可以把预留降到 1%
+```
+
+**所以 `Use%` 到 95% 左右，普通用户其实已经写不进去了**——最后那 5% 只有 root 能用。
+:::
+
+## `du`：看目录占用
+
+```bash
+du -sh /var/log         # 目录总大小
+du -sh *                # 当前目录下每项
+du -h --max-depth=1 /   # 只看一层
+```
+
+本机实测：
+
+```bash
+du -sh /var/log
+# 286M	/var/log
+```
+
+:::tip[`df` 和 `du` 的分工]
+| 命令 | 看什么 | 速度 |
+| --- | --- | --- |
+| **`df`** | **文件系统整体**用量 | 快 |
+| **`du`** | **具体目录/文件**占多少 | 慢（要遍历） |
+
+**排查顺序：先 `df -h` 找到哪个分区满了，再 `du` 往下钻。**
+:::
+
+## 磁盘满了怎么查（实战流程）
+
+### 第一步：确认哪个分区满
+
+```bash
+df -h
+```
+
+假设发现 `/` 是 100%。
+
+### 第二步：从上往下钻
+
+```bash
+sudo du -h --max-depth=1 / 2>/dev/null | sort -rh | head -10
+```
+
+输出类似：
+
+```text
+12G	/var
+3.2G	/usr
+1.1G	/home
+```
+
+**锁定 `/var` 后继续**：
+
+```bash
+sudo du -h --max-depth=1 /var 2>/dev/null | sort -rh | head -10
+```
+
+### 第三步：找大文件
+
+```bash
+sudo find / -type f -size +100M 2>/dev/null
+```
+
+### 常见占空间的东西
+
+| 位置 | 原因 |
+| --- | --- |
+| `/var/log` | **日志累积**（最常见） |
+| `/var/lib/docker` | Docker 镜像和容器 |
+| `/var/cache/apt` | 包管理器缓存 |
+| `/var/lib/mysql` | 数据库文件 |
+| 被删除但仍被占用的文件 | 进程还开着句柄（见下） |
+
+### 清理示例
+
+```bash
+# 清 apt 缓存
+sudo apt clean
+
+# 清旧日志（用 journalctl，见下）
+sudo journalctl --vacuum-time=7d
+
+# 删 30 天前的日志
+sudo find /var/log -name "*.log" -mtime +30 -delete
+```
+
+:::danger[经典坑：删了文件但空间没释放]
+```bash
+rm /var/log/huge.log        # 空间没变！
+df -h                       # 还是满的
+```
+
+**原因**：某个进程还打开着这个文件。Linux 里**只有"没有进程引用"且"没有文件名"时，数据才真正释放**。
+
+**查是谁占着**：
+
+```bash
+sudo lsof | grep deleted
+```
+
+**解决**：重启那个进程（或 `: > /var/log/huge.log` 直接清空内容）。
+:::
+
+:::tip[清空日志的正确姿势]
+```bash
+rm /var/log/app.log         # ⚠️ 可能不释放空间
+> /var/log/app.log          # ✅ 清空内容，保留文件
+: > /var/log/app.log        # ✅ 同上
+truncate -s 0 /var/log/app.log   # ✅ 同上
+```
+
+**推荐 `> file`**——文件还在，正在写的进程不受影响，空间立刻释放。
+:::
+
+## 挂载（mount）
+
+:::info[什么是挂载]
+Linux 没有盘符。**把某个分区"接"到目录树上的某个位置**，这个过程叫挂载。
+
+```bash
+mount /dev/sdb1 /mnt/data
+```
+
+之后访问 `/mnt/data` 就是访问那块新分区。
+:::
+
+```bash
+mount                   # 看当前所有挂载
+findmnt                 # 树形显示（更清楚）
+lsblk                   # 看块设备树
+```
+
+### 手动挂载
+
+```bash
+sudo mkdir -p /mnt/usb
+sudo mount /dev/sdb1 /mnt/usb
+# ... 用完 ...
+sudo umount /mnt/usb
+```
+
+:::danger[卸载前要退出目录]
+```bash
+cd /mnt/usb
+sudo umount /mnt/usb
+# umount: /mnt/usb: target is busy
+```
+
+**因为你的 shell 还在这个目录里。**
+
+```bash
+cd ~
+sudo umount /mnt/usb        # ✅
+```
+:::
+
+### 开机自动挂载
+
+编辑 `/etc/fstab`：
+
+```text
+/dev/sdb1  /mnt/data  ext4  defaults  0  2
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| 设备 | `/dev/sdb1` 或 UUID |
+| 挂载点 | `/mnt/data` |
+| 文件系统 | `ext4`、`xfs`、`ntfs` |
+| 选项 | `defaults` |
+| dump | 通常 0 |
+| fsck 顺序 | 根分区 1，其他 2，不检查 0 |
+
+:::danger[`fstab` 写错会导致开不了机]
+系统启动时如果挂载失败，可能进入紧急模式。
+
+**安全做法**：
+
+1. **用 UUID 而不是 `/dev/sdb1`**（设备名可能变）
+2. 加 `nofail` 选项（挂载失败也能启动）
+3. 改完用 `sudo mount -a` 测试
+
+```bash
+blkid /dev/sdb1                # 查 UUID
+sudo mount -a                  # 测试 fstab 有没有写错
+```
+:::
+
+## inode 耗尽：少见但很坑
+
+```bash
+df -i
+```
+
+:::danger[磁盘还有空间，但创建不了文件]
+```text
+No space left on device
+```
+
+**但 `df -h` 显示还有几十 G 空闲！**
+
+原因：**inode 用完了**。
+
+每个文件占一个 inode。**大量小文件**（比如几百万个会话文件、缓存碎片）会先把 inode 用完。
+
+**查证**：
+
+```bash
+df -i                 # 看 IUse% 是不是 100%
+```
+
+**解决**：找出哪个目录有海量小文件，清理掉。
+:::
+
+## 完整排查示例
+
+```bash
+# ① 整体情况
+df -h
+
+# ② inode 也看一下
+df -i
+
+# ③ 找最大的目录
+sudo du -h --max-depth=1 / 2>/dev/null | sort -rh | head -8
+
+# ④ 钻进最大的那个
+sudo du -h --max-depth=1 /var 2>/dev/null | sort -rh | head -8
+
+# ⑤ 找大文件
+sudo find /var -type f -size +50M 2>/dev/null
+
+# ⑥ 检查有没有"已删除但被占用"的文件
+sudo lsof 2>/dev/null | grep deleted | head
+
+# ⑦ 清理
+sudo apt clean
+sudo journalctl --vacuum-time=7d
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `df` 和 `du` 数字对不上 | 差很多 | 有已删除但被占用的文件 | `lsof \| grep deleted` |
+| `rm` 后空间没释放 | df 不变 | 进程还开着句柄 | 重启进程或 `> file` 清空 |
+| 磁盘有空但写不了 | No space left | **inode 耗尽** | `df -i` 查 |
+| `umount` 报 busy | 卸不掉 | 有进程在用 | 先 `cd ~`、`lsof` 查 |
+| `fstab` 写错 | 开不了机 | 挂载失败 | 用 UUID + `nofail` |
+| 用 `/dev/sdb1` | 换机器后挂不上 | 设备名会变 | 用 UUID |
+
+## 本课自检
+
+- [ ] 会用 `df -h` 看整体用量
+- [ ] **知道 `Avail` 小于 `Size - Used` 是保留空间造成的**
+- [ ] 会用 `du -sh` / `du --max-depth=1`
+- [ ] **知道排查顺序：先 `df` 定位分区，再 `du` 往下钻**
+- [ ] **知道 `rm` 后空间可能不释放（进程占用），要用 `lsof \| grep deleted`**
+- [ ] **知道清空日志用 `> file` 而不是 `rm`**
+- [ ] 理解"挂载"的概念，会 `mount` / `umount`
+- [ ] 知道 `fstab` 写错会开不了机，要用 UUID + `nofail`
+- [ ] **知道 inode 会耗尽（`df -i`）**
+- [ ] 会用 `lsblk` / `findmnt` 看设备
+
+## 第三阶段小结
+
+你现在掌握了系统层的基本操作：
+
+- **进程**（`ps` `top` `kill`、前后台）
+- **软件**（`apt` 及各家对照）
+- **用户与组**（`useradd` `sudo`）
+- **磁盘**（`df` `du`、挂载、排查满了）
+
+**这些是运维日常的 80%。**
+
+## 下一步
+
+[14 网络基础](./14-network) —— `ip` `ping` `curl` `ss` 这一套。

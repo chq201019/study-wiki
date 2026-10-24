@@ -1,0 +1,274 @@
+---
+id: thread
+title: C++ 并发：thread 与原子
+sidebar_position: 15
+description: std::thread 的 join 与 detach、mutex 的四种锁类型、atomic 的内存序到底要不要管、condition_variable 的正确写法、以及 thread 比 pthread 好在哪。
+---
+
+# C++ 并发：thread 与原子
+
+**本课目标**：会用标准库写正确的并发代码，知道内存序什么时候可以忽略。
+
+## `std::thread` 与 RAII
+
+```cpp
+#include <thread>
+
+std::thread t([]{
+    std::cout << "子线程\n";
+});
+t.join();               // 等它结束
+```
+
+:::danger[`std::thread` 析构时如果还 joinable 会直接 `std::terminate`]
+```cpp
+{
+    std::thread t(work);
+    // 忘记 join 或 detach
+}   // ← 析构 → std::terminate → 整个程序直接死
+```
+
+**这是 `std::thread` 和 `pthread_t` 最大的行为差异**：pthread 不 join 只是泄漏，**C++ 直接终止进程**。
+
+**这是刻意的设计** —— 强制你明确"我等它"还是"我不管它"。
+:::
+
+:::tip[用 C++20 的 `std::jthread` 自动 join]
+```cpp
+{
+    std::jthread t(work);       // 析构时自动 join
+}   // ✅ 安全
+```
+
+**`jthread` 还支持协作式取消**（通过 `stop_token`），比 `detach` 安全得多。
+:::
+
+## `mutex` 的四种锁
+
+| 类型 | 特点 |
+| --- | --- |
+| `std::mutex` | 最基础，不可重入 |
+| `std::recursive_mutex` | **同一线程可重复加锁**（少用，通常说明设计有问题） |
+| `std::timed_mutex` | 支持 `try_lock_for` |
+| `std::shared_mutex`（C++17） | **读写锁**：多读并发、写独占 |
+
+:::danger[`recursive_mutex` 常常是设计问题的信号]
+```cpp
+void a() { std::lock_guard g(m); b(); }
+void b() { std::lock_guard g(m); }        // 同一线程重复加锁
+```
+
+**用 `recursive_mutex` 能让它跑通，但掩盖了"锁的职责边界不清"这个问题。**
+
+**更好的做法**：把"需要加锁的部分"抽成一个内部函数，公开函数只加一次锁。
+:::
+
+```cpp
+// 读写锁：读多写少的场景
+std::shared_mutex sm;
+
+// 读
+{
+    std::shared_lock lk(sm);        // 多个读可以同时持有
+    read_data();
+}
+// 写
+{
+    std::unique_lock lk(sm);        // 写独占
+    write_data();
+}
+```
+
+## 用 RAII 包装，别手写 lock/unlock
+
+:::tip[四种 RAII 锁]
+```cpp
+{
+    std::lock_guard lk(m);          // 最简单，构造加锁、析构解锁
+    // ...
+}
+
+std::unique_lock lk(m, std::defer_lock);   // 可以中途 lock/unlock
+lk.lock();
+// ...
+lk.unlock();
+
+std::scoped_lock lk(m1, m2);        // C++17：一次锁多个，避免死锁
+```
+
+**`std::scoped_lock` 内部用死锁避免算法（try-and-back-off），是同时锁多个 mutex 的正确方式。**
+:::
+
+:::warning[手写 lock/unlock 一定会漏]
+```cpp
+void f() {
+    m.lock();
+    if (error) return;          // ❌ 漏了 unlock
+    m.unlock();
+}
+```
+
+**RAII 版本从语言层面消除了这种错误。**
+:::
+
+## `atomic` 与内存序
+
+```cpp
+#include <atomic>
+
+std::atomic<int> counter{0};
+counter.fetch_add(1);           // 原子自增
+counter++;                       // 也原子
+counter.store(5);
+int v = counter.load();
+```
+
+:::info[内存序：默认的 `seq_cst` 就够用]
+```cpp
+counter.fetch_add(1, std::memory_order_seq_cst);    // 默认
+```
+
+**六种内存序**：
+
+| 序 | 含义 |
+| --- | --- |
+| **`seq_cst`** | 全局统一顺序（**最安全，默认**） |
+| `acquire` / `release` | 用于"发布-订阅"模式 |
+| `acq_rel` | 读改写操作 |
+| `relaxed` | 只保证原子性，不保证顺序 |
+:::
+
+:::danger[`relaxed` 是最容易写错的]
+```cpp
+std::atomic<bool> ready{false};
+int data = 0;
+
+// 线程 A
+data = 42;
+ready.store(true, std::memory_order_relaxed);
+
+// 线程 B
+while (!ready.load(std::memory_order_relaxed)) { }
+assert(data == 42);          // ❌ 可能失败！
+```
+
+**`relaxed` 允许编译器/CPU 重排** —— `data = 42` 可能被排到 `ready.store` 之后。**B 看到 ready=true 时 data 还是 0。**
+
+**正确写法**：`release` / `acquire`
+
+```cpp
+ready.store(true, std::memory_order_release);
+while (!ready.load(std::memory_order_acquire)) { }
+assert(data == 42);          // ✅ 保证成立
+```
+:::
+
+:::tip[什么时候可以放心用默认值]
+**99% 的代码用默认 `seq_cst` 就够了**：
+
+- 计数器、标志位
+- 引用计数
+
+**只有当你在写无锁数据结构、或者性能剖析证明原子操作是瓶颈时，才需要研究内存序。**
+
+**过早优化内存序 = 引入极难复现的 bug。**
+:::
+
+## `condition_variable` 的正确写法
+
+```cpp
+std::mutex m;
+std::condition_variable cv;
+bool ready = false;
+
+// 等待方
+{
+    std::unique_lock lk(m);
+    cv.wait(lk, []{ return ready; });      // ✅ 带谓词的版本
+    // 醒来时持锁
+}
+
+// 通知方
+{
+    std::lock_guard lk(m);
+    ready = true;
+}
+cv.notify_one();
+```
+
+:::danger[不带谓词的 `wait` 必须手写 while]
+```cpp
+cv.wait(lk);                 // ❌ 虚假唤醒会让它直接返回
+if (!ready) cv.wait(lk);     // ❌ 只判一次，同样错
+```
+
+**`cv.wait(lk, pred)` 等价于 `while (!pred()) cv.wait(lk);`** —— **永远用带谓词的版本。**
+:::
+
+:::warning[通知时是否要持锁]
+```cpp
+{
+    std::lock_guard lk(m);
+    ready = true;
+    cv.notify_one();          // 在锁内通知
+}
+cv.notify_one();              // 在锁外通知
+```
+
+**两种都可以**。锁内通知会让被唤醒者立刻竞争锁（可能"惊群"后再睡），**锁外通知通常效率略高**。
+
+**但必须保证：修改条件时持锁** —— 这一步不能省，否则等待方可能错过通知。
+:::
+
+## 与 pthread 的对比
+
+| 维度 | pthread | **C++ 标准库** |
+| --- | --- | --- |
+| 可移植性 | POSIX 平台（Windows 没有原生） | **全平台** |
+| 资源管理 | 手动 join/detach | **RAII（jthread）** |
+| 类型安全 | `void*` 传参 | **模板 + 可变参数** |
+| 锁 | `pthread_mutex_t` | `std::mutex` + RAII 包装 |
+| 原子操作 | C11 `stdatomic.h` | **`std::atomic`（更强）** |
+
+**新项目直接用标准库。** 只有在需要 pthread 特有功能（如设置栈大小、调度策略、CPU 亲和性）时才降级。
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 程序直接 `terminate` | `std::thread` 析构时还 joinable | join / detach / 用 `jthread` |
+| 偶发死锁 | 两锁反序 | `std::scoped_lock` |
+| 数据错乱 | 共享变量没加锁 | 加锁或用 atomic |
+| `assert` 偶发失败 | 用了 `relaxed` 内存序 | 改 `seq_cst` 或配 acquire/release |
+| 等待永不返回 | 通知时没持锁修改条件 | 修改时持锁 |
+| 虚假唤醒后逻辑错 | 用了不带谓词的 `wait` | 用带谓词版本 |
+| 性能差 | 锁粒度过大 | 缩小临界区 |
+| 死锁在析构里 | 锁对象先于使用者析构 | 注意成员声明顺序 |
+
+:::danger[别忘了编译时链接线程库]
+```bash
+g++ -std=c++20 main.cpp -pthread -o main
+```
+
+**C++ 标准库的 `std::thread` 底层仍然依赖平台线程库**，`-pthread` 不能省。
+:::
+
+## 本课自检
+
+- [ ] 会用 `std::thread` + `join`
+- [ ] **知道 `std::thread` 析构时 joinable 会 `std::terminate`**
+- [ ] 知道用 `std::jthread` 自动 join
+- [ ] 能说出四种 mutex 的适用场景
+- [ ] **知道 `shared_mutex` 适合读多写少**
+- [ ] **知道 `std::scoped_lock` 是同时锁多个的正确方式**
+- [ ] 知道用 RAII 锁不要手写 lock/unlock
+- [ ] 会用 `std::atomic` 的基本操作
+- [ ] **理解 `relaxed` 允许重排，会导致 assert 失败**
+- [ ] **知道 99% 场景用默认 `seq_cst` 就够**
+- [ ] **知道 `cv.wait` 必须用带谓词的版本**
+- [ ] 知道修改条件时必须持锁
+- [ ] 知道编译要加 `-pthread`
+
+## 下一步
+
+[C++20 概念](./concepts) 或 [模板元编程](./metaprogramming)。

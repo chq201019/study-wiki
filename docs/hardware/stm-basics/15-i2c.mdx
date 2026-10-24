@@ -1,0 +1,297 @@
+---
+id: 15-i2c
+title: 15 I2C 接 OLED
+sidebar_position: 15
+description: CubeMX 配 I2C、HAL_I2C_Master_Transmit 用法、地址是 7 位要左移、为什么必须开漏、通信失败怎么查。
+---
+
+# 15 I2C 接 OLED
+
+**本课目标**：点亮一块 OLED 屏幕并显示数据。
+
+## I2C 基础回顾
+
+只用两根线，靠**地址**区分多设备：
+
+| 线 | 作用 |
+| --- | --- |
+| **SCL** | 时钟 |
+| **SDA** | 数据 |
+
+常见设备地址：
+
+| 设备 | 地址 |
+| --- | --- |
+| **SSD1306 OLED** | **0x3C** 或 0x3D |
+| MPU6050 | 0x68 |
+| BME280 | 0x76 |
+
+（[ESP32 第 12 课](../esp-basics/12-i2c)讲过完整原理。）
+
+## CubeMX 配置
+
+以 **PB6/PB7（I2C1）** 为例：
+
+1. 引脚图上点 **PB6** → 选 **I2C1_SCL**
+2. 点 **PB7** → 选 **I2C1_SDA**
+3. 左侧 **Connectivity → I2C1**：
+
+| 参数 | 值 |
+| --- | --- |
+| I2C Speed Mode | **Standard Mode** |
+| **I2C Clock Speed** | **100000**（100 kHz） |
+
+:::danger[I2C 引脚必须是"开漏"模式]
+在 CubeMX 里配 I2C 后，引脚会自动设成 **Alternate Function Open Drain**。
+
+**千万别手动改回 Push Pull**——两个设备同时输出会短路。
+
+**这是硬件要求，不是可选项。**
+:::
+
+:::warning[上拉电阻必须有]
+I2C 是开漏总线，**必须有上拉电阻**才能拉高电平。
+
+| 情况 | 需要外接 |
+| --- | --- |
+| OLED 模块自带 4.7k 上拉 | ❌ 不用 |
+| 只有裸芯片 | ✅ 每根线 4.7k |
+
+**大部分 OLED 模块都自带**，但买的时候要确认。
+:::
+
+## ⚠️ 地址的左移陷阱
+
+:::danger[这是 STM32 HAL 最容易错的地方]
+```c
+#define OLED_ADDR  0x3C
+HAL_I2C_Master_Transmit(&hi2c1, OLED_ADDR, buf, len, 100);        /* ❌ 可能失败 */
+HAL_I2C_Master_Transmit(&hi2c1, OLED_ADDR << 1, buf, len, 100);   /* ✅ 通常正确 */
+```
+
+**原因**：HAL 库的地址参数是 **8 位格式**（7 位地址 + 读写位），所以要把 7 位地址**左移一位**。
+
+| 写法 | 值 | 说明 |
+| --- | --- | --- |
+| 7 位地址 | `0x3C` | 数据手册给的 |
+| 8 位写地址 | `0x78` = `0x3C << 1` | HAL 要的 |
+
+**表现**：`HAL_I2C_Master_Transmit` 返回 `HAL_ERROR`，OLED 一直不亮。
+
+**解决：先试 `<< 1`，不行再试原值。** （有些 HAL 版本/重载会自动处理。）
+:::
+
+## 用 I2C 发数据
+
+```c
+uint8_t buf[2] = { 0x00, 0xAF };      /* 命令：开显示 */
+HAL_I2C_Master_Transmit(&hi2c1, OLED_ADDR << 1, buf, 2, 100);
+```
+
+:::info[SSD1306 的控制字节]
+SSD1306 收到的数据，第一个字节是**控制字节**：
+
+| 控制字节 | 含义 |
+| --- | --- |
+| `0x00` | 后面全是**命令**（初始化、设坐标） |
+| `0x40` | 后面全是**显存数据**（要显示的内容） |
+
+**所以每次传输的开头都要加一个控制字节。**
+:::
+
+## 用现成库（推荐）
+
+手写 SSD1306 驱动要发几十条初始化命令，**没必要**。
+
+### 方案一：STM32 的 SSD1306 库
+
+找一份开源的 `ssd1306.c/h`（常见的有 afiskon/stm32-ssd1306），加进工程：
+
+```c
+#include "ssd1306.h"
+#include "fonts.h"
+
+ssd1306_Init();                            /* 初始化 */
+
+ssd1306_Fill(Black);                       /* 清屏 */
+ssd1306_SetCursor(0, 0);
+ssd1306_WriteString("Hello STM32", Font_11x18, White);
+ssd1306_UpdateScreen();                    /* 刷到屏幕 */
+```
+
+:::tip[为什么用库而不是自己写]
+| 自己做 | 用库 |
+| --- | --- |
+| 要查手册发 20+ 条初始化命令 | 一行 `Init()` |
+| 要自己实现字库 | 库自带字体 |
+| 要自己管理显存缓冲 | 库处理好了 |
+
+**除非你要学原理，否则直接用库。**
+:::
+
+### 方案二：先跑扫描程序确认设备在
+
+:::danger[接线后第一件事：扫描总线]
+不要直接写业务代码，**先确认设备能被找到**。
+
+```c
+#include <stdio.h>
+
+void i2c_scan(void)
+{
+    printf("扫描 I2C 总线...\r\n");
+
+    for (uint8_t addr = 1; addr < 128; addr++) {
+        /* HAL 用 8 位地址，所以左移 */
+        if (HAL_I2C_IsDeviceReady(&hi2c1, addr << 1, 2, 10) == HAL_OK) {
+            printf("  发现设备: 0x%02X\r\n", addr);
+        }
+    }
+    printf("扫描完成\r\n");
+}
+```
+
+**扫到 `0x3C` 就说明 OLED 接线和地址都对。**
+:::
+
+## 接线
+
+| OLED 引脚 | STM32 引脚 |
+| --- | --- |
+| VCC | **3.3V**（有些模块支持 5V，但用 3.3V 最安全） |
+| GND | GND |
+| **SCL** | **PB6**（I2C1_SCL） |
+| **SDA** | **PB7**（I2C1_SDA） |
+
+:::warning[不同型号的 STM32 默认 I2C 引脚不同]
+| 系列 | I2C1 默认引脚 |
+| --- | --- |
+| F103 | PB6 / PB7（或重映射到 PB8/PB9） |
+| F4 | PB6 / PB7 或 PB8/PB9 |
+
+**但 STM32 的 I2C 引脚可以重映射**，所以**任何 GPIO 都可能做 I2C**（CubeMX 里选就行）。
+
+**看你在 CubeMX 里选了哪两个引脚，就接那两个。**
+:::
+
+## 完整示例：显示 ADC 读数
+
+```c
+#include "main.h"
+#include "i2c.h"
+#include "adc.h"
+#include "ssd1306.h"
+#include "fonts.h"
+#include <stdio.h>
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_I2C1_Init();
+    MX_ADC1_Init();
+
+    /* 初始化屏幕 */
+    ssd1306_Init();
+    ssd1306_Fill(Black);
+    ssd1306_SetCursor(0, 0);
+    ssd1306_WriteString("STM32 Monitor", Font_11x18, White);
+    ssd1306_UpdateScreen();
+
+    char line[32];
+
+    while (1)
+    {
+        /* 读 ADC */
+        HAL_ADC_Start(&hadc1);
+        HAL_ADC_PollForConversion(&hadc1, 10);
+        uint32_t raw = HAL_ADC_GetValue(&hadc1);
+        HAL_ADC_Stop(&hadc1);
+
+        float volt = raw * 3.3f / 4095.0f;
+
+        /* 显示 */
+        ssd1306_SetCursor(0, 24);
+        snprintf(line, sizeof(line), "ADC: %4lu   ", raw);
+        ssd1306_WriteString(line, Font_11x18, White);
+
+        ssd1306_SetCursor(0, 44);
+        snprintf(line, sizeof(line), "Volt: %.2f V ", volt);
+        ssd1306_WriteString(line, Font_11x18, White);
+
+        ssd1306_UpdateScreen();
+
+        HAL_Delay(200);
+    }
+}
+```
+
+:::tip[为什么要补空格]
+```c
+snprintf(line, sizeof(line), "ADC: %4lu   ", raw);   /* 尾部空格 */
+```
+
+**如果不补空格，数字变短时旧字符会残留**（比如 `100` 变成 `99` 会显示成 `990`）。
+
+**这是字符屏刷新的经典问题。**
+:::
+
+## 通信失败怎么查
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 扫描不到任何设备 | **SDA/SCL 接反** | 对调 |
+| 同上 | 没供电 | 量 VCC 对 GND |
+| 同上 | 没上拉电阻 | 加 4.7k |
+| 同上 | 引脚配错 | 核对 CubeMX |
+| 扫到但发数据失败 | **地址没左移** | `<< 1` |
+| 同上 | 地址错（0x3D vs 0x3C） | 用扫描出的地址 |
+| 偶发失败 | 线太长 | 缩短到 30cm 内 |
+| 屏幕全黑 | 没发初始化命令 | 用库的 `Init()` |
+| 屏幕雪花 | 初始化序列不对 | 换库/核对型号 |
+
+:::danger[STM32 的 I2C 有个著名硬件 bug（F103）]
+**STM32F103 的 I2C 外设在某些错误状态下会锁死总线**（BUSY 标志一直为 1）。
+
+**表现**：读一次失败后，之后所有 I2C 操作都超时。
+
+**应急办法**：重新初始化 I2C
+
+```c
+HAL_I2C_DeInit(&hi2c1);
+HAL_I2C_Init(&hi2c1);
+```
+
+**根治办法**：用软件 I2C（GPIO 模拟），或升级到 F4 系列。
+
+（这是 F103 的已知问题，很多人踩过。）
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 地址没左移 | 一直失败 | HAL 要 8 位地址 | `<< 1` |
+| 引脚设成推挽 | 通信失败 | I2C 要开漏 | 用 AF Open Drain |
+| 没上拉电阻 | 不稳定 | 开漏无法拉高 | 加 4.7k |
+| 不扫描就写业务 | 排查困难 | 不知道设备在不在 | 先扫描 |
+| 用 5V 供电 | 可能损坏 | 电平不匹配 | 用 3.3V |
+| F103 I2C 锁死 | BUSY 一直 1 | 硬件 bug | 重初始化或软件 I2C |
+
+## 本课自检
+
+- [ ] 会在 CubeMX 配 I2C（100kHz 标准模式）
+- [ ] **知道 I2C 引脚必须是开漏模式**
+- [ ] 知道需要上拉电阻（模块一般自带）
+- [ ] **知道 HAL 的地址参数要 7 位地址左移 1 位**
+- [ ] **知道接线后第一件事是写扫描程序**
+- [ ] 会用 `HAL_I2C_IsDeviceReady` 探测设备
+- [ ] 知道 SSD1306 的控制字节（0x00 命令 / 0x40 数据）
+- [ ] 会引入现成的 ssd1306 库
+- [ ] **知道刷字符串要补空格防止残留**
+- [ ] **知道 F103 的 I2C 有锁死 bug，可重初始化恢复**
+
+## 下一步
+
+[16 SPI 通信](./16-spi) —— 更快的总线，接屏幕和 Flash。

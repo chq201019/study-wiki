@@ -1,0 +1,221 @@
+---
+id: ble
+title: BLE 深度
+sidebar_position: 3
+description: BLE 世界模型、两个协议栈、广播与 GATT 服务的完整定义、功耗预算与调参、手机端调试工具。
+---
+
+# BLE 深度
+
+**BLE（Bluetooth Low Energy，低功耗蓝牙）**是为纽扣电池设备设计的蓝牙版本：大部分时间睡觉、需要时快速醒来发一点数据。手环、体温计、电子价签用的都是它。**注意：S3 只支持 BLE，不支持经典蓝牙**（能连蓝牙耳机音箱的那种是 BR/EDR，只有老款 ESP32 支持）——网上教程里出现 `esp_bt_mode` 设成 BTDM、A2DP 音频之类的写法，在 S3 上都用不了。
+
+## 0. BLE 的世界模型（三分钟建立）
+
+| 概念 | 意思 | 类比 |
+| --- | --- | --- |
+| **广播（Advertising）** | 设备定期喊话："我叫 ESP32-S3，在这儿！" | 店铺门口的喇叭 |
+| **连接（Connection）** | 手机听到广播后"进店"建立连接 | 顾客进店 |
+| **GATT** | 连接后数据的组织方式：服务里套着若干"特征" | 店里的货架（服务）和商品（特征） |
+| **特征（Characteristic）** | 一条可以读/写/订阅的数据，如"当前温度" | 每件商品 |
+| **订阅（Notify）** | 数据变化时设备主动推给手机 | 到货了主动给你打电话 |
+| **UUID** | 服务/特征的编号。标准功能有全球统一 UUID，自定义用随意编的 | 门牌号 |
+
+**一次典型的 BLE 交互**：设备广播 → 手机扫码连接 → 手机发现服务（GATT discovery）→ 手机读"温度"特征 / 订阅它 / 往"配置"特征写新阈值。所有 BLE 应用的骨架都是这个流程。
+
+## 1. 两个协议栈
+
+| | Bluedroid | NimBLE（推荐） |
+| --- | --- | --- |
+| 内存占用 | 大（初始化 60KB+ RAM） | 小很多 |
+| 功能完整度 | 全（经典蓝牙全支持） | BLE 5.x 完整，经典蓝牙不支持 |
+| 适合 | 需要经典蓝牙、音频（老款芯片） | **绝大多数 BLE 项目** |
+
+```bash
+idf.py menuconfig
+# Component config → Bluetooth → 启用 Bluetooth
+#   → Bluetooth host → NimBLE - BLE only
+```
+
+内存紧张的项目优先 NimBLE——S3 又没有经典蓝牙，没理由选 Bluedroid。
+
+## 2. GAP：广播与连接
+
+GAP（Generic Access Profile）管"设备怎么被发现和建立连接"。以 NimBLE 为例：
+
+```c
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/util/util.h"
+
+static void start_advertising(void) {
+    // 广播内容：标志位 + 设备名
+    struct ble_hs_adv_fields fields = {0};
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;   // 普通可发现 + 不支持经典蓝牙
+    fields.name = (uint8_t *)"ESP32-S3";
+    fields.name_len = 9;
+    fields.name_is_complete = 1;
+    ble_gap_adv_set_fields(&fields);
+
+    // 广播参数：可连接 + 可发现
+    struct ble_gap_adv_params adv_p = {
+        .conn_mode = BLE_GAP_CONN_MODE_UND,      // UND = 可被连接
+        .disc_mode = BLE_GAP_DISC_MODE_GEN,
+    };
+    uint8_t own_addr_type;
+    ble_hs_id_infer_auto(0, &own_addr_type);          // 推断本机地址类型
+    ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER, &adv_p,
+                      ble_gap_event_handler, NULL);   // BLE_HS_FOREVER = 一直广播
+}
+```
+
+### 广播 vs 扫描
+
+| 模式 | 谁主动 | 耗电 | 用途 |
+| --- | --- | --- | --- |
+| **广播（Advertise）** | 设备 | 中 | 等待连接 / 发送 iBeacon |
+| **扫描（Scan）** | 手机或设备 | 高 | 找设备、RSSI 测距 |
+| 广播 + 扫描 | 都做 | 高 | 环境感知 |
+
+⚠️ 扫描很耗电（射频要持续开着收包）。NimBLE 里把扫描持续时间（`ble_gap_disc` 的 `duration_ms`）设短，并用扫描窗口/间隔控制占空比——窗口越短越省电，但发现设备越慢。
+
+### 广播包的 31 字节极限
+
+广播数据包最大 31 字节（扩展广播更大）——名字、UUID、厂商数据全要挤在里面。**这是 BLE 调试常客**：加了长名字就放不下服务 UUID 了。iBeacon 这类"只广播不连接"的应用，就是把传感器数据塞进这 31 字节循环喊，功耗极低。
+
+## 3. GATT：用 NimBLE 定义一个服务
+
+以 NimBLE 为例（推荐栈），定义服务就是**填一张"货架清单"**——一个 `ble_gatt_svc_def` 结构体数组，服务里再嵌套 `ble_gatt_chr_def` 特征数组：
+
+```c
+#include "host/ble_gatt.h"
+
+static uint16_t s_chr1_handle;
+
+// 特征被读写时，NimBLE 会回调这个函数（L0 讲的回调模式）
+static int chr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
+                         struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        os_mbuf_append(ctxt->om, "hello", 5);   // 返回给手机的数据
+        return 0;                               // 0 = 成功
+    }
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        // 手机写进来的数据在 ctxt->om 里，取出来处理
+        return 0;
+    }
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+// 货架清单：一个服务 + 两个特征（一个可读/通知，一个可写）
+static const struct ble_gatt_svc_def gatt_svcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = BLE_UUID16_INIT(0xFFA0),          // 服务 UUID（门牌号）
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {
+                .uuid = BLE_UUID16_INIT(0xFFA1),  // 特征 1：传感器数据
+                .access_cb = chr_access_cb,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+                .val_handle = &s_chr1_handle,     // 记下句柄，Notify 时要用
+            },
+            {
+                .uuid = BLE_UUID16_INIT(0xFFA2),  // 特征 2：下发配置
+                .access_cb = chr_access_cb,
+                .flags = BLE_GATT_CHR_F_WRITE,    // 手机可写
+            },
+            { 0 },   // ← 数组必须以全 0 结尾！漏掉会导致奇怪故障
+        },
+    },
+    { 0 },       // ← 服务数组同样
+};
+
+// 初始化时注册：
+ble_gatts_count_cfg(gatt_svcs);
+ble_gatts_add_svcs(gatt_svcs);
+```
+
+`flags` 是特征的"权限"——手机能对它做什么：
+
+| 标志 | 含义 |
+| --- | --- |
+| `BLE_GATT_CHR_F_READ` | 可读 |
+| `BLE_GATT_CHR_F_WRITE` | 可写 |
+| `BLE_GATT_CHR_F_NOTIFY` | 可订阅（设备主动推，无确认） |
+| `BLE_GATT_CHR_F_INDICATE` | 可订阅（推送带确认，更可靠） |
+
+:::danger[手机"找不到特征"或"写不进去"，九成是 flags]
+权限没给，手机端表现就是 discover 不到、或 write 返回 `ATT_ERR_WRITE_NOT_PERMITTED`。先查 flags 再查别的。
+:::
+
+向手机推送数据（Notify）：
+
+```c
+struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
+ble_gatts_notify_custom(conn_handle, s_chr1_handle, om);
+```
+
+**注意数据长度**：一次 Notify 最多约 20 字节（默认 MTU），更长的数据要么开 MTU 交换（ble_att_set_preferred_mtu），要么分片——手机 App 那边要对应拼包。
+
+## 4. ⚠️ 功耗预算：BLE 项目真正关心的数
+
+```mermaid
+flowchart LR
+  A[MCU 活跃/待机<br/>µA~mA] --> B[BLE 广播间隔]
+  B --> C[连接间隔]
+  C --> D[决定平均电流]
+```
+
+| 参数 | 影响 |
+| --- | --- |
+| **广播间隔** | 0.625ms ～ 10.24s，越长越省电（但手机发现你越慢——Android 后台扫描间隔约 1s，广播间隔 >1.28s 可能漏检） |
+| **连接间隔** | 7.5ms ～ 4s，由从设备请求，越长越省电 |
+| **Supervisor Timeout** | 断线判定时间 |
+| **数据量** | 每次唤醒能传多少 |
+
+| 场景 | 参数 | 典型平均电流 |
+| --- | --- | --- |
+| 纯广播 beacon | 广播间隔 1s | 20～50 µA |
+| 连接 + 100ms 传一次 | 连接间隔 100ms | 1～3 mA |
+| 连接 + 1s 传一次 | 连接间隔 1s | 150～300 µA |
+| 深睡眠 + 定时唤醒广播 | 唤醒间隔 10s | < 50 µA |
+
+要长期供电，第一选择是「深睡眠 + 定时唤醒广播」而不是「保持连接」——电流差一个数量级以上。
+
+## 5. 手机作为 GATT Client 调设备
+
+开发时先在手机上验证服务定义是否正确，能连上、能读写，再去做嵌入式端逻辑，能省大量时间：
+
+| 平台 | 工具 |
+| --- | --- |
+| Android / iOS | nRF Connect（Nordic 出品，功能最全） |
+| iOS | LightBlue |
+| Web | Chrome 的 Web Bluetooth API |
+| Linux | `bleak`（Python 库，写自动化测试脚本利器） |
+
+调试工作流：nRF Connect 里连上设备 → 看 Service 列表和 UUID 对不对 → 点读、写、订阅试一轮 → 全通了再写嵌入式端业务逻辑。
+
+## 6. 如果看到"经典蓝牙"教程怎么办
+
+老款 ESP32 支持经典蓝牙（BR/EDR），能做 SPP 串口透传、A2DP 音频——网上这类教程不少。**S3 的蓝牙控制器只实现了 BLE**，这些教程在 S3 上都跑不了。替代方案：
+
+| 教程里的经典蓝牙功能 | S3 上的替代 |
+| --- | --- |
+| SPP 串口透传 | BLE 的 Nordic UART Service（NUS，业界标准透传服务） |
+| A2DP 音频接收 | 只能用带经典蓝牙的芯片（老款 ESP32 / ESP32-C 系列也不行） |
+| 蓝牙键盘 HID | BLE HID（S3 可用，LE 的键盘鼠标协议） |
+
+## 7. 常见故障
+
+| 现象 | 原因 |
+| --- | --- |
+| 手机搜不到设备 | 广播没启动；广播包超 31 字节格式非法；广播间隔太长被后台扫描漏掉 |
+| 能连上但找不到服务 | flags 权限位写错；数组没以全 0 结尾；服务 UUID 不匹配 |
+| 写入返回 not permitted | 特征没给 `BLE_GATT_CHR_F_WRITE` |
+| 连接后立刻断开 | Supervisor timeout 太短；主设备没发数据 |
+| RSSI 不稳定 | 天线附近有金属；2.4G 干扰（WiFi 同频） |
+| 内存不够 OOM | 用了 Bluedroid；连接数太多——换 NimBLE |
+| Notify 数据截断 | MTU 太小，协商更大的 MTU |
+
+## 下一步
+
+[lwIP 与网络栈](./lwip)

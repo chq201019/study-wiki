@@ -1,0 +1,110 @@
+---
+id: arduino-ide
+title: QS-3 Arduino IDE（可选）
+sidebar_position: 6
+description: 需要直接写代码时再装。纯图形化使用者可以整节跳过。
+---
+
+# QS-3 Arduino IDE（可选）
+
+:::tip[串口波特率]
+所有示例程序里的串口都初始化成 9600（米思齐的默认值）。
+在米思齐里点开串口窗口，把右下角的波特率也选成 `9600`，两边不一致串口就是乱码。
+:::
+
+这节可以整节跳过。全程用米思齐图形化的话，永远不需要它。
+
+:::info[什么情况下才需要装]
+- 比赛的提交要求里明确写了"提交 Arduino 源码"
+- 米思齐的某个扩展不支持你需要的传感器，你需要自己补代码
+- 你已经开始想搞懂原理了（那建议直接去[完整教程](../course/)，比这一节深得多）
+
+只是想做出东西 → 跳过这节，回去看[QS-2](./mixly)。
+:::
+
+**时长 30 分钟（可选）· 产出：能用 Arduino IDE 编译并上传一个程序**
+
+## 装软件
+
+下载 [Arduino IDE 2.x](https://www.arduino.cc/en/software)，安装后打开。
+
+## 让 IDE 认识 ESP32
+
+Arduino IDE 出厂只认识树莓派和 Arduino 官方板子，ESP32 要单独装。
+
+**第一步：添加开发板网址**
+
+`文件 → 首选项`（`File → Preferences`）→ 最下面的 **附加开发板管理器网址**，填：
+
+:::tip[一定用国内镜像]
+用官方地址下载会非常慢甚至超时，很多人卡在这一步。
+
+```
+https://espressif.github.io/arduino-esp32/package_esp32_index_cn.json
+```
+:::
+
+**第二步：安装开发板支持**
+
+`工具 → 开发板 → 开发板管理器` → 搜 `esp32` → 找 **esp32 by Espressif Systems** → 版本选 **3.3.x** → 安装（几百 MB，慢慢等）。
+
+## 设置菜单项
+
+| 菜单项 | 选什么 |
+| --- | --- |
+| **开发板** | `ESP32S3 Dev Module` |
+| **Upload Speed** | `921600`（传不上就降到 `460800`） |
+| **Flash Size** | `16MB (128Mb)`（WROOM-1 模组就是 16MB，别选 32MB，菜单里也没有） |
+| **PSRAM** | `OPI PSRAM`（板载 8MB PSRAM；不开很多程序也能跑） |
+| **Partition Scheme** | 默认的 `4MB with spiffs` 就够用；要装大程序再选 `16M Flash` 开头的那几项 |
+| **端口** | USB-UART 口对应的那个 |
+
+## 传第一个程序
+
+板载灯是 **WS2812 RGB 灯**，`digitalWrite` 点不亮，要用 Adafruit_NeoPixel（IDE 里 `工具 → 管理库` 搜 `Adafruit NeoPixel` 安装；米思齐内置的就是它）：
+
+```cpp
+#include <Arduino.h>
+#include <Adafruit_NeoPixel.h>
+
+#define LED_PIN 48   // v1.0 板载灯在 GPIO48；v1.1 板在 GPIO38，改成 38
+
+Adafruit_NeoPixel rgb(1, LED_PIN, NEO_GRB + NEO_KHZ800);
+//                    ↑灯数  ↑引脚  ↑WS2812 是 GRB 字节序；设红亮绿/蓝就换 NEO_RGB，NEO_RGBW 是四通道灯珠才用
+
+void setup() {
+  Serial.begin(9600);
+  rgb.begin();
+  rgb.setBrightness(20);   // 别开满亮度，刺眼
+}
+
+void loop() {
+  rgb.setPixelColor(0, rgb.Color(255, 0, 0));   // 红色
+  rgb.show();
+  Serial.println("LED ON");
+  delay(1000);
+  rgb.setPixelColor(0, rgb.Color(0, 0, 0));     // 熄灭
+  rgb.show();
+  Serial.println("LED OFF");
+  delay(1000);
+}
+```
+
+保存成 `blink.ino`，点左下角 **上传箭头**。
+
+:::info[为什么是 48？38 的板子怎么办]
+这块板子新旧两个版本，板载 RGB 灯一个接 48（v1.0）一个接 38（v1.1）。程序里把 `LED_PIN` 改成自己批次对应的号就行，见[引脚速查](../reference/pinout)。
+:::
+
+## 传不上怎么办
+
+| 现象 | 怎么办 |
+| --- | --- |
+| `Failed to connect` | 手动进下载模式：按住 BOOT → 点 RST → 松手，然后立刻点上传 |
+| 端口列表空的 | 换线（必须数据线）；换 USB 口 |
+| 传到一半断开 | 供电问题（[QS-0](./board)），换粗一点的线 |
+| 编译报找不到头文件 | 开发板选错了，确认是 `ESP32S3 Dev Module` |
+
+## 下一步
+
+[QS-4 GPIO 与按键](./arduino-basics) —— 回到图形化主线。

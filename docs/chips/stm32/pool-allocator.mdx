@@ -1,0 +1,211 @@
+---
+id: pool-allocator
+title: 内存分配器与对象池
+sidebar_position: 26
+description: 对象池解决什么、三种实现（固定块/slab/arena）、与 malloc 的实测差异、以及什么时候不该用池。
+---
+
+# 内存分配器与对象池
+
+**本课目标**：知道什么时候该自己管内存，能写出可用的池。
+
+## malloc 在嵌入式里的三个问题
+
+:::danger[① 耗时不确定]
+**`malloc` 可能要遍历空闲链表** —— 最坏情况耗时无法预估。
+
+**硬实时系统不能接受这种不确定性。**
+:::
+
+:::danger[② 碎片]
+```text
+总量还有 60KB 空闲，但最大连续块只有 200 字节
+→ malloc(1KB) 失败
+```
+
+**长时间运行的系统几乎必然会碎片化。**
+:::
+
+:::danger[③ 不可重入 / 有锁]
+**多数实现的 `malloc` 有全局锁** —— 多线程下会竞争；中断里调用更是灾难。
+:::
+
+## 固定块池：最简单也最常用
+
+```c
+#define BLK_SZ   64
+#define BLK_CNT  32
+
+static uint8_t pool[BLK_SZ * BLK_CNT];
+static uint8_t used[BLK_CNT];
+static size_t  n_used;
+
+void *pool_alloc(void) {
+    if (n_used >= BLK_CNT) return NULL;
+    for (size_t i = 0; i < BLK_CNT; i++) {
+        if (!used[i]) {
+            used[i] = 1;
+            n_used++;
+            return &pool[i * BLK_SZ];
+        }
+    }
+    return NULL;
+}
+
+void pool_free(void *p) {
+    size_t i = ((uint8_t *)p - pool) / BLK_SZ;
+    if (i < BLK_CNT && used[i]) { used[i] = 0; n_used--; }
+}
+```
+
+:::warning[上面这个实现的分配是 O(n)]
+**每次都要线性扫描找空位。**
+
+**改进：用空闲链表**（把空闲块的第一个字节当作 next 指针）。
+:::
+
+```c
+/* 空闲链表版：O(1) 分配 */
+static void *free_list;
+
+void pool_init(void) {
+    free_list = NULL;
+    for (int i = BLK_CNT - 1; i >= 0; i--) {
+        void *blk = &pool[i * BLK_SZ];
+        *(void **)blk = free_list;
+        free_list = blk;
+    }
+}
+
+void *pool_alloc(void) {
+    void *blk = free_list;
+    if (blk) free_list = *(void **)blk;
+    return blk;
+}
+
+void pool_free(void *blk) {
+    *(void **)blk = free_list;
+    free_list = blk;
+}
+```
+
+:::danger[空闲链表版要求块大小至少等于一个指针]
+**`BLK_SZ` 必须大于等于 `sizeof(void*)`**（64 位上是 8）。
+
+**而且这个实现不是线程安全的** —— 多线程要加锁或用原子操作。
+:::
+
+## slab：多尺寸分级
+
+:::info[解决"固定块浪费"的问题]
+**固定块池的问题是：所有块一样大**，要 1KB 的对象会浪费 15/16。
+
+**slab 按尺寸分级**：8/16/32/64/128/256/512/1024 字节各一个池。
+
+**分配时向上取整到最近的尺寸级别**。
+:::
+
+```text
+请求 100 字节 → 分配 128 字节的块（浪费 28 字节，可接受）
+请求 1000 字节 → 分配 1024 字节的块
+请求 5000 字节 → 超过最大级别，回退到 malloc
+```
+
+**这是 Linux 内核的 slab 和多数 RTOS 堆实现的思路。**
+
+## arena：一次性分配，一次性释放
+
+```c
+/* 适合"一个请求周期"的内存 */
+typedef struct {
+    uint8_t *base;
+    size_t   size;
+    size_t   used;
+} arena_t;
+
+void *arena_alloc(arena_t *a, size_t n) {
+    n = (n + 7) & ~7u;              /* 8 字节对齐 */
+    if (a->used + n > a->size) return NULL;
+    void *p = a->base + a->used;
+    a->used += n;
+    return p;
+}
+
+void arena_reset(arena_t *a) { a->used = 0; }
+```
+
+:::tip[arena 的适用场景]
+**处理一个 HTTP 请求**：请求开始时 reset，请求期间随意分配，请求结束整块丢弃。
+
+**好处**：
+
+- **分配是 O(1)**（只是指针加法）
+- **零碎片**（不需要 free）
+- **批量释放**（reset 一次全清）
+
+**限制**：不能单独释放某一块。
+:::
+
+## 什么时候不该用池
+
+:::danger[三个明确的信号]
+**① 对象大小差异极大**
+
+要 16 字节又有 100KB 的对象 —— 固定块池要么浪费，要么需要很多级。
+
+**② 生命周期复杂**
+
+如果用 arena 就得小心"这块内存活得比我以为的久"。
+
+**③ 对象数量本来就不多**
+
+**十几个对象的场景，用 malloc 完全没问题** —— 池的复杂度不值得。
+:::
+
+:::warning[池会掩盖泄漏]
+**"池没满"不等于"没泄漏"** —— 泄漏会慢慢吃掉池容量，最终在一次分配时突然失败。
+
+**要加计数**：
+```c
+static int g_alloc_count;      /* 在 alloc/free 里加减 */
+```
+**并把它暴露到监控里。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 池里有块但分配失败 | `used` 数组没正确复位 | 检查 free 的索引计算 |
+| 空闲链表版崩溃 | `BLK_SZ` 小于指针大小 | 保证至少 8 字节 |
+| 多线程下数据错乱 | 池不是线程安全的 | 加锁或原子操作 |
+| 分配越来越慢 | 用了 O(n) 扫描版 | 改空闲链表 |
+| 明明 free 了还失败 | free 的指针不是池里的 | 校验范围 |
+| 内存越用越少 | 泄漏被池掩盖 | 加分配计数 |
+
+:::danger[`pool_free` 必须校验指针范围]
+```c
+size_t i = ((uint8_t *)p - pool) / BLK_SZ;
+if (i < BLK_CNT && used[i]) { ... }
+```
+
+**如果传进来的指针不属于池，`i` 会是巨大值或负数** —— 越界写会静默破坏内存。
+
+**还要检查 `p` 是否正好落在块边界上**（否则计算出的 `i` 可能意外合法）。
+:::
+
+## 本课自检
+
+- [ ] **知道 malloc 在嵌入式里的三个问题（耗时/碎片/锁）**
+- [ ] 会写固定块池
+- [ ] **知道 O(n) 扫描版可以改进成空闲链表（O(1)）**
+- [ ] **知道空闲链表要求块大小至少等于指针大小**
+- [ ] 理解 slab 的多尺寸分级思路
+- [ ] **理解 arena 的适用场景（一个请求周期）与限制（不能单独释放）**
+- [ ] **知道三个不该用池的信号**
+- [ ] **知道池会掩盖泄漏，要加分配计数**
+- [ ] **知道 pool_free 必须校验指针范围**
+
+## 下一步
+
+[动态内存管理](../../software/c/memory) 或 [内存分配器对比](./link-script)。

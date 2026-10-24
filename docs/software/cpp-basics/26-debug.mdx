@@ -1,0 +1,245 @@
+---
+id: 26-debug
+title: 26 调试与常见错误
+sidebar_position: 26
+description: C++ 特有的崩溃、未定义行为、迭代器失效、ASan 与 gdb 用法，以及常见错误速查。
+---
+
+# 26 调试与常见错误
+
+**本课目标**：能定位 C++ 特有的崩溃，会用工具检查内存问题。
+
+## C++ 比 C 多出来的坑
+
+| 问题 | 说明 |
+| --- | --- |
+| **迭代器失效** | 容器改动后旧迭代器不能再用 |
+| **悬垂引用** | 引用指向已销毁的对象 |
+| **对象切片** | 多态信息丢失（[第 10 课](./10-inherit)） |
+| **未定义行为更多** | 移动后用源对象、构造/析构期调虚函数 |
+
+C 的坑（内存泄漏、越界、野指针）在 C++ 里同样存在，见 [C 第 29 课](../c-basics/29-debug)。
+
+## 编译器警告：第一道防线
+
+```bash
+g++ -std=c++17 -Wall -Wextra -Wpedantic main.cpp -o prog
+```
+
+:::tip[值得单独开的警告]
+| 选项 | 抓什么 |
+| --- | --- |
+| `-Wall -Wextra` | 基础（必开） |
+| `-Wpedantic` | 非标准扩展 |
+| `-Wshadow` | 变量遮蔽外层同名变量 |
+| `-Wconversion` | 隐式类型转换丢精度 |
+| `-Wnon-virtual-dtor` | **基类析构不是 virtual** |
+| `-Wold-style-cast` | C 风格强制转换 |
+
+**最后一个 `-Wnon-virtual-dtor` 尤其值钱**——它能自动抓出第 10 课那个最严重的继承陷阱。
+:::
+
+## AddressSanitizer：抓内存错误
+
+```bash
+g++ -g -fsanitize=address,undefined -fno-omit-frame-pointer main.cpp -o prog
+```
+
+:::danger[加 `undefined` 能抓未定义行为]
+```bash
+-fsanitize=address      # 越界、泄漏、use-after-free
+-fsanitize=undefined    # 有符号溢出、空指针解引用、越界移位
+```
+
+**两个都开，能抓到 C++ 里最难查的一类 bug。**
+:::
+
+### 典型输出
+
+数组越界：
+
+```text
+==8840==ERROR: AddressSanitizer: heap-buffer-overflow
+WRITE of size 4 at 0x...
+    #0 main.cpp:3:54
+0x... is located 0 bytes after 16-byte region
+allocated by thread T0 here:
+    #0 malloc ...
+    #1 main.cpp:3:26
+```
+
+**信息量极大**：错误类型、精确行号、越界多少字节、谁分配的。
+
+## 迭代器失效：C++ 头号陷阱
+
+:::danger[容器改动后，旧迭代器可能全部失效]
+| 操作 | 影响 |
+| --- | --- |
+| `vector::push_back` 触发扩容 | **所有**迭代器失效 |
+| `vector::insert` / `erase` | 插入/删除位置**之后**的失效 |
+| `map::insert` | 不影响（树结构稳定） |
+| `list::insert` / `erase` | 只影响被删的那个 |
+
+**失效的迭代器再用就是未定义行为——可能崩溃，也可能数据错乱。**
+:::
+
+### 典型错误
+
+```cpp
+std::vector<int> v = {1, 2, 3};
+
+for (auto it = v.begin(); it != v.end(); ++it) {
+    if (*it == 2) v.push_back(99);      /* ❌ 扩容后 it 失效，++it 崩溃 */
+}
+```
+
+### 正确做法
+
+```cpp
+/* ① 先收集，后修改 */
+std::vector<int> to_add;
+for (int x : v) if (x == 2) to_add.push_back(99);
+v.insert(v.end(), to_add.begin(), to_add.end());
+
+/* ② 删除用 erase 返回值 */
+for (auto it = v.begin(); it != v.end(); ) {
+    if (*it < 0) it = v.erase(it);      /* ✅ erase 返回下一个有效位置 */
+    else ++it;
+}
+
+/* ③ C++20 */
+std::erase_if(v, [](int x) { return x < 0; });
+```
+
+### 用索引避免失效
+
+```cpp
+for (size_t i = 0; i < v.size(); i++) {
+    if (v[i] == 2) v.push_back(99);     /* ✅ 索引用重新读取，没失效问题 */
+}
+```
+
+:::warning[索引也不是万能的]
+如果用**范围 for**（`for (int x : v)`），底层还是迭代器，**同样会失效**。
+:::
+
+## 悬垂引用 / 悬垂指针
+
+:::danger[三种常见悬垂]
+```cpp
+/* ① 返回局部变量的引用 */
+int &bad() {
+    int x = 42;
+    return x;                       /* ❌ 已销毁 */
+}
+
+/* ② 引用容器元素后容器扩容 */
+const std::string &ref = v[0];
+v.push_back("new");                 /* 可能重新分配 */
+use(ref);                           /* ❌ 可能悬垂 */
+
+/* ③ lambda 用 [&] 捕获局部变量后返回 */
+auto make() {
+    int local = 1;
+    return [&local]() { return local; };   /* ❌ local 已销毁 */
+}
+```
+
+**编译器的 `-Wdangling-reference`（GCC 13+）、`-Wreturn-local-addr` 能抓一部分。**
+:::
+
+## 未定义行为的常见来源
+
+| 行为 | 后果 |
+| --- | --- |
+| 解引用空指针 | 崩溃 |
+| 越界访问 | 崩溃或数据错乱 |
+| 移动后再用源对象 | 值不确定 |
+| 构造/析构期调虚函数 | 不生效 |
+| 有符号整数溢出 | 任意行为 |
+| 迭代器失效后使用 | 崩溃或错乱 |
+| 基类析构非 virtual + delete | 资源泄漏 |
+| 同一裸指针建两个 shared_ptr | double free |
+
+:::tip[好消息：`-fsanitize=undefined` 能抓大部分]
+```bash
+g++ -g -fsanitize=address,undefined ...
+```
+
+**开发期一律带上**，别等到线上出事。
+:::
+
+## gdb 基础
+
+```bash
+g++ -g prog.cpp -o prog          # -g 才带调试信息
+gdb ./prog
+```
+
+| 命令 | 作用 |
+| --- | --- |
+| `run` | 运行 |
+| `bt` | **崩溃后看调用栈** |
+| `break main.cpp:10` | 断点 |
+| `print x` | 打印变量 |
+| `info locals` | 打印所有局部变量 |
+| `next` / `step` | 单步 |
+
+崩溃后 `bt` 的输出：
+
+```text
+Program received signal SIGSEGV, Segmentation fault.
+0x0000555555555161 in process (data=0x0) at main.cpp:42
+42      data->run();
+(gdb) bt
+#0  process (data=0x0) at main.cpp:42
+#1  main () at main.cpp:60
+```
+
+**看到 `data=0x0` 就知道传了空指针。**
+
+## 调试输出
+
+```cpp
+#include <iostream>
+
+/* 简单但有风险 */
+std::cerr << "[DEBUG] x = " << x << "\n";       /* cerr 不缓冲，崩溃前内容不丢 */
+
+/* 带行号的宏 */
+#define DBG(x) do { std::cerr << "[" << __FILE__ << ":" << __LINE__ \
+                             << "] " << #x << " = " << (x) << "\n"; } while (0)
+
+DBG(v.size());
+```
+
+## 常见错误速查表
+
+| 现象 | 最可能原因 | 怎么查 |
+| --- | --- | --- |
+| `Segmentation fault` | 空指针/野指针/越界 | ASan + gdb `bt` |
+| 改容器后崩溃 | 迭代器失效 | 检查是否有 push_back |
+| `double free` | 拷贝语义错误 | 查 Rule of Three |
+| `undefined reference` | 链接问题 | 见第 24 课 |
+| 多态不生效 | 忘了 `virtual` | 检查基类方法 |
+| 子类析构没执行 | 基类析构非 virtual | `-Wnon-virtual-dtor` |
+| 值莫名变了 | 越界写入 | ASan |
+| 换编译器就崩 | 未定义行为 | `-fsanitize=undefined` |
+| 引用返回后崩溃 | 悬垂引用 | 检查返回的是不是局部变量 |
+
+## 本课自检
+
+- [ ] 知道 C++ 特有的四类坑（迭代器失效、悬垂引用、切片、更多 UB）
+- [ ] **会开 `-Wall -Wextra -Wpedantic`**
+- [ ] **知道 `-Wnon-virtual-dtor` 能抓基类析构问题**
+- [ ] 会用 `-fsanitize=address,undefined`
+- [ ] **知道 `push_back` 扩容会让所有迭代器失效**
+- [ ] 会三种正确的删除元素写法
+- [ ] 知道三种常见的悬垂来源
+- [ ] 会 `gdb` 的 `bt` 看调用栈
+- [ ] 知道用 `std::cerr` 调试（不缓冲）
+- [ ] 能对照速查表定位问题
+
+## 下一步
+
+[27 性能与零开销抽象](./27-performance) —— C++ 到底会不会比 C 慢。

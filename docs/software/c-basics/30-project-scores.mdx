@@ -1,0 +1,519 @@
+---
+id: 30-project-scores
+title: 30 实战：学生成绩管理
+sidebar_position: 30
+description: 用动态数组 + 结构体 + qsort 做一个完整系统：自动扩容、排序、统计、文件持久化。
+---
+
+# 30 实战：学生成绩管理
+
+**本课目标**：把前面所有知识综合起来，做一个结构完整、能长期运行的程序。
+
+## 要做什么
+
+一个成绩管理系统：
+
+- 添加学生（**容量不足时自动扩容**）
+- 按分数排序
+- 统计平均分、最高/最低
+- 保存到文件、从文件读取
+- 正确管理内存
+
+**和上上节课的通讯录不同**：这个用**动态数组**而不是链表，能直观对比两种数据结构的差别。
+
+## 第一步：数据结构
+
+```c
+#define NAME_LEN 32
+
+typedef struct {
+    char name[NAME_LEN];
+    int  score;
+} Student;
+
+/* 动态数组：data + count + capacity */
+typedef struct {
+    Student *data;
+    int      count;          /* 当前有多少个 */
+    int      capacity;       /* 最多能放多少个 */
+} ScoreBook;
+```
+
+:::tip[为什么用"动态数组"而不是链表]
+| | 动态数组 | 链表 |
+| --- | --- | --- |
+| 随机访问 | **O(1)** `data[i]` | O(n) |
+| 内存连续 | ✅ cache 友好 | ❌ 分散 |
+| 排序 | **qsort 直接用** | 要转数组 |
+| 追加 | O(1) 均摊（扩容时 O(n)） | O(1) |
+| 中间插入删除 | O(n) 要挪数据 | O(1) 改指针 |
+
+**需要频繁随机访问和排序 → 数组；频繁中间增删 → 链表。**
+:::
+
+## 第二步：创建（初始容量）
+
+```c
+ScoreBook *book_create(int initial_capacity) {
+    if (initial_capacity <= 0) initial_capacity = 4;
+
+    ScoreBook *b = malloc(sizeof(ScoreBook));
+    if (b == NULL) return NULL;
+
+    b->data = malloc((size_t)initial_capacity * sizeof(Student));
+    if (b->data == NULL) {
+        free(b);                        /* 注意：失败要把 b 也释放 */
+        return NULL;
+    }
+
+    b->count    = 0;
+    b->capacity = initial_capacity;
+    return b;
+}
+```
+
+:::danger[部分失败的清理]
+```c
+b->data = malloc(...);
+if (b->data == NULL) {
+    free(b);          /* ← 这一步不能漏 */
+    return NULL;
+}
+```
+
+前面分配的 `b` 必须释放，否则**内存泄漏**。
+
+**多层分配时，失败要反向清理已分配的部分。**
+:::
+
+## 第三步：添加 + 自动扩容
+
+```c
+int book_add(ScoreBook *b, const char *name, int score) {
+    /* 满了就扩容，容量翻倍 */
+    if (b->count >= b->capacity) {
+        int new_cap = b->capacity * 2;
+        Student *new_data = realloc(b->data,
+                                    (size_t)new_cap * sizeof(Student));
+        if (new_data == NULL) return 0;      /* 扩容失败 */
+
+        b->data     = new_data;             /* 成功才赋值 */
+        b->capacity = new_cap;
+    }
+
+    strncpy(b->data[b->count].name, name, NAME_LEN - 1);
+    b->data[b->count].name[NAME_LEN - 1] = '\0';
+    b->data[b->count].score = score;
+    b->count++;
+    return 1;
+}
+```
+
+本机实测扩容过程：
+
+```text
+加 Alice  后 count=1 cap=2
+加 Bob    后 count=2 cap=2
+加 Carol  后 count=3 cap=4     ← 扩容了
+加 Dave   后 count=4 cap=4
+加 Eve    后 count=5 cap=8     ← 又扩容
+```
+
+:::tip[为什么是"翻倍"而不是"+1"]
+| 策略 | n 次追加的总开销 |
+| --- | --- |
+| 每次 +1 | O(n²) —— 每次都要复制 |
+| **每次翻倍** | **O(n) 均摊** —— 复制次数是对数级的 |
+
+翻倍让每次追加的**平均成本是 O(1)**，这是 `std::vector`、`ArrayList` 都采用的策略。
+:::
+
+:::warning[注意 `realloc` 要用临时变量]
+```c
+b->data = realloc(b->data, ...);      /* ❌ 失败时原指针丢失 */
+Student *tmp = realloc(b->data, ...); /* ✅ */
+if (tmp) { b->data = tmp; }
+```
+:::
+
+## 第四步：排序（qsort）
+
+```c
+int cmp_by_score_desc(const void *a, const void *b) {
+    const Student *x = (const Student *)a;
+    const Student *y = (const Student *)b;
+
+    if (y->score > x->score) return 1;
+    if (y->score < x->score) return -1;
+    return 0;
+}
+
+qsort(b->data, (size_t)b->count, sizeof(Student), cmp_by_score_desc);
+```
+
+本机实测排序结果：
+
+```text
+按分数降序:
+  Dave      95
+  Bob       92
+  Alice     88
+  Carol     75
+  Eve       60
+```
+
+:::danger[比较函数别写 `return y->score - x->score`]
+```c
+return y->score - x->score;      /* ⚠️ 理论上可能溢出 */
+```
+
+分值只有 0~100 时不会溢出，但**养成好习惯**：用比较返回 `-1/0/1`。
+
+**尤其是比较函数将来要用于大数、时间戳时，减法溢出是真实 bug。**
+:::
+
+## 第五步：统计
+
+```c
+typedef struct {
+    double average;
+    int    max;
+    int    min;
+} Stats;
+
+Stats book_stats(const ScoreBook *b) {
+    Stats s = {0.0, 0, 0};
+    if (b->count == 0) return s;
+
+    int sum = 0;
+    s.max = b->data[0].score;
+    s.min = b->data[0].score;
+
+    for (int i = 0; i < b->count; i++) {
+        int v = b->data[i].score;
+        sum += v;
+        if (v > s.max) s.max = v;
+        if (v < s.min) s.min = v;
+    }
+    s.average = (double)sum / b->count;
+    return s;
+}
+```
+
+**返回结构体**——比传一堆指针干净。（结构体只有 3 个成员，复制成本可接受。）
+
+## 第六步：保存与读取
+
+```c
+int book_save(const ScoreBook *b, const char *path) {
+    FILE *fp = fopen(path, "w");
+    if (fp == NULL) return 0;
+
+    for (int i = 0; i < b->count; i++) {
+        if (fprintf(fp, "%s %d\n", b->data[i].name, b->data[i].score) < 0) {
+            fclose(fp);
+            return 0;
+        }
+    }
+    return fclose(fp) == 0;
+}
+
+int book_load(ScoreBook *b, const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (fp == NULL) return 0;           /* 文件不存在不算错误 */
+
+    char line[128];
+    int loaded = 0;
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        line[strcspn(line, "\n")] = '\0';
+        if (line[0] == '\0') continue;
+
+        char name[NAME_LEN];
+        int score;
+        if (sscanf(line, "%31s %d", name, &score) == 2) {
+            if (book_add(b, name, score)) loaded++;
+        }
+    }
+    fclose(fp);
+    return loaded;
+}
+```
+
+## 完整程序
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define NAME_LEN 32
+#define INITIAL_CAP 4
+
+typedef struct {
+    char name[NAME_LEN];
+    int  score;
+} Student;
+
+typedef struct {
+    Student *data;
+    int      count;
+    int      capacity;
+} ScoreBook;
+
+typedef struct {
+    double average;
+    int    max;
+    int    min;
+} Stats;
+
+/* ---------- 创建与销毁 ---------- */
+
+ScoreBook *book_create(int initial_capacity) {
+    if (initial_capacity <= 0) initial_capacity = INITIAL_CAP;
+
+    ScoreBook *b = malloc(sizeof(ScoreBook));
+    if (b == NULL) return NULL;
+
+    b->data = malloc((size_t)initial_capacity * sizeof(Student));
+    if (b->data == NULL) {
+        free(b);
+        return NULL;
+    }
+    b->count = 0;
+    b->capacity = initial_capacity;
+    return b;
+}
+
+void book_free(ScoreBook *b) {
+    if (b == NULL) return;
+    free(b->data);
+    free(b);
+}
+
+/* ---------- 操作 ---------- */
+
+int book_add(ScoreBook *b, const char *name, int score) {
+    if (b->count >= b->capacity) {
+        int new_cap = b->capacity * 2;
+        Student *tmp = realloc(b->data, (size_t)new_cap * sizeof(Student));
+        if (tmp == NULL) return 0;
+        b->data = tmp;
+        b->capacity = new_cap;
+    }
+
+    strncpy(b->data[b->count].name, name, NAME_LEN - 1);
+    b->data[b->count].name[NAME_LEN - 1] = '\0';
+    b->data[b->count].score = score;
+    b->count++;
+    return 1;
+}
+
+int cmp_by_score_desc(const void *a, const void *b) {
+    const Student *x = (const Student *)a;
+    const Student *y = (const Student *)b;
+    if (y->score > x->score) return 1;
+    if (y->score < x->score) return -1;
+    return 0;
+}
+
+void book_sort(ScoreBook *b) {
+    if (b->count > 1) {
+        qsort(b->data, (size_t)b->count, sizeof(Student), cmp_by_score_desc);
+    }
+}
+
+Stats book_stats(const ScoreBook *b) {
+    Stats s = {0.0, 0, 0};
+    if (b->count == 0) return s;
+
+    int sum = 0;
+    s.max = b->data[0].score;
+    s.min = b->data[0].score;
+    for (int i = 0; i < b->count; i++) {
+        int v = b->data[i].score;
+        sum += v;
+        if (v > s.max) s.max = v;
+        if (v < s.min) s.min = v;
+    }
+    s.average = (double)sum / b->count;
+    return s;
+}
+
+void book_print(const ScoreBook *b) {
+    printf("  %-10s %6s\n", "姓名", "分数");
+    printf("  ------------------\n");
+    for (int i = 0; i < b->count; i++) {
+        printf("  %-10s %6d\n", b->data[i].name, b->data[i].score);
+    }
+}
+
+/* ---------- 文件 ---------- */
+
+int book_save(const ScoreBook *b, const char *path) {
+    FILE *fp = fopen(path, "w");
+    if (fp == NULL) return 0;
+
+    for (int i = 0; i < b->count; i++) {
+        if (fprintf(fp, "%s %d\n", b->data[i].name, b->data[i].score) < 0) {
+            fclose(fp);
+            return 0;
+        }
+    }
+    return fclose(fp) == 0;
+}
+
+int book_load(ScoreBook *b, const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (fp == NULL) return 0;
+
+    char line[128];
+    int loaded = 0;
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        line[strcspn(line, "\n")] = '\0';
+        if (line[0] == '\0') continue;
+
+        char name[NAME_LEN];
+        int score;
+        if (sscanf(line, "%31s %d", name, &score) == 2) {
+            if (book_add(b, name, score)) loaded++;
+        }
+    }
+    fclose(fp);
+    return loaded;
+}
+
+/* ---------- 主程序 ---------- */
+
+int main(void) {
+    const char *path = "scores.txt";
+
+    ScoreBook *book = book_create(INITIAL_CAP);
+    if (book == NULL) {
+        fprintf(stderr, "创建失败\n");
+        return 1;
+    }
+
+    /* 添加数据，观察扩容 */
+    const char *names[]  = {"Alice", "Bob", "Carol", "Dave", "Eve"};
+    const int   scores[] = {88, 92, 75, 95, 60};
+    int n = (int)(sizeof(scores) / sizeof(scores[0]));
+
+    for (int i = 0; i < n; i++) {
+        if (!book_add(book, names[i], scores[i])) {
+            fprintf(stderr, "添加失败\n");
+            book_free(book);
+            return 1;
+        }
+    }
+    printf("添加 %d 条，容量 %d\n\n", book->count, book->capacity);
+
+    /* 排序并显示 */
+    book_sort(book);
+    printf("按分数降序：\n");
+    book_print(book);
+
+    /* 统计 */
+    Stats s = book_stats(book);
+    printf("\n平均 %.2f  最高 %d  最低 %d\n", s.average, s.max, s.min);
+
+    /* 保存 */
+    if (book_save(book, path)) {
+        printf("\n已保存到 %s\n", path);
+    } else {
+        printf("\n保存失败\n");
+    }
+
+    /* 验证读取 */
+    ScoreBook *reloaded = book_create(2);
+    if (reloaded) {
+        int cnt = book_load(reloaded, path);
+        printf("重新读回 %d 条，容量 %d\n", cnt, reloaded->capacity);
+        book_free(reloaded);
+    }
+
+    book_free(book);
+    printf("内存已释放\n");
+    return 0;
+}
+```
+
+### 运行输出
+
+```text
+添加 5 条，容量 8
+
+按分数降序：
+  姓名            分数
+  ------------------
+  Dave            95
+  Bob             92
+  Alice           88
+  Carol           75
+  Eve             60
+
+平均 82.00  最高 95  最低 60
+
+已保存到 scores.txt
+重新读回 5 条，容量 8
+内存已释放
+```
+
+## 这个程序覆盖了哪些知识
+
+| 技术 | 用在何处 | 出自 |
+| --- | --- | --- |
+| `struct` / `typedef` | `Student`、`ScoreBook` | [21](./21-struct) |
+| 结构体嵌套 | `ScoreBook` 里有 `Student*` | [21](./21-struct) |
+| `malloc` | 创建数组 | [20](./20-malloc) |
+| `realloc` | 扩容 | [20](./20-malloc) |
+| `free` | 销毁 | [20](./20-malloc) |
+| 指针访问 | `b->data[i]` | [17](./17-pointers) |
+| 函数指针（回调） | `qsort` 的比较函数 | [19](./19-pointer-advanced) |
+| `strncpy` + 补 `\0` | 复制姓名 | [13](./13-string) |
+| `fopen`/`fprintf`/`fgets` | 存取文件 | [25](./25-files) |
+| `sscanf` | 解析行 | [25](./25-files) |
+| `strcspn` | 去掉换行 | [13](./13-string) |
+| `const` 指针 | 只读参数 | [17](./17-pointers) |
+
+## 想自己加的功能
+
+| 挑战 | 提示 |
+| --- | --- |
+| 支持删除某个学生 | 找到后把后面元素前移，`count--` |
+| 按姓名查找 | 线性查找，或排序后二分 |
+| 按姓名排序 | 换一个比较函数传给 `qsort` |
+| 支持修改分数 | 先查找再赋值 |
+| 统计分数段分布 | 用数组统计各分数段人数 |
+| 改成链表版本 | 对比两者的代码量和性能 |
+| 加上命令行参数 | `argv[1]` 指定文件名（第 27 课） |
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `realloc` 直接赋回 | 失败时泄漏 | 原指针丢失 | 用临时变量 |
+| 扩容后忘更新 `capacity` | 反复扩容 | 状态不一致 | 一起更新 |
+| `qsort` 比较函数返回减法 | 大数时错 | 溢出 | 返回 -1/0/1 |
+| `strncpy` 不补 `\0` | 打印乱码 | 不保证补零 | 手动加 |
+| 忘了 `book_free` | 内存泄漏 | 没释放 | 每个 create 配 free |
+| 文件读回时容量不对 | 反复扩容 | 初始容量给小了 | 可先数行数 |
+| `fclose` 不检查 | 写入失败没发现 | 磁盘满 | 检查返回值 |
+
+## 第四阶段小结
+
+到这里，你已经**完整走完了 C 语言的核心内容**。你现在会：
+
+- 理解编译链接的全过程
+- 掌握指针和内存管理
+- 会用结构体组织复杂数据
+- 能读写文件、拆分多文件工程
+- 会位运算操作寄存器
+- 能用 ASan 和 gdb 排查问题
+- 能独立完成一个完整项目
+
+**这已经足够你开始学嵌入式了。**
+
+## 下一步
+
+[31 下一步：走向嵌入式](./31-next) —— 最后一课，告诉你该往哪走。

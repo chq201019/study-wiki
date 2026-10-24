@@ -1,0 +1,269 @@
+---
+id: engineering-02
+title: "02 mypy：静态类型检查"
+sidebar_position: 3
+description: "工程化 第 2 部分：mypy：静态类型检查"
+---
+
+# 02 mypy：静态类型检查
+```bash
+python -m pip install mypy
+python -m mypy src/
+```
+
+mypy 读你的类型注解，**在运行前**发现错误：
+
+```python
+# 有 bug 的代码
+def greet(name: str) -> str:
+    return "hi " + name
+
+greet(123)          # mypy 报错，运行时也会崩
+```
+
+```text
+error: Argument 1 to "greet" has incompatible type "int"; expected "str"
+```
+
+### 严格模式
+
+建议新项目直接开 `strict = true`（在 `pyproject.toml` 的 `[tool.mypy]` 里）。它包含：
+
+| 选项 | 效果 |
+| --- | --- |
+| `disallow_untyped_defs` | 函数必须写注解 |
+| `disallow_any_generics` | 不能写裸 `list`，要写 `list[int]` |
+| `warn_return_any` | 返回 `Any` 会警告 |
+| `warn_unused_ignores` | 多余的 `# type: ignore` 会警告 |
+| `no_implicit_optional` | 默认参数 `= None` 必须显式写 `Optional` |
+
+渐进式采用（老项目）：先用默认级别，只检查新增文件，逐步收紧。
+
+```toml
+[tool.mypy]
+files = ["src"]
+# 先不严，逐个模块开启
+[[tool.mypy.overrides]]
+module = "my_package.core"
+strict = true
+```
+
+:::info[mypy 抓不到的三类问题]
+1. **运行时数据问题**：从 JSON 读来的内容 mypy 不知道真实类型
+2. **逻辑错误**：类型对了但算法错了
+3. **第三方库没注解**：会退化成 `Any`，检查失效（装 `types-requests` 之类的 stub 包能补上）
+
+所以 **mypy 是测试的补充，不是替代**。两个都要有。
+:::
+
+### 常见注解写法
+
+```python
+from typing import TypeVar, Callable, ParamSpec, Concatenate
+
+T = TypeVar("T")
+P = ParamSpec("P")          # 3.10+，用于给装饰器保留签名
+
+
+def retry(fn: Callable[P, T]) -> Callable[P, T]:
+    """保留原函数参数类型的装饰器。"""
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+        return fn(*args, **kwargs)
+    return wrapper
+```
+
+`ParamSpec` 让装饰器**不丢失**被装饰函数的参数类型——第 7 页那些 `@functools.wraps` 的装饰器，加上它就能保住签名。
+
+## 4. 依赖管理：怎么锁死版本
+
+### 两套清单的分工（第 2 页回顾）
+
+| 文件 | 写什么 | 例子 |
+| --- | --- | --- |
+| `pyproject.toml` | **意图**（兼容范围） | `requests>=2.31` |
+| `requirements.txt` | **精确版本**（可复现） | `requests==2.31.0` |
+
+**库和应用的策略不同**：
+
+- **应用/服务**：必须锁死全部（含间接依赖），保证线上环境可复现 → 用 `requirements.txt` 或 `uv.lock`
+- **库**：只声明兼容下限（`>=`），别锁死，否则会和使用者的其他依赖冲突 → 只写 `pyproject.toml`
+
+### 生成锁定清单
+
+```bash
+# 方式一：pip freeze（简单，但会混入无关包）
+python -m pip freeze > requirements.txt
+
+# 方式二：uv（推荐，只会锁定真正需要的）
+uv pip compile pyproject.toml -o requirements.txt
+uv pip sync requirements.txt      # 严格同步：会卸载多余的
+```
+
+`uv pip sync` 比 `pip install -r` 更严格——它保证环境**精确等于**清单，多出来的包会被卸载。
+
+### uv 的项目流程
+
+```bash
+uv init my-project        # 生成 pyproject.toml 骨架
+cd my-project
+uv add requests           # 装包并写入 pyproject.toml
+uv add --dev pytest mypy  # 开发依赖
+uv run pytest             # 自动建环境、装依赖、运行（不用手动激活）
+uv lock                   # 生成 uv.lock（跨平台锁定，比 requirements.txt 强）
+```
+
+`uv run` 是最舒服的一点——**不用记着激活环境**，它自己搞定。
+
+:::tip[把 `uv.lock` 提交到版本库]
+`uv.lock` 记录了所有依赖的精确版本和哈希，且是**跨平台**的（不像 `requirements.txt` 在 Windows/Linux 上可能解出不同结果）。
+
+应用项目提交它，能保证团队每个人、每台 CI 机器装出**完全一致**的环境。
+:::
+
+## 5. 日志规范
+
+### 库和应用的区别
+
+```python
+import logging
+
+log = logging.getLogger(__name__)     # 库：只获取，不配置
+```
+
+**库永远不要调 `basicConfig()` 或添加 handler**——那是应用的事。库只管 `log.info(...)`，让使用者决定日志去哪。
+
+应用才配置：
+
+```python
+import logging
+import sys
+
+def setup_logging(level: int = logging.INFO) -> None:
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stderr,        # 日志走 stderr，stdout 留给程序输出
+        force=True,               # 3.8+，覆盖已有配置
+    )
+
+
+if __name__ == "__main__":
+    setup_logging()
+```
+
+### 三条硬规范
+
+1. **用 `%s` 惰性格式化**（第 9 页已讲，这里重申）
+
+```python
+log.info("处理了 %d 条", n)        # 好
+log.info(f"处理了 {n} 条")         # 不好：被过滤时也拼接了字符串
+```
+
+2. **异常要带堆栈**
+
+```python
+try:
+    risky()
+except Exception:
+    log.exception("处理失败")       # 自动附带 traceback
+    # 等价于 log.error("处理失败", exc_info=True)
+    raise
+```
+
+`log.exception()` 只能在 `except` 块里用，它会把完整堆栈写进去——排查线上问题时这是救命信息。
+
+3. **日志走 stderr，程序输出走 stdout**
+
+这样 `python tool.py > out.txt` 时日志不会污染结果文件，管道也能正常工作。
+
+:::warning[不要在日志里记敏感信息]
+密码、token、身份证号、完整请求体……日志经常会被收集到集中式系统里留存很久，而且访问权限比数据库宽得多。
+
+```python
+log.info("登录失败 user=%s", username)          # 可以
+log.info("登录失败 user=%s pwd=%s", u, pwd)     # 灾难
+```
+:::
+
+## 6. 打包与发布
+
+### 构建
+
+```bash
+python -m pip install build
+python -m build          # 生成 dist/xxx.whl 和 dist/xxx.tar.gz
+```
+
+产出两个文件：
+
+- **wheel**（`.whl`）：预编译分发包，装得快，优先用它
+- **sdist**（`.tar.gz`）：源码分发，wheel 不合适时的退路
+
+### 本地先验证
+
+```bash
+# 在干净环境里装一次，确认没漏文件
+python -m venv /tmp/test-install
+/tmp/test-install/Scripts/python.exe -m pip install dist/*.whl
+/tmp/test-install/Scripts/python.exe -c "import my_package; print(my_package.__file__)"
+```
+
+**这一步能抓住「忘了把数据文件打进 wheel」这类问题**——直接跑测试发现不了（因为 `src` 布局下测试用的是源码目录）。
+
+### 发布到 PyPI
+
+```bash
+python -m pip install twine
+python -m twine check dist/*
+python -m twine upload --repository testpypi dist/*   # 先传测试站
+python -m twine upload dist/*                          # 再传正式站
+```
+
+**先传 TestPyPI** 验证一遍，别直接传正式站——PyPI 上的版本号**不能重复使用**，传错了只能发新版本。
+
+:::danger[永远不要把 token 写进代码]
+用 `~/.pypirc` 或环境变量 `TWINE_USERNAME` / `TWINE_PASSWORD`，并且**用 API token 而不是密码**。token 可以随时吊销，密码泄露等于账号泄露。
+
+记得把 `.pypirc` 加进 `.gitignore`。
+:::
+
+## 7. 其他必备工具
+
+| 工具 | 作用 | 命令 |
+| --- | --- | --- |
+| **Ruff** | lint + 格式化（比 flake8+black 快百倍） | `ruff check .` / `ruff format .` |
+| **pre-commit** | 提交前自动跑检查 | `pre-commit install` |
+| **tox / nox** | 多 Python 版本测试 | `tox` |
+| **pip-audit** | 检查依赖的已知漏洞 | `pip-audit` |
+
+Ruff 现在是事实标准（Rust 写的，秒级完成）：
+
+```bash
+python -m pip install ruff
+ruff check .        # 查问题
+ruff check --fix .  # 自动修能修的
+ruff format .       # 格式化（兼容 black 风格）
+```
+
+`.pre-commit-config.yaml`：
+
+```yaml
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.11.2
+    hooks:
+      - id: mypy
+        additional_dependencies: [types-requests]
+```
+
+---
+
+**翻页**：[← 上一页](./engineering-01) · [下一页 →](./engineering-03) · [返回目录](./)

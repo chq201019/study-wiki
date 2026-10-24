@@ -1,0 +1,280 @@
+---
+id: oop-03
+title: "03 dataclass：告别样板代码"
+sidebar_position: 4
+description: "面向对象 第 3 部分：dataclass：告别样板代码"
+---
+
+# 03 dataclass：告别样板代码
+写「主要用来装数据」的类时，`__init__`、`__repr__`、`__eq__` 全是重复的样板。`dataclass` 帮你生成。
+
+```python
+from dataclasses import dataclass, field, asdict, astuple, replace, fields
+
+@dataclass
+class Point:
+    x: float
+    y: float = 0.0
+    tags: list[str] = field(default_factory=list)
+
+p = Point(1.0)
+print("repr :", repr(p))
+print("eq   :", Point(1.0) == Point(1.0))
+print("asdict :", asdict(p))
+print("astuple:", astuple(p))
+print("replace:", replace(p, y=9))
+print("fields :", [(f.name, f.default) for f in fields(Point)])
+```
+
+```text
+repr : Point(x=1.0, y=0.0, tags=[])
+eq   : True
+asdict : {'x': 1.0, 'y': 0.0, 'tags': []}
+astuple: (1.0, 0.0, [])
+replace: Point(x=1.0, y=9, tags=[])
+fields : [('x', 0.0, ...), ('y', 0.0, ...), ('tags', ...)]
+```
+
+### 参数对照
+
+| 参数 | 默认 | 效果 |
+| --- | --- | --- |
+| `init` | `True` | 生成 `__init__` |
+| `repr` | `True` | 生成 `__repr__` |
+| `eq` | `True` | 生成 `__eq__` |
+| `order` | `False` | 生成 `<` `<=` `>` `>=` |
+| `frozen` | `False` | 实例不可变，并生成 `__hash__` |
+| `slots` | `False` | 生成 `__slots__`（3.10+） |
+| `match_args` | `True` | 支持 `match` 位置模式（3.10+） |
+
+验证几个关键行为：
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class P:
+    x: int
+
+print("order=False 时生成 __lt__ 了吗:", "__lt__" in P.__dict__)
+print("默认生成 __eq__ 了吗:", "__eq__" in P.__dict__)
+print("__hash__ 被置为 None 了吗:", P.__hash__ is None)
+
+@dataclass(order=True)
+class Q:
+    x: int
+print("order=True 时生成 __lt__ 了吗:", "__lt__" in Q.__dict__)
+
+@dataclass(frozen=True)
+class R:
+    x: int
+print("frozen=True 时生成 __hash__ 了吗:", "__hash__" in R.__dict__)
+```
+
+```text
+order=False 时生成 __lt__ 了吗: False
+默认生成 __eq__ 了吗: True
+__hash__ 被置为 None 了吗: True
+order=True 时生成 __lt__ 了吗: True
+frozen=True 时生成 __hash__ 了吗: True
+```
+
+:::caution[dataclass 默认不可哈希]
+因为它默认生成了 `__eq__`，按上一节的规则 `__hash__` 就成了 `None`。要能进 set / 当 dict 键，用 `@dataclass(frozen=True)`（同时得到不可变性）或 `@dataclass(eq=False)`（保留默认哈希）。
+
+另外，`frozen=True` **不是深度冻结**——里面的 list 字段照样能改：
+
+```python
+@dataclass(frozen=True)
+class Box:
+    items: list
+
+b = Box([1])
+b.items.append(2)      # 可以，因为改的是列表本身
+print(b)               # Box(items=[1, 2])
+```
+:::
+
+### `field` 与 `default_factory`
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass
+class Config:
+    name: str
+    values: list[int] = field(default_factory=list)      # 每次新建
+    meta: dict = field(default_factory=dict, repr=False)  # 不显示在 repr 里
+    _cache: dict = field(default_factory=dict, init=False)  # 不进 __init__
+```
+
+**为什么必须用 `default_factory`？** 因为直接写 `values: list = []` 会触发 dataclass 的显式检查：
+
+```text
+ValueError: mutable default <class 'list'> for field values is not allowed
+```
+
+dataclass 主动拦住了第 5 页那个坑——这是它比手写类更好的地方之一。
+
+### `__post_init__`：生成后的钩子
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class Range:
+    lo: int
+    hi: int
+
+    def __post_init__(self):
+        if self.lo > self.hi:
+            raise ValueError(f"lo({self.lo}) 不能大于 hi({self.hi})")
+
+try:
+    Range(5, 1)
+except ValueError as e:
+    print("->", e)
+```
+
+```text
+-> lo(5) 不能大于 hi(1)
+```
+
+`__post_init__` 在生成的 `__init__` 末尾被调用，适合放校验和派生字段。
+
+### `InitVar`：只在初始化时用的参数
+
+```python
+from dataclasses import dataclass, InitVar, fields
+from typing import ClassVar
+
+@dataclass
+class Cfg:
+    scale: InitVar[int] = 1       # 传给 __post_init__，但不存为字段
+    unit: ClassVar[str] = "mm"    # 类变量，不是字段
+    value: int = 0
+
+    def __post_init__(self, scale):
+        self.value *= scale
+
+c = Cfg(scale=10, value=3)
+print(c, "| unit:", Cfg.unit)
+print("字段列表:", [f.name for f in fields(Cfg)])
+```
+
+```text
+Cfg(value=30) | unit: mm
+字段列表: ['value']
+```
+
+:::warning[`InitVar` 在 `dataclasses` 里，不在 `typing` 里]
+我第一次写这段代码时写成了 `from typing import InitVar`，直接报错：
+
+```text
+ImportError: cannot import name 'InitVar' from 'typing'
+```
+
+`ClassVar` 在两个模块里都有，但 **`InitVar` 只在 `dataclasses` 里**。这是个很容易记混的点。
+:::
+
+## 9. `__slots__`：省内存与防拼写错误
+
+默认情况下每个实例都有一个 `__dict__`，能随时加属性——灵活但费内存。
+
+```python
+import sys
+
+class Point:
+    __slots__ = ("x", "y")
+    def __init__(self, x, y):
+        self.x, self.y = x, y
+
+class Normal:
+    pass
+
+p = Point(1, 2)
+n = Normal(); n.x = 1; n.y = 2
+
+print("slots 实例有 __dict__ 吗:", hasattr(p, "__dict__"))
+print("slots 实例大小:", sys.getsizeof(p))
+print("普通实例大小:", sys.getsizeof(n), "+ __dict__:", sys.getsizeof(n.__dict__))
+
+try:
+    p.z = 3        # 不在 __slots__ 里的名字直接拒绝
+except AttributeError as e:
+    print("->", e)
+```
+
+```text
+slots 实例有 __dict__ 吗: False
+slots 实例大小: 48
+普通实例大小: 56 + __dict__: 296
+-> 'Point' object has no attribute 'z'
+```
+
+**内存省了约 85%**（48 vs 56+296）。当你有上百万个同类对象时（解析大文件、树节点、ORM 行）这个差距非常可观。
+
+另一个好处：**拼写错误会立刻报错**而不是悄悄创建一个新属性。
+
+:::caution[`__slots__` 的三个限制]
+1. 不能动态加新属性（上面已演示）
+2. **子类也要声明 `__slots__`**，否则子类又会有 `__dict__`，白省了
+3. 需要弱引用时要显式加 `"__weakref__"` 到 slots 里
+
+```python
+import weakref
+
+class W:
+    __slots__ = ("a", "__weakref__")
+
+w = W()
+print("弱引用可用:", weakref.ref(w)() is w)
+```
+
+```text
+弱引用可用: True
+```
+
+dataclass 用户直接写 `@dataclass(slots=True)`（3.10+）即可。
+:::
+
+## 10. 抽象基类（ABC）
+
+```python
+from abc import ABC, abstractmethod
+
+class Shape(ABC):
+    @abstractmethod
+    def area(self) -> float:
+        ...
+
+try:
+    Shape()          # 抽象类不能实例化
+except TypeError as e:
+    print("->", e)
+
+class Square(Shape):
+    def __init__(self, side): self.side = side
+    def area(self): return self.side ** 2
+
+print("具体类 OK:", Square(4).area())
+```
+
+```text
+-> Can't instantiate abstract class Shape with abstract method area
+具体类 OK: 16
+```
+
+`@abstractmethod` 的作用是**强制子类实现**，漏实现会在实例化时报错（而不是调用时才炸）。
+
+:::info[Python 的鸭子类型与 ABC 的关系]
+Python 崇尚「鸭子类型」——「如果它走起来像鸭子、叫起来像鸭子，那它就是鸭子」，不需要显式继承某个接口。
+
+ABC 的价值在于**明确契约**和**提前报错**，适合框架代码。日常小项目不必给每个类都配一个 ABC——那会把 Python 写成 Java。
+
+另外 `collections.abc` 提供了一堆现成的抽象基类（`Iterable`、`Mapping`、`Sequence`），可以用 `isinstance` 做能力检查，比检查具体类型灵活。
+:::
+
+---
+
+**翻页**：[← 上一页](./oop-02) · [下一页 →](./oop-04) · [返回目录](./)

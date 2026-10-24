@@ -1,0 +1,277 @@
+---
+id: advanced-04
+title: "04 虚调用的代价"
+sidebar_position: 5
+description: "进阶特性 第 4 部分：虚调用的代价"
+---
+
+# 04 虚调用的代价
+```cpp
+// virtual_cost.cpp
+#include <chrono>
+#include <cstdio>
+#include <vector>
+
+struct Base     { virtual int calc(int x) const { return x + 1; } virtual ~Base() = default; };
+struct Derived1 : Base { int calc(int x) const override { return x * 2; } };
+struct Derived2 : Base { int calc(int x) const override { return x + 7; } };
+struct Plain    { int calc(int x) const { return x + 1; } };
+
+template<typename F> long long us(F&& f) {
+    auto t0 = std::chrono::high_resolution_clock::now(); f();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count();
+}
+
+volatile int g_acc = 0;   // volatile：让每次累加都可观测，防止被优化掉
+
+int main() {
+    const int N = 20000000;
+    Plain p;
+    Derived1 d1;
+    Base* mono = &d1;                 // 单一类型（分支预测友好）
+    std::vector<Base*> poly;          // 3 种类型混合（分支预测失效）
+    for (int i = 0; i < 64; ++i)
+        poly.push_back((i%3==0) ? (Base*)new Base()
+                     : (i%3==1) ? (Base*)new Derived1()
+                                : (Base*)new Derived2());
+
+    long long t_direct=0, t_mono=0, t_poly=0;
+    for (int r = 0; r < 3; ++r) {
+        t_direct += us([&]{ int s=0;
+            for (int i=0;i<N;++i){ s+=p.calc(i); if((i&0xFFFF)==0) g_acc=s; } g_acc=s; });
+        t_mono   += us([&]{ int s=0;
+            for (int i=0;i<N;++i){ s+=mono->calc(i); if((i&0xFFFF)==0) g_acc=s; } g_acc=s; });
+        t_poly   += us([&]{ int s=0; for (int i=0;i<N;++i){
+            s += poly[i%poly.size()]->calc(i); if((i&0xFFFF)==0) g_acc=s; } g_acc=s; });
+    }
+    std::printf("direct (non-virtual) : %lld us (avg of 3)\n", t_direct/3);
+    std::printf("virtual (single type): %lld us\n", t_mono/3);
+    std::printf("virtual (3 types)    : %lld us\n", t_poly/3);
+    std::printf("poly / direct ratio  : %.1fx\n", (double)t_poly/t_direct);
+}
+```
+
+**实测输出（`-O2`）：**
+
+```text
+direct (non-virtual) : 4690 us (avg of 3)
+virtual (single type): 9193 us
+virtual (3 types)    : 36112 us
+poly / direct ratio  : 7.7x
+```
+
+**结论（数字来自上表）：**
+
+- **单态虚调用**（同一类型反复调）相对直接调用慢约 **2 倍**（9193 vs 4690 us）——现代 CPU 的间接分支预测很准，主要代价是**失去内联机会**
+- **多态调用**（3 种类型混合）慢约 **7.7 倍**（36112 vs 4690 us）——分支预测频繁失效 + 无法内联 + 指令缓存压力
+- **虚函数真正的代价往往不是"那一次跳转"，而是"不能内联"**：`calc` 这种一行函数被内联后整个循环能被大幅优化，变成虚调用后这些优化全部失效
+
+:::info[别拿这个倍数吓唬人]
+上面的场景是"循环两千万次调用一个一行的函数"——**刻意放大了调用开销**。真实程序里函数体更大、调用更分散，虚函数的相对代价会小得多。**用它理解趋势，不要用它做绝对判断。**
+
+另外一个真实发现：我第一版测试里 `direct` 和 `virtual (mono)` 都被优化成了 0 us（编译器发现结果可预测就整个删掉了）。**基准测试必须确保结果可观测**（本例用 `volatile` 累加器 + 多种派生类型），否则你测的是"优化器有多聪明"，不是"代码有多快"。
+:::
+
+:::caution[别过早害怕虚函数]
+一次虚调用的典型代价在**纳秒级**。除非在每秒调用千万次以上的热路径，否则**不值得为了性能放弃多态**。
+
+真正该关心虚函数的场景是嵌入式：**每个对象多 8 字节 vptr、每张 vtable 占 flash、且 `-fno-rtti` 下部分功能受限**。见 [嵌入式 C++](./embedded-cpp)。
+:::
+
+### final 与去虚拟化
+
+```cpp
+struct A { virtual void f(); };
+struct B final : A { void f() override; };   // B 不能再被继承
+
+// 编译器知道 B* 指向的一定是 B，可以去掉虚调用
+B* p = get_b();
+p->f();    // 可能直接调用 B::f()，不走 vtable
+```
+
+`final` 也能用于单个虚函数：
+
+```cpp
+struct C : A { void f() override final; };   // f 不能再被覆盖
+```
+
+## 5. dynamic_cast 的代价
+
+`dynamic_cast` 是**运行时**的类型安全转换，用于多态类型的向下转换（downcast）或交叉转换（cross-cast）。
+
+### 三种用法
+
+| 用法 | 失败时 | 需要 RTTI |
+| --- | --- | --- |
+| `dynamic_cast<T*>(ptr)` | 返回 `nullptr` | 是 |
+| `dynamic_cast<T&>(ref)` | 抛 `std::bad_cast` | 是 |
+| `static_cast<T*>(ptr)` | **UB**（不检查） | 否 |
+
+```cpp
+// dynamic_cast.cpp
+#include <cstdio>
+#include <typeinfo>
+#include <chrono>
+#include <vector>
+
+struct Base { virtual ~Base() = default; int b = 1; };
+struct D1 : Base { int d1 = 2; };
+struct D2 : Base { int d2 = 3; };
+struct D11 : D1 { int d11 = 4; };   // 更深的继承
+
+int main() {
+    Base* b1 = new D1();
+    Base* b2 = new D2();
+    Base* b3 = new D11();
+
+    // 向下转换
+    D1* d = dynamic_cast<D1*>(b1);
+    std::printf("b1 -> D1 : %s\n", d ? "ok" : "null");
+    std::printf("b2 -> D1 : %s\n", dynamic_cast<D1*>(b2) ? "ok" : "null");
+    std::printf("b3 -> D11: %s  (跨越两层也行)\n",
+                dynamic_cast<D11*>(b3) ? "ok" : "null");
+
+    // 引用版本会抛异常
+    try {
+        D1& r = dynamic_cast<D1&>(*b2);   // b2 实际是 D2
+        (void)r;
+    } catch (const std::bad_cast& e) {
+        std::printf("caught bad_cast: %s\n", e.what());
+    }
+
+    // typeid
+    std::printf("typeid(*b1).name() = %s\n", typeid(*b1).name());
+    std::printf("typeid(*b2).name() = %s\n", typeid(*b2).name());
+
+    delete b1; delete b2; delete b3;
+}
+```
+
+**实测输出：**
+
+```text
+b1 -> D1 : ok
+b2 -> D1 : null
+b3 -> D11: ok  (跨越两层也行)
+caught bad_cast: std::bad_cast
+typeid(*b1).name() = 2D1
+typeid(*b2).name() = 2D2
+```
+
+### 代价实测
+
+```cpp
+// dyncast_cost.cpp
+#include <chrono>
+#include <cstdio>
+
+struct B { virtual ~B() = default; };
+struct D0 : B {}; struct D1 : D0 {}; struct D2 : D1 {};
+struct D3 : D2 {}; struct D4 : D3 {};   // 5 层继承链
+
+template<typename F> long long us(F&& f) {
+    auto t0 = std::chrono::high_resolution_clock::now(); f();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count();
+}
+
+int main() {
+    const int N = 20000000;
+    D4 obj;
+    B* base = &obj;
+    long long sink = 0;
+
+    long long t_static = us([&]{
+        for (int i = 0; i < N; ++i) sink += (static_cast<D4*>(base) != nullptr);
+    });
+    long long t_dynamic = us([&]{
+        for (int i = 0; i < N; ++i) sink += (dynamic_cast<D4*>(base) != nullptr);
+    });
+
+    std::printf("static_cast  : %lld us\n", t_static);
+    std::printf("dynamic_cast : %lld us  (5 层继承链)\n", t_dynamic);
+    std::printf("ratio        : %.1fx  (sink=%lld)\n",
+                (double)t_dynamic / t_static, sink);
+}
+```
+
+**实测输出（`-O2`）：**
+
+```text
+static_cast  : 10519 us
+dynamic_cast : 414388 us  (5 层继承链)
+ratio        : 39.4x  (sink=40000000)
+```
+
+### 为什么慢，以及替代方案
+
+`dynamic_cast` 需要在运行时遍历继承层次、比较 `type_info`。继承链越深越慢。
+
+:::warning[用 dynamic_cast 通常意味着设计问题]
+大量使用 `dynamic_cast` 是**"用 RTTI 模拟虚函数"**的味道。更好的设计：
+
+```cpp
+// 不好：用 dynamic_cast 分派
+void handle(Base* b) {
+    if (auto* d1 = dynamic_cast<D1*>(b))      d1->do_d1();
+    else if (auto* d2 = dynamic_cast<D2*>(b)) d2->do_d2();
+    else if (auto* d3 = dynamic_cast<D3*>(b)) d3->do_d3();
+}
+
+// 好：用虚函数分派
+struct Base { virtual void handle() = 0; };
+void handle(Base* b) { b->handle(); }   // 一次虚调用搞定
+```
+
+**如果确实需要"访问者模式"式的双分派，用 CRTP 或静态分发**（见 [模板](./templates)）。
+
+只在"无法修改类层次"（比如第三方库）时才该依赖 `dynamic_cast`。
+:::
+
+### 关闭 RTTI
+
+```bash
+g++ -fno-rtti ...
+```
+
+关闭后 `dynamic_cast` 和 `typeid` **不可用**（编译错误），但对象大小不变（vptr 还在，只是 vtable 里的 typeinfo 指针没了/不用了）。这能省 flash——**嵌入式常用**，见 [嵌入式 C++](./embedded-cpp)。
+
+## 常见坑
+
+| 坑 | 现象 | 解法 |
+| --- | --- | --- |
+| 析构函数抛异常 | `std::terminate` | 析构永远不抛 |
+| 乱加 `noexcept` | 抛异常 → terminate | 只在确实不抛时加 |
+| 移动构造没加 `noexcept` | vector 扩容退化成拷贝 | 移动操作一律 `noexcept` |
+| `decltype(auto)` 返回局部引用 | 悬空引用 | 检查返回的是什么 |
+| `decltype(x)` vs `decltype((x))` | 括号改变结果 | 记住括号 = 表达式 |
+| `consteval` 函数传运行时值 | 编译错误 | consteval 必须产生常量 |
+| 以为虚函数只是"多一次跳转" | 低估"不能内联"的代价 | 热路径才需要担心 |
+| 滥用 `dynamic_cast` | 慢 + 设计味道 | 用虚函数分派 |
+| 多重继承用 C 风格强转 | 地址偏移错误 | 用 `static_cast` |
+| 依赖 vtable 具体布局 | 换编译器就废 | 只用于理解，不用于代码 |
+
+## 自检清单
+
+- [ ] 说出异常安全的三个保证等级，各举一个例子
+- [ ] 解释为什么 `vector::push_back` 能提供强保证
+- [ ] 说明 `noexcept` 对 `std::vector` 扩容行为的实际影响
+- [ ] 说出 `constexpr` / `consteval` / `constinit` 的区别和各自的版本
+- [ ] 解释 `decltype(x)` 和 `decltype((x))` 的差异
+- [ ] 画出带虚函数的对象内存布局（vptr 在哪、占多少）
+- [ ] 解释为什么同一类的对象共享同一张 vtable
+- [ ] 说明多重继承下 `B*` 和 `C*` 地址不同的原因
+- [ ] 说出虚函数的真正代价是什么（不只是跳转）
+- [ ] 说明 `dynamic_cast` 为什么慢，以及通常的替代设计
+
+## 下一步
+
+- 编译期计算的嵌入式应用 → [嵌入式 C++ 实战](./embedded-cpp)
+- 编译流程与 RTTI 开关 → [构建与工具链](./build)
+- 静态多态替代虚函数 → [模板](./templates)
+- 回到 [C++ 主线导读](./)
+
+---
+
+**翻页**：[← 上一页](./advanced-03) · [返回目录](./)

@@ -1,0 +1,356 @@
+---
+id: 15-http
+title: 15 HTTP 请求
+sidebar_position: 15
+description: 用 esp_http_client 发 GET/POST、用 cJSON 解析返回、抓天气数据，以及内存与超时的坑。
+---
+
+# 15 HTTP 请求
+
+**本课目标**：让板子从网上的接口拿数据，并用起来。
+
+## HTTP 请求长什么样
+
+```text
+GET /v1/current.json?q=Beijing HTTP/1.1
+Host: api.weatherapi.com
+Authorization: Bearer 你的key
+
+（服务器返回）
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"current":{"temp_c":22.5,...}}
+```
+
+**ESP32 要做的事**：发出请求 → 等响应 → 解析内容。
+
+## ESP-IDF 的 HTTP 客户端
+
+本机 ESP-IDF v5.3.5 的实际 API（`esp_http_client.h`）：
+
+```c
+esp_err_t esp_http_client_perform(esp_http_client_handle_t client);
+esp_err_t esp_http_client_set_url(esp_http_client_handle_t client, const char *url);
+esp_err_t esp_http_client_set_post_field(esp_http_client_handle_t client, const char *data, int len);
+esp_err_t esp_http_client_cleanup(esp_http_client_handle_t client);
+```
+
+## 最简单的 GET（把响应打到串口）
+
+```c
+#include "esp_http_client.h"
+#include "esp_log.h"
+
+static const char *TAG = "http";
+
+/* 响应回调：每收到一块数据调一次 */
+static esp_err_t on_data(esp_http_client_event_t *e)
+{
+    if (e->event_id == HTTP_EVENT_ON_DATA) {
+        /* 注意：不是以 '\0' 结尾的字符串！ */
+        ESP_LOGI(TAG, "收到 %d 字节: %.*s", e->data_len, e->data_len, (char *)e->data);
+    }
+    return ESP_OK;
+}
+
+void http_get_demo(void)
+{
+    esp_http_client_config_t cfg = {
+        .url          = "http://httpbin.org/get",
+        .event_handler = on_data,
+        .timeout_ms   = 10000,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        ESP_LOGE(TAG, "初始化失败");
+        return;
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "状态码 %d", esp_http_client_get_status_code(client));
+    } else {
+        ESP_LOGE(TAG, "请求失败: %s", esp_err_to_name(err));
+    }
+
+    esp_http_client_cleanup(client);        /* ← 不能漏 */
+}
+```
+
+:::danger[`HTTP_EVENT_ON_DATA` 的数据不是字符串]
+```c
+ESP_LOGI(TAG, "%s", (char *)e->data);          /* ❌ 可能读到缓冲区以外的内容 */
+ESP_LOGI(TAG, "%.*s", e->data_len, (char *)e->data);   /* ✅ 指定长度 */
+```
+
+**`data` 是原始字节，没有 `\0` 结尾。** 用 `%s` 会越界读到垃圾甚至崩溃。
+
+**规矩：永远用 `%.*s` 配合 `data_len`。**
+:::
+
+:::warning[响应可能分多次到达]
+一次请求的回调可能被调用**多次**（每次几 KB）。
+
+**所以数据不能只在回调里处理一半**——要么累积到缓冲区，要么在 `HTTP_EVENT_ON_FINISH` 里统一处理。
+:::
+
+## 把响应累积起来
+
+```c
+#define MAX_BODY 2048
+
+static char   s_body[MAX_BODY + 1];
+static size_t s_len = 0;
+
+static esp_err_t on_data(esp_http_client_event_t *e)
+{
+    if (e->event_id == HTTP_EVENT_ON_DATA) {
+        size_t room = MAX_BODY - s_len;
+        size_t n = (e->data_len < room) ? e->data_len : room;
+        memcpy(s_body + s_len, e->data, n);
+        s_len += n;
+        s_body[s_len] = '\0';           /* 手动补结束符 */
+    } else if (e->event_id == HTTP_EVENT_ON_FINISH) {
+        ESP_LOGI(TAG, "完整响应 %d 字节:\n%s", s_len, s_body);
+    }
+    return ESP_OK;
+}
+```
+
+:::danger[缓冲区一定要限长]
+```c
+memcpy(s_body + s_len, e->data, e->data_len);   /* ❌ 可能溢出 */
+```
+
+服务器可能返回比你预期大得多的内容（错误页、重定向页面）。
+
+**不检查长度会栈溢出/踩内存——这是嵌入式的经典崩溃原因。**
+:::
+
+## 用 cJSON 解析返回
+
+ESP-IDF **内置 cJSON**（`components/json/cJSON/`），直接 include 就能用：
+
+```c
+#include "cJSON.h"
+```
+
+### JSON 是什么
+
+```json
+{
+  "name": "esp32",
+  "temp": 22.5,
+  "ok": true,
+  "list": [1, 2, 3]
+}
+```
+
+| 概念 | 例子 |
+| --- | --- |
+| 对象 `{}` | `{"a":1}` |
+| 数组 `[]` | `[1,2,3]` |
+| 字符串 | `"abc"` |
+| 数字 | `22.5` |
+| 布尔 | `true` / `false` |
+| 空值 | `null` |
+
+### 解析流程
+
+```c
+void parse_json(const char *json)
+{
+    cJSON *root = cJSON_Parse(json);
+    if (root == NULL) {
+        ESP_LOGE(TAG, "JSON 解析失败");
+        return;
+    }
+
+    /* 取字段 */
+    cJSON *temp = cJSON_GetObjectItem(root, "temp");
+    if (cJSON_IsNumber(temp)) {
+        ESP_LOGI(TAG, "温度 = %.1f", temp->valuedouble);
+    }
+
+    cJSON *name = cJSON_GetObjectItem(root, "name");
+    if (cJSON_IsString(name)) {
+        ESP_LOGI(TAG, "名字 = %s", name->valuestring);
+    }
+
+    /* 嵌套对象 */
+    cJSON *current = cJSON_GetObjectItem(root, "current");
+    if (cJSON_IsObject(current)) {
+        cJSON *t = cJSON_GetObjectItem(current, "temp_c");
+        if (cJSON_IsNumber(t)) {
+            ESP_LOGI(TAG, "当前温度 = %.1f", t->valuedouble);
+        }
+    }
+
+    cJSON_Delete(root);        /* ← 必须释放！ */
+}
+```
+
+:::danger[`cJSON_Delete` 不能漏]
+`cJSON_Parse` 会 `malloc` 一整棵对象树。
+
+**不 `cJSON_Delete` → 每次请求泄漏几百字节 → 跑几小时后内存耗尽崩溃。**
+
+**规矩：`Parse` 之后一定要 `Delete`（包括每个分支的提前 return）。**
+:::
+
+:::warning[`cJSON_GetObjectItem` 返回 NULL 是正常的]
+字段不存在时返回 `NULL`，**不是错误**。
+
+**所以取值后必须判 `cJSON_IsNumber/String/Object`**，否则解引用 NULL 直接崩。
+:::
+
+## 完整示例：抓天气
+
+```c
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_http_client.h"
+#include "esp_log.h"
+#include "cJSON.h"
+
+static const char *TAG = "weather";
+
+#define MAX_BODY 2048
+static char   s_body[MAX_BODY + 1];
+static size_t s_len;
+
+static esp_err_t on_data(esp_http_client_event_t *e)
+{
+    if (e->event_id == HTTP_EVENT_ON_DATA) {
+        size_t room = MAX_BODY - s_len;
+        size_t n = (e->data_len < room) ? (size_t)e->data_len : room;
+        memcpy(s_body + s_len, e->data, n);
+        s_len += n;
+        s_body[s_len] = '\0';
+    }
+    return ESP_OK;
+}
+
+void fetch_weather(void)
+{
+    s_len = 0;
+    s_body[0] = '\0';
+
+    esp_http_client_config_t cfg = {
+        .url           = "http://api.weatherapi.com/v1/current.json"
+                         "?key=YOUR_KEY&q=Beijing&lang=zh",
+        .event_handler = on_data,
+        .timeout_ms    = 10000,
+    };
+
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (!c) return;
+
+    if (esp_http_client_perform(c) != ESP_OK) {
+        ESP_LOGE(TAG, "请求失败");
+        esp_http_client_cleanup(c);
+        return;
+    }
+
+    int code = esp_http_client_get_status_code(c);
+    esp_http_client_cleanup(c);
+
+    if (code != 200) {
+        ESP_LOGE(TAG, "HTTP 状态码 %d（不是 200）", code);
+        return;
+    }
+
+    cJSON *root = cJSON_Parse(s_body);
+    if (!root) { ESP_LOGE(TAG, "解析失败"); return; }
+
+    cJSON *cur = cJSON_GetObjectItem(root, "current");
+    if (cJSON_IsObject(cur)) {
+        cJSON *t = cJSON_GetObjectItem(cur, "temp_c");
+        cJSON *h = cJSON_GetObjectItem(cur, "humidity");
+        if (cJSON_IsNumber(t) && cJSON_IsNumber(h)) {
+            ESP_LOGI(TAG, "北京 %.1f°C，湿度 %d%%",
+                     t->valuedouble, h->valueint);
+        }
+    }
+    cJSON_Delete(root);
+}
+
+void app_main(void)
+{
+    /* 假设 WiFi 已连上（见第 14 课） */
+    while (1) {
+        fetch_weather();
+        vTaskDelay(pdMS_TO_TICKS(60000));
+    }
+}
+```
+
+:::warning[这个例子需要你自己的 API key]
+`YOUR_KEY` 要换成真实 key，**否则返回 401**。
+
+**并且注意：HTTP 是明文传输，key 会被中间人看到。生产环境要用 HTTPS。**
+:::
+
+## HTTPS 需要注意什么
+
+```c
+esp_http_client_config_t cfg = {
+    .url = "https://api.example.com/...",
+};
+```
+
+:::tip[HTTPS 通常能直接用]
+ESP-IDF 内置 mbedTLS，**`https://` 的 url 一般直接能跑**（默认不校验证书）。
+
+代价：**TLS 握手要 3~10 秒，且占约 40 KB 内存**。
+:::
+
+:::danger[默认不校验证书 = 不防中间人]
+```c
+.crt_bundle_attach = esp_crt_bundle_attach,   /* 启用证书校验 */
+```
+
+不加这行，`https` 只是加密了，**但不验证对方是谁**。
+
+**产品环境应启用证书 bundle**（ESP-IDF 内置根证书集合）。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `%s` 打 `e->data` | 乱码/崩溃 | 没有 `\0` | `%.*s` + `data_len` |
+| 缓冲区不限长 | 栈溢出崩溃 | 响应超预期 | 检查剩余空间 |
+| 漏 `cJSON_Delete` | 跑几小时后 OOM | 内存泄漏 | 每个分支都释放 |
+| 不判 `cJSON_IsXxx` | 解引用 NULL 崩溃 | 字段不存在 | 先判类型 |
+| 漏 `esp_http_client_cleanup` | 句柄泄漏 | 没释放 | 每次都 cleanup |
+| 超时设太短 | 偶发失败 | TLS 握手慢 | 至少 10 秒 |
+| 没等 IP 就请求 | 必定失败 | 网络没就绪 | 等 GOT_IP |
+
+:::danger[内存是大问题]
+一次 HTTPS 请求可能占 **40~60 KB** 堆内存。
+
+ESP32 总共只有约 300 KB 可用堆。**同时开多个请求很容易 OOM。**
+
+**规矩：串行发请求，不要并发。** 报 `ESP_ERR_HTTP_CONNECT` 或 `no mem` 时先查内存。
+:::
+
+## 本课自检
+
+- [ ] 会用 `esp_http_client_init` / `perform` / `cleanup`
+- [ ] **知道 `HTTP_EVENT_ON_DATA` 的数据没有 `\0`，要用 `%.*s`**
+- [ ] 知道响应可能分多次到达，要累积并限长
+- [ ] 知道 ESP-IDF 内置 cJSON，直接 `#include "cJSON.h"`
+- [ ] 会用 `cJSON_Parse` / `GetObjectItem` / `IsNumber` / `Delete`
+- [ ] **知道漏 `cJSON_Delete` 会内存泄漏**
+- [ ] **知道取值后必须判类型（可能返回 NULL）**
+- [ ] 知道要检查 HTTP 状态码是不是 200
+- [ ] **知道 HTTPS 默认不校验证书**
+- [ ] 知道 HTTPS 请求内存开销大，要串行
+
+## 下一步
+
+[16 MQTT 上云](./16-mqtt) —— 让设备持续上报数据、远程控制。

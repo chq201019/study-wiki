@@ -1,0 +1,152 @@
+---
+id: transition-04
+title: "04 其它必须知道的小改动"
+sidebar_position: 5
+description: "从 C 到 C++ 第 4 部分：其它必须知道的小改动"
+---
+
+# 04 其它必须知道的小改动
+### 布尔类型
+
+```cpp
+bool flag = true;    // C++ 内建类型，不是 C99 的 _Bool/stdbool.h
+std::printf("sizeof(bool)=%zu\n", sizeof(bool));
+```
+
+**实测输出：**
+
+```text
+sizeof(bool)=1
+```
+
+### 强类型枚举 `enum class`（C++11）
+
+```cpp
+// enum_class.cpp
+#include <cstdio>
+
+enum class Color : unsigned char { Red = 1, Green = 2, Blue = 3 };  // 可指定底层类型
+enum       OldColor { Red2 = 1 };
+
+int main() {
+    Color c = Color::Green;
+    // int x = c;                       // 编译错误：不会隐式转 int
+    int x = static_cast<int>(c);        // 必须显式转换
+    std::printf("c=%d sizeof(Color)=%zu\n", x, sizeof(Color));
+
+    OldColor o = Red2;
+    int y = o;                          // 老式 enum 会隐式转 int
+    std::printf("o=%d sizeof(OldColor)=%zu\n", y, sizeof(OldColor));
+}
+```
+
+**实测输出：**
+
+```text
+c=2 sizeof(Color)=1
+o=1 sizeof(OldColor)=4
+```
+
+三个好处：
+1. **不会污染外层作用域**（`Color::Green` vs 全局的 `Green`）
+2. **不会隐式转 int**（消灭 `if (status == 1)` 这种类型混乱）
+3. **能指定底层类型**（嵌入式里传协议、写寄存器时非常有用，`sizeof` 从 4 变 1）
+
+### 统一初始化 `{}`（C++11）
+
+```cpp
+int a{5};                    // 等价于 int a = 5;
+std::vector<int> v{1,2,3};   // 初始化列表
+int b{};                     // 值初始化为 0
+```
+
+`{}` 的最大好处是**禁止窄化转换**：
+
+```cpp
+// int x{3.14};   // 编译错误：double -> int 是窄化
+int y(3.14);      // 编译通过（并悄悄截断成 3）
+int z = 3.14;     // 编译通过（同样截断）
+```
+
+**真实错误：**
+
+```text
+narrowing2.cpp:1:19: error: narrowing conversion of '3.1400000000000001e+0'
+from 'double' to 'int' [-Wnarrowing]
+```
+
+:::warning[`{}` 的一个反直觉之处]
+`std::vector<int> v(10)` 是"10 个元素"，`std::vector<int> v{10}` 是"1 个元素，值为 10"。**括号和花括号对 `std::vector` 意义完全不同。**
+
+```cpp
+std::vector<int> a(10);      // size=10, 全 0
+std::vector<int> b{10};      // size=1,  元素=10
+std::vector<int> c(10, 7);   // size=10, 全 7
+std::vector<int> d{10, 7};   // size=2,  元素=10,7
+```
+
+**实测输出：**
+
+```text
+a(10)   size=10 [0]=0
+b{10}   size=1 [0]=10
+c(10,7) size=10 [0]=7
+d{10,7} size=2 [0]=10
+```
+:::
+
+### 函数返回类型后置（C++11）
+
+```cpp
+auto add(int a, int b) -> int { return a + b; }
+```
+
+平时没什么用，但在**返回类型依赖参数**时是必需的：
+
+```cpp
+template<typename T, typename U>
+auto multiply(T a, U b) -> decltype(a * b) {   // C++11 写法
+    return a * b;
+}
+```
+
+C++14 起可以直接写 `auto multiply(T a, U b)` 让编译器推导。
+
+## 常见坑
+
+| 坑 | 现象 | 解法 |
+| --- | --- | --- |
+| 返回局部变量的引用 | 悬空引用，UB，但可能"看起来正常" | 返回值；开 `-Wall -Werror` |
+| `for (auto x : big_vector)` | 拷贝 10 万个大对象，慢 100 倍 | 写 `const auto&` |
+| 用 `NULL` 配重载 | 静默选中 `f(int)` 版本 | 一律 `nullptr` |
+| 头文件里 `using namespace std` | 名字冲突，且改不掉 | 头文件写全名 |
+| `std::vector<int> v{10}` 以为是 10 个 0 | 实际是 1 个元素值 10 | `(10)` 和 `{10}` 分清 |
+| `auto x = const_ref;` 以为保留了 const | const 被剥掉 | 写 `const auto&` |
+| 遍历时 `push_back` | 迭代器失效，UB | 见 [STL 容器](./stl-containers) |
+| 在 printf 参数里写 `rx = 99` | 求值顺序未指定，结果反直觉 | 副作用单独成句 |
+| 以为 `const` = 线程安全 | 别的线程照样改 | `const` 只约束这条路径 |
+| 老式 `enum` 隐式转 int | 类型混乱 | 用 `enum class` |
+
+## 自检清单
+
+- [ ] 说出引用的三个"不能"（不能空、不能不初始化、不能重绑定）
+- [ ] 解释为什么 `sizeof(int&)` 是 4 而结构体里的 `int&` 占 8 字节
+- [ ] 读出 `const int* const p` 里两个 const 各管什么
+- [ ] 说清 `const&` 相比值传递和 `&` 的三个好处
+- [ ] 说明 `f(NULL)` 为什么调了 `f(int)`
+- [ ] 写出 `enum class` 相对老式 `enum` 的三个优点
+- [ ] 解释 `std::vector<int> v(10)` 与 `v{10}` 的区别
+- [ ] 判断何时用 `auto`、何时用 `const auto&`、何时不该用 `auto`
+- [ ] 说出匿名命名空间相对 C 的 `static` 的好处
+- [ ] 知道为什么不能在头文件写 `using namespace`
+
+## 下一步
+
+- 下一步核心：类、构造析构、RAII → [类与对象](./classes)
+- 想先搞懂资源管理的具体工具 → [资源管理与智能指针](./raii-smartptr)
+- 容器与迭代器的细节 → [STL 容器](./stl-containers)
+- 回到 [C++ 主线导读](./)
+
+---
+
+**翻页**：[← 上一页](./transition-03) · [返回目录](./)

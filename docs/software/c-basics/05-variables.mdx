@@ -1,0 +1,326 @@
+---
+id: 05-variables
+title: 05 变量与数据类型
+sidebar_position: 5
+description: C 声明变量的语法、必须写明类型的原因、变量的生命周期，以及未初始化变量这个隐形炸弹。
+---
+
+# 05 变量与数据类型
+
+**本课目标**：会声明和使用变量，理解"为什么 C 必须写类型"。
+
+## 声明变量的语法
+
+```c
+类型 变量名 = 初始值;
+```
+
+```c
+int age = 18;           /* 整数 */
+double height = 1.75;   /* 小数 */
+char grade = 'A';       /* 单个字符 */
+```
+
+**必须写类型**，这是 C 和 Python 最大的语法差别。
+
+:::tip[和 Python 对比]
+```python
+# Python：不用写类型
+age = 18
+height = 1.75
+```
+
+```c
+/* C：必须写 */
+int age = 18;
+double height = 1.75;
+```
+
+**为什么 C 要求写明**：编译器要**预先分配**内存。写 `int` 就知道分 4 字节，运行时才能精确定位。
+
+Python 的变量只是一个"标签"，指向堆上的对象，运行时才决定类型——灵活但慢。
+:::
+
+## 基本类型一览
+
+| 类型 | 大小（本机实测） | 范围/用途 |
+| --- | --- | --- |
+| `char` | 1 字节 | 单个字符，或小整数 -128~127 |
+| `short` | 2 字节 | 小整数 -32768~32767 |
+| `int` | 4 字节 | 常用整数 ±21 亿 |
+| `long` | **4 或 8 字节** | 平台相关 |
+| `long long` | 8 字节 | 大整数 |
+| `float` | 4 字节 | 单精度小数（约 7 位有效数字） |
+| `double` | 8 字节 | 双精度小数（约 15 位） |
+
+本机实测命令：
+
+```c
+printf("char=%zu short=%zu int=%zu long=%zu long long=%zu\n",
+       sizeof(char), sizeof(short), sizeof(int), sizeof(long), sizeof(long long));
+```
+
+输出（Windows / LLVM-MinGW，x86-64）：
+
+```text
+char=1 short=2 int=4 long=4 long long=8
+```
+
+:::danger[`long` 的大小是平台相关的！]
+| 平台 | `long` 大小 |
+| --- | --- |
+| Windows（LLP64） | **4 字节** |
+| Linux/macOS 64位（LP64） | **8 字节** |
+| 32位系统 | 4 字节 |
+
+**同一个程序在 Windows 和 Linux 上，`long` 的范围不一样。**
+
+**对策**：需要确定大小时，用 `<stdint.h>` 的定宽类型：
+
+```c
+#include <stdint.h>
+
+int8_t  a;      /* 一定是 1 字节 */
+int16_t b;      /* 一定是 2 字节 */
+int32_t c;      /* 一定是 4 字节 */
+int64_t d;      /* 一定是 8 字节 */
+uint32_t e;     /* 无符号 4 字节 */
+```
+
+**嵌入式开发中几乎只用这些定宽类型**——因为跨平台必须确定大小。
+:::
+
+## 三个必须立刻记住的规则
+
+### ① 变量必须先声明再用
+
+```c
+int main(void) {
+    printf("%d\n", x);    /* ❌ error: 'x' undeclared */
+    int x = 1;
+    return 0;
+}
+```
+
+C 是**严格从上往下**的，声明必须在前面。
+
+### ② 未初始化的变量是"垃圾值"
+
+:::danger[这是 C 最危险的坑之一]
+```c
+int main(void) {
+    int x;                /* 只声明，没初始化 */
+    printf("%d\n", x);    /* 打印什么？ */
+    return 0;
+}
+```
+
+**结果是随机的**——可能是 0，可能是 32767，可能是任意值。
+
+**原因**：C 只保证给你一块内存，但不清理里面的旧数据。那块内存可能被之前的程序用过。
+:::
+
+验证一下（本机实测）：
+
+```c
+int x;              /* 未初始化 */
+int y = 0;          /* 初始化为 0 */
+printf("x=%d y=%d\n", x, y);
+```
+
+输出可能类似：
+
+```text
+x=0 y=0
+```
+
+**这次恰好是 0，但这不是保证！** 换个编译器、开优化、换函数调用顺序，值都会变。
+
+:::warning[为什么这个坑特别危险]
+因为**它可能"看起来正常"**。
+
+你本地测试时 `x` 恰好是 0，程序跑对了。交到客户手上，换台机器就变成随机值崩了。
+
+**规矩：所有变量声明时都初始化。**
+
+```c
+int count = 0;        /* ✅ 显式给初值 */
+char buf[256] = {0};  /* ✅ 数组全部清零 */
+int *p = NULL;        /* ✅ 指针先置空 */
+```
+:::
+
+### ③ `const` 表示"不打算改"
+
+```c
+const int MAX_SIZE = 100;
+MAX_SIZE = 200;       /* ❌ error: assignment of read-only variable */
+```
+
+**用 `const` 表达意图**：告诉读代码的人（和编译器）"这个值不会变"。
+
+```c
+const double PI = 3.14159;
+const int MAX_RETRY = 3;
+```
+
+:::tip[`const` 的好处]
+1. **防止手滑改错**
+2. **编译器能优化**（知道值不变）
+3. **自我说明**：看到 `const` 就知道不用去找它被谁改了
+
+**嵌入式里尤其常用**——很多常量会放进 Flash 而不是 RAM，省内存。
+:::
+
+## 命名规则
+
+| 规则 | 合法 | 不合法 |
+| --- | --- | --- |
+| 只能用字母、数字、下划线 | `user_age` | `user-age` |
+| 不能以数字开头 | `name1` | `1name` |
+| 区分大小写 | `Age` 和 `age` 不同 | —— |
+| 不能用关键字 | `count` | `int`、`return` |
+
+C 的关键字（32 个，不能用作变量名）：
+
+```text
+auto     break    case     char     const    continue
+default  do       double   else     enum     extern
+float    for      goto     if       inline   int
+long     register restrict return   short    signed
+sizeof   static   struct   switch   typedef  union
+unsigned void     volatile while
+```
+
+### 命名习惯
+
+```c
+/* 好 */
+int user_age;
+double total_price;
+const int MAX_BUFFER_SIZE = 1024;
+
+/* 差 */
+int a;
+int x1;
+int n;
+```
+
+| 类型 | 惯例 | 例子 |
+| --- | --- | --- |
+| 变量/函数 | 小写 + 下划线 | `user_name`、`get_age()` |
+| 常量/宏 | 全大写 + 下划线 | `MAX_SIZE`、`PI` |
+| 类型（typedef） | 加 `_t` 后缀 | `size_t`、`uint32_t` |
+
+## 变量的作用域
+
+```c
+int main(void) {
+    int outer = 1;          /* 在 main 里有效 */
+
+    {
+        int inner = 2;      /* 只在这个花括号里有效 */
+        printf("%d %d\n", outer, inner);   /* ✅ 都能访问 */
+    }
+
+    printf("%d\n", outer);  /* ✅ */
+    printf("%d\n", inner);  /* ❌ error: 'inner' undeclared */
+    return 0;
+}
+```
+
+**变量从声明处开始，到所在的花括号结束**。第 16 课会详细讲。
+
+## 声明和赋值的区别
+
+```c
+int a;          /* 声明：分配内存，值是垃圾 */
+a = 42;         /* 赋值：把 42 写进去 */
+
+int b = 42;     /* 声明 + 初始化：一步完成 */
+```
+
+**术语区分**：
+
+| 说法 | 含义 |
+| --- | --- |
+| 声明（declare） | 告诉编译器"有这么个变量" |
+| 定义（define） | 真正分配内存（C 里通常声明即定义） |
+| 初始化（initialize） | 声明时给初值 |
+| 赋值（assign） | 之后改值 |
+
+日常交流不用严格区分，但看文档时会遇到这些词。
+
+## 完整示例
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    /* 全部初始化 —— 好习惯 */
+    int age = 18;
+    double height = 1.75;
+    char grade = 'A';
+    const int MAX_AGE = 150;
+
+    printf("年龄：%d\n", age);
+    printf("身高：%.2f\n", height);
+    printf("等级：%c\n", grade);
+    printf("最大年龄限制：%d\n", MAX_AGE);
+
+    /* 计算 */
+    double next_year_height = height + 0.05;
+    printf("明年预计身高：%.2f\n", next_year_height);
+
+    return 0;
+}
+```
+
+输出：
+
+```text
+年龄：18
+身高：1.75
+等级：A
+最大年龄限制：150
+明年预计身高：1.80
+```
+
+## 常见错误
+
+| 错误 | 报错 | 原因 |
+| --- | --- | --- |
+| 未声明就用 | `'x' undeclared` | 声明要放在使用之前 |
+| 用了未初始化变量 | 无报错，值随机 | 声明时就要初始化 |
+| 改了 `const` 变量 | `assignment of read-only variable` | const 不能改 |
+| 用中文标点 | `stray '\357'` | 输入法没切英文 |
+| 变量名用关键字 | `expected identifier` | 换个名字 |
+| `int` 声明了却赋小数 | 值被截断，无报错 | 用 `double` |
+| 大小写拼错 | `'UserAge' undeclared` | C 区分大小写 |
+
+:::danger[`int` 存小数会静默截断]
+```c
+int x = 3.99;
+printf("%d\n", x);      /* 3，不是 4 */
+```
+
+**没有报错，没有警告（除非开 `-Wconversion`）**，就是悄悄变 3。
+
+**规矩**：要小数就用 `double`。
+:::
+
+## 本课自检
+
+- [ ] 会写 `类型 名字 = 值;`
+- [ ] 知道 C 必须写类型，因为要预分配内存
+- [ ] 记住 `int` 是 4 字节、`double` 是 8 字节
+- [ ] **知道 `long` 大小是平台相关的**
+- [ ] 知道该用 `int32_t` 这类定宽类型保证大小
+- [ ] **知道未初始化变量的值是垃圾，必须初始化**
+- [ ] 会用 `const` 表示常量
+- [ ] 知道变量作用域到花括号结束
+- [ ] 知道命名规则和习惯
+
+## 下一步
+
+[06 整数：范围与溢出](./06-integers) —— 整数不是无限的，溢出会带来难以发现的 bug。

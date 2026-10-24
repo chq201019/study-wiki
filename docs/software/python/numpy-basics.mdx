@@ -1,0 +1,245 @@
+---
+id: numpy-basics
+title: NumPy 基础与向量化
+sidebar_position: 30
+description: ndarray 与 list 的本质区别、广播规则、视图与副本的陷阱、向量化改写套路、以及内存布局对性能的影响。
+---
+
+# NumPy 基础与向量化
+
+**本课目标**：把 Python 循环改写成向量化运算，理解为什么能快几十倍。
+
+## ndarray 与 list 的本质区别
+
+| 维度 | `list` | `ndarray` |
+| --- | --- | --- |
+| 存储 | **指针数组**，元素是独立对象 | **连续内存**，同类型紧凑排列 |
+| 每元素开销 | 约 28 字节（int） | 4 或 8 字节 |
+| 运算 | 走 Python 解释器逐元素 | **C 层循环 + SIMD** |
+| 类型 | 混合 | **必须同类型**（dtype） |
+
+:::info[这就是 10~100 倍差距的来源]
+```python
+# list：每个 int 都是独立 PyObject，循环在解释器里跑
+total = sum(x * 2 for x in data)
+
+# ndarray：数据连续，循环在 C 里跑，还能 SIMD
+total = (arr * 2).sum()
+```
+
+**关键不是"语法更短"，而是"循环被搬到了 C 层"。**
+:::
+
+## 创建与 dtype
+
+```python
+import numpy as np
+
+np.array([1, 2, 3])                 # int64
+np.zeros((3, 4))                    # 全 0 浮点
+np.ones((2, 3), dtype=np.int32)
+np.arange(0, 10, 2)                 # [0 2 4 6 8]
+np.linspace(0, 1, 5)                # [0. 0.25 0.5 0.75 1.]
+np.full((2, 2), 7)
+```
+
+:::warning[`np.array` 会自动推断 dtype，可能不是你想要的]
+```python
+a = np.array([1, 2, 3])             # int64（Windows 上可能是 int32）
+b = a / 2                           # ❌ 变成 float64（除法总是浮点）
+a // 2                              # ✅ 整数除法
+```
+
+**要确定就显式写 `dtype=`。**
+:::
+
+:::danger[`dtype` 决定内存与溢出行为]
+```python
+np.array([200], dtype=np.int8) + np.array([100], dtype=np.int8)
+# 结果是 -156（静默溢出，不报错）
+```
+
+**整型溢出在 NumPy 里是"静默回绕"** —— 和 C 的无符号语义一样，没有异常。
+:::
+
+## 视图 vs 副本
+
+:::danger[切片返回的是**视图**，不是副本]
+```python
+a = np.arange(10)
+b = a[2:5]          # 视图，和 a 共享内存
+b[0] = 99
+print(a[2])         # 99  ← a 被改了！
+```
+
+**要独立副本必须 `.copy()`**：
+
+```python
+b = a[2:5].copy()
+b[0] = 99           # ✅ 不影响 a
+```
+:::
+
+**什么时候返回副本**：
+
+| 操作 | 结果 |
+| --- | --- |
+| 基本切片 `a[1:3]` | **视图** |
+| 花式索引 `a[[0,2]]` | **副本** |
+| 布尔索引 `a[a>5]` | **副本** |
+| `.reshape()` | 视图（如果不跨内存） |
+| `.flatten()` | 副本 |
+| `.ravel()` | 视图（能的话） |
+
+:::tip[怎么判断是不是视图]
+```python
+b.base is a         # True 说明 b 是 a 的视图
+b.flags.owndata     # False 说明不拥有数据
+```
+:::
+
+## 广播规则
+
+:::info[从右往左比较维度，兼容条件：相等 或 其中一个是 1]
+```python
+(3, 4) + (4,)       # ✅ → (3, 4)，第二个广播到每行
+(3, 4) + (3, 1)     # ✅ → (3, 4)
+(3, 4) + (3,)       # ❌ 报错（3 != 4 且都不为 1）
+(3, 1) + (1, 4)     # ✅ → (3, 4)
+```
+:::
+
+```python
+# 给每行减去行均值（最常见的用法）
+arr - arr.mean(axis=1, keepdims=True)
+```
+
+:::danger[不加 `keepdims=True` 会广播错]
+```python
+arr.shape                    # (3, 4)
+arr.mean(axis=1).shape       # (3,)
+arr - arr.mean(axis=1)       # ❌ 报错：(3,4) 与 (3,) 不兼容
+
+arr.mean(axis=1, keepdims=True).shape   # (3, 1)
+arr - arr.mean(axis=1, keepdims=True)   # ✅ 正确
+```
+
+**`keepdims=True` 保留那个维度为 1，让广播能正确对齐。**
+:::
+
+## 向量化改写套路
+
+:::tip[三步把循环改写成向量化]
+**① 找出循环体里对每个元素的独立操作**
+
+```python
+# 原始
+out = []
+for i in range(len(a)):
+    out.append(a[i] * 2 + b[i])
+```
+
+**② 换成数组运算**
+
+```python
+out = a * 2 + b
+```
+
+**③ 条件分支用 `np.where`**
+
+```python
+# 原始：if x > 0: 1 else: 0
+out = np.where(a > 0, 1, 0)
+```
+:::
+
+**常用替换表**：
+
+| Python 写法 | 向量化 |
+| --- | --- |
+| `[x*2 for x in a]` | `a * 2` |
+| `sum(a)` | `a.sum()` |
+| `max(a)` | `a.max()` |
+| `[x for x in a if x>0]` | `a[a > 0]` |
+| `if x>0 else` | `np.where` |
+| 累积求和 | `np.cumsum` |
+| 排序 | `np.sort` |
+
+:::danger[**在 Python 层逐元素访问 ndarray 比 list 还慢**]
+```python
+for i in range(len(arr)):
+    arr[i] = arr[i] * 2         # ❌ 每次都要装箱/拆箱 Python 对象
+```
+
+**必须整体运算。**
+:::
+
+## 内存布局与性能
+
+:::info[C 序（行优先）vs F 序（列优先）]
+```python
+a = np.zeros((1000, 1000))                  # 默认 C 序：行内连续
+b = np.zeros((1000, 1000), order="F")       # 列内连续
+```
+
+**NumPy 默认 C 序**（最后那个维度变化最快）。
+:::
+
+```python
+# 按行求和（连续访问）→ 快
+a.sum(axis=1)
+
+# 按列求和（跨步长访问）→ 稍慢
+a.sum(axis=0)
+```
+
+:::warning[转置不复制数据]
+```python
+a = np.zeros((1000, 1000))
+b = a.T             # 视图，只是改了 strides
+```
+
+**所以 `a.T` 是 O(1) 的，但后续按它遍历会变慢（非连续）。**
+
+**要连续副本用 `np.ascontiguousarray(a.T)`。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 改切片影响了原数组 | 切片是视图 | `.copy()` |
+| 计算结果静默溢出 | dtype 太窄 | 显式指定 dtype |
+| 广播报错 | 形状不兼容 | `keepdims=True` 或 `reshape` |
+| 比 list 还慢 | 在 Python 层逐元素访问 | 整体运算 |
+| 内存暴涨 | 用了副本而不自知 | 检查 `.base` |
+| 整数除法结果不对 | `/` 总是浮点 | 用 `//` |
+| `nan` 参与比较全 False | IEEE 语义 | 用 `np.isnan` |
+
+:::danger[`nan` 会污染统计]
+```python
+a = np.array([1.0, np.nan, 3.0])
+a.mean()            # nan
+np.nanmean(a)       # 2.0  ✅
+```
+
+**任何含 `nan` 的算术都会传播 `nan`。** 用 `np.nan*` 系列函数。
+:::
+
+## 本课自检
+
+- [ ] **理解 ndarray 是连续内存、list 是指针数组**
+- [ ] **知道 10~100 倍差距来自"C 层循环 + SIMD"**
+- [ ] 会显式指定 dtype，知道整型溢出是静默的
+- [ ] **知道切片返回视图，要副本必须 `.copy()`**
+- [ ] 会用 `.base` / `.flags.owndata` 判断视图
+- [ ] **掌握广播规则（从右往左，相等或为 1）**
+- [ ] **知道 `keepdims=True` 是行/列运算的关键**
+- [ ] 会把循环改写成向量化（`np.where` 处理条件）
+- [ ] **知道在 Python 层逐元素访问比 list 还慢**
+- [ ] 知道 C 序/F 序对性能的影响、转置不复制数据
+- [ ] **知道 `nan` 会污染统计，要用 `np.nanmean`**
+
+## 下一步
+
+[性能剖析与优化](./perf) 或 [collections 容器工具箱](./collections)。

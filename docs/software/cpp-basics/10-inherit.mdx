@@ -1,0 +1,377 @@
+---
+id: 10-inherit
+title: 10 继承与多态
+sidebar_position: 10
+description: 继承的语法、虚函数如何实现多态、为什么基类析构必须 virtual、override 关键字，以及对象切片这个陷阱。
+---
+
+# 10 继承与多态
+
+**本课目标**：会写继承、理解虚函数，避开三个经典陷阱。
+
+## 继承的基本语法
+
+```cpp
+class Animal {
+public:
+    void eat() { std::cout << "吃东西\n"; }
+};
+
+class Dog : public Animal {          /* public 继承 */
+public:
+    void bark() { std::cout << "汪汪\n"; }
+};
+
+Dog d;
+d.eat();        /* 继承自 Animal */
+d.bark();       /* 自己的 */
+```
+
+:::warning[继承方式几乎总是 `public`]
+```cpp
+class Dog : public Animal { };       /* ✅ 99% 的场景 */
+class Dog : private Animal { };      /* ⚠️ 很少用 */
+class Dog : Animal { };              /* ⚠️ class 默认 private 继承 */
+```
+
+**写 `class` 时如果漏了 `public`，就是私有继承**——行为完全不是你想要的。
+
+**规矩：继承一律显式写 `public`。**
+:::
+
+## 虚函数：多态的核心
+
+:::danger[没有 virtual 就没有多态]
+```cpp
+class Base {
+public:
+    void speak() { std::cout << "Base\n"; }      /* 没有 virtual */
+};
+
+class Derived : public Base {
+public:
+    void speak() { std::cout << "Derived\n"; }   /* 这只是"隐藏" */
+};
+
+Derived d;
+Base &r = d;
+r.speak();          /* 输出 Base —— 不是你想要的！ */
+```
+:::
+
+加上 `virtual`：
+
+```cpp
+class Base {
+public:
+    virtual void speak() const { std::cout << "Base\n"; }
+};
+
+class Derived : public Base {
+public:
+    void speak() const override { std::cout << "Derived\n"; }
+};
+
+Derived d;
+Base &r = d;
+r.speak();          /* Derived ✅ */
+```
+
+本机实测：
+
+```text
+Derived::speak       ← 虚函数，调到实际类型
+Base::nonvirt        ← 非虚函数，调到声明类型
+```
+
+:::tip[虚函数的工作原理]
+编译器给每个有虚函数的类建一张**虚函数表（vtable）**，对象里存一个指向它的指针。
+
+调用 `r.speak()` 时，程序**运行时才查表决定调哪个**——这叫**动态绑定**。
+
+非虚函数则在**编译期就确定**了（静态绑定）。
+
+（原理细节见 [C++ 进阶](../cpp/advanced) 的 vtable 图。）
+:::
+
+## `override`：必写
+
+```cpp
+class Derived : public Base {
+public:
+    void speak() const override { }      /* ✅ 让编译器检查确实重写了 */
+};
+```
+
+:::danger[`override` 能抓到签名写错]
+```cpp
+class Derived : public Base {
+public:
+    void speak() override { }            /* ❌ 编译错：基类是 const 版本 */
+};
+```
+
+**如果忘了写 `const`、参数类型不对、拼错名字**——没有 `override` 的话，编译器会以为你只是加了个新函数，**静默通过**，多态失效。
+
+**规矩：重写虚函数一律加 `override`。**
+:::
+
+## 陷阱一：基类析构必须 `virtual`
+
+:::danger[这是最严重的继承陷阱]
+```cpp
+class BadBase {
+public:
+    ~BadBase() { }                       /* ❌ 没有 virtual */
+};
+
+class BadDerived : public BadBase {
+public:
+    ~BadDerived() { /* 释放自己的资源 */ }
+};
+
+BadBase *p = new BadDerived;
+delete p;                                 /* 只调 ~BadBase！ */
+```
+
+本机实测输出：
+
+```text
+  ~BadBase          ← 只有这一个！~BadDerived 没被调用
+```
+
+**结果**：`Derived` 自己的资源全部泄漏。
+:::
+
+### 正确做法
+
+```cpp
+class Base {
+public:
+    virtual ~Base() = default;           /* ✅ 基类析构加 virtual */
+};
+```
+
+本机实测（加了 virtual 后）：
+
+```text
+  ~Derived
+  ~Base            ← 两个都调用了，正确
+```
+
+:::tip[规则：有虚函数的类，析构必须 virtual]
+```cpp
+class Base {
+public:
+    virtual void foo();
+    virtual ~Base() = default;           /* 别忘 */
+};
+```
+
+**或者更简单**：如果你的类会被继承并且通过基类指针删除，析构就必须 `virtual`。
+
+**这是 C++ 里最重要的规则之一。**
+:::
+
+## 陷阱二：对象切片
+
+```cpp
+Derived d;
+Base sliced = d;          /* ❌ 切片：Derived 部分被丢掉 */
+sliced.speak();           /* 调到 Base::speak */
+```
+
+本机实测：
+
+```text
+Base::speak         ← 不是 Derived
+```
+
+:::warning[为什么会切片]
+`Base sliced = d` 会**按 Base 的大小**构造一个新对象，只复制 Base 部分。
+
+`Derived` 多出来的成员和它的虚表指针**统统丢失**。
+
+**规矩：多态对象一律用指针或引用传递，不要按值。**
+:::
+
+### 切片最常发生在哪里
+
+```cpp
+void process(Base b) { }          /* ❌ 按值传参 → 切片 */
+void process(const Base &b) { }   /* ✅ 引用，不切片 */
+
+std::vector<Base> v;              /* ❌ 存全部是 Base，Derived 信息丢失 */
+std::vector<std::unique_ptr<Base>> v;   /* ✅ 存指针，保留多态 */
+```
+
+## 陷阱三：构造函数和析构函数里调用虚函数
+
+:::danger[这不会多态]
+```cpp
+class Base {
+public:
+    Base() { speak(); }              /* ⚠️ 调的是 Base::speak，不是 Derived */
+    virtual void speak() { }
+};
+```
+
+**构造期间，对象的 Derived 部分还没构造好**，虚表指针还指向 `Base` 的表。
+
+所以调不到子类版本——**这叫"构造期间不启用多态"**。
+
+（同理，析构期间也是。）
+:::
+
+## 抽象类：纯虚函数
+
+```cpp
+class Shape {
+public:
+    virtual double area() const = 0;         /* 纯虚函数：= 0 */
+    virtual ~Shape() = default;
+};
+
+/* Shape s;       ❌ 不能实例化抽象类 */
+```
+
+**含纯虚函数的类是抽象类**，只能被继承，不能实例化。
+
+```cpp
+class Circle : public Shape {
+public:
+    explicit Circle(double r) : r_(r) {}
+    double area() const override { return 3.14159 * r_ * r_; }
+private:
+    double r_;
+};
+
+Circle c(5);          /* ✅ */
+```
+
+:::tip[抽象类的价值：定义接口]
+```cpp
+void print_area(const Shape &s) {
+    std::cout << s.area() << "\n";        /* 不关心具体是什么形状 */
+}
+```
+
+**调用方只依赖抽象接口，实现方可以自由扩展。**
+
+这是 C++ 里实现"面向接口编程"的标准做法。
+:::
+
+## 完整示例
+
+```cpp
+#include <iostream>
+#include <memory>
+#include <vector>
+
+class Shape {
+public:
+    virtual ~Shape() = default;
+    virtual double area() const = 0;             /* 纯虚 */
+    virtual const char *name() const = 0;
+};
+
+class Circle : public Shape {
+public:
+    explicit Circle(double r) : r_(r) {}
+    double area() const override { return 3.14159 * r_ * r_; }
+    const char *name() const override { return "圆"; }
+private:
+    double r_;
+};
+
+class Rect : public Shape {
+public:
+    Rect(double w, double h) : w_(w), h_(h) {}
+    double area() const override { return w_ * h_; }
+    const char *name() const override { return "矩形"; }
+private:
+    double w_, h_;
+};
+
+int main() {
+    /* 多态容器：存基类指针，实际是不同子类 */
+    std::vector<std::unique_ptr<Shape>> shapes;
+    shapes.push_back(std::make_unique<Circle>(5));
+    shapes.push_back(std::make_unique<Rect>(3, 4));
+
+    for (const auto &s : shapes) {
+        std::cout << s->name() << " 面积 " << s->area() << "\n";
+    }
+
+    /* 出作用域自动 delete，且调对了析构（因为 virtual ~Shape） */
+    return 0;
+}
+```
+
+输出：
+
+```text
+圆 面积 78.5397
+矩形 面积 12
+```
+
+:::tip[这个模式是 C++ 多态的标准用法]
+1. **基类定义接口**（纯虚函数）
+2. **子类实现细节**
+3. **用 `vector<unique_ptr<Base>>` 存多态对象**
+4. **加新形状不用改 `main` 里的循环**
+
+**这就是"开闭原则"**——对扩展开放，对修改关闭。
+:::
+
+## 继承 vs 组合
+
+:::danger[继承被滥用得最多]
+**继承表示「is-a」（是一种）**：
+
+```cpp
+class Dog : public Animal     /* 狗是一种动物 ✅ */
+```
+
+**如果只是「有一个」，用组合**：
+
+```cpp
+/* ❌ 错：汽车不是引擎 */
+class Car : public Engine { };
+
+/* ✅ 对：汽车有一个引擎 */
+class Car {
+    Engine engine_;           /* 成员 */
+};
+```
+
+**C++ 社区的经验：优先用组合，继承只在真需要多态时用。**
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 基类析构不是 virtual | 子类资源泄漏 | 只调基类析构 | `virtual ~Base() = default;` |
+| 忘写 `public` 继承 | 变成私有继承 | class 默认 private | `: public Base` |
+| 重写没加 `override` | 签名错也不报错 | 编译期无法检查 | 一律加 `override` |
+| 按值传多态对象 | 切片，多态失效 | 复制了基类部分 | 传引用/指针 |
+| 构造/析构里调虚函数 | 不生效 | 虚表还没就绪 | 别这么做 |
+| 用 `vector<Base>` 存子类 | 切片 | 按值存 | `vector<unique_ptr<Base>>` |
+
+## 本课自检
+
+- [ ] 会写 `class Derived : public Base`
+- [ ] **知道继承一律写 `public`**
+- [ ] **理解虚函数实现多态，非虚函数不会**
+- [ ] 重写虚函数一律加 `override`
+- [ ] **知道基类析构必须 `virtual`**
+- [ ] **理解对象切片，知道多态要用指针/引用**
+- [ ] 知道构造/析构期间不启用多态
+- [ ] 会写抽象类（纯虚函数 `= 0`）
+- [ ] 会用 `vector<unique_ptr<Base>>` 存多态对象
+- [ ] 知道优先用组合而非继承
+
+## 下一步
+
+[11 阶段实战：简易银行账户](./11-project-bank) —— 把类、继承、多态串起来。

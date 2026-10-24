@@ -1,0 +1,451 @@
+---
+id: 27-multi-file
+title: 27 多文件工程
+sidebar_position: 27
+description: 头文件与源文件的职责、extern 与 static、编译链接流程、Makefile 入门，以及常见的链接错误。
+---
+
+# 27 多文件工程
+
+**本课目标**：会拆分多个源文件，理解头文件的作用，能排查链接错误。
+
+## 为什么要拆分
+
+单个 `.c` 文件超过几百行就难以维护。拆分的原则：
+
+| 文件 | 放什么 |
+| --- | --- |
+| `math_utils.h` | **声明**（函数原型、类型、宏） |
+| `math_utils.c` | **定义**（函数实现） |
+| `main.c` | 主程序，`#include` 需要的头文件 |
+
+**核心规则：声明放头文件，定义放源文件。**
+
+## 一个完整例子
+
+### `math_utils.h` —— 声明
+
+```c
+#ifndef MATH_UTILS_H
+#define MATH_UTILS_H
+
+int add(int a, int b);
+int mul(int a, int b);
+
+extern int g_ops;          /* 声明：这个变量在别处定义 */
+
+#endif
+```
+
+### `math_utils.c` —— 定义
+
+```c
+#include "math_utils.h"
+
+int g_ops = 0;             /* 定义：真正分配内存 */
+
+int add(int a, int b) {
+    g_ops++;
+    return a + b;
+}
+
+int mul(int a, int b) {
+    g_ops++;
+    return a * b;
+}
+```
+
+### `main.c` —— 使用
+
+```c
+#include <stdio.h>
+#include "math_utils.h"
+
+int main(void) {
+    printf("add(3,4)=%d\n", add(3, 4));
+    printf("mul(3,4)=%d\n", mul(3, 4));
+    printf("操作次数=%d\n", g_ops);
+    return 0;
+}
+```
+
+### 编译
+
+```bash
+# 方式一：分别编译再链接
+gcc -c math_utils.c -o math_utils.o
+gcc -c main.c -o main.o
+gcc math_utils.o main.o -o prog
+
+# 方式二：一次性编译（编译器自动处理）
+gcc main.c math_utils.c -o prog
+```
+
+本机实测输出：
+
+```text
+add(3,4)=7
+mul(3,4)=12
+操作次数=2
+```
+
+## 声明 vs 定义
+
+:::info[这两个概念必须分清]
+| | 声明（declaration） | 定义（definition） |
+| --- | --- | --- |
+| 作用 | 告诉编译器"有这个东西" | 真正创建它 |
+| 函数 | `int add(int, int);` | `int add(int a,int b){...}` |
+| 变量 | `extern int x;` | `int x = 0;` |
+| 出现次数 | 可以多次 | **只能一次** |
+:::
+
+**头文件里只放声明**，因为头文件会被多个 `.c` 包含——如果放定义，就变成多次定义。
+
+## `extern`：声明别处定义的变量
+
+```c
+/* a.c */
+int g_count = 0;           /* 定义 */
+
+/* b.c */
+extern int g_count;        /* 声明：它在别处定义，我要用 */
+```
+
+:::warning[不加 `extern` 会怎样]
+```c
+/* b.c */
+int g_count;               /* 这是"暂定义"，C 里会被合并 */
+```
+
+在 C 里，多个文件的 `int g_count;`（没有初值）会被链接器"合并"成一个，**看起来能用**。
+
+但如果你写成：
+
+```c
+/* a.c */ int g_count = 0;
+/* b.c */ int g_count = 0;      /* 有初值 → 强定义 */
+```
+
+就会报错：
+
+```text
+multiple definition of `g_count'
+```
+
+**规矩：定义放一个 `.c`，其他地方用 `extern` 声明，声明放头文件。**
+:::
+
+## `static` 限制可见性
+
+```c
+/* a.c */
+static int counter = 0;            /* 只有 a.c 能用 */
+
+static void helper(void) { }       /* 只有 a.c 能调 */
+```
+
+本机验证（`nm` 显示 `main.o` 里的符号）：
+
+```text
+         U add            ← U = Undefined（未定义，等链接）
+         U mul
+         U g_ops
+         U printf
+00000000 T main           ← T = Text（已定义在本文件）
+```
+
+:::tip[`static` 的两个好处]
+**① 避免命名冲突**
+
+两个 `.c` 文件都需要一个叫 `init` 的辅助函数，都加 `static` 就不会冲突。
+
+**② 表达意图**
+
+告诉读代码的人："这个函数只在本文件用，别在外面调。"
+
+**规矩：只在本文件用的函数和全局变量，一律加 `static`。**
+:::
+
+## 头文件保护
+
+```c
+#ifndef MATH_UTILS_H
+#define MATH_UTILS_H
+
+/* 内容 */
+
+#endif
+```
+
+:::danger[不保护会重复定义]
+```c
+/* main.c */
+#include "a.h"
+#include "b.h"
+
+/* 而 a.h 和 b.h 都 #include "common.h" */
+/* → common.h 被包含两次 → 里面的 struct 定义重复 → 编译错误 */
+```
+
+**头文件保护让同一个文件只被处理一次。**
+
+现代替代方案（更简洁，非标准但通用）：
+
+```c
+#pragma once
+```
+:::
+
+## 头文件里该放什么
+
+| ✅ 放 | ❌ 不放 |
+| --- | --- |
+| 函数原型（声明） | 函数定义（会产生多重定义） |
+| `extern` 变量声明 | 变量定义 |
+| `typedef`、`struct` 定义 | —— |
+| 宏、常量 | —— |
+| 需要的 `#include` | —— |
+
+:::warning[头文件里不要 `using namespace`（C++）或定义变量]
+```c
+/* ❌ 错 */
+int g_value = 0;           /* 每个包含它的文件都定义一次 */
+```
+
+**头文件会被"复制"到每个包含它的源文件里**，所以只能放"允许多次出现"的东西（声明、类型、宏）。
+:::
+
+## 常见链接错误
+
+:::danger[`undefined reference`（未定义引用）]
+```text
+undefined reference to `add'
+```
+
+**含义**：声明了，但找不到定义。
+
+**原因与解决**：
+
+| 原因 | 解决 |
+| --- | --- |
+| 忘了把 `.c` 加入编译 | `gcc main.c math_utils.c` |
+| 函数名拼错 | 检查头文件和实现是否一致 |
+| 忘了链接库 | 加 `-lm` 等 |
+| `static` 修饰导致本文件私有 | 去掉 `static` |
+:::
+
+:::danger[`multiple definition`（多重定义）]
+```text
+multiple definition of `g_count'
+```
+
+**含义**：同一个东西定义了两次。
+
+**原因**：
+
+- 两个 `.c` 都定义了同名全局变量
+- 头文件里放了变量定义（被多个文件包含）
+
+**解决**：定义放一个 `.c`，其他地方用 `extern` 声明。
+:::
+
+:::danger[`implicit declaration of function`（隐式声明）]
+```text
+warning: implicit declaration of function 'add'
+```
+
+**含义**：用了函数但没声明。
+
+**原因**：忘了 `#include` 对应的头文件。
+
+**虽然只是警告，但很危险**——编译器会假设返回 `int`，如果实际返回别的类型就会出错。
+:::
+
+## Makefile：自动编译
+
+文件多了，手动敲 `gcc a.c b.c c.c` 很烦。用 `Makefile`：
+
+```makefile
+CC      = gcc
+CFLAGS  = -std=c17 -Wall -Wextra -g
+
+prog: main.o math_utils.o
+	$(CC) main.o math_utils.o -o prog
+
+main.o: main.c math_utils.h
+	$(CC) $(CFLAGS) -c main.c
+
+math_utils.o: math_utils.c math_utils.h
+	$(CC) $(CFLAGS) -c math_utils.c
+
+clean:
+	rm -f *.o prog
+
+.PHONY: clean
+```
+
+使用：
+
+```bash
+make          # 编译
+make clean    # 清理
+```
+
+:::warning[Makefile 的缩进必须用 Tab！]
+```makefile
+prog: main.o
+	$(CC) ...        /* ← 这行开头必须是 Tab，不是空格 */
+```
+
+**用空格会报 `missing separator`**，这是新手最常踩的 Makefile 坑。
+
+（有些编辑器会把 Tab 转成空格，要注意配置。）
+:::
+
+:::tip[Makefile 的核心价值：增量编译]
+改了 `main.c`，只重新编译 `main.o`，其他 `.o` 直接复用。
+
+```bash
+$ make
+gcc -c main.c                 # 只编这一个
+gcc main.o math_utils.o -o prog
+
+$ make                        # 没改动
+make: 'prog' is up to date.   # 什么都不做
+```
+
+**项目大了能省大量时间。**
+:::
+
+## 目录结构建议
+
+```text
+myproject/
+├── Makefile
+├── include/              # 头文件
+│   ├── math_utils.h
+│   └── config.h
+├── src/                  # 源文件
+│   ├── main.c
+│   └── math_utils.c
+└── build/                # 编译产物（加进 .gitignore）
+```
+
+编译时要告诉编译器头文件在哪：
+
+```bash
+gcc -Iinclude src/main.c src/math_utils.c -o build/prog
+```
+
+`-Iinclude` 表示"去 `include/` 目录找头文件"。
+
+## 完整示例：三个文件
+
+### `include/student.h`
+
+```c
+#ifndef STUDENT_H
+#define STUDENT_H
+
+#define NAME_LEN 32
+
+typedef struct {
+    char name[NAME_LEN];
+    int  score;
+} Student;
+
+void  student_print(const Student *s);
+int   student_better(const Student *a, const Student *b);
+double student_average(const Student arr[], int n);
+
+#endif
+```
+
+### `src/student.c`
+
+```c
+#include <stdio.h>
+#include "student.h"
+
+void student_print(const Student *s) {
+    printf("%-12s %d\n", s->name, s->score);
+}
+
+int student_better(const Student *a, const Student *b) {
+    return a->score > b->score;
+}
+
+double student_average(const Student arr[], int n) {
+    if (n <= 0) return 0.0;
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += arr[i].score;
+    return (double)sum / n;
+}
+```
+
+### `src/main.c`
+
+```c
+#include <stdio.h>
+#include "student.h"
+
+int main(void) {
+    Student list[] = {
+        {"Alice", 88},
+        {"Bob",   92},
+        {"Carol", 75},
+    };
+    int n = (int)(sizeof(list) / sizeof(list[0]));
+
+    for (int i = 0; i < n; i++) {
+        student_print(&list[i]);
+    }
+    printf("平均分：%.2f\n", student_average(list, n));
+
+    return 0;
+}
+```
+
+### 编译
+
+```bash
+gcc -Iinclude src/main.c src/student.c -o prog
+./prog
+```
+
+输出：
+
+```text
+Alice        88
+Bob          92
+Carol        75
+平均分：85.00
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 头文件放了定义 | `multiple definition` | 被多次包含 | 只放声明 |
+| 忘了 `#include` | `implicit declaration` | 没声明 | 加 include |
+| 忘了加 `.c` 到编译 | `undefined reference` | 没参与链接 | 加入命令行 |
+| 头文件没保护 | 重复定义 | 多次包含 | `#ifndef` |
+| Makefile 用空格缩进 | `missing separator` | 必须是 Tab | 改 Tab |
+| `extern` 变量没定义 | `undefined reference` | 只有声明 | 某个 `.c` 里定义 |
+
+## 本课自检
+
+- [ ] 理解**声明放头文件、定义放源文件**
+- [ ] 会写头文件保护
+- [ ] 会用 `extern` 声明别处定义的变量
+- [ ] 知道 `static` 限制符号可见性的作用
+- [ ] 会分别编译再链接（`-c`）
+- [ ] 能看懂 `nm` 输出的 `U` 和 `T`
+- [ ] 会区分 `undefined reference` 和 `multiple definition`
+- [ ] 会写简单的 Makefile，**知道缩进用 Tab**
+- [ ] 知道 `-I` 指定头文件目录
+
+## 下一步
+
+[28 位运算](./28-bitops) —— 嵌入式必学，直接操作寄存器的基本功。

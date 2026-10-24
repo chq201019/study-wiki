@@ -1,0 +1,286 @@
+---
+id: filelock
+title: 文件锁与并发写
+sidebar_position: 26
+description: flock 与 fcntl 的区别、建议锁为什么常常"不生效"、原子创建文件的正确姿势、多个进程写同一日志的三种方案。
+---
+
+# 文件锁与并发写
+
+**本课目标**：让多个进程安全地共享同一个文件。
+
+## 三种"锁"
+
+| 机制 | 粒度 | 跨进程 | 跨机器 |
+| --- | --- | --- | --- |
+| **`flock()`** | 整个文件 | ✅ | ❌ |
+| **`fcntl()` 记录锁** | 字节区间 | ✅ | ⚠️（NFS 支持但不可靠） |
+| 线程锁（`pthread_mutex`） | 进程内 | ❌ | ❌ |
+
+:::danger[两种锁是"独立的"，互不干扰]
+**`flock` 和 `fcntl` 的锁在 Linux 上是两套独立的机制** —— 一个进程用 `flock` 加锁，另一个用 `fcntl` 加锁，**两者都能成功**。
+
+**所以团队里必须约定用同一种。**
+:::
+
+## flock：最简单
+
+```c
+#include <sys/file.h>
+
+int fd = open("/var/lock/myapp.lock", O_CREAT | O_RDWR, 0644);
+
+/* 阻塞加锁（等同 LOCK_EX） */
+if (flock(fd, LOCK_EX) < 0) {
+    perror("flock");
+    return 1;
+}
+
+/* ... 临界区 ... */
+
+flock(fd, LOCK_UN);      /* 解锁（close 时也会自动解锁） */
+close(fd);
+```
+
+:::tip[非阻塞版本 + 重试]
+```c
+if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+    if (errno == EWOULDBLOCK) {
+        fprintf(stderr, "另一个实例正在运行\n");
+        return 1;
+    }
+    perror("flock");
+    return 1;
+}
+```
+
+**这是实现"单实例运行"最省事的办法** —— 比 PID 文件可靠（PID 会复用，锁不会）。
+:::
+
+:::warning[`flock` 在 NFS 上行为不可靠]
+**老内核里 `flock` 在 NFS 上被静默忽略**（返回成功但没锁）。
+
+**现在的 Linux 会用 `fcntl` 模拟，但仍然不建议在网络文件系统上用锁做关键同步。**
+:::
+
+## fcntl 记录锁：可以锁字节区间
+
+```c
+#include <fcntl.h>
+
+struct flock fl = {
+    .l_type   = F_WRLCK,      /* 写锁（独占）；F_RDLCK 是读锁（共享） */
+    .l_whence = SEEK_SET,
+    .l_start  = 0,
+    .l_len    = 0,            /* 0 表示"到文件末尾" */
+};
+
+if (fcntl(fd, F_SETLKW, &fl) < 0) {      /* W = wait，阻塞版 */
+    perror("fcntl");
+}
+```
+
+:::danger[`fcntl` 锁的最大陷阱：fork 后子进程不继承，但 close 任一 fd 就全丢]
+**`fcntl` 的锁属于"进程"而不是"文件描述符"。**
+
+**所以在同一个进程里**：
+
+```c
+int fd1 = open("f", O_RDWR);
+fcntl(fd1, F_SETLKW, &fl);       /* 加锁成功 */
+int fd2 = open("f", O_RDWR);
+close(fd2);                       /* ❌ 这个 close 会把锁释放掉！ */
+```
+
+**只要进程关闭了"指向该文件的任意一个 fd"，锁就被释放** —— 这是 POSIX 的规定，非常反直觉。
+
+**`flock` 没有这个问题**（锁跟着 fd 走）。
+:::
+
+:::warning[递延锁与死锁]
+**同一进程对同一区间重复加锁会"升级/替换"而不是死锁**（POSIX 语义），但这行为很容易写错。
+
+**跨进程用锁时仍然要遵守"全局加锁顺序"**，否则死锁照旧。
+:::
+
+## 建议锁 vs 强制锁
+
+:::danger[Linux 的文件锁默认是"建议锁"（advisory）]
+**建议锁的意思是：只有"主动去检查锁"的程序才会被挡住。**
+
+```bash
+# 进程 A 用 flock 锁住了文件
+# 进程 B 直接 write，完全不受影响！
+echo "hello" > /var/lock/myapp.lock
+```
+
+**要防止 B 写入，必须让 B 也调用 `flock` 检查。**
+
+**Linux 的"强制锁"（mandatory locking）** 需要挂载选项 `-o mand` + 设置 setgid 位 + 关掉 group execute 位 —— **配置繁琐且已被废弃（5.14 起移除）**。
+:::
+
+:::tip[所以锁的正确用法是"约定"]
+**所有访问该文件的程序都必须先拿锁** —— 锁本身不能强制约束任何人。
+
+**这也是为什么"锁文件"通常配一个明确的文档说明。**
+:::
+
+## 原子创建文件：O_EXCL
+
+:::danger[`if (!exists(f)) create(f);` 是竞态的]
+```c
+if (access(path, F_OK) != 0) {       /* ❌ 两步之间有窗口 */
+    creat(path, 0644);
+}
+```
+
+**两个进程可能同时通过 `access` 检查，然后都创建。**
+
+**正确做法：让"创建"本身是原子的**
+:::
+
+```c
+/* O_CREAT | O_EXCL：文件已存在就失败（原子操作） */
+int fd = open("/var/run/myapp.pid", O_CREAT | O_EXCL | O_WRONLY, 0644);
+if (fd < 0) {
+    if (errno == EEXIST) {
+        fprintf(stderr, "已经有一个实例在运行\n");
+        return 1;
+    }
+    perror("open");
+    return 1;
+}
+```
+
+:::warning[PID 文件方案的两个缺陷]
+1. **进程崩溃后文件残留** → 下次启动误判"已在运行"
+2. **PID 会被复用** → kill 时可能杀错进程
+
+**所以 PID 文件要么配合 `flock` 用，要么在启动时检查"那个 PID 是不是真的是我"。**
+:::
+
+```c
+/* 检查残留的 PID 文件是否指向活着的自己人 */
+int pid = read_pid_from(file);
+if (pid > 0 && kill(pid, 0) == 0) {
+    /* 进程还活着，但可能是别人复用了这个 PID */
+    char cmdline[256];
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+    /* 读出来比对是不是同一个程序 */
+}
+```
+
+## 多进程写同一日志
+
+:::danger[直接多进程 append 同一个文件]
+```c
+/* 每个进程都这样写 */
+int fd = open("/var/log/app.log", O_WRONLY | O_APPEND);
+write(fd, buf, len);
+```
+
+**`O_APPEND` 保证"定位到末尾 + 写"是原子的（对小于 PIPE_BUF 的写）**，所以**小消息通常不会交错**。
+
+**但**：
+
+- **大消息（超过几 KB）可能被拆成多次写 → 交错**
+- 日志轮转时各进程的 fd 指向不同 inode
+:::
+
+**三种可靠方案**：
+
+| 方案 | 说明 | 适合 |
+| --- | --- | --- |
+| **每进程一个文件** | `app-{pid}.log` | **最简单可靠** |
+| **syslog / journald** | 交给系统统一收 | systemd 环境首选 |
+| **专门日志进程 + 队列** | 所有进程发到 socket/pipe | 需要集中格式 |
+
+:::tip[Python 里的对应做法]
+```python
+# 每进程一个文件
+handler = RotatingFileHandler(f"app-{os.getpid()}.log", ...)
+
+# 或交给 journald
+# 直接 print 到 stdout，systemd 收走
+```
+
+**别指望 `logging` 自己解决多进程问题** —— 它的锁只在单进程内有效。
+:::
+
+## 一个完整的单实例守护进程
+
+```c
+int acquire_single_instance(const char *lockpath)
+{
+    int fd = open(lockpath, O_CREAT | O_RDWR, 0644);
+    if (fd < 0) return -1;
+
+    if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+        if (errno == EWOULDBLOCK) {
+            fprintf(stderr, "已有实例在运行\n");
+        }
+        close(fd);
+        return -1;
+    }
+
+    /* 把 PID 写进去便于排查 */
+    if (ftruncate(fd, 0) == 0) {
+        char buf[32];
+        int n = snprintf(buf, sizeof(buf), "%d\n", getpid());
+        if (write(fd, buf, n) < 0) { /* 忽略 */ }
+    }
+
+    /* fd 故意不关：进程活着锁就在，进程死了内核自动释放 */
+    return fd;
+}
+```
+
+:::tip[为什么"不关 fd"是对的]
+**`flock` 的锁在 fd 关闭时自动释放，进程退出时内核也会释放。**
+
+**所以只要进程活着锁就在** —— 不需要任何"清理残留"的逻辑。
+
+**这比 PID 文件方案优雅得多。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 锁不生效 | 只用了建议锁，对方没检查 | 约定所有程序都加锁 |
+| `fcntl` 锁莫名释放 | 关闭了同文件的另一个 fd | 改用 `flock` 或只保留一个 fd |
+| 单实例检测失败 | 用了 `access` + `creat` | 用 `O_CREAT\|O_EXCL` |
+| 崩溃后起不来 | PID 文件残留 | 改用 `flock` |
+| NFS 上锁失效 | 网络文件系统 | 不要在 NFS 上做关键同步 |
+| 日志行交错 | 大消息多进程写 | 每进程一个文件 |
+| fork 后锁丢了 | `fcntl` 锁不继承 | 子进程重新加锁 |
+| 重启后文件一堆 | 锁文件没清理 | 放 `/run`（tmpfs，重启清空） |
+
+:::warning[锁文件放哪]
+- **`/var/lock`** —— 传统位置，持久
+- **`/run`** —— **tmpfs，重启自动清空（推荐）**
+- 别放 `/tmp`（可能有清理策略，也可能被其他用户干扰）
+
+```c
+#define LOCK_PATH "/run/myapp.pid"     /* 重启自动消失 */
+```
+:::
+
+## 本课自检
+
+- [ ] 能区分 `flock`（整文件）与 `fcntl`（字节区间）
+- [ ] **知道两种锁彼此独立，一个加锁另一个照样能成功**
+- [ ] **知道 `fcntl` 锁属于进程，close 任意 fd 就全释放**
+- [ ] **知道 `flock` 锁跟着 fd 走，更适合单实例检测**
+- [ ] **理解 Linux 文件锁是"建议锁"，不检查的程序不受约束**
+- [ ] **知道强制锁已被废弃**
+- [ ] **知道 `access` + `creat` 有竞态，要用 `O_CREAT|O_EXCL`**
+- [ ] 知道 PID 文件有两个缺陷（残留 + PID 复用）
+- [ ] **知道 `O_APPEND` 对小消息原子但不保证大消息**
+- [ ] 能说出多进程写日志的三种方案
+- [ ] 会写 `flock` 版的单实例检测
+- [ ] **知道锁文件该放 `/run`（tmpfs）**
+
+## 下一步
+
+[进程与信号工具](../../hardware/linux/tools-process) 或 [多线程与原子操作](./concurrency)。

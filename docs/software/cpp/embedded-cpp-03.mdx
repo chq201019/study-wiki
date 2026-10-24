@@ -1,0 +1,285 @@
+---
+id: embedded-cpp-03
+title: "03 与 ESP-IDF / Arduino 混编"
+sidebar_position: 4
+description: "嵌入式 C++ 实战 第 3 部分：与 ESP-IDF / Arduino 混编"
+---
+
+# 03 与 ESP-IDF / Arduino 混编
+### 情况一：C++ 调用 C 的 API（最常见）
+
+ESP-IDF 是 C 写的，你在 `.cpp` 里 include 它的头文件。**IDF 的头文件已经带了 `extern "C"` 保护**，所以直接 include 就行：
+
+```cpp
+// main.cpp  —— 在 ESP-IDF 里用 C++
+#include <cstdio>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+
+static const char* TAG = "cpp_app";
+
+class Blinker {
+    gpio_num_t pin_;
+    bool state_ = false;
+public:
+    explicit Blinker(gpio_num_t pin) : pin_(pin) {
+        gpio_reset_pin(pin_);
+        gpio_set_direction(pin_, GPIO_MODE_OUTPUT);
+    }
+    void toggle() {
+        state_ = !state_;
+        gpio_set_level(pin_, state_ ? 1 : 0);
+    }
+};
+
+extern "C" void app_main(void) {     // 关键：app_main 必须 C 链接！
+    Blinker led(GPIO_NUM_2);
+    while (true) {
+        led.toggle();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+```
+
+:::danger[`app_main` 必须是 `extern "C"`]
+ESP-IDF 的启动代码是 C，它按 C 的符号名找 `app_main`。如果你不写 `extern "C"`，C++ 编译器会对函数名做**名字改编**（name mangling），链接器就找不到 `app_main` → **undefined reference / 启动失败**。
+
+```cpp
+extern "C" void app_main(void) { }        // 正确
+// void app_main(void) { }                // 错误：符号名变成 _Z8app_mainv
+```
+
+**实测名字改编**（这是 C++ 支持重载的机制）：
+
+```bash
+g++ -c main.cpp -o main.o && nm main.o | grep app_main
+```
+
+**真实输出：**
+
+```text
+0000000000000000 T _Z8app_mainv
+```
+:::
+
+### 情况二：C 调用 C++ 的函数
+
+需要你自己写 `extern "C"` 包装层：
+
+```cpp
+// mylib.hpp —— C++ 实现
+class Processor { public: int run(int x); };
+
+// mylib_c_api.h —— 给 C 用的接口
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void* processor_create(void);
+int   processor_run(void* handle, int x);
+void  processor_destroy(void* handle);
+
+#ifdef __cplusplus
+}
+#endif
+```
+
+```cpp
+// mylib_c_api.cpp —— 桥接层
+#include "mylib_c_api.h"
+#include "mylib.hpp"
+
+void* processor_create(void)  { return new Processor(); }
+int  processor_run(void* h, int x) {
+    return static_cast<Processor*>(h)->run(x);
+}
+void processor_destroy(void* h) { delete static_cast<Processor*>(h); }
+```
+
+`extern "C"` 块里的函数**不能重载**（C 没有名字改编机制）。
+
+### 情况三：给 C++ 回调给 C API
+
+ESP-IDF 的回调通常是 C 函数指针。C++ 的 lambda **只有无捕获的**能转成函数指针：
+
+```cpp
+// 无捕获 lambda → 可以转函数指针
+void (*cb)(void*) = [](void* arg) { /* ... */ };   // OK
+
+// 有捕获的 lambda → 不能转
+int captured = 5;
+// void (*cb2)(void*) = [captured](void*) { };   // 编译错误！
+```
+
+**有捕获时的解决方案**：用 C API 提供的 `user_data` / `arg` 参数传上下文：
+
+```cpp
+struct CallbackContext { int multiplier; };
+
+void my_callback(void* arg) {
+    auto* ctx = static_cast<CallbackContext*>(arg);
+    // ...
+}
+
+CallbackContext ctx{2};
+some_c_api_register(my_callback, &ctx);   // 把上下文当 user_data 传进去
+```
+
+### ESP-IDF 的 C++ 配置
+
+```cmake
+# main/CMakeLists.txt
+idf_component_register(
+    SRCS "main.cpp"              # 注意是 .cpp
+    INCLUDE_DIRS "."
+    REQUIRES driver esp_timer
+)
+
+# 设置 C++ 标准与选项
+target_compile_features(${COMPONENT_LIB} PRIVATE cxx_std_17)
+target_compile_options(${COMPONENT_LIB} PRIVATE
+    -fno-exceptions        # 关异常（可选，IDF 默认可能已关）
+    -fno-rtti              # 关 RTTI（可选）
+    -Wall -Wextra
+)
+```
+
+:::info[ESP-IDF 的实际情况]
+ESP-IDF 5.x 的 **C++ 支持是官方支持的**（IDF 自身部分组件用 C++ 编写）。但：
+
+- **异常**：IDF 默认编译选项中通常**关闭**异常（`-fno-exceptions`）。启用异常需要额外配置，且会显著增大固件
+- **RTTI**：默认通常关闭
+- **标准库**：用的是交叉编译器的 libstdc++，功能完整但体积大
+- **推荐标准**：自建项目显式设 `cxx_std_17`
+
+**实测你自己的 IDF 环境的配置**（在 IDF 环境里）：
+
+```bash
+idf.py build 2>&1 | grep -o '\-std=[a-z+0-9]*' | head -3
+idf.py build --verbose 2>&1 | grep -o '\-fno-exceptions\|-fno-rtti' | sort -u
+```
+:::
+
+### Arduino 框架
+
+Arduino-ESP32 的核心**本身就是 C++**（`HardwareSerial`、`WiFiClient` 都是类）。所以：
+
+- 你的 `.ino` 文件**会被当成 C++ 编译**（Arduino IDE 会加上函数原型生成和 `#include <Arduino.h>`）
+- 可以自由用类、模板、RAII
+- **但要注意**：Arduino 的默认配置通常关闭异常和 RTTI
+
+```cpp
+// Arduino 风格：类封装传感器
+class DHT22Reader {
+    uint8_t pin_;
+public:
+    explicit DHT22Reader(uint8_t pin) : pin_(pin) {}
+    bool read(float& temp, float& hum) {
+        // ... 单总线时序 ...
+        return true;
+    }
+};
+
+DHT22Reader sensor(4);
+
+void setup() { Serial.begin(115200); }
+void loop() {
+    float t, h;
+    if (sensor.read(t, h)) {
+        Serial.printf("%.1f C, %.1f %%\n", t, h);
+    }
+    delay(2000);
+}
+```
+
+## 8. 嵌入式 C++ 配置清单
+
+一份实用的编译器配置：
+
+```cmake
+target_compile_options(my_firmware PRIVATE
+    -std=c++17
+    -Os                     # 优化体积（或 -O2 优化速度）
+    -fno-exceptions         # 关异常
+    -fno-rtti               # 关 RTTI
+    -fno-threadsafe-statics # 关静态局部变量线程安全守卫（单核/无 OS 时可省）
+    -ffunction-sections     # 每个函数一个 section
+    -fdata-sections         # 每个数据一个 section
+    -Wall -Wextra -Werror
+)
+target_link_options(my_firmware PRIVATE
+    -Wl,--gc-sections       # 链接时丢弃未用到的 section（配合上面两个）
+)
+```
+
+`-ffunction-sections` + `-Wl,--gc-sections` 非常重要：**它能剔除未使用的模板实例化和标准库代码**，往往能省掉 30-50% 的 flash。
+
+### 该用 / 不该用速查表
+
+| 特性 | 嵌入式上 | 说明 |
+| --- | --- | --- |
+| `std::array` | ✅ 推荐 | 零开销，栈/静态区 |
+| `std::string_view`（C++17） | ✅ 推荐 | 不拥有内存 |
+| `std::span`（C++20） | ✅ 推荐 | 不拥有内存，自带长度 |
+| `constexpr` / `consteval` | ✅ 强烈推荐 | 编译期计算，省 flash 和 CPU |
+| 模板（适度） | ✅ 推荐 | 零开销抽象；但注意实例化数量 |
+| `enum class` | ✅ 推荐 | 类型安全，可指定底层类型 |
+| RAII | ✅ 强烈推荐 | 硬件资源管理的最佳方式 |
+| 类 / 封装 | ✅ 推荐 | 无额外代价 |
+| 虚函数（少量） | ⚠️ 谨慎 | 每对象 8 字节 + vtable 占 flash |
+| `std::vector` | ⚠️ 谨慎 | 必须 `reserve`；或改用固定容量容器 |
+| `std::string` | ⚠️ 谨慎 | SSO 内 OK，超了会分配 |
+| 异常 | ❌ 关闭 | unwind 表占 flash |
+| RTTI（`dynamic_cast`） | ❌ 关闭 | typeinfo 占 flash |
+| `iostream` | ❌ 不用 | 体积巨大，用 `printf` / `esp_log` |
+| 大量 STL 算法 | ⚠️ 谨慎 | 部分会隐式分配 |
+| `std::function` | ⚠️ 谨慎 | 可能堆分配 + 间接调用 |
+| 动态多态的深继承树 | ❌ 避免 | vtable 多、体积大 |
+
+## 常见坑
+
+| 坑 | 现象 | 解法 |
+| --- | --- | --- |
+| `app_main` 没写 `extern "C"` | 链接失败 / 不启动 | 必须 `extern "C"` |
+| C++ 回调给 C API 时捕获 lambda | 编译错误 | 用 `user_data` 传上下文，或无捕获 lambda |
+| 忘了 `-fno-exceptions` | 固件大 / 行为不符预期 | 显式配置 |
+| `std::string` 拼接超 SSO | 运行时 `malloc`，可能失败 | 预分配 / `string_view` / 固定缓冲 |
+| `vector` 不 `reserve` | 反复分配 + 碎片 | 构造后立即 `reserve` |
+| 用了 `iostream` | flash 爆掉 | 用 `printf` / `esp_log` |
+| 没开 `--gc-sections` | 大量死代码留在 flash | 配 `-ffunction-sections` + 链接器选项 |
+| 全局 C++ 对象构造顺序 | 用到未初始化的对象 | 用 `constinit`（C++20）或函数内 static |
+| 模板实例化爆炸 | 编译慢 + 体积大 | 控制模板参数组合，显式实例化 |
+| 以为虚函数很便宜 | flash/RAM 都被吃掉 | 少量使用，或用 CRTP |
+
+## 自检清单
+
+- [ ] 说出嵌入式慎用 C++ 的 4-5 个真实理由（不是"性能差"）
+- [ ] 解释异常"零成本模型"的"零成本"指的是什么、不指什么
+- [ ] 说出 `-fno-exceptions` / `-fno-rtti` 各自关掉了什么、保留了什么
+- [ ] 解释为什么关掉 RTTI 后虚函数仍然可用
+- [ ] 说出 `std::string` / `vector` 在什么情况下会碰堆
+- [ ] 知道 `std::array` 相对 `std::vector` 在嵌入式的优势
+- [ ] 能用 `constexpr` 写一个编译期查找表，并用 `static_assert` 验证
+- [ ] 解释 placement new 的用途和为什么必须手动调析构
+- [ ] 知道为什么 `app_main` 必须 `extern "C"`
+- [ ] 说明有捕获的 lambda 不能直接传给 C 回调的原因和解法
+- [ ] 列出嵌入式该用/不该用的 C++ 特性清单
+
+## 下一步
+
+- 回顾整条主线 → [C++ 主线导读](./)
+- 寄存器封装用到的强类型枚举 → [从 C 到 C++](./transition)
+- 无堆容器的原理 → [STL 容器](./stl-containers)
+- 编译期计算的更多细节 → [进阶特性](./advanced)
+- 构建配置 → [构建与工具链](./build)
+- 硬件主线 → [硬件开发](../../hardware/)
+
+---
+
+**其他主线**：[Python](../python/) · [C](../c/) · 返回 [软件编程总览](../)
+
+---
+
+**翻页**：[← 上一页](./embedded-cpp-02) · [返回目录](./)

@@ -1,0 +1,340 @@
+---
+id: 19-webserver
+title: 19 Web 服务器控制灯
+sidebar_position: 19
+description: 在 ESP32 上跑一个网页、浏览器直接控制 GPIO、HTTP 处理函数的写法，以及公网访问的安全提醒。
+---
+
+# 19 Web 服务器控制灯
+
+**本课目标**：让手机浏览器打开一个网页，点按钮控制板子上的灯。
+
+## 为什么这个项目有意思
+
+**不用装 App、不用连 MQTT**——掏出手机浏览器就能控制。
+
+```text
+手机浏览器 → http://192.168.1.50/on  → 灯亮
+手机浏览器 → http://192.168.1.50/off → 灯灭
+```
+
+**这是最直观的"物联网"体验。**
+
+## ESP-IDF 的 HTTP 服务器
+
+本机 ESP-IDF v5.3.5 有 `examples/protocols/http_server` 一组示例。
+
+核心 API：
+
+```c
+#include "esp_http_server.h"
+
+httpd_handle_t server = NULL;
+httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+httpd_start(&server, &config);
+
+/* 注册 URI 处理函数 */
+httpd_uri_t uri_on = {
+    .uri      = "/on",
+    .method   = HTTP_GET,
+    .handler  = on_handler,
+    .user_ctx = NULL,
+};
+httpd_register_uri_handler(server, &uri_on);
+```
+
+## 处理函数签名
+
+```c
+static esp_err_t on_handler(httpd_req_t *req)
+{
+    gpio_set_level(LED_GPIO, 1);
+
+    /* 必须回一个响应，否则浏览器一直转圈 */
+    const char *resp = "LED ON";
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+```
+
+:::danger[处理函数必须发响应]
+```c
+static esp_err_t on_handler(httpd_req_t *req)
+{
+    gpio_set_level(LED_GPIO, 1);
+    return ESP_OK;          /* ❌ 没发响应 → 浏览器超时 */
+}
+```
+
+**规矩：每个处理函数都要调 `httpd_resp_send`（或 `resp_send_chunk`）。**
+:::
+
+## 完整示例：网页 + 两个按钮
+
+```c
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_http_server.h"
+#include "esp_log.h"
+
+static const char *TAG = "webserver";
+#define LED_GPIO  4
+
+/* ---------- 处理函数 ---------- */
+
+static esp_err_t root_handler(httpd_req_t *req)
+{
+    /* 返回一个简单网页 */
+    const char *html =
+        "<!DOCTYPE html><html><head>"
+        "<meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>ESP32 控制</title>"
+        "<style>"
+        "body{font-family:sans-serif;text-align:center;padding:40px}"
+        "a{display:inline-block;margin:10px;padding:20px 40px;"
+        "background:#007bff;color:#fff;text-decoration:none;"
+        "border-radius:8px;font-size:20px}"
+        "</style></head><body>"
+        "<h1>ESP32 灯控</h1>"
+        "<a href='/on'>开灯</a>"
+        "<a href='/off'>关灯</a>"
+        "</body></html>";
+
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t on_handler(httpd_req_t *req)
+{
+    gpio_set_level(LED_GPIO, 1);
+    ESP_LOGI(TAG, "开灯");
+
+    /* 302 跳回首页，体验更好 */
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+static esp_err_t off_handler(httpd_req_t *req)
+{
+    gpio_set_level(LED_GPIO, 0);
+    ESP_LOGI(TAG, "关灯");
+
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+/* ---------- 启动 ---------- */
+
+void web_start(void)
+{
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.max_uri_handlers = 8;
+
+    httpd_handle_t server = NULL;
+    ESP_ERROR_CHECK(httpd_start(&server, &cfg));
+
+    httpd_uri_t root = { .uri = "/",    .method = HTTP_GET, .handler = root_handler };
+    httpd_uri_t on   = { .uri = "/on",  .method = HTTP_GET, .handler = on_handler   };
+    httpd_uri_t off  = { .uri = "/off", .method = HTTP_GET, .handler = off_handler  };
+
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &root));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &on));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &off));
+
+    ESP_LOGI(TAG, "服务器已启动，浏览器访问 http://<板子IP>/");
+}
+
+void app_main(void)
+{
+    /* 配置 LED */
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+
+    /* 这里应先连 WiFi（第 14 课）并打印 IP */
+    /* wifi_init_sta(); ... 等 GOT_IP ... */
+
+    web_start();
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
+}
+```
+
+:::tip[为手机优化的两个细节]
+1. **`<meta name='viewport' ...>`** —— 让页面在手机上不缩放、可点
+2. **大按钮 + 居中** —— 手指好点
+
+**加这两条，体验立刻不一样。**
+:::
+
+:::tip[用 302 跳转比返回纯文本体验好]
+```c
+httpd_resp_set_status(req, "302 Found");
+httpd_resp_set_hdr(req, "Location", "/");
+```
+
+**点按钮 → 操作完成 → 自动回首页**，没有"白页面"。
+
+比返回 `"LED ON"` 这种纯文本好得多。
+:::
+
+## 怎么知道板子的 IP
+
+**方法一：串口打印**（最可靠）
+
+```c
+ESP_LOGI(TAG, "IP: " IPSTR, IP2STR(&ip));
+```
+
+**方法二：路由器后台**看 DHCP 客户端列表
+
+**方法三：固定 IP**（推荐给产品）
+
+```c
+esp_netif_ip_info_t ip = {
+    .ip.addr      = ESP_IP4TOADDR(192, 168, 1, 50),
+    .gw.addr      = ESP_IP4TOADDR(192, 168, 1, 1),
+    .netmask.addr = ESP_IP4TOADDR(255, 255, 255, 0),
+};
+esp_netif_dhcpc_stop(netif);
+esp_netif_set_ip_info(netif, &ip);
+```
+
+:::warning[IP 会变，别写死]
+DHCP 分配的 IP **重启后可能变**。
+
+**做产品应该**：
+
+- 用固定 IP，或
+- 用 **mDNS**（`http://esp32.local`），或
+- 上报自己的 IP 给服务器
+:::
+
+## 用 POST + JSON 传参数
+
+GET 适合简单命令，**传数据要用 POST**：
+
+```c
+static esp_err_t set_handler(httpd_req_t *req)
+{
+    char buf[128];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[len] = '\0';
+
+    /* buf 里是 JSON，用 cJSON 解析（第 15 课） */
+    ESP_LOGI(TAG, "收到: %s", buf);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+```
+
+:::danger[`httpd_req_recv` 不保证一次收完]
+```c
+int len = httpd_req_recv(req, buf, sizeof(buf));
+```
+
+**body 大时可能只收到一部分**，要循环收：
+
+```c
+int total = 0, remaining = req->content_len;
+while (remaining > 0) {
+    int n = httpd_req_recv(req, buf + total, remaining);
+    if (n <= 0) { /* 超时或错误 */ break; }
+    total += n;
+    remaining -= n;
+}
+```
+
+**用 `req->content_len` 才知道总共多长。**
+:::
+
+## 安全提醒
+
+:::danger[局域网内就已经不安全了]
+| 风险 | 说明 |
+| --- | --- |
+| **没有认证** | 同一 WiFi 下任何人打开浏览器就能控制 |
+| **明文 HTTP** | 密码/数据可被抓包 |
+| **暴露到公网 = 极高风险** | 几小时内就会被爬虫扫到并利用 |
+
+**家用玩可以，产品绝对不行。**
+:::
+
+:::warning[如果一定要公网访问]
+**不要**直接在路由器上把 80 端口映射到 ESP32。
+
+**正确做法**：
+
+- 用 **MQTT** 走内网穿透（设备主动连出去）
+- 或走云平台的中转
+- **绝不让设备直接暴露在公网**
+
+（这也是几乎所有 IoT 产品都"设备主动连云"而不是"等外面连进来"的原因。）
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 处理函数不发响应 | 浏览器超时 | 没调 `resp_send` | 必须发 |
+| 忘了注册 handler | 404 | 没 `register_uri_handler` | 补上 |
+| URI 拼错（大小写） | 404 | `/On` vs `/on` | 一致 |
+| `max_uri_handlers` 不够 | 注册失败 | 默认值小 | 调大 |
+| 网页中文乱码 | 显示问号 | 没设 charset | `text/html; charset=utf-8` |
+| `httpd_req_recv` 一次收完 | body 截断 | 可能分批 | 循环收 |
+| 直接映射到公网 | 被入侵 | 无认证 | 用 MQTT 中转 |
+
+:::info[HTTP 服务器占多少资源]
+一个 `httpd` 实例默认占 **约 4~8 KB 栈 + 每个连接一个任务**。
+
+**同时连 4~7 个客户端就到上限了。**
+
+`HTTPD_DEFAULT_CONFIG()` 里 `max_open_sockets` 默认是 7。
+:::
+
+## 本课自检
+
+- [ ] 会用 `httpd_start` + `httpd_register_uri_handler`
+- [ ] **知道处理函数必须发响应**
+- [ ] 会返回 HTML 页面（含 viewport meta）
+- [ ] 会用 302 跳转优化体验
+- [ ] 知道三种获取板子 IP 的方法
+- [ ] 知道 DHCP 的 IP 会变，产品应固定或上报
+- [ ] 会用 `httpd_req_recv` 收 POST body
+- [ ] **知道 body 可能要循环收，用 `content_len`**
+- [ ] **知道没有认证 = 同一局域网任何人都能控制**
+- [ ] **知道绝不要把设备直接映射到公网**
+
+## 第三阶段小结
+
+你现在能让 ESP32 联网做实际的事：
+
+| 能力 | 用什么 |
+| --- | --- |
+| 连路由器 | WiFi（等 GOT_IP） |
+| 拉数据 | HTTP + cJSON |
+| 持续上报/远程控制 | MQTT |
+| 手机近距通信 | BLE |
+| 准确时间 | SNTP |
+| 浏览器控制 | HTTP 服务器 |
+
+**这已经能做出一台"智能设备"了。**
+
+## 下一步
+
+[20 FreeRTOS 任务](./20-freertos-task) —— 让多件事"同时"进行。

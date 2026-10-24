@@ -1,0 +1,343 @@
+---
+id: 22-namespace
+title: 22 命名空间与头文件
+sidebar_position: 22
+description: namespace 解决命名冲突、using 的三种用法、匿名命名空间，以及头文件的正确写法。
+---
+
+# 22 命名空间与头文件
+
+**本课目标**：会用 `namespace` 组织代码，写出正确的头文件。
+
+## 为什么需要命名空间
+
+大型项目里，两个库都定义了 `Logger` 类——**名字撞车了**。
+
+C 只能靠加前缀（`mylib_logger_init`），C++ 用命名空间：
+
+```cpp
+namespace mylib {
+    class Logger { };
+}
+
+namespace thirdparty {
+    class Logger { };
+}
+
+mylib::Logger a;             /* 不冲突 */
+thirdparty::Logger b;
+```
+
+## 基本语法
+
+```cpp
+namespace mylib {
+    int add(int a, int b) { return a + b; }
+    constexpr int VERSION = 2;
+}
+
+mylib::add(2, 3);            /* 用 :: 访问 */
+mylib::VERSION;
+```
+
+本机实测：
+
+```text
+mylib::add(2,3)=5
+VERSION=2
+```
+
+## 嵌套命名空间
+
+```cpp
+namespace mylib {
+    namespace detail {
+        inline int helper(int x) { return x * 2; }
+    }
+    int add(int a, int b) {
+        return a + b + detail::helper(0);
+    }
+}
+```
+
+C++17 可以简写：
+
+```cpp
+namespace mylib::detail {        /* 等价于嵌套 */
+    inline int helper(int x) { return x * 2; }
+}
+```
+
+:::tip[`detail` 命名空间的惯例]
+社区惯例：**内部实现放在 `xxx::detail`**，对外不承诺稳定。
+
+用户看到 `detail` 就知道"这不该直接用"。
+:::
+
+## 三种 using 用法
+
+### ① `using namespace`（指令）
+
+```cpp
+{
+    using namespace A;
+    std::cout << value;          /* 直接写 value，不用 A:: */
+}
+```
+
+本机实测：`using 后 value=1`
+
+:::danger[不要在头文件里写 `using namespace`]
+```cpp
+/* mylib.h */
+using namespace std;             /* ❌ 污染所有包含它的文件 */
+```
+
+**头文件的 `using namespace` 会传染给每个包含它的源文件**，导致别人的名字突然冲突，而且**改不掉**（你不能改那个头文件）。
+
+**规矩：头文件里永远不写 `using namespace`。**
+:::
+
+### ② `using` 声明（引入个别名字）
+
+```cpp
+using mylib::add;                /* 只引入这一个 */
+
+add(1, 1);                       /* 现在可以直接用 */
+```
+
+本机实测：`using 声明后 add(1,1)=2`
+
+**比 `using namespace` 安全**——只引入你要的。
+
+### ③ 命名空间别名
+
+```cpp
+namespace C = A;                 /* C 是 A 的别名 */
+C::value;                         /* 等价于 A::value */
+```
+
+本机实测：`C::value(别名A)=1`
+
+**常用于长名字**：
+
+```cpp
+namespace fs = std::filesystem;
+fs::path p = "a.txt";
+```
+
+## 匿名命名空间：替代 `static`
+
+C 用 `static` 限制函数只在当前文件可见（[C 第 27 课](../c-basics/27-multi-file)）。C++ 更推荐**匿名命名空间**：
+
+```cpp
+namespace {
+    int helper() { return 42; }      /* 只在本文件可见 */
+    int counter = 0;
+}
+```
+
+:::tip[匿名命名空间 vs `static`]
+| | `static` | 匿名命名空间 |
+| --- | --- | --- |
+| 作用 | 只对函数和变量 | **也能用于类、模板** |
+| C++ 推荐 | ⚠️ 兼容用途 | ✅ 推荐 |
+
+`static` 不能修饰类定义，匿名命名空间可以。
+
+**新代码用匿名命名空间。**
+:::
+
+## 头文件的正确写法
+
+```cpp
+/* mylib.h */
+#ifndef MYLIB_H                    /* 头文件保护 */
+#define MYLIB_H
+
+#include <string>
+
+namespace mylib {
+
+class Widget {
+public:
+    explicit Widget(std::string name);
+    const std::string &name() const;
+
+private:
+    std::string name_;
+};
+
+int add(int a, int b);
+
+}  /* namespace mylib */
+
+#endif
+```
+
+:::warning[头文件里只放声明，不放定义]
+```cpp
+/* ❌ 会产生多重定义 */
+int g_value = 0;
+void do_something() { }
+
+/* ✅ 只声明 */
+extern int g_value;
+void do_something();
+```
+
+**例外**：`inline` 函数、模板、`constexpr` 可以放头文件（它们允许多份相同定义）。
+:::
+
+### `#pragma once`
+
+```cpp
+#pragma once                       /* 更简洁，非标准但通用 */
+```
+
+等价于头文件保护，所有主流编译器都支持。
+
+:::tip[选哪种]
+- `#ifndef`：标准，绝对可靠
+- `#pragma once`：简洁，编译略快，**实践中完全够用**
+
+**大型项目常用 `#pragma once`**，因为不会因为宏重名而出错。
+:::
+
+## 完整的多文件示例
+
+**`mylib.h`**：
+
+```cpp
+#pragma once
+
+#include <string>
+
+namespace mylib {
+
+inline constexpr int VERSION = 2;
+
+class Greeter {
+public:
+    explicit Greeter(std::string name) : name_(std::move(name)) {}
+    std::string greet() const;
+
+private:
+    std::string name_;
+};
+
+int add(int a, int b);
+
+}  /* namespace mylib */
+```
+
+**`mylib.cpp`**：
+
+```cpp
+#include "mylib.h"
+
+namespace mylib {
+
+std::string Greeter::greet() const {
+    return "你好，" + name_;
+}
+
+int add(int a, int b) {
+    return a + b;
+}
+
+}  /* namespace mylib */
+```
+
+**`main.cpp`**：
+
+```cpp
+#include <iostream>
+#include "mylib.h"
+
+int main() {
+    mylib::Greeter g("小明");
+    std::cout << g.greet() << "\n";
+    std::cout << "1 + 2 = " << mylib::add(1, 2) << "\n";
+    std::cout << "版本 " << mylib::VERSION << "\n";
+    return 0;
+}
+```
+
+编译：
+
+```bash
+g++ -std=c++17 -Wall -Wextra main.cpp mylib.cpp -o prog
+```
+
+输出：
+
+```text
+你好，小明
+1 + 2 = 3
+版本 2
+```
+
+## 关于 `std` 命名空间
+
+```cpp
+std::cout << "hi";               /* cout 在 std 里 */
+```
+
+:::danger[为什么很多教程写 `using namespace std;`——但你不该学]
+```cpp
+using namespace std;             /* ❌ 教科书的坏习惯 */
+```
+
+**问题**：`std` 里有几千个名字，包括 `count`、`data`、`size`、`hash`、`swap` 等常见词。
+
+```cpp
+using namespace std;
+int count = 0;                   /* ⚠️ 可能和 std::count 冲突 */
+```
+
+**三种正确做法**：
+
+```cpp
+/* ① 全部写全名（最清晰） */
+std::cout << "hi";
+
+/* ② 引入个别名字（推荐在 .cpp 里用） */
+using std::cout;
+using std::string;
+
+/* ③ 只在函数内 using（作用域小） */
+void f() {
+    using namespace std;
+    cout << "hi";
+}
+```
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 头文件里 `using namespace` | 别人名字冲突 | 污染全局 | 写全名或作用域内用 |
+| 头文件里定义变量/函数 | `multiple definition` | 被多次包含 | 只放声明 |
+| 忘写头文件保护 | 重复定义 | 多次包含 | `#pragma once` |
+| 命名空间没闭合 | 编译错 | 括号不匹配 | 检查 `}` |
+| 用 `static` 修饰类 | 编译错 | 不能修饰类 | 用匿名命名空间 |
+| `using namespace std;` 后定义 `count` | 二义性 | 名字冲突 | 避免 `using namespace` |
+
+## 本课自检
+
+- [ ] 会定义命名空间，用 `::` 访问
+- [ ] 知道嵌套命名空间和 C++17 的 `a::b` 简写
+- [ ] 会用命名空间别名 `namespace fs = ...`
+- [ ] **知道头文件里不能写 `using namespace`**
+- [ ] 会用 `using std::cout` 引入个别名字
+- [ ] 会用匿名命名空间替代 `static`
+- [ ] 会写正确的头文件（保护 + 只放声明）
+- [ ] 知道 `inline` / 模板 / `constexpr` 可以放头文件
+- [ ] 知道 `#pragma once` 和 `#ifndef` 的取舍
+- [ ] **养成不用 `using namespace std;` 的习惯**
+
+## 下一步
+
+[23 const 的完全指南](./23-const) —— `const` 在 C++ 里位置不同含义完全不同。

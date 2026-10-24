@@ -1,0 +1,316 @@
+---
+id: pointers-02
+title: "02 函数指针"
+sidebar_position: 3
+description: "指针专章 第 2 部分：函数指针"
+---
+
+# 02 函数指针
+函数也有地址，也能取地址放进指针。
+
+### 语法
+
+```c
+int (*fp)(int, int);        /* fp 是指针，指向"接受两个 int、返回 int"的函数 */
+int *fp2(int, int);         /* 错误理解：这是函数声明！返回 int * */
+```
+
+**括号是关键**：`(*fp)` 表明 `fp` 先和 `*` 结合，是指针。
+
+实测大小：
+
+```text
+sizeof(fp) = 8
+```
+
+### 完整示例：回调与跳转表
+
+```c
+#include <stdio.h>
+
+typedef int (*op_t)(int, int);
+
+static int add(int a, int b) { return a + b; }
+static int sub(int a, int b) { return a - b; }
+static int mul(int a, int b) { return a * b; }
+
+/* 跳转表：用索引代替 switch */
+static op_t ops[] = {add, sub, mul};
+
+/* 回调：把函数交给别人调用 */
+static void for_each(int *arr, size_t n, void (*fn)(int *, size_t)) {
+    for (size_t i = 0; i < n; i++) fn(arr, i);
+}
+
+static void print_idx(int *arr, size_t i) {
+    printf("arr[%zu]=%d\n", i, arr[i]);
+}
+
+int main(void) {
+    printf("ops[0](6,7)=%d\n", ops[0](6, 7));
+    printf("ops[2](6,7)=%d\n", ops[2](6, 7));
+
+    op_t f = add;
+    printf("f(3,4)=%d\n", f(3, 4));        /* 直接调用 */
+    printf("(*f)(3,4)=%d\n", (*f)(3, 4));  /* 等价，显式解引用 */
+
+    int a[3] = {10, 20, 30};
+    for_each(a, 3, print_idx);
+    return 0;
+}
+```
+
+要点：
+
+- `f(3,4)` 和 `(*f)(3,4)` **都合法且等价**——C 标准允许两种写法。推荐 `f(3,4)`，更简洁
+- 函数名在表达式里**自动退化**成函数指针，所以 `ops[] = {add, sub, mul}` 不用写 `&add`（写也行，等价）
+- 用 `typedef` 定义函数指针类型能大幅提升可读性，**嵌入式代码里几乎总是这么做**
+
+### 嵌入式里的典型用途
+
+| 用途 | 例子 |
+| --- | --- |
+| 中断向量表 | 一个函数指针数组，硬件按中断号索引 |
+| 驱动抽象层 | 结构体里放 `init`/`read`/`write`/`deinit` 函数指针（模拟虚函数） |
+| 回调 | `gpio_isr_handler_add(pin, my_isr, arg)` |
+| 状态机 | 每个状态一个处理函数，用函数指针跳转 |
+
+FreeRTOS 里的 `TimerCallbackFunction_t`、ESP-IDF 里的 `esp_timer_create` 回调，都是这个模式。
+
+:::warning[函数指针和 `void *` 不能互相转换]
+C 标准**不保证**函数指针和 `void *` 之间可以转换（POSIX 额外保证了，但 C 没有）。在**哈佛架构**（程序存储器和数据存储器分开）的 MCU 上，函数地址和数据地址根本不在同一地址空间，`sizeof` 都可能不同。
+
+不要写 `void *p = (void *)my_func;`。如果需要在结构体里存"不定类型的函数指针"，统一用一个函数指针类型，转换回来后再调用。
+
+注意：不同**函数指针类型之间**互相转换是允许的，但**通过错误类型调用是 UB**。
+:::
+
+## 七、`restrict`（C99）
+
+`restrict` 是一个**类型限定符**（和 `const`、`volatile` 同级），作用是给编译器一个承诺：
+
+:::info[`restrict` 的语义]
+用 `restrict` 修饰指针 `p` 时，程序员向编译器承诺：**在 `p` 的作用域内，凡是经由 `p` 访问的对象，不会经由任何其他途径被访问**（即不存在别名）。
+
+有了这个承诺，编译器可以大胆优化——因为它不必假设"写 `*p` 可能会影响 `q` 指向的值"。
+:::
+
+### 为什么需要它
+
+考虑这个函数：
+
+```c
+void add_arrays(int *a, const int *b, int n) {
+    for (int i = 0; i < n; i++) {
+        a[i] += b[i];
+    }
+}
+```
+
+编译器不知道 `a` 和 `b` 是否指向同一块内存。如果 `a == b`，那么写 `a[i]` 会影响下次读到的 `b[i]`。所以编译器**每次迭代都要重新从内存加载 `b[i]`**——不能缓存到寄存器。
+
+加上 `restrict`：
+
+```c
+void add_arrays(int * restrict a, const int * restrict b, int n) { ... }
+```
+
+你承诺了 `a` 和 `b` 不重叠，编译器就能把 `b[i]` 缓存进寄存器、做向量化、重排循环——**这正是 C 能生成接近手写汇编代码的关键机制之一**。
+
+### 违反承诺是 UB
+
+```c
+int buf[10] = {1,2,3,4,5,6,7,8,9,10};
+add_arrays(buf, buf, 10);   /* 违反 restrict 承诺 → UB */
+```
+
+编译器已经按"不重叠"优化了，实际重叠时结果未定义。
+
+:::caution[`restrict` 的几条规定]
+1. `restrict` 只能修饰**指针**类型（含数组参数退化后的指针）
+2. 违反 `restrict` 承诺是 **UB**，编译器不会帮你检查
+3. C++ 没有 `restrict`——它是 C99 特性（很多 C++ 编译器提供 `__restrict` 扩展）
+4. 标准库里大量使用：`memcpy` 的两个指针参数是 `restrict`（所以 `memcpy` 重叠区域是 UB），而 `memmove` **不是** `restrict`（所以 `memmove` 可以处理重叠）
+:::
+
+### 实测：`memcpy` 做类型双关（type punning）
+
+`restrict` 的兄弟问题是**严格别名规则**（strict aliasing）：通过一个类型写入、通过另一个不兼容的类型读取，是 UB（少数例外）。
+
+实测本机的正确做法：
+
+```c
+float f = 3.14f;
+unsigned int bits;
+__builtin_memcpy(&bits, &f, sizeof(bits));
+printf("float 3.14f as bits = 0x%08X\n", bits);
+```
+
+```text
+float 3.14f as bits = 0x4048F5C3
+```
+
+`0x4048F5C3` 正是 3.14f 的 IEEE 754 单精度表示。
+
+:::danger[不要用指针强转做类型双关]
+```c
+float f = 3.14f;
+unsigned int bits = *(unsigned int *)&f;   /* 违反严格别名规则 → UB */
+```
+
+这个写法在 `-O2` 下可能被优化成完全不同的结果。**正确做法是用 `memcpy`**——标准明确允许通过 `memcpy` 逐字节复制（编译器会把它优化成一条指令，零开销）。
+
+另一种合法方式是用 `union`（C11 起明确允许），详见 [复合类型](./aggregate)。
+:::
+
+## 八、`void *` 与泛型指针
+
+`void *` 是"指向未知类型的指针"：
+
+- 可以存放**任何对象指针**（无需显式转换，C 里 `void *` 和对象指针间隐式转换是允许的）
+- **不能解引用**（不知道读几个字节）
+- **不能做算术**（没有步长信息）
+- 函数指针不能转成 `void *`（见上文）
+
+典型用途：通用内存接口和回调的用户数据。
+
+```c
+void *malloc(size_t size);
+void *memcpy(void *dest, const void *src, size_t n);
+```
+
+嵌入式里最常见的用法是**回调携带用户上下文**：
+
+```c
+/* ESP-IDF 风格：注册回调时传入自己想要的上下文 */
+esp_timer_create(&cfg, &timer);
+/* cfg.callback 是函数指针，cfg.arg 是 void *，回调时原样传回 */
+void my_callback(void *arg) {
+    my_ctx_t *ctx = (my_ctx_t *)arg;   /* 转回真实类型 */
+}
+```
+
+这是 C 实现"闭包"的标准手法。
+
+## 九、指针的生命周期：悬垂指针
+
+指针的危险不在于算术，而在于**它指向的内存可能已经失效**。
+
+| 悬垂来源 | 例子 | 后果 |
+| --- | --- | --- |
+| 返回局部变量地址 | `int *f(void){ int x=5; return &x; }` | 栈帧销毁后指针失效 |
+| `free` 后继续用 | `free(p); *p = 1;` | use-after-free |
+| 指针指向已出作用域的数组 | 同第一类 | 栈内存被后续调用覆盖 |
+| 重复 `free` | `free(p); free(p);` | double free，堆损坏 |
+
+### 实测：UBSan/ASan 抓 use-after-free
+
+```c
+#include <stdlib.h>
+int main(void) {
+    int *p = (int *)malloc(4 * sizeof(int));
+    for (int i = 0; i < 4; i++) p[i] = i;
+    free(p);
+    printf("use after free: p[0] = %d\n", p[0]);
+    return 0;
+}
+```
+
+```bash
+clang -fsanitize=address -g -O0 uaf.c -o uaf.exe && ./uaf.exe
+```
+
+```text
+==10336==ERROR: AddressSanitizer: heap-use-after-free on address 0x121010aa0030 at pc 0x7ff6ee34153f bp 0x000f5ddafbb0 sp 0x000f5ddafbf8
+READ of size 4 at 0x121010aa0030 thread T0
+    #0 0x7ff6ee34153e in main C:\cprobe/uaf.c:8:43
+0x121010aa0030 is located 0 bytes inside of 16-byte region [0x121010aa0030,0x121010aa0040)
+freed by thread T0 here:
+    #1 0x7ff6ee341506 in main C:\cprobe/uaf.c:7:5
+```
+
+ASan 精确指出：地址在哪、多大区域、什么时候被释放的、谁在读。
+
+:::tip[`free` 后立即置 NULL]
+```c
+free(p);
+p = NULL;
+```
+
+这不是万能药（如果有别的副本仍指向那块内存，照样悬垂），但能消除最常见的"同一个指针被 free 两次"和"free 后误用"。而且 `free(NULL)` 是**标准保证安全的空操作**——实测通过：
+
+```text
+free(NULL) ok
+```
+:::
+
+## 十、指针与整数
+
+可以用 `uintptr_t`（`<stdint.h>`）在指针和整数之间往返：
+
+```c
+#include <stdint.h>
+uintptr_t addr = (uintptr_t)some_ptr;   /* 指针 → 整数 */
+void *back = (void *)addr;              /* 整数 → 指针 */
+```
+
+`uintptr_t` 是**可选**类型（只在平台确实有足够宽的整型时才提供），但主流平台都有。
+
+:::warning[不要用 `unsigned long` 存指针]
+Windows 上 `long` 是 4 字节，指针是 8 字节——会截断。用 `uintptr_t`。
+
+这是把 32 位代码移植到 64 位时的经典 bug。
+:::
+
+指针转整数后再转回来，只有当整数值**没有丢失信息**时才保证得到原指针。中间对整数做算术再转回指针是 UB。
+
+嵌入式里这个转换的**正当用途是内存映射 IO**——详见 [嵌入式 C](./embedded)。
+
+## 常见坑
+
+| 陷阱 | 现象 | 原因 | 正确做法 |
+| --- | --- | --- | --- |
+| `sizeof(arr)` 在函数里变小 | 函数内得到 8 而不是 20 | 数组参数退化为指针 | 额外传长度参数 |
+| 以为数组就是指针 | 对数组名赋值报错 | 数组不是可修改左值 | 用指针变量或 `memcpy` |
+| `p + 1` 以为加 1 字节 | 实际加了 4/8 字节 | 步长 = `sizeof(*p)` | 要按字节走先转 `char *` |
+| `void *` 做算术 | 编译错误（gcc 扩展允许但非标准） | 无步长信息 | 转成 `char *` 或具体类型 |
+| 跨数组指针相减 | 结果无意义 | UB | 先转 `char *` 再减（仅当地址可比时） |
+| 返回局部变量地址 | 值随机变化 | 栈帧已销毁 | 用 `static`、堆分配、或由调用方提供缓冲区 |
+| `free` 后继续使用 | 偶尔正常偶尔崩 | use-after-free UB | `free` 后立刻置 NULL |
+| 指针强转做类型双关 | `-O2` 下结果不对 | 违反严格别名规则 | 用 `memcpy`（零开销） |
+| `*(int *)&float_var` | 同上 | 严格别名 | `memcpy` |
+| 修改 `const` 对象 | 可能崩也可能"成功" | UB | 不要去掉 `const` 后写入 |
+| 用 `unsigned long` 存指针 | 64 位上截断 | LLP64 下 `long` 是 4 字节 | 用 `uintptr_t` |
+| 函数指针转 `void *` | 哈佛架构上出错 | C 不保证可转 | 用统一的函数指针类型 |
+| `int *fp(int,int)` 以为是函数指针 | 实际是函数声明 | `()` 优先级高于 `*` | 写 `int (*fp)(int,int)` |
+| 给 `restrict` 参数传重叠内存 | 结果错误 | 违反承诺，UB | 确保不重叠，或改用无 `restrict` 版本 |
+
+## 自检清单
+
+- [ ] 能解释"地址是运行时的，类型是编译期的"吗？
+- [ ] 知道 `p + 1` 的实际地址计算公式吗？
+- [ ] 能说出 `sizeof(arr)`、`sizeof(p)`、`sizeof(&arr)` 三者的区别吗？
+- [ ] 知道 `&arr` 的类型是什么吗？`&arr + 1` 前进多少？
+- [ ] 数组名在哪四种情况下不退化成指针？
+- [ ] 为什么函数参数里的 `int arr[5]` 等价于 `int *arr`？
+- [ ] 能区分 `const int *p` 和 `int * const p` 吗？
+- [ ] 知道什么时候必须用 `int **` 吗？
+- [ ] 能写一个函数指针 `typedef` 并用它做跳转表吗？
+- [ ] 知道 C 标准对函数指针和 `void *` 互相转换的规定吗？
+- [ ] `restrict` 承诺了什么？违反了会怎样？
+- [ ] 知道为什么 `memcpy` 比 `memmove` 快吗？（提示：`restrict`）
+- [ ] 知道为什么不能用指针强转做类型双关吗？正确做法是什么？
+- [ ] 能说出四种悬垂指针的来源吗？
+- [ ] `free(NULL)` 安全吗？
+
+## 下一步
+
+- [内存模型](./memory) —— 指针指向的内存到底在栈、堆还是静态区
+- [复合类型](./aggregate) —— 结构体指针、成员偏移、padding
+- [函数](./functions) —— 传参机制与栈帧，理解"传地址才能改"
+- [嵌入式 C](./embedded) —— 指针在内存映射 IO 里的实际应用
+- [回到导读](./)
+
+---
+
+**翻页**：[← 上一页](./pointers-01) · [返回目录](./)

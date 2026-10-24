@@ -1,0 +1,54 @@
+{
+  "version.label": {
+    "message": "Next",
+    "description": "The label for version current"
+  },
+  "sidebar.quickstartSidebar.category.快速上手（赛事版）": {
+    "message": "快速上手（赛事版）",
+    "description": "The label for category '快速上手（赛事版）' in sidebar 'quickstartSidebar'"
+  },
+  "sidebar.quickstartSidebar.category.赛事实战": {
+    "message": "赛事实战",
+    "description": "The label for category '赛事实战' in sidebar 'quickstartSidebar'"
+  },
+  "sidebar.courseSidebar.category.完整教程": {
+    "message": "完整教程",
+    "description": "The label for category '完整教程' in sidebar 'courseSidebar'"
+  },
+  "sidebar.courseSidebar.category.L0 预备知识": {
+    "message": "L0 预备知识",
+    "description": "The label for category 'L0 预备知识' in sidebar 'courseSidebar'"
+  },
+  "sidebar.courseSidebar.category.L1 硬件与最小系统": {
+    "message": "L1 硬件与最小系统",
+    "description": "The label for category 'L1 硬件与最小系统' in sidebar 'courseSidebar'"
+  },
+  "sidebar.courseSidebar.category.L2 编程模型": {
+    "message": "L2 编程模型",
+    "description": "The label for category 'L2 编程模型' in sidebar 'courseSidebar'"
+  },
+  "sidebar.courseSidebar.category.L3 Arduino 快速通道": {
+    "message": "L3 Arduino 快速通道",
+    "description": "The label for category 'L3 Arduino 快速通道' in sidebar 'courseSidebar'"
+  },
+  "sidebar.courseSidebar.category.L4 外设深度": {
+    "message": "L4 外设深度",
+    "description": "The label for category 'L4 外设深度' in sidebar 'courseSidebar'"
+  },
+  "sidebar.courseSidebar.category.L5 无线与网络": {
+    "message": "L5 无线与网络",
+    "description": "The label for category 'L5 无线与网络' in sidebar 'courseSidebar'"
+  },
+  "sidebar.courseSidebar.category.L6 系统能力": {
+    "message": "L6 系统能力",
+    "description": "The label for category 'L6 系统能力' in sidebar 'courseSidebar'"
+  },
+  "sidebar.courseSidebar.category.L7 工程化": {
+    "message": "L7 工程化",
+    "description": "The label for category 'L7 工程化' in sidebar 'courseSidebar'"
+  },
+  "sidebar.referenceSidebar.category.速查表": {
+    "message": "速查表",
+    "description": "The label for category '速查表' in sidebar 'referenceSidebar'"
+  }
+}

@@ -1,0 +1,207 @@
+---
+id: tcp-ip
+title: TCP/IP 协议深入
+sidebar_position: 15
+description: 三次握手与四次挥手的状态迁移、TIME_WAIT 为什么必须存在、Nagle 与延迟确认的冲突、常见内核参数怎么调。
+---
+
+# TCP/IP 协议深入
+
+**本课目标**：看懂 `ss` 的状态列，知道每个调优参数在解决什么。
+
+## TCP 状态机（11 种状态）
+
+![TCP 关闭流程状态机：左侧主动关闭方 FIN_WAIT_1/2 到 TIME_WAIT，右侧被动关闭方 CLOSE_WAIT 到 LAST_ACK](/img/diagrams/net-tcp-states.svg)
+
+
+| 状态 | 含义 | 正常吗 |
+| --- | --- | --- |
+| `LISTEN` | 服务端在等连接 | ✅ |
+| `SYN_SENT` | 客户端已发 SYN，等回应 | ✅ 短暂 |
+| `SYN_RECV` | 服务端收到 SYN，等第三次握手 | ✅ 短暂 |
+| `ESTABLISHED` | 连接已建立 | ✅ |
+| `FIN_WAIT1` | 主动关闭方已发 FIN | ✅ 短暂 |
+| `FIN_WAIT2` | 已收到对方 ACK，等对方 FIN | ✅ |
+| `CLOSE_WAIT` | **被动关闭方收到 FIN，但自己还没关** | ⚠️ **堆积就是 bug** |
+| `LAST_ACK` | 被动关闭方发了 FIN，等最后 ACK | ✅ 短暂 |
+| `TIME_WAIT` | **主动关闭方等 2MSL** | ✅ **但也可能堆积** |
+| `CLOSING` | 双方同时关闭（罕见） | ✅ |
+| `CLOSED` | 已关闭 | — |
+
+:::danger[`CLOSE_WAIT` 堆积 = 你的程序忘了 `close()`]
+```bash
+ss -tan | awk '{print $1}' | sort | uniq -c | sort -rn
+#   1200 ESTABLISHED
+#    800 CLOSE_WAIT      ← 这就是问题
+```
+
+**`CLOSE_WAIT` 的含义**：对端已经关了（发了 FIN，我回了 ACK），**但我的应用还没调 `close()`**。
+
+**TCP 不会自己关**，要等应用层关。**所以堆积的唯一原因就是代码里漏了 `close()`**（或连接池没回收）。
+
+**这是纯应用层的 bug，调内核参数没用。**
+:::
+
+:::warning[`TIME_WAIT` 堆积通常不是问题]
+**`TIME_WAIT` 是主动关闭方的正常状态，持续 2MSL（Linux 默认 60 秒）。**
+
+**它存在有两个必须的理由**：
+
+1. **保证最后一个 ACK 能到达**（如果丢了，对端会重发 FIN，我还能再回 ACK）
+2. **让旧连接的残留报文在网络中消亡**，不会串到复用了同一四元组的新连接上
+
+**所以"缩短这段等待或开 `tcp_tw_reuse`"要谨慎** —— 牺牲的是正确性。
+
+**顺带纠正一个流传很广的说法**：`tcp_fin_timeout` 管的是 `FIN_WAIT_2` 的超时，**不是 `TIME_WAIT`**；`TIME_WAIT` 的 2MSL 是内核里写死的，改不了。
+
+**正确的解法是减少短连接**（改用连接池或长连接）。
+:::
+
+```bash
+cat /proc/sys/net/ipv4/tcp_fin_timeout        # 默认 60
+ss -s                                          # 汇总统计
+```
+
+## 三次握手为什么不能是两次
+
+:::info[两次握手的致命问题]
+```text
+客户端发 SYN（序号 x）
+  → 这个 SYN 在网络里卡了 10 秒
+客户端超时重发 SYN
+  → 连接建立、传输、关闭
+  → 然后那个卡住的旧 SYN 到达服务端
+
+服务端以为是新连接 → 回 SYN+ACK → 建立连接
+客户端：我没要连啊 → 这个连接永远空着，占资源
+```
+
+**第三次握手让服务端能确认"对方确实收到了我的应答"。**
+:::
+
+## 四次挥手为什么是四次
+
+:::warning[因为 TCP 是全双工]
+```text
+A: FIN          "我不发了"
+B: ACK          "知道了"      ← B 可能还有数据要发
+B: (继续发数据...)
+B: FIN          "我也不发了"
+A: ACK          "知道了"
+```
+
+**收到 FIN 只代表"对方没有数据要发了"，我这边还可以继续发** —— 所以 `ACK` 和 `FIN` 必须分开发（除非此刻我也正好要关，那就是三次）。
+:::
+
+## Nagle 算法与延迟确认的冲突
+
+:::danger[这两个机制同时开启会造成 40ms 延迟]
+| 机制 | 行为 |
+| --- | --- |
+| **Nagle（发送端）** | 小包先攒着，等前一个包被 ACK 再发 |
+| **延迟确认（接收端）** | 收到数据后不立刻回 ACK，等 40~200ms 看有没有数据要捎带 |
+
+**两者相遇：**
+
+```text
+发送端：发了小包 A，等 ACK 才发 B
+接收端：收到 A，等 40ms 再回 ACK
+结果：B 被推迟 40ms
+```
+
+**这就是"小包通信时延迟莫名 40ms"的经典原因**（游戏、SSH、RPC 常见）。
+:::
+
+```c
+/* 关闭 Nagle（适合小包交互） */
+int on = 1;
+setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+```
+
+:::tip[什么时候该关 Nagle]
+| 场景 | 建议 |
+| --- | --- |
+| 交互式（SSH、游戏、RPC） | **关（`TCP_NODELAY`）** |
+| 大批量传输 | 保持开启（能减少包数） |
+| 请求-响应模式 | **关** |
+
+**关掉后网络包会变多**，所以要按场景选，不是一律关。
+:::
+
+## 常用调优参数
+
+| 参数 | 默认 | 解决什么 |
+| --- | --- | --- |
+| `net.core.somaxconn` | 4096 | `listen()` backlog 上限 |
+| `net.ipv4.tcp_max_syn_backlog` | 1024 | 半连接队列长度 |
+| `net.ipv4.tcp_tw_reuse` | 0 | 允许复用 TIME_WAIT 连接（**出向连接**才有用） |
+| `net.ipv4.tcp_fin_timeout` | 60 | `FIN_WAIT_2` 的超时（**不是** `TIME_WAIT` 时长） |
+| `net.ipv4.tcp_keepalive_time` | 7200 | 空闲多久开始探活 |
+| `net.ipv4.tcp_syncookies` | 1 | SYN 洪水防护 |
+| `net.core.rmem_max` / `wmem_max` | 212992 | 收发缓冲区上限 |
+
+:::warning[`tcp_tw_reuse` 只影响"主动发起连接"的一方]
+```text
+客户端场景：大量短连接 → tcp_tw_reuse=1 有用
+服务端场景：TIME_WAIT 是被动关闭方产生的？
+```
+
+**注意：TIME_WAIT 出现在"主动关闭方"**。如果服务端主动关（HTTP/1.0 短连接），TIME_WAIT 就在服务端。
+
+**`tcp_tw_reuse` 对"接受连接"没有帮助** —— 那种情况只能减少短连接或扩大端口范围。
+:::
+
+:::danger[不要动 `tcp_tw_recycle`]
+**它已经在 Linux 4.12 被移除**（在 NAT 环境下会破坏连接，因为依赖时间戳且 NAT 后面多个客户端的时钟不一致）。
+
+**如果你的老系统里还设着它，删掉。**
+:::
+
+## 排查流程
+
+:::tip[按这个顺序查]
+```bash
+# ① 连接状态分布
+ss -tan | awk 'NR>1{print $1}' | sort | uniq -c | sort -rn
+
+# ② 汇总（含各种计数器）
+ss -s
+
+# ③ 是不是端口耗尽
+ss -tan | grep TIME_WAIT | wc -l
+cat /proc/sys/net/ipv4/ip_local_port_range      # 可用端口范围
+
+# ④ 是不是 backlog 溢出（看 ListenOverflows / ListenDrops）
+nstat -az | grep -i listen
+
+# ⑤ 重传率
+nstat -az | grep -i retrans
+```
+:::
+
+| 现象 | 检查项 |
+| --- | --- |
+| 连接慢 | `SYN_RECV` 堆积 → backlog / syn backlog / 防火墙 |
+| 连接失败 | 端口耗尽、`somaxconn` 太小 |
+| 偶发超时 | 重传率高 → 网络质量或缓冲区太小 |
+| 吞吐上不去 | 窗口太小（`rmem`/`wmem`）、RTT 高 |
+| 40ms 延迟 | Nagle + 延迟确认 |
+| 大量 `CLOSE_WAIT` | **应用没 `close()`** |
+
+## 本课自检
+
+- [ ] 能说出 11 种 TCP 状态的大致含义
+- [ ] **知道 `CLOSE_WAIT` 堆积 = 应用忘了 `close()`，调内核没用**
+- [ ] **知道 `TIME_WAIT` 有两个必须存在的理由**
+- [ ] 知道减少短连接比调参更正确
+- [ ] **能解释为什么握手是三次不是两次**
+- [ ] **能解释为什么挥手是四次（全双工）**
+- [ ] **理解 Nagle + 延迟确认造成 40ms 延迟**
+- [ ] 知道 `TCP_NODELAY` 该用在什么场景
+- [ ] 知道 `tcp_tw_reuse` 只对主动发起连接有用
+- [ ] **知道 `tcp_tw_recycle` 已被移除，别再设**
+- [ ] 会用 `ss -s` / `nstat` / `ss -tan` 做排查
+
+## 下一步
+
+[网络编程：Socket](./network) 讲了具体的 API 用法。

@@ -1,0 +1,260 @@
+---
+id: filesystem-deep
+title: 文件系统深入
+sidebar_position: 18
+description: inode 到底存什么、为什么硬链接不能跨文件系统、ext4 的日志与延迟分配、df 与 du 结果不一致的原因、以及磁盘满了但删不掉文件的排查。
+---
+
+# 文件系统深入
+
+**本课目标**：解释"df 说满了但 du 找不到"这类诡异现象。
+
+## inode：文件的元数据
+
+:::info[inode 里存什么，不存什么]
+| 存 | 不存 |
+| --- | --- |
+| 文件类型、权限、所有者 | **文件名** |
+| 大小、时间戳（atime/mtime/ctime） | 文件内容（内容在数据块里） |
+| **数据块的位置** | |
+| **链接计数** | |
+:::
+
+```bash
+stat /etc/hostname
+#   File: /etc/hostname
+#   Size: 12          Blocks: 8     IO Block: 4096   regular file
+# Inode: 37042       Links: 1       ← 链接计数
+# Access: (0644/-rw-r--r--)  Uid: (0/root)   Gid: (0/root)
+```
+
+:::tip[文件名存在目录里，不在 inode 里]
+**目录本质上是一张表**：`文件名 → inode 号`。
+
+**所以**：
+
+- 同一个 inode 可以有多个名字（**硬链接**）
+- 改名只是改目录表里的一项，inode 不变
+- 删除文件是"减少链接计数"，计数到 0 才真正释放数据块
+:::
+
+```bash
+# 亲手验证：two names, one inode
+echo hello > a.txt
+ln a.txt b.txt
+ls -li a.txt b.txt
+# 37042 -rw-r--r-- 2 root root 6 ... a.txt
+# 37042 -rw-r--r-- 2 root root 6 ... b.txt
+#  ↑ 同一个 inode         ↑ 链接计数变成 2
+```
+
+## 硬链接 vs 软链接
+
+| | 硬链接 | 软链接（符号链接） |
+| --- | --- | --- |
+| 本质 | **另一个名字指向同一 inode** | 一个文件，内容是"目标路径" |
+| 跨文件系统 | ❌ **不行**（inode 号只在单个 FS 内唯一） | ✅ 可以 |
+| 指向目录 | ❌ 一般不允许 | ✅ 可以 |
+| 删除原文件 | **不影响**（计数减 1） | 变成悬空链接 |
+| `ls -l` 显示 | 普通文件 | `l` 类型 + `->` |
+| inode | **与原文件相同** | 不同 |
+
+:::danger[软链接的相对路径是相对于"链接所在目录"]
+```bash
+mkdir -p a/b
+ln -s ../target a/b/link        # 相对路径相对于 a/b/
+```
+
+**用绝对路径更不容易出错**（但迁移目录后会失效）。**两种都有取舍。**
+:::
+
+## 稀疏文件与 `du` / `ls` 的差异
+
+```bash
+truncate -s 1G sparse.img       # 逻辑大小 1GB
+ls -l sparse.img                # 1073741824  ← 逻辑大小
+du -h sparse.img                # 0           ← 实际占用 0
+stat sparse.img                 # Blocks: 0
+```
+
+:::info[为什么 `du` 和 `ls -l` 不一样]
+- **`ls -l`** 显示 **逻辑大小**（inode 里记的 size）
+- **`du`** 显示 **实际占用块数 × 块大小**
+
+**稀疏文件**（全零区域不分配块）就会差很多。**虚拟机镜像、数据库预分配文件常见这种情况。**
+:::
+
+**`du` 的三个常用参数**：
+
+```bash
+du -h --max-depth=1 /var        # 只看一层
+du -sh /var/log                 # 汇总
+du -h --apparent-size file      # 按逻辑大小算（等同 ls）
+```
+
+## `df` 说满了但 `du` 找不到
+
+:::danger[这是最经典的"磁盘满"诡异现象]
+```bash
+df -h /
+# /dev/sda1  56G  55G  0G  100% /        ← df 说满了
+
+du -sh /* 2>/dev/null | sort -rh | head
+# 加起来只有 30G                        ← du 找不到
+```
+:::
+
+**四个可能原因**：
+
+| 原因 | 怎么确认 | 怎么处理 |
+| --- | --- | --- |
+| **被删除但仍被进程打开的文件** | `lsof +L1` | 重启那个进程 |
+| 挂载点覆盖了目录内容 | 在挂载点下看不到原内容 | 卸载后检查 |
+| 文件系统元数据（inode/日志） | `dumpe2fs` | 一般很小 |
+| **inode 用完了**（不是空间） | `df -i` | 删小文件 |
+
+:::tip[第一条最常见：删除的文件还被打开着]
+```bash
+lsof +L1
+# COMMAND   PID   USER   FD   ...  SIZE/OFF  NLINK  NAME
+# java     1234   app    5w   ...  2.1G      0     /var/log/app.log (deleted)
+```
+
+**文件已经被 `rm`，但进程还持有 fd** —— **块不会释放，直到进程关闭 fd 或退出**。
+
+**修法**：
+
+```bash
+# 不重启进程的做法：清空那个 fd（会截断文件）
+: > /proc/1234/fd/5
+```
+
+**注意 `NLink` 为 0 就是这种文件。**
+:::
+
+:::warning[`df -i` 检查 inode]
+```bash
+df -i /
+# Filesystem    Inodes  IUsed   IFree IUse% Mounted on
+# /dev/sda1    3670016 3670016      0  100% /
+```
+
+**空间还有，但 inode 用完了** —— 常见于大量小文件（邮件队列、session 文件、缓存）。
+
+**表现和"磁盘满"一样：无法创建新文件。**
+:::
+
+## ext4 的两个重要特性
+
+:::info[① 日志（journal）：防止掉电损坏]
+ext4 默认 `data=ordered`：**元数据走日志，数据先落盘再提交元数据**。
+
+**代价**：每次 `write` 之后、`fsync` 之前，数据可能还在页缓存里（掉电会丢）。
+:::
+
+```bash
+# 看挂载参数
+mount | grep ' / '
+# /dev/sda1 on / type ext4 (rw,relatime,errors=remount-ro)
+```
+
+:::danger[掉电安全必须靠 `fsync`，不能靠"文件系统有日志"]
+```c
+write(fd, buf, len);        // ❌ 只写到页缓存
+fsync(fd);                  // ✅ 强制落盘
+```
+
+**日志保护的是"文件系统结构一致"，不是"你的数据不丢"。**
+
+**数据库、配置文件写入必须 `fsync`**（`O_SYNC` 或显式调用）。
+
+**代价**：`fsync` 会等磁盘，慢（机械盘几毫秒，SSD 几十微秒）。
+:::
+
+:::info[② 延迟分配（delalloc）：写满才决定放哪]
+**数据先写进页缓存，真正落盘时才分配块** —— 这样能让连续写入的数据尽量物理连续（减少碎片）。
+
+**副作用**：`write` 返回成功时，磁盘上可能还没分配任何块。
+:::
+
+## 磁盘空间排查流程
+
+```bash
+# ① 先看是空间还是 inode
+df -h / ; df -i /
+
+# ② 找大目录（-x 不跨文件系统）
+du -h -x --max-depth=1 / 2>/dev/null | sort -rh | head -10
+
+# ③ 找大文件
+find / -xdev -type f -size +1G -exec ls -lh {} + 2>/dev/null
+
+# ④ 检查"被删除但被占用"的文件
+lsof +L1 2>/dev/null | head
+
+# ⑤ 检查是否有挂载点覆盖
+cat /proc/mounts | awk '{print $2}' | sort
+```
+
+:::warning[别直接 `rm -rf /var/log/*`]
+**很多服务的日志文件被打开着，删除后空间不会释放**（见上）。
+
+**正确做法**：
+
+```bash
+# 清空而不删除（保留 inode 和打开的 fd）
+: > /var/log/app.log
+
+# 或者用 logrotate 配置
+```
+
+**这也是为什么日志应该用 `logrotate` 管理，而不是手动删。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `df` 满但 `du` 找不到 | 有 deleted 文件被打开 | `lsof +L1`，清 fd |
+| 空间够但建不了文件 | **inode 用完** | `df -i`，删小文件 |
+| 硬链接不能跨分区 | inode 号只在单 FS 内唯一 | 改软链接 |
+| `du` 比 `ls -l` 小很多 | 稀疏文件 | 正常 |
+| 掉电后文件内容丢失 | 没 `fsync` | 关键写入必须 fsync |
+| 改名后软链接失效 | 指向的是路径不是 inode | 注意相对路径基准 |
+| 删除大目录很慢 | 逐个 unlink | 正常，或用 `rsync --delete` |
+| 挂载后原目录内容"消失" | 挂载点覆盖 | 卸载后可看到 |
+
+:::tip[验证"删除但被打开"的最小实验]
+```bash
+# 终端 A
+python3 -c "f=open('/tmp/big','w'); f.write('x'*100000000); f.flush(); import time; time.sleep(300)"
+
+# 终端 B
+ls -l /tmp/big              # 100MB
+rm /tmp/big
+df -h /tmp                  # 空间没变
+lsof +L1 | grep big         # 看到了（deleted）
+```
+
+**终端 A 结束后空间立刻释放** —— 这就证明了原因。
+:::
+
+## 本课自检
+
+- [ ] **知道 inode 存元数据但**不存文件名**
+- [ ] **知道文件名在目录里，目录是"名字→inode"的表**
+- [ ] **知道硬链接 = 同一 inode 的多个名字，靠链接计数管理**
+- [ ] **知道硬链接不能跨文件系统（inode 号只在单 FS 内唯一）**
+- [ ] 知道软链接存的是路径，删原文件会悬空
+- [ ] **理解稀疏文件导致 `du` 与 `ls -l` 差异**
+- [ ] **知道 `df` 满但 `du` 找不到的第一原因是"删除但被打开的文件"**
+- [ ] 会用 `lsof +L1` 找这类文件，会用 `: > /proc/<pid>/fd/N` 清
+- [ ] **知道 `df -i` 检查 inode 耗尽**
+- [ ] **知道 ext4 日志保护的是结构一致，不是数据不丢**
+- [ ] **知道必须 `fsync` 才能保证落盘**
+- [ ] 知道延迟分配的作用与副作用
+- [ ] **知道清日志要用 `: > file` 而不是 `rm`**
+
+## 下一步
+
+[进程与信号](./process) 或 [系统调用](./sysprog)。

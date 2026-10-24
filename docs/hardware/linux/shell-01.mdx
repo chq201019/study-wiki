@@ -1,0 +1,154 @@
+---
+id: shell-01
+title: "01 本页学什么"
+sidebar_position: 2
+description: "Shell 与命令行 第 1 部分：本页学什么"
+---
+
+# 01 本页学什么
+嵌入式 Linux 开发者的**一天有 80% 时间在命令行里**。这一页的目标不是给你一份命令抄写清单，而是让你理解：
+
+- `/etc`、`/proc`、`/sys` 各自存在的理由是什么（而不是死记目录名）
+- 权限位 `rwx` 在**文件**上和在**目录**上的含义完全不同（这是最高频的理解错误）
+- `umask 022` 到底在算什么
+- `find` / `grep` / `sed` / `awk` / `xargs` 各自的**分工边界**，以及它们怎么组合
+- `2>&1` 为什么写在 `>` 后面和前面效果不同
+- 环境变量为什么 `export` 了子进程才看得到
+
+:::info[本页所有输出均为实测]
+除非特别注明，本页所有命令输出都来自一台真实的 **Debian 13 (trixie) / 内核 6.12.94 / x86_64** 服务器，以 root 身份执行，默认 `umask 0022`。你在本机（或 WSL）复现时，用户名、主机名、PID 会不同，这是正常的。
+:::
+
+## 1. 文件系统层次标准 FHS
+
+### 1.1 为什么要有标准
+
+早期 Unix 各家目录名不统一，后来定了 **FHS（Filesystem Hierarchy Standard）**：规定哪个目录放什么。好处是**你在任何 Linux 上都知道去哪找东西**。
+
+先看实测的根目录：
+
+```bash
+$ ls -1 /
+bin
+boot
+dev
+etc
+home
+initrd.img
+initrd.img.old
+lib
+lib64
+lost+found
+media
+mnt
+opt
+proc
+root
+run
+sbin
+srv
+sys
+tmp
+usr
+var
+vmlinuz
+vmlinuz.old
+```
+
+对照表，逐个说清楚**职责**（重点是"为什么"）：
+
+| 目录 | 放什么 | 嵌入式开发中的意义 |
+| --- | --- | --- |
+| `/bin` | 基本用户命令（`ls`、`cat`、`sh`） | 单用户模式也要能用。**BusyBox 就是提供这些的** |
+| `/sbin` | 系统管理命令（`fdisk`、`mount`、`ifconfig`） | 只有 root 用 |
+| `/etc` | **配置文件**（纯文本） | 你改网络 `/etc/network/interfaces`、改启动项都在这 |
+| `/dev` | 设备节点 | `/dev/ttyS0` 是串口，`/dev/mmcblk0` 是 SD 卡。**一切皆文件的体现** |
+| `/proc` | **内核数据结构的窗口**（伪文件系统，不占磁盘） | `/proc/cpuinfo`、`/proc/<pid>/`、`/proc/cmdline`。**调试必备** |
+| `/sys` | **设备与驱动模型的窗口**（sysfs） | 在板子上控制 GPIO 的老方法就是写 `/sys/class/gpio/` |
+| `/tmp` | 临时文件，重启清空 | 常挂载为 **tmpfs**（内存盘），避免写 Flash |
+| `/run` | 运行时数据（PID 文件、socket），比 `/tmp` 更早可用 | 老系统是 `/var/run`，现在是符号链接 |
+| `/var` | 可变数据：日志 `/var/log`、缓存 `/var/cache` | **日志会写 Flash，嵌入式上要限速或改 tmpfs** |
+| `/usr` | 用户程序的主体（`/usr/bin`、`/usr/lib`、`/usr/share`） | 只读也没问题，常做成只读分区 |
+| `/home` | 用户家目录 | 嵌入式上常常根本没有 |
+| `/lib` `/lib64` | 共享库和内核模块（`/lib/modules`） | `/lib/modules/$(uname -r)/` 放 .ko 驱动文件 |
+| `/boot` | 内核镜像、dtb、bootloader | **板子上可能是独立 FAT 分区**（`/boot` 里放 zImage/*.dtb） |
+| `/mnt` `/media` | 临时挂载点 | 挂 U 盘、挂 NFS 用 |
+| `/opt` | 第三方软件 | 交叉工具链常解压在这 |
+| `/srv` | 服务数据（如网站根目录） | 嵌入式基本用不到 |
+| `/lost+found` | fsck 找回的碎片 | ext4 分区格式化时自动建 |
+
+### 1.2 三个"假"的文件系统
+
+`/proc`、`/sys`、`/dev` **不占磁盘空间**，它们是内核在内存里动态生成的：
+
+```bash
+$ head -8 /proc/mounts
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+udev /dev devtmpfs rw,nosuid,relatime,size=1973660k,nr_inodes=493415,mode=755,inode64 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=600,ptmxmode=000 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,noexec,relatime,size=400428k,mode=755,inode64 0 0
+/dev/sda1 / ext4 rw,relatime,errors=remount-ro 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev,inode64 0 0
+```
+
+注意前五行：`sysfs`、`proc`、`devtmpfs`、`devpts`、`tmpfs` 的**源设备**都不是磁盘分区，而是内核自己。它们存在的意义是**把内核内部状态暴露成文件**，这样你用 `cat`、`echo` 就能读写内核状态，不需要专门的 API。
+
+:::tip[这就是"一切皆文件"]
+在嵌入式板子上**用 shell 控 GPIO** 的经典写法（老式 sysfs 接口）：
+
+```bash
+echo 42 > /sys/class/gpio/export         # 导出 GPIO42
+echo out > /sys/class/gpio/gpio42/direction
+echo 1 > /sys/class/gpio/gpio42/value    # 拉高
+```
+
+不需要写 C 程序、不需要驱动，用 `echo` 重定向就行——**因为 sysfs 把 GPIO 抽象成了文件**。
+:::
+
+### 1.3 Debian 的 usrmerge 变化（发行版差异）
+
+细心的你可能注意到：上面 `ls /` 里同时有 `/bin` 和 `/usr/bin`。在**较新的 Debian/Ubuntu（以及 Fedora、Arch）**上，`/bin` 其实是**指向 `/usr/bin` 的符号链接**——这叫 **usrmerge**。
+
+实测确认（Debian 13）：
+
+```bash
+$ ls -ld /bin /sbin /lib
+lrwxrwxrwx 1 root root 7 Aug 11 15:17 /bin -> usr/bin
+lrwxrwxrwx 1 root root 7 Aug 11 15:17 /lib -> usr/lib
+lrwxrwxrwx 1 root root 8 Aug 11 15:17 /sbin -> usr/sbin
+```
+
+确实是符号链接，这台机器已完成 usrmerge。
+
+:::warning[发行版差异]
+- **Debian ≥ 11 / Ubuntu ≥ 20.04 / Fedora / Arch**：已 usrmerge，`/bin` 是符号链接
+- **旧 Debian / CentOS 7 / RHEL 7**：`/bin` 和 `/usr/bin` 是两个真实目录
+- **嵌入式 rootfs（BusyBox 手工搭）**：通常是**两个真实目录**或只保留 `/bin`
+
+判断方法很简单：`ls -ld /bin`，看到 `->` 就是符号链接。
+:::
+
+### 1.4 路径：绝对、相对与那两个点
+
+| 写法 | 含义 |
+| --- | --- |
+| `/etc/hostname` | **绝对路径**，从根开始 |
+| `src/main.c` | **相对路径**，相对于当前工作目录 |
+| `./configure` | 同上，`./` 明确表示"当前目录" |
+| `../include/foo.h` | `..` = 父目录 |
+| `~` | 当前用户的家目录（`/root` 或 `/home/xxx`） |
+| `-` | 在 `cd -` 里表示"上一次所在的目录" |
+
+:::danger[为什么执行当前目录的程序要写 `./`]
+在 Windows 上你敲 `app.exe` 就会执行当前目录的程序，但 Linux 上敲 `app` 会报 `command not found`。
+
+原因是 shell 只在 `PATH` 环境变量列出的目录里找命令，**当前目录（`.`）默认不在 PATH 里**（有安全原因）。所以必须显式写 `./app` 告诉 shell "就是这个文件"。
+
+**不要用把 `.` 加进 PATH 的方式解决这个问题**，那意味着你在 `/tmp` 里 `ls` 一下就可能执行到别人放的同名恶意程序。
+:::
+
+---
+
+**翻页**：[下一页 →](./shell-02) · [返回目录](./)

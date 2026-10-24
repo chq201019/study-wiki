@@ -1,0 +1,182 @@
+---
+id: build-03
+title: "03 让工具帮你找 bug"
+sidebar_position: 4
+description: "构建与工具链 第 3 部分：让工具帮你找 bug"
+---
+
+# 03 让工具帮你找 bug
+### 编译警告：最低配置
+
+```bash
+g++ -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror
+```
+
+| 选项 | 作用 |
+| --- | --- |
+| `-Wall` | 常见警告（未使用变量、返回值缺失等） |
+| `-Wextra` | 更多警告（sign-compare、missing-field-initializers 等） |
+| `-Wpedantic` | 严格符合标准（禁用扩展） |
+| `-Wshadow` | 变量遮蔽 |
+| `-Wconversion` | 隐式转换可能丢数据 |
+| `-Wold-style-cast` | C 风格强转 |
+| `-Werror` | **警告变错误**（CI 里必备） |
+
+:::tip[`-Werror` 是团队项目的分水岭]
+没有 `-Werror`，警告会不断累积直到没人看。有了它，警告必须在出现时就修掉。
+
+**新项目从第一天就开 `-Werror`。** 老项目可以先开部分警告，逐步收紧。
+:::
+
+### Sanitizer：运行时的 bug 检测器
+
+这是**性价比最高**的调试工具——编译时插桩，运行时检测。
+
+```bash
+# AddressSanitizer：内存错误（越界、use-after-free、double-free）
+g++ -fsanitize=address -g -O1 -o app app.cpp && ./app
+
+# UndefinedBehaviorSanitizer：未定义行为（溢出、除零、空引用）
+g++ -fsanitize=undefined -g -O1 -o app app.cpp && ./app
+
+# 一起用
+g++ -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1 -o app app.cpp
+```
+
+**实测：ASan 抓到一个越界访问**
+
+```cpp
+// asan_demo.cpp
+#include <vector>
+#include <cstdio>
+
+int main() {
+    std::vector<int> v{1, 2, 3};
+    std::printf("v[5] = %d\n", v[5]);   // 越界！下标运算符不检查
+}
+```
+
+```bash
+g++ -std=c++17 -fsanitize=address -g -O1 -o asan_demo.exe asan_demo.cpp && ./asan_demo.exe
+```
+
+:::danger[诚实说明：本机的 MinGW 打包里没有 sanitizer 运行时]
+我在本机（MinGW-W64 GCC 16.2.0，niXman 构建）实际执行上面这条命令，得到的是**链接错误**，不是 ASan 报告：
+
+```text
+ld.exe: cannot find -lasan: No such file or directory
+collect2.exe: error: ld returned 1 exit status
+```
+
+`-fsanitize=undefined` 同样失败（`cannot find -lubsan`）。**这个 MinGW 发行版只带了编译器，没有打包 sanitizer 运行时库。**
+
+所以下面这份 ASan 输出**不是我在本机跑出来的**，我无法为它提供实测证据。**标准 ASan 报告长这样（真实格式，摘自 ASan 的通用输出格式）：**
+
+```text
+==12345==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x...
+READ of size 4 at 0x... thread T0
+    #0 0x... in main asan_demo.cpp:5
+SUMMARY: AddressSanitizer: heap-buffer-overflow ...
+```
+
+**要在本机真正跑出这份报告，你需要：** 用 clang（自带 sanitizer）、Linux 上的 GCC（通常有 `libasan`）、或 MSVC 的 `/fsanitize=address`。
+
+**我要强调的核心结论不受影响**：ASan 会直接告诉你错误类型、哪一行、内存何时分配的。没有 sanitizer，这个 bug 的表现就是"偶尔输出一个奇怪的数"——越界的 `v[5]` 不会崩溃，只是读到垃圾。
+:::
+
+:::warning[sanitizer 的开销]
+- **ASan**：运行速度约慢 **2 倍**，内存占用约 **2-3 倍**
+- **UBSan**：开销很小（约 20%）
+- **TSan**（线程）：约慢 **5-15 倍**
+
+**只用于 Debug/测试，不要用于生产构建。**
+:::
+
+### 静态分析
+
+| 工具 | 类型 | 用法 |
+| --- | --- | --- |
+| `clang-tidy` | 静态分析 + 自动修复 | `clang-tidy main.cpp -- -std=c++17` |
+| `cppcheck` | 静态分析 | `cppcheck --enable=all src/` |
+| `include-what-you-use` | 头文件依赖清理 | 减少编译时间 |
+| `clang-format` | 格式化 | 统一风格，消除代码审查里的格式争论 |
+
+```bash
+# clang-tidy 用编译数据库（CMake 生成）
+cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+clang-tidy -p build src/main.cpp
+```
+
+**推荐的最小 `.clang-tidy`：**
+
+```yaml
+Checks: >
+  bugprone-*,
+  performance-*,
+  modernize-*,
+  readability-*,
+  -modernize-use-trailing-return-type
+WarningsAsErrors: ''
+HeaderFilterRegex: 'src/.*'
+```
+
+### 编译缓存：ccache
+
+```bash
+ccache --max-size=5G
+cmake -B build -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+```
+
+第二次构建时未改动的文件直接复用缓存，**全量重编从几分钟降到几秒**。
+
+## 6. 常见构建问题速查
+
+| 症状 | 原因 | 解法 |
+| --- | --- | --- |
+| `undefined reference to X` | 有声明无定义 / 没链接库 | 检查实现是否参与编译；加 `-lxxx` |
+| `multiple definition of X` | 头文件里定义了变量/函数 | 用 `extern` 或 `inline`（C++17） |
+| `fatal error: xxx.h: No such file` | 头文件搜索路径 | `-I` 或 `target_include_directories` |
+| "在我机器上能编译" | 编译器/标准库版本不同 | 固定工具链版本，用 CI 验证 |
+| 头文件改动后没重编 | 依赖没声明 | CMake 会自动处理；手写 Makefile 要加依赖 |
+| 编译慢 | 头文件展开 + 模板实例化 | 前置声明、减少依赖、ccache、预编译头 |
+| 链接慢 | 目标文件多 / 无增量 | 用 `lld` 或 `mold` 链接器 |
+| Debug 能跑 Release 崩 | UB 被优化器暴露 | 用 sanitizer 在 Debug 下先查 |
+
+## 常见坑
+
+| 坑 | 现象 | 解法 |
+| --- | --- | --- |
+| 头文件里定义全局变量 | multiple definition | `extern` + 单一定义，或 C++17 `inline` |
+| 忘了 include guard | 重定义错误 | `#pragma once` |
+| 模板定义放 `.cpp` | undefined reference | 放头文件，或显式实例化 |
+| 用老式 CMake 全局命令 | 依赖混乱 | `target_*` 系列 |
+| 不开 `-Werror` | 警告累积成山 | 新项目第一天就开 |
+| 不开 sanitizer | 内存 bug 藏到生产 | Debug 构建常开 ASan+UBSan |
+| Release 才发现问题 | UB | Debug + sanitizer 先验证 |
+| 头文件里宏改变类布局 | 隐蔽 ODR 违反 | 通过构建系统统一传 `-D` |
+| 交叉编译时用宿主的库 | 架构不匹配 | 用 triplet / sysroot |
+| 含 C++ 的库给 C 用时链接失败 | 名字改编 | `extern "C"` + C++ 运行库链接 |
+
+## 自检清单
+
+- [ ] 说出编译链接的四个阶段，以及各阶段的典型错误
+- [ ] 看到 `undefined reference` 能列出 4 个以上可能原因
+- [ ] 解释 `#include` 的本质（文本复制）和它带来的编译开销
+- [ ] 说出 ODR 是什么，以及头文件中定义全局变量的正确做法
+- [ ] 解释 CMake 中 `PUBLIC` / `PRIVATE` / `INTERFACE` 的区别
+- [ ] 写出一个现代风格的 `CMakeLists.txt`（库 + 可执行 + 目标属性）
+- [ ] 说明 vcpkg 和 Conan 的取舍
+- [ ] 列出至少 4 个推荐的编译警告选项
+- [ ] 说出 ASan / UBSan / TSan 各自的用途和开销量级
+- [ ] 知道 `CMAKE_EXPORT_COMPILE_COMMANDS` 的用途
+
+## 下一步
+
+- 交叉编译与嵌入式构建（ESP-IDF 组件模型）→ [嵌入式 C++ 实战](./embedded-cpp)
+- C++ 与 C 互操作 → [从 C 到 C++](./transition)
+- 模板与头文件的关系 → [模板](./templates)
+- 回到 [C++ 主线导读](./)
+
+---
+
+**翻页**：[← 上一页](./build-02) · [返回目录](./)

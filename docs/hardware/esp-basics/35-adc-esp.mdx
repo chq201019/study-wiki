@@ -1,0 +1,168 @@
+---
+id: 35-adc-esp
+title: 22 ESP32 ADC 实战
+sidebar_position: 35
+description: ESP32 ADC 的真实精度、attenuation 怎么选、为什么 WiFi 一开读数就飘、校准与替代方案。
+---
+
+# 22 ESP32 ADC 实战
+
+**本课目标**：知道 ESP32 的 ADC 能干什么、不能干什么。
+
+## 先说结论
+
+:::danger[ESP32 的 ADC 是它最弱的外设之一]
+| 指标 | 典型表现 |
+| --- | --- |
+| 标称分辨率 | 12 位 |
+| **实际有效位数** | **约 9~10 位** |
+| 线性度 | 差（两端尤其明显） |
+| **WiFi 开启时** | **读数严重受干扰** |
+
+**要精确测量请外接 ADS1115（16 位 I2C ADC）或 INA219。**
+:::
+
+## attenuation：先解决量程
+
+```c
+adc1_atten_t atten;
+adc1_channel_t ch = ADC1_CHANNEL_0;    /* S3 上对应 GPIO1 */
+
+/* 四种衰减 */
+adc1_config_channel_atten(ch, ADC_ATTEN_DB_11);   /* 0~3.1V 左右 */
+```
+
+| 衰减 | 建议量程 | 说明 |
+| --- | --- | --- |
+| `ADC_ATTEN_DB_0` | 0 ~ 1.1V | 最线性 |
+| `ADC_ATTEN_DB_2_5` | 0 ~ 1.5V | |
+| `ADC_ATTEN_DB_6` | 0 ~ 2.2V | |
+| **`ADC_ATTEN_DB_11`** | **0 ~ 3.1V** | 最常用，但线性最差 |
+
+:::warning[11dB 是历史命名]
+**实际不是 11dB 衰减，而是一个量程档位的名字。**
+
+**ESP32 的 11dB 档实际可用范围约 0.15~3.1V** —— 低于 0.15V 读出来是 0，高于 3.1V 饱和到 4095。
+
+**所以测 4.2V 电池必须先分压。**
+:::
+
+```c
+/* 读一个通道 */
+adc1_config_width(ADC_WIDTH_BIT_12);
+int raw = adc1_get_raw(ch);              /* 0 ~ 4095 */
+
+/* 换算成电压（粗略，未校准） */
+float v = raw / 4095.0f * 3.1f;
+```
+
+## WiFi 干扰：这是真实存在的严重问题
+
+![ESP32 ADC2 与 WiFi 共用硬件：WiFi 开启时 ADC2 不可用，ADC1 不受影响](/img/diagrams/esp32-adc-wifi.svg)
+
+
+:::danger[开启 WiFi 后 ADC2 完全不可用]
+**ADC2 与 WiFi 共用硬件** —— 所以：
+
+- **WiFi 开启时，ADC2 的读数无效**（会返回错误或乱数）
+- **ADC1 仍然可用**，但会受到一定干扰
+
+**这是硬件限制，不是软件 bug。**
+:::
+
+```c
+/* ADC2 在 WiFi 下会失败 */
+esp_err_t err = adc2_get_raw(ch, ADC_WIDTH_BIT_12, &raw);
+if (err == ESP_ERR_INVALID_STATE) {
+    /* WiFi 正在使用 ADC2 */
+}
+```
+
+:::tip[三条实用建议]
+1. **要用 ADC 就用 ADC1**（S3 上是 GPIO1~10）
+2. **采样时如果能短暂关 WiFi 就关**
+3. **多次采样取中位数**（去掉最大最小再平均）
+:::
+
+```c
+/* 中位数滤波比平均值更抗尖峰 */
+static int median_of(int *a, int n) {
+    for (int i = 1; i < n; i++) {
+        int k = a[i], j = i - 1;
+        while (j >= 0 && a[j] > k) { a[j+1] = a[j]; j--; }
+        a[j+1] = k;
+    }
+    return a[n/2];
+}
+```
+
+## 校准
+
+```c
+/* ESP-IDF 提供校准 API */
+#include "esp_adc_cal.h"
+
+esp_adc_cal_characteristics_t chars;
+esp_adc_cal_value_t type = esp_adc_cal_characterize(
+    ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &chars);
+
+uint32_t mv;
+esp_adc_cal_raw_to_voltage(raw, &chars, &mv);
+```
+
+:::warning[校准能改善但救不了根本精度]
+**校准主要修正增益与偏移** —— 能把 ±100mV 的误差降到 ±30mV 左右。
+
+**但线性度差和噪声大这两个问题校准解决不了。**
+:::
+
+## 什么时候该换方案
+
+| 需求 | 建议 |
+| --- | --- |
+| 电池电量（粗略） | **ESP32 ADC 够用** |
+| 电位器/按键（10 位精度） | 够用 |
+| **测量小于 10mV 的变化** | 换 ADS1115 |
+| **需要 ±1% 精度** | 换外部 ADC |
+| 电流测量 | 用 INA219/INA226（自带 ADC + 计算） |
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 读数一直是 4095 | 输入超过 3.1V | 分压 |
+| 读数一直是 0 | 输入低于 0.15V | 换更小衰减档 |
+| 开 WiFi 后乱跳 | ADC2 被占用 | 改用 ADC1 |
+| 读数抖动 ±50 | 噪声 | 多次采样取中位数 |
+| 两端不准 | 非线性 | 避开 0V 与 3.1V 附近 |
+| GPIO 读不到 | 该引脚不是 ADC | 查引脚表（S3 上 1~10 是 ADC1） |
+
+:::danger[输入超过 3.3V 会损坏引脚]
+**ESP32 的 ADC 引脚不耐 5V。**
+
+**测 5V 或电池（4.2V）必须用电阻分压**：
+
+```text
+4.2V --[R1 100k]--+--[R2 100k]-- GND
+                  |
+                GPIO（读到 2.1V）
+```
+
+**分压比 2:1，满量程 4.2V 对应 2.1V，在安全范围内。**
+:::
+
+## 本课自检
+
+- [ ] **知道 ESP32 ADC 实际只有 9~10 位有效精度**
+- [ ] **知道 11dB 档实际量程约 0.15~3.1V**
+- [ ] 知道低于 0.15V 读到 0，高于 3.1V 饱和
+- [ ] **知道 WiFi 开启时 ADC2 不可用（硬件限制）**
+- [ ] 知道要用 ADC 就用 ADC1（S3 上是 GPIO1~10）
+- [ ] **会用中位数滤波抗尖峰**
+- [ ] 会用 `esp_adc_cal` 校准（改善有限）
+- [ ] **知道要精确测量该换 ADS1115/INA219**
+- [ ] **知道输入超 3.3V 会损坏引脚，必须分压**
+
+## 下一步
+
+回到 [ESP32 零基础导读](../esp-basics/)。

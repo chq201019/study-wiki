@@ -1,0 +1,31 @@
+---
+title: 速查表
+sidebar_position: 1
+description: 引脚映射、API 对照、错误码、参考示例库与库版本清单。
+---
+
+# 速查表
+
+查东西的地方，不需要按顺序读。
+
+| 页面 | 什么时候用 |
+| --- | --- |
+| [引脚映射](./pinout) | 接任何模块前先确认引脚能不能用 |
+| [Arduino ↔ IDF API 对照](./api-map) | 需要用 IDF 重写 Arduino 代码时 |
+| [错误码速查](./error-codes) | **出现报错时第一个查的地方** |
+| [参考示例库](./examples) | 不知道从哪开始写时，直接抄官方例程 |
+| [库与版本清单](./libraries) | 装库、选版本、排查版本差异 |
+| [跨型号移植指南](./porting) | 换 ESP32 家族内型号时 |
+| [其他芯片专栏](../chips/) | **换 STM32 等其他主流芯片时** |
+| [AI 辅助开发专栏](../ai-coding/) | 用 AI 辅助开发、想拦住 AI 幻觉时 |
+
+## 全站通用约定
+
+| 项 | 值 |
+| --- | --- |
+| 芯片 | ESP32-S3-WROOM-1 |
+| 调试串口 | GPIO43(TX) / GPIO44(RX)，115200 8N1 |
+| Arduino 核心 | arduino-esp32 3.3.x |
+| ESP-IDF | v5.5.x |
+| **禁止使用** | **GPIO35 / GPIO36 / GPIO37**（Flash/PSRAM 占用） |
+| 深度睡眠可唤醒引脚 | GPIO0～GPIO21（RTC 域） |

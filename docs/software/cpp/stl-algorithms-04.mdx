@@ -1,0 +1,109 @@
+---
+id: stl-algorithms-04
+title: "04 实战：一个综合例子"
+sidebar_position: 5
+description: "STL 算法与函数对象 第 4 部分：实战：一个综合例子"
+---
+
+# 04 实战：一个综合例子
+```cpp
+// pipeline.cpp
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <numeric>
+#include <cstdio>
+
+struct Reading {
+    std::string sensor;
+    double value;
+    bool   valid;
+};
+
+int main() {
+    std::vector<Reading> data = {
+        {"temp",  23.5, true},
+        {"temp",  -999, false},   // 无效
+        {"humid", 60.0, true},
+        {"temp",  25.1, true},
+        {"humid", 62.3, true},
+        {"temp",  22.9, true},
+    };
+
+    // 1. 过滤出 temp 的有效读数
+    std::vector<double> temps;
+    for (const auto& r : data)
+        if (r.sensor == "temp" && r.valid) temps.push_back(r.value);
+
+    // 2. 统计
+    auto [mn, mx] = std::minmax_element(temps.begin(), temps.end());
+    double avg = std::accumulate(temps.begin(), temps.end(), 0.0) / temps.size();
+
+    std::printf("temp readings: ");
+    for (double t : temps) std::printf("%.1f ", t);
+    std::printf("\n");
+    std::printf("min=%.1f max=%.1f avg=%.2f  n=%zu\n",
+                *mn, *mx, avg, temps.size());
+
+    // 3. 排序后取中位数
+    std::sort(temps.begin(), temps.end());
+    std::printf("median=%.1f\n", temps[temps.size() / 2]);
+
+    // 4. 计数
+    std::printf("valid count   = %zu\n",
+                std::count_if(data.begin(), data.end(),
+                              [](const Reading& r){ return r.valid; }));
+    std::printf("any invalid?  = %s\n",
+                std::any_of(data.begin(), data.end(),
+                            [](const Reading& r){ return !r.valid; }) ? "yes" : "no");
+}
+```
+
+**实测输出：**
+
+```text
+temp readings: 23.5 25.1 22.9
+min=22.9 max=25.1 avg=23.83  n=3
+median=23.5
+valid count   = 5
+any invalid?  = yes
+```
+
+## 常见坑
+
+| 坑 | 现象 | 解法 |
+| --- | --- | --- |
+| `std::remove` 以为删了元素 | `size` 没变 | 用 erase-remove 或 C++20 `std::erase` |
+| 按引用捕获局部变量，lambda 逃逸 | UB，可能"看起来正常" | 按值捕获或初始化捕获 |
+| 捕获 `this`，对象先死 | UB | C++17 用 `[*this]` |
+| `[=]` 在成员函数里以为拷贝了成员 | 实际捕获的是 `this` 指针 | 显式写 `[*this]`（C++17）；C++20 起 `[=]` 捕 this 已弃用 |
+| 到处用 `std::function` | 不必要的间接调用 + 堆分配 | 立即调用的场景用模板参数 |
+| 调用空的 `std::function` | 抛 `bad_function_call` | 先 `if (f)` |
+| `mutable` 以为能改外部变量 | 只改了副本 | 要改外部就按引用捕获 |
+| `std::sort` 以为稳定 | 相等元素顺序改变 | 用 `stable_sort` |
+| ranges view 存起来后原容器销毁 | 悬空 | view 不拥有数据，注意生命周期 |
+| 对未排序容器用 `binary_search` | 结果错误 | 先 `sort` |
+
+## 自检清单
+
+- [ ] 说出算法库按功能分的 6 大类，每类举 2 个例子
+- [ ] 解释为什么 `std::remove` 不删除元素，写出 erase-remove 惯用法
+- [ ] 说出 `sort` / `stable_sort` / `nth_element` 的复杂度和稳定性差异
+- [ ] 列出 lambda 的 5 种捕获写法，并说明各自的生命周期含义
+- [ ] 解释为什么"按引用捕获 + lambda 逃逸"是 UB，即使它当时打印出了正确的值
+- [ ] 说出 `[=]` 在成员函数中的真实行为，以及 C++20 的变化
+- [ ] 说明 `std::function` 的三层代价，并知道何时不该用它
+- [ ] 写出把 lambda 作为函数参数传递的两种正确方式（模板 vs `std::function`）
+- [ ] 用 ranges 写出"过滤 + 变换 + 取前 N 个"的管道
+- [ ] 知道 view 是惰性的，以及它对被引用对象生命周期的要求
+
+## 下一步
+
+- 移动语义的底层 → [移动语义与完美转发](./move-semantics)
+- 泛型与约束 → [模板](./templates)
+- 嵌入式上能不能用 lambda/ranges → [嵌入式 C++ 实战](./embedded-cpp)
+- 回到 [C++ 主线导读](./)
+
+---
+
+**翻页**：[← 上一页](./stl-algorithms-03) · [返回目录](./)

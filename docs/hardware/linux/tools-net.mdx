@@ -1,0 +1,284 @@
+---
+id: tools-net
+title: 网络诊断工具
+sidebar_position: 24
+description: ip 取代 ifconfig、ss 取代 netstat、curl 的三个必会参数、dig 看 DNS 解析、以及抓包前的正确姿势。
+---
+
+# 网络诊断工具
+
+**本课目标**：会用现代工具（`ip`/`ss`/`dig`/`curl`）定位网络问题。
+
+## `ip` 取代 `ifconfig`
+
+```bash
+ip addr                      # 看所有网卡与 IP（缩写 ip a）
+ip link                      # 只看链路层状态
+ip route                     # 路由表
+ip route get 8.8.8.8         # 到某地址走哪条路由、从哪个源 IP 出
+ip neigh                     # ARP 表（邻居）
+ip -s link                   # 收发统计（含错误/丢包计数）
+```
+
+:::tip[`ip route get` 是排查"从哪个网卡出去"的最快方式]
+```bash
+ip route get 8.8.8.8
+# 8.8.8.8 via 192.168.1.1 dev eth0 src 192.168.1.50 uid 0
+#              ↑ 网关        ↑ 出接口  ↑ 源 IP
+```
+
+**多网卡机器上"为什么走错网卡"一查就知道。**
+:::
+
+:::warning[`ifconfig` 已废弃但仍常见]
+`net-tools` 包（`ifconfig`/`netstat`/`route`/`arp`）很多新发行版默认不装。
+
+**新写法对照**：
+
+| 老 | 新 |
+| --- | --- |
+| `ifconfig` | `ip addr` |
+| `ifconfig eth0 up` | `ip link set eth0 up` |
+| `route -n` | `ip route` |
+| `arp -n` | `ip neigh` |
+| `netstat -tlnp` | **`ss -tlnp`** |
+| `netstat -s` | `ss -s` / `nstat` |
+:::
+
+## `ss` 取代 `netstat`
+
+```bash
+ss -tan                      # 所有 TCP（含状态）
+ss -tlnp                     # 监听的 TCP，显示进程
+ss -tanp                     # 所有 TCP + 进程
+ss -s                        # 汇总统计
+ss -tan state established    # 只看已建立
+ss -tan dport = :443         # 按端口过滤
+```
+
+:::danger[`ss -l` 不加 `-n` 会做反向 DNS，很慢]
+```bash
+ss -tl                # 慢：把 IP 解析成主机名
+ss -tln               # 快：数字形式
+```
+
+**`-n` 是"不解析"，所有排查场景都应该加。**
+:::
+
+**`ss -tan` 的 State 列是排查的核心**：
+
+```bash
+ss -tan | awk 'NR>1{print $1}' | sort | uniq -c | sort -rn
+#   1200 ESTABLISHED
+#    800 CLOSE_WAIT      ← 应用忘了 close()
+#    300 TIME_WAIT       ← 通常是正常的
+```
+
+**`CLOSE_WAIT` 堆积是纯应用层 bug**，调内核参数无效。
+
+:::tip[`ss` 的过滤语法比 `grep` 好用]
+```bash
+ss -tan 'sport = :22'                # 源端口
+ss -tan 'dport = :443'               # 目的端口
+ss -tan 'dst 192.168.1.0/24'         # 目标网段
+ss -tan state time-wait              # 按状态
+```
+:::
+
+## `curl` 的四个必会参数
+
+```bash
+curl -v https://example.com              # 详细（看握手、请求头）
+curl -I https://example.com              # 只看响应头（HEAD）
+curl -s -o /dev/null -w '%{http_code} %{time_total}\n' URL   # 只看状态码与耗时
+curl --resolve example.com:443:1.2.3.4 https://example.com   # 绕过 DNS 直连指定 IP
+```
+
+:::tip[`--resolve` 是排查 DNS/CDN 问题的利器]
+```bash
+# 不改 /etc/hosts 也不用 -k，直接测某个 IP
+curl --resolve api.example.com:443:10.0.0.5 https://api.example.com/health
+
+# 对比不同后端
+for ip in 10.0.0.1 10.0.0.2; do
+  curl -so /dev/null -w "$ip -> %{http_code} %{time_total}s\n" \
+       --resolve api.example.com:443:$ip https://api.example.com/health
+done
+```
+
+**这样能直接确认"是某个后端有问题"还是"整体有问题"。**
+:::
+
+:::warning[`-w` 能输出的关键指标]
+```bash
+curl -so /dev/null -w 'code=%{http_code} dns=%{time_namelookup} conn=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}\n' URL
+```
+
+**分段耗时能定位"慢在 DNS / TCP / TLS / 服务端"。**
+:::
+
+```bash
+# POST JSON
+curl -X POST -H 'Content-Type: application/json' -d '{"a":1}' https://api/x
+
+# 带认证
+curl -u user:pass https://api/x
+curl -H 'Authorization: Bearer TOKEN' https://api/x
+
+# 跟随重定向 + 限制超时 + 重试
+curl -L --max-time 10 --retry 3 https://api/x
+
+# 只测连通（不发 body）
+curl -so /dev/null -w '%{http_code}\n' --head https://example.com
+```
+
+:::danger[`curl -k` 只是跳过证书验证，不是"修好"]
+```bash
+curl -k https://self-signed/       # 能通，但你不再知道对方是谁
+```
+
+**排查时临时用可以，写进脚本/生产就是安全漏洞。**
+
+**正确做法**：把 CA 加进信任链，或用 `--cacert` 指定。
+:::
+
+## DNS 诊断
+
+```bash
+dig example.com                  # 完整答案
+dig +short example.com           # 只要结果
+dig @8.8.8.8 example.com         # 指定 DNS 服务器
+dig +trace example.com           # 从根开始逐级查
+dig -x 8.8.8.8                   # 反查（PTR）
+dig MX example.com               # 指定记录类型
+```
+
+:::tip[`@8.8.8.8` 对比能立刻判断是不是本地 DNS 的问题]
+```bash
+dig +short example.com                    # 用系统配置的 DNS
+dig +short @8.8.8.8 example.com           # 用公共 DNS
+
+# 结果不同 → 本地 DNS 有问题（缓存/配置/劫持）
+```
+:::
+
+:::warning[`dig` 与 `nslookup` / `host` 的分工]
+- **`dig`** —— 信息最全，排查首选
+- `host` —— 简洁，脚本里方便
+- `nslookup` —— 老工具，交互式有问题时容易误导
+
+**另外别忘了 `/etc/nsswitch.conf`** —— 它决定"先查 hosts 还是先查 DNS"：
+
+```text
+hosts: files dns        # 先 /etc/hosts 再 DNS
+```
+:::
+
+## 抓包
+
+```bash
+tcpdump -i any -nn port 80                    # 抓 80 端口
+tcpdump -i eth0 -nn -w cap.pcap 'tcp port 443' # 存文件给 Wireshark
+tcpdump -i any -nn -A port 80 | grep -A5 GET   # 看明文内容
+```
+
+:::danger[抓包有性能与隐私代价]
+**大流量下 `tcpdump` 可能吃掉大量 CPU 和磁盘**，而且**包里可能有密码/令牌**。
+
+**规矩**：
+
+- **限定过滤条件**（`port` / `host`），别裸抓
+- `-c 100` 限制包数
+- `-w` 存文件而不是打到终端
+- **生产环境抓包要有人授权**
+:::
+
+```bash
+# 看 TCP 握手与挥手（排查连接问题）
+tcpdump -i any -nn 'tcp[tcpflags] & (tcp-syn|tcp-fin) != 0' -c 50
+```
+
+## 按层排查的顺序
+
+:::tip[从下往上，找到第一个断点]
+```bash
+# ① 链路：网卡 UP？
+ip link show
+
+# ② IP：有地址？路由对？
+ip addr ; ip route get 8.8.8.8
+
+# ③ 邻居：ARP 能解析？
+ip neigh
+
+# ④ 三层连通
+ping -c2 8.8.8.8
+
+# ⑤ DNS
+dig +short example.com
+
+# ⑥ 端口
+nc -zv host 443
+
+# ⑦ 应用
+curl -v https://host/
+```
+:::
+
+| 卡在哪 | 原因 |
+| --- | --- |
+| ① 网卡 DOWN | 网线/驱动/配置 |
+| ② 无 IP | DHCP 失败/静态配置错 |
+| ③ ARP 不完整 | 同网段不可达/交换机问题 |
+| ④ ping 不通 | 路由/防火墙/上游 |
+| ⑤ DNS 失败 | `/etc/resolv.conf`、上游 DNS |
+| ⑥ 端口不通 | 服务没监听/防火墙 |
+| ⑦ HTTP 错 | 应用层（看 `-v` 的响应） |
+
+:::danger[`ping` 通不代表服务可用]
+ICMP 和 TCP 是独立的两套。**防火墙常"放 ICMP 封 TCP"**。
+
+**必须用 `nc -zv host port` 或 `curl` 测实际端口。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `ss` 很慢 | 没加 `-n`，在做反向 DNS | 加 `-n` |
+| `ifconfig` 找不到 | 没装 net-tools | 用 `ip` |
+| 域名通但 `ping` 不通 | 防火墙封 ICMP | 正常，用 `curl` 测 |
+| `curl -k` 后忘了删 | 跳过证书校验 | 上线前检查脚本 |
+| 抓包文件巨大 | 没加过滤 | `-c` / `port` |
+| 多网卡走错 | 路由优先级 | `ip route` 看 metric |
+| DNS 时好时坏 | 多个 nameserver 中有坏的 | `dig @each` 逐个测 |
+| MTU 问题 | 隧道/VPN | `ping -M do -s 1400` |
+
+:::tip[测 MTU]
+```bash
+ping -M do -s 1472 -c2 8.8.8.8     # 1500 - 28
+# 不通就减到 1400、1300 再试
+```
+
+**`-M do` 禁止分片**，这样才能测出真实 MTU。
+:::
+
+## 本课自检
+
+- [ ] 会用 `ip addr` / `ip route` / `ip neigh` / `ip -s link`
+- [ ] **会用 `ip route get` 看"从哪个网卡出去"**
+- [ ] **知道 `ss -n` 不加会很慢**
+- [ ] **会用 `ss -tan | awk ... | uniq -c` 统计状态分布**
+- [ ] 知道 `CLOSE_WAIT` 堆积是应用 bug
+- [ ] 会用 `ss` 的过滤语法（`dport`/`state`）
+- [ ] 会用 `curl -v` / `-I` / `-w` / `--resolve`
+- [ ] **知道 `-w` 的分段耗时能定位慢在 DNS/TCP/TLS/服务端**
+- [ ] **知道 `curl -k` 是安全漏洞不是修复**
+- [ ] 会用 `dig @server` 对比判断本地 DNS 问题
+- [ ] 知道 `/etc/nsswitch.conf` 决定解析顺序
+- [ ] **知道抓包要限定过滤条件并注意隐私**
+- [ ] 会按七层顺序排查，知道 `ping` 通不代表端口通
+
+## 下一步
+
+[SSH 深入](./ssh) 或 [系统故障排查](./troubleshoot)。

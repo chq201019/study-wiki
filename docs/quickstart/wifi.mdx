@@ -1,0 +1,102 @@
+---
+title: QS-9 WiFi 联网与配网
+sidebar_position: 12
+description: STA 联网、三种配网方式、信号优化、连接速度调优与断线重连。
+---
+
+# QS-9 WiFi 联网与配网
+
+**时长 60 分钟 · 产出：设备自动连上家里 WiFi 并拿到 IP，串口能看到 RSSI**
+
+:::tip[串口波特率]
+所有示例程序里的串口都初始化成 9600（米思齐的默认值）。
+在米思齐里点开串口窗口，把右下角的波特率也选成 `9600`，两边不一致串口就是乱码。
+:::
+
+:::tip[这一页的代码块要不要看]
+不用看，也不用抄。这些代码就是米思齐「混合」模式里显示的内容，只读、不能编辑。
+你要做的事只有两个：照着接线，照着拖积木。
+出问题时看不懂代码没关系，把当时的串口打印贴出来就行。
+:::
+
+## 从零到连上 WiFi（积木版）
+
+「网络 → Wi-Fi」子分类里积木是现成的：
+
+```text
+初始化
+  └─ 设置Wi-Fi 名称 "你的WiFi名字" 密码 "你的密码"      ← 「网络 → Wi-Fi」子分类
+当 WiFi连接事件（WiFi已连接）执行                         ← 帽子积木，连上那一刻才跑一次
+  └─ Serial 打印 自动换行 "已连上 WiFi"
+Serial 打印 自动换行 <Wi-Fi连接状态>                 ← 没连上/连接中/已连接
+延时 1000 毫秒
+```
+
+上传后看串口：状态从未连接变成已连接，就成功了。想拿 IP 和信号强度，Wi-Fi 分类里还有「获取设备 MAC 地址」这类取值积木，咬进打印就能看。
+
+对照代码（逻辑更细：20 秒超时、打印 IP/网关/RSSI）：
+
+```cpp
+#include <WiFi.h>
+
+void setup() {
+  Serial.begin(9600);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin("你的WiFi名字", "你的密码");
+
+  Serial.print("连接中");
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+    Serial.print(".");
+    delay(500);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ 连接成功");
+    Serial.print("IP:   "); Serial.println(WiFi.localIP());
+    Serial.print("网关: "); Serial.println(WiFi.gatewayIP());
+    Serial.print("RSSI: "); Serial.print(WiFi.RSSI()); Serial.println(" dBm");
+  } else {
+    Serial.println("\n❌ 连接失败，检查 SSID/密码/信号");
+  }
+}
+
+void loop() {}
+```
+
+## 配网：现场不能写死 WiFi 名字怎么办
+
+赛场的网络和家里不一样。三种常见方案，**配网是纯代码活，积木做不了**：
+
+| 方案 | 原理 | 适合 |
+| --- | --- | --- |
+| **SoftAP**（最可靠） | 板子自己开热点，手机连上去在网页里填 WiFi 信息 | ✅ 比赛推荐 |
+| SmartConfig | 手机 App 广播 WiFi 名字密码，板子监听 | 方便但容易被路由器拦 |
+| 串口命令配网 | 用电脑串口把 WiFi 信息发进去 | 调试最快 |
+
+真要用，把 [L5 · WiFi](../course/l5-wireless/wifi) 的配网代码模板抄进 Arduino IDE（见 [QS-3](./arduino-ide)）。用积木的替代做法：把 WiFi 名字密码做成「变量」放在程序开头，换场地时改变量重新上传。
+
+## 断线重连
+
+现场演示最尴尬的是掉线连不回来。基础做法：在主循环里定期看「Wi-Fi连接状态」，不是"已连接"就把「设置Wi-Fi」积木再执行一次重连（代码里是 `WiFi.reconnect()`）。更稳的完整写法见 [L5 · WiFi](../course/l5-wireless/wifi)。
+
+## 连接质量优化（知道就行）
+
+| 做法 | 干什么 |
+| --- | --- |
+| 打印 RSSI | 负值越接近 0 信号越好，低于 -70dBm 该挪板子了 |
+| 静态 IP | 跳过 DHCP，连得更快 |
+| 远离 2.4G 干扰源 | 信号差先查环境，不先查代码 |
+
+## 验证
+
+- [ ] 上传后串口从未连接变成已连接，能拿到 IP
+- [ ] 断开路由器 5 秒再接上，设备能自动恢复连接
+
+## 之后想深入？
+
+想搞懂"为什么"，去 [完整教程 · WiFi](../course/l5-wireless/wifi)。
+
+## 下一步
+
+[QS-10 MQTT 上云](./mqtt) —— 把数据传到云端平台。

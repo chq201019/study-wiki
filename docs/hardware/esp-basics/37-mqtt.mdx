@@ -1,0 +1,220 @@
+---
+id: 37-mqtt
+title: 24 MQTT 实战
+sidebar_position: 37
+description: MQTT 的发布订阅模型、QoS 三级的实际含义、遗嘱消息与保留消息、重连与离线缓存、以及主题设计。
+---
+
+# 24 MQTT 实战
+
+**本课目标**：会用 MQTT 做可靠的设备-云通信。
+
+## 为什么 IoT 常用 MQTT
+
+| 特性 | 价值 |
+| --- | --- |
+| **发布订阅** | 设备之间解耦，加设备不用改代码 |
+| **头部极小** | 最小 2 字节，适合窄带 |
+| **QoS 分级** | 按重要性选可靠性 |
+| **遗嘱消息** | 设备掉线能自动通知 |
+| **保留消息** | 新订阅者立刻拿到最新状态 |
+
+:::warning[MQTT 需要 Broker]
+**它不是点对点协议** —— 必须有中间服务器（Mosquitto、EMQX、云厂商 IoT Hub）。
+
+**ESP-IDF 官方示例连的是公共 broker**（test.mosquitto.org），**生产不能这么用**。
+:::
+
+## 发布订阅模型
+
+```text
+设备A ──publish──> Broker ──> 设备B（订阅了该主题）
+                          └──> 服务端（也订阅了）
+```
+
+:::info[主题是分层的字符串]
+```text
+home/livingroom/temperature
+home/+/temperature           # + 匹配单层
+home/#                       # # 匹配多层（必须在末尾）
+```
+
+**`+` 与 `#` 是通配符**，只在订阅时用，**发布时不能用**。
+:::
+
+## QoS 三级的真实含义
+
+| QoS | 语义 | 开销 |
+| --- | --- | --- |
+| **0** | 最多一次（可能丢） | 最小 |
+| **1** | 至少一次（可能重复） | 中 |
+| **2** | 恰好一次（不丢不重） | **最大（4 次握手）** |
+
+:::danger[QoS 1 会重复，应用层必须幂等]
+**网络抖动时 Broker 会重发** —— 你的处理逻辑必须能承受同一条消息被处理两次。
+
+**做法**：消息里带唯一 ID，处理前查重。
+:::
+
+:::warning[QoS 2 最可靠但最慢]
+**它有四次握手**（PUBLISH → PUBREC → PUBREL → PUBCOMP），**开销是 QoS 0 的好几倍**。
+
+**大多数传感器数据用 QoS 1 就够** —— 偶尔重复可以接受，丢了才麻烦。
+:::
+
+## 遗嘱消息（LWT）
+
+:::tip[设备异常掉线时自动通知]
+```c
+/* 连接时声明遗嘱 */
+mqtt_cfg.session.last_will.topic = "dev/123/status";
+mqtt_cfg.session.last_will.msg = "offline";
+mqtt_cfg.session.last_will.msg_len = 7;
+mqtt_cfg.session.last_will.qos = 1;
+mqtt_cfg.session.last_will.retain = 1;
+```
+
+**Broker 检测到连接异常断开（心跳超时）时，自动发布这条消息。**
+
+**注意**：正常断连（发 DISCONNECT）时**不会**发遗嘱。
+:::
+
+## 保留消息（Retain）
+
+:::info[让新订阅者立刻拿到最新状态]
+```text
+普通消息：只有订阅者在线时才能收到
+保留消息：Broker 保存每个主题的最后一条，新订阅者立刻收到
+```
+
+**典型用途**：设备状态、配置参数、传感器最新值。
+:::
+
+:::warning[保留消息会一直存在 Broker 上]
+**要清除保留消息，得发一条 payload 为空且 retain=1 的消息。**
+
+**否则它会永久占用 Broker 内存，新订阅者一直收到过期数据。**
+:::
+
+## ESP-IDF 的连接骨架
+
+```c
+esp_mqtt_client_config_t cfg = {
+    .broker.address.uri = "mqtt://broker.example.com:1883",
+    .credentials.username = "device123",
+    .credentials.authentication.password = "secret",
+    .session.keepalive = 60,
+};
+client = esp_mqtt_client_init(&cfg);
+esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, handler, NULL);
+esp_mqtt_client_start(client);
+```
+
+:::danger[必须处理断线重连]
+**WiFi 抖动、Broker 重启都会导致断连。**
+
+**要做的**：
+
+- 在 `MQTT_EVENT_DISCONNECTED` 里标记状态
+- **重连后重新订阅**（订阅关系不会自动恢复，除非用持久会话）
+- 离线期间的数据要缓存或丢弃（取决于业务）
+:::
+
+```c
+static void mqtt_event_handler(void *arg, esp_event_base_t base,
+                              int32_t id, void *data) {
+    switch ((esp_mqtt_event_id_t)id) {
+    case MQTT_EVENT_CONNECTED:
+        esp_mqtt_client_subscribe(client, "cmd/device123", 1);
+        break;
+    case MQTT_EVENT_DISCONNECTED:
+        /* 标记离线，等自动重连 */
+        break;
+    case MQTT_EVENT_DATA:
+        /* 处理下行命令 */
+        break;
+    }
+}
+```
+
+## 主题设计
+
+:::tip[推荐结构]
+```text
+{产品}/{设备ID}/{数据类型}
+
+如：sensor/AABBCC/temperature
+     sensor/AABBCC/cmd
+```
+
+**好处**：
+
+- 用 `+/+` 通配订阅所有设备的数据
+- 权限可以按前缀划分（只给某产品权限）
+- **设备 ID 用 MAC 或芯片 ID，不要用自增数字**
+:::
+
+:::danger[不要用 "设备上电顺序" 之类的不稳定 ID]
+**设备重装系统后 ID 变了，历史数据就断了。**
+
+**用 eFuse MAC（ESP32 有全球唯一 MAC）**。
+:::
+
+## 安全
+
+:::danger[生产环境的三条底线]
+1. **必须用 TLS**（8883 端口），不能用 1883 明文
+2. **每个设备独立账号密码**（不要全设备共用一个）
+3. **Broker 侧做主题权限控制**（设备 A 不能订阅设备 B 的数据）
+:::
+
+```c
+/* TLS 配置 */
+.broker.address.uri = "mqtts://broker.example.com:8883",
+.broker.verification.certificate = server_ca_pem,
+```
+
+:::warning[ESP32 的时间必须准确才能验证证书]
+**TLS 证书验证依赖系统时间。**
+
+**如果 RTC 时间没同步（比如一直停在 1970 年），证书会被判定为"未生效"而握手失败。**
+
+**所以要先 NTP 对时，再连 MQTT over TLS。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 连不上 | URL 协议前缀错 | mqtt:// 或 mqtts:// |
+| TLS 握手失败 | 时间没同步 | 先 NTP |
+| 重连后收不到消息 | 没重新订阅 | CONNECTED 事件里订阅 |
+| 消息重复处理 | QoS 1 的语义 | 应用层幂等 |
+| 新订阅者收到旧数据 | 有保留消息 | 主动清除或接受 |
+| 掉线不通知 | 没设遗嘱 | 配 last_will |
+| 频繁断连 | keepalive 太短 | 加大到 60 秒 |
+| 内存不够 | 消息太大 | MQTT 单条建议小于 1KB |
+
+:::warning[MQTT 不适合传大文件]
+**受限于 Broker 的 max packet size，通常几百 KB 上限。**
+
+**传固件、图片请用 HTTP 或对象存储**。
+:::
+
+## 本课自检
+
+- [ ] 知道 MQTT 是发布订阅、需要 Broker
+- [ ] **知道 `+` 与 `#` 只在订阅时能用**
+- [ ] **知道 QoS 1 可能重复，应用层要幂等**
+- [ ] **知道 QoS 2 有四次握手，开销最大**
+- [ ] 会用遗嘱消息做掉线通知
+- [ ] **知道正常断连不会发遗嘱**
+- [ ] 会用保留消息，知道要清除过期保留消息
+- [ ] **知道重连后必须重新订阅**
+- [ ] 会用 MAC 作为设备唯一 ID
+- [ ] **知道 TLS 需要准确时间，要先 NTP**
+- [ ] 知道生产必须用 TLS 并做主题权限控制
+
+## 下一步
+
+回到 [ESP32 零基础导读](../esp-basics/)。

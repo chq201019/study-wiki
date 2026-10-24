@@ -1,0 +1,214 @@
+---
+id: ebpf
+title: eBPF 与可观测性
+sidebar_position: 32
+description: eBPF 是什么、为什么安全、bpftrace 与 bcc 工具怎么用、常见排查场景、以及它的边界。
+---
+
+# eBPF 与可观测性
+
+**本课目标**：用 eBPF 工具在不改代码、不重启的情况下看内核行为。
+
+## 它解决了什么问题
+
+![eBPF 挂载点分布：从系统调用入口到 VFS、文件系统、块设备各层，对应 tracepoint/kprobe/kretprobe](/img/diagrams/linux-ebpf-hooks.svg)
+
+
+:::info[传统手段的三个短板]
+| 手段 | 问题 |
+| --- | --- |
+| `strace` | **慢几十倍**，生产不能用 |
+| `perf` | 采样，看不到精确的每次调用 |
+| 加日志 | 要改代码、要重启 |
+
+**eBPF**：把小程序挂到内核的探针上，**在内核里执行**，只把汇总结果传回用户态。
+
+**开销接近零**（纳秒级），**可以上生产**。
+:::
+
+## 为什么安全
+
+:::danger[它有三重保护，不会像内核模块那样搞崩系统]
+1. **验证器（verifier）** 在加载前做静态检查 —— 保证无死循环、无越界访问
+2. **不能调用任意内核函数** —— 只能调白名单里的 helper
+3. **执行时间受限**（早期版本有指令数上限，现在有运行时限制）
+
+**所以 eBPF 程序加载失败是"编译期"问题，不会让系统崩溃。**
+:::
+
+## 三个常用工具
+
+| 工具 | 特点 | 适合 |
+| --- | --- | --- |
+| **`bpftrace`** | 单行脚本，类 awk 语法 | **快速排查** |
+| `bcc` | Python + C 写工具 | 复杂逻辑 |
+| `bpftool` | 底层管理 | 调试 eBPF 本身 |
+
+```bash
+# 安装
+apt install bpftrace bpfcc-tools linux-headers-$(uname -r)
+```
+
+:::warning[需要内核支持]
+**内核 4.9+ 有基本 eBPF，4.14+ 才比较完整。**
+
+```bash
+uname -r
+grep CONFIG_BPF /boot/config-$(uname -r)
+```
+
+**还要有 `linux-headers`**（编译 eBPF 程序需要）。
+:::
+
+## bpftrace 单行示例
+
+```bash
+# ① 统计各进程的系统调用次数（3 秒）
+bpftrace -e 'tracepoint:raw_syscalls:sys_enter { @[comm] = count(); }'
+
+# ② 哪些文件被打开最多
+bpftrace -e 'tracepoint:syscalls:sys_enter_openat { @[str(args->filename)] = count(); }'
+
+# ③ 谁的 read 耗时最长（直方图）
+bpftrace -e 'kprobe:vfs_read { @start[tid] = nsecs; }
+  kretprobe:vfs_read /@start[tid]/ {
+    @us = hist((nsecs - @start[tid]) / 1000); delete(@start[tid]); }'
+
+# ④ 看某个进程的 TCP 连接
+bpftrace -e 'kprobe:tcp_connect /pid == 1234/ { printf("%s\n", comm); }'
+```
+
+:::tip[`hist()` 生成的直方图极有用]
+```text
+@us:
+[1]       1200 |@@@@@@@@@@@@@@@@@@@@                |
+[2, 4)     800 |@@@@@@@@@@@                         |
+[4, 8)     200 |@@                                  |
+[8, 16)     50 |                                    |
+[16, 32)    10 |                                    |
+```
+
+**一眼看出"大多数调用很快，但有个长尾"** —— 这比平均值有用得多。
+:::
+
+## 五个实用排查场景
+
+### ① 找"哪个进程在疯狂读磁盘"
+
+```bash
+bpftrace -e 'kprobe:vfs_read { @[comm] = count(); }'
+```
+
+### ② 找"慢在哪一层"
+
+```bash
+# 跟踪一次系统调用从进入到返回的耗时
+bpftrace -e '
+  tracepoint:syscalls:sys_enter_read { @s[tid] = nsecs; }
+  tracepoint:syscalls:sys_exit_read /@s[tid]/ {
+    @ms = hist((nsecs - @s[tid]) / 1000000); delete(@s[tid]); }
+'
+```
+
+### ③ 看 TCP 重传
+
+```bash
+bpftrace -e 'kprobe:tcp_retransmit_skb { @[comm] = count(); }'
+```
+
+### ④ 看 OOM 前的内存申请
+
+```bash
+bpftrace -e 'kprobe:__alloc_pages_nodemask /args->gfp_mask & 0x100/ {
+  @[comm, ustack] = count(); }'
+```
+
+### ⑤ 看某个函数被谁调用
+
+```bash
+bpftrace -e 'kprobe:vfs_write { printf("%s <- %s\n", comm, kstack); }'
+```
+
+:::tip[`kstack` / `ustack` 打印调用栈]
+**`kstack` 是内核栈，`ustack` 是用户态栈** —— 一眼看出"谁调用的"。
+
+**这是 tracing 类工具最有价值的能力。**
+:::
+
+## 边界与限制
+
+:::danger[四个做不了的事]
+1. **不能改内核数据结构**（只能读和统计）
+2. **不能长时间持有大量状态**（栈空间和 map 都有限）
+3. **不能替代业务日志**（它看的是系统行为，不是业务语义）
+4. **在容器里受权限限制**（需要 `CAP_BPF` 或特权）
+:::
+
+:::warning[性能不是绝对零成本]
+**挂在极热的函数上（每秒数百万次）时开销会显现。**
+
+**建议**：
+
+- 先用 `count()` 粗看，别一开始就 `printf`
+- 加过滤条件（`/pid == 1234/`）
+- 控制在几秒到几十秒
+:::
+
+## 一个完整的排查例子
+
+```bash
+# 现象：某服务响应慢，但 CPU 不高
+
+# ① 先看系统调用分布
+bpftrace -e 'tracepoint:raw_syscalls:sys_enter /comm == "mysvc"/ {
+  @[args->id] = count(); }'
+# 发现大量 futex
+
+# ② 看 futex 等待时长
+bpftrace -e 'kprobe:do_futex /comm == "mysvc"/ { @s[tid] = nsecs; }
+  kretprobe:do_futex /@s[tid]/ {
+    @ms = hist((nsecs - @s[tid])/1000000); delete(@s[tid]); }'
+# 发现锁竞争严重
+
+# ③ 看是谁在抢锁（用户态栈）
+bpftrace -e 'kprobe:do_futex /comm == "mysvc"/ { printf("%s\n", ustack); }'
+```
+
+**结论：不是 IO 慢，是锁竞争。**
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 加载失败 | 内核太老 / 缺 headers | 升级内核、装 headers |
+| `Permission denied` | 需要 root 或 CAP_BPF | `sudo` |
+| 输出太多刷屏 | 没加过滤 | 加 `/pid == N/` |
+| 系统变慢 | 挂在极热函数上 | 用 `count()` 而非 `printf` |
+| 容器里不能用 | 缺权限 | `--privileged` 或 `--cap-add` |
+| `@map` 不打印 | 没触发退出 | 加 `interval:s:5 { exit(); }` |
+
+:::tip[常用退出方式]
+```bash
+# 跑 5 秒自动退出
+bpftrace -e '... interval:s:5 { exit(); }'
+
+# 或者 Ctrl+C（会打印已收集的 map）
+```
+:::
+
+## 本课自检
+
+- [ ] **知道 eBPF 解决了 strace 太慢、perf 只能采样的问题**
+- [ ] **知道三重安全保护（验证器/helper 白名单/时间限制）**
+- [ ] 知道 `bpftrace` / `bcc` / `bpftool` 的分工
+- [ ] 会用 `tracepoint` 与 `kprobe` 写单行脚本
+- [ ] **会用 `hist()` 看分布而不是平均值**
+- [ ] 会用 `kstack` / `ustack` 看调用栈
+- [ ] 知道加 `/pid == N/` 之类的过滤条件
+- [ ] **知道 eBPF 不能改内核数据、不能替代业务日志**
+- [ ] 知道容器里需要 `CAP_BPF` 或特权
+- [ ] **知道挂在极热函数上性能开销会显现**
+
+## 下一步
+
+[性能分析：perf 与火焰图](./performance) 或 [系统故障排查](./troubleshoot)。

@@ -1,0 +1,295 @@
+---
+id: metaprogramming
+title: 模板元编程
+sidebar_position: 14
+description: 编译期计算能做什么、constexpr 与 consteval 的分工、类型萃取与 if constexpr、变参模板与折叠表达式、以及别过度使用元编程的边界。
+---
+
+# 模板元编程
+
+**本课目标**：知道编译期能算什么，能读懂常见的元编程代码。
+
+## 为什么要编译期计算
+
+| 收益 | 说明 |
+| --- | --- |
+| **零运行时开销** | 循环展开、常量折叠、分支消除 |
+| **提前报错** | 类型不匹配在编译期暴露 |
+| **消除重复代码** | 一份模板生成多种实现 |
+| **安全** | 编码/解码可在编译期验证 |
+
+**代价**：编译变慢、报错变长、调试变难。
+
+## `constexpr`：能编译期就编译期
+
+```cpp
+constexpr int square(int x) { return x * x; }
+
+int a = square(5);            // 编译期算出 25
+int b = 5;
+int c = square(b);            // 运行期算（b 不是常量）
+```
+
+:::tip[`constexpr` 是"可以"，不是"必须"]
+同一个函数既能编译期求值，也能运行期求值 —— **编译器在参数是常量表达式时才在编译期算**。
+
+```cpp
+constexpr int n = square(5);      // 强制编译期（因为要当常量用）
+int m = square(5);                // 不保证，但绝大多数编译器会折叠
+```
+:::
+
+:::warning[C++14 前 `constexpr` 函数只能有一句 return]
+C++11 的 `constexpr` 函数体只能是 `return expr;`。
+
+C++14 起允许循环、局部变量、多语句。**所以要循环就至少要 C++14。**
+:::
+
+### `consteval`：必须编译期
+
+```cpp
+consteval int f(int x) { return x * 2; }    // C++20
+
+int a = f(3);       // ✅
+int b = 3;
+int c = f(b);       // ❌ 编译错误：b 不是常量
+```
+
+**`consteval` 适合"只应该在编译期做"的东西**（比如生成查找表、校验格式串）。
+
+### `constinit`：保证静态初始化期完成
+
+```cpp
+constinit int g = compute();      // C++20
+```
+
+**解决"静态初始化顺序问题"** —— 保证这个变量在动态初始化阶段之前就绪。
+
+## 类型萃取：`type_traits`
+
+```cpp
+#include <type_traits>
+
+static_assert(std::is_integral_v<int>);
+static_assert(!std::is_integral_v<double>);
+static_assert(std::is_same_v<int, int>);
+
+// 条件选择类型
+using T = std::conditional_t<sizeof(void*) == 8, uint64_t, uint32_t>;
+
+// 去掉引用/const
+using U = std::remove_cvref_t<const int&>;      // int
+```
+
+:::info[常用萃取速查]
+| 萃取 | 作用 |
+| --- | --- |
+| `is_integral` / `is_floating_point` | 类别判断 |
+| `is_same` | 类型相同 |
+| `is_base_of` | 继承关系 |
+| `is_convertible` | 可转换 |
+| `remove_cv` / `remove_reference` | 去修饰 |
+| `decay` | 退化为值类型（数组→指针、函数→指针） |
+| `conditional` | 三元选择 |
+| `enable_if` | SFINAE 开关 |
+| `void_t` | 检测成员是否存在 |
+:::
+
+## `if constexpr`：编译期分支
+
+:::danger[普通的 `if` 会实例化两个分支]
+```cpp
+template <typename T>
+void f(T v) {
+    if (std::is_pointer_v<T>) {
+        std::cout << *v;        // ❌ T = int 时这一行也会被编译 → 报错
+    } else {
+        std::cout << v;
+    }
+}
+```
+
+**因为 `if` 是运行期分支，两个分支都要能编译。**
+:::
+
+```cpp
+template <typename T>
+void f(T v) {
+    if constexpr (std::is_pointer_v<T>) {
+        std::cout << *v;        // ✅ T = int 时这一整个分支被丢弃，不编译
+    } else {
+        std::cout << v;
+    }
+}
+```
+
+:::tip[`if constexpr` 丢弃的分支仍然要语法正确]
+```cpp
+if constexpr (false) {
+    this_is_not_defined_anywhere();     // ✅ 不会报错（没实例化）
+}
+if constexpr (false) {
+    int x = ;                            // ❌ 语法错误，照样报
+}
+```
+
+**它跳过的是"模板实例化"，不是"语法检查"。**
+:::
+
+## 变参模板与折叠表达式
+
+```cpp
+// 递归展开（C++11 风格）
+template <typename T>
+T sum(T v) { return v; }
+
+template <typename T, typename... Rest>
+T sum(T first, Rest... rest) {
+    return first + sum(rest...);
+}
+
+// 折叠表达式（C++17，一行搞定）
+template <typename... Args>
+auto sum2(Args... args) { return (args + ...); }
+
+// 带初始值
+template <typename... Args>
+auto sum3(Args... args) { return (0 + ... + args); }
+```
+
+:::warning[空参数包会让 `(args + ...)` 编译失败]
+```cpp
+sum2();      // ❌ 空包的一元折叠，没有初始值 → 错误
+sum3();      // ✅ 有初始值 0 → 返回 0
+```
+
+**要支持空包就必须给一元折叠配初始值。**
+:::
+
+**四种折叠形式**：
+
+```cpp
+(args + ...)        // 一元右折叠
+(... + args)        // 一元左折叠
+(0 + ... + args)    // 二元右折叠（有初始值）
+(args + ... + 0)    // 二元左折叠
+```
+
+**加法用哪种都一样，但减法和除法不同**（结合顺序不同）。
+
+## 编译期数据结构：`std::array` 与查找表
+
+```cpp
+#include <array>
+
+template <std::size_t N>
+constexpr std::array<int, N> make_squares()
+{
+    std::array<int, N> a{};
+    for (std::size_t i = 0; i < N; ++i) a[i] = int(i * i);
+    return a;
+}
+
+constexpr auto squares = make_squares<16>();       // 编译期生成
+static_assert(squares[4] == 16);
+```
+
+**这张表在 Flash 里是常量数据，运行时零计算开销。**
+
+## `void_t` 检测成员是否存在
+
+```cpp
+template <typename T, typename = void>
+struct has_size : std::false_type {};
+
+template <typename T>
+struct has_size<T, std::void_t<decltype(std::declval<T>().size())>>
+    : std::true_type {};
+
+static_assert(has_size<std::vector<int>>::value);
+static_assert(!has_size<int>::value);
+```
+
+:::tip[C++20 之后用 `requires` 更清晰]
+```cpp
+template <typename T>
+concept HasSize = requires(T t) { t.size(); };
+
+static_assert(HasSize<std::vector<int>>);
+static_assert(!HasSize<int>);
+```
+
+**`void_t` 那套是 C++17 的写法，新代码直接用 concepts**（见 [C++20 概念](./concepts)）。
+:::
+
+## 什么时候不该用元编程
+
+:::danger[三个明确的停手信号]
+**① 编译时间超过 30 秒**
+
+模板爆炸会让编译时间指数增长。**开发迭代慢下来，收益全部被吃掉。**
+
+**② 报错信息你自己都看不懂**
+
+如果一段代码出错时你需要在几十行模板展开里找线索，**说明它太复杂了**。
+
+**③ 只有一处使用**
+
+模板的价值在于复用。**只用一次的东西，写成普通函数/类更好维护。**
+:::
+
+:::warning[可读性永远优先]
+```cpp
+// 这段代码很"聪明"，但半年后没人敢改
+template <typename... Ts>
+auto process(Ts&&... ts) {
+    return std::apply([&](auto&&... xs) {
+        return ((xs * 2) + ...);
+    }, std::forward_as_tuple(ts...));
+}
+
+// 等价且清晰
+int process(int a, int b) { return a * 2 + b * 2; }
+```
+
+**"聪明"的代码在团队里是负债。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `constexpr` 函数编译失败 | 用了运行期才有的东西（`new`、虚函数） | 改成普通函数 |
+| `if constexpr` 里语法错还报错 | 语法检查不做丢弃 | 保证语法正确 |
+| 空变参包折叠报错 | 一元折叠无初始值 | 用二元折叠 |
+| 编译时间暴涨 | 模板层层递归 | 用折叠表达式 / concepts 替代 |
+| 静态初始化顺序错乱 | 跨编译单元的全局对象 | 用 `constinit` 或函数内静态 |
+| 元编程代码没法调试 | 没有运行时实体 | 加 `static_assert` 做编译期断言 |
+
+:::tip[调试元编程的唯一有效手段是 `static_assert`]
+```cpp
+static_assert(std::is_same_v<decltype(expr), int>, "这里应该是 int");
+```
+
+**编译失败时它会打印出实际类型**，这是"编译期 printf"。
+:::
+
+## 本课自检
+
+- [ ] 能说出编译期计算的四个收益
+- [ ] **知道 `constexpr` 是"能"编译期求值，不是"必须"**
+- [ ] 知道 `consteval`（必须编译期）与 `constinit`（静态初始化期）的分工
+- [ ] 会用常见 `type_traits`
+- [ ] **理解 `if constexpr` 丢弃的是"实例化"不是"语法检查"**
+- [ ] **知道 `if`（非 constexpr）会实例化两个分支**
+- [ ] 会写变参模板和折叠表达式
+- [ ] **知道空参数包的一元折叠会失败，要用二元折叠**
+- [ ] 能用 `constexpr` 函数生成查找表
+- [ ] 知道 `void_t` 检测成员，但 C++20 应改用 `requires`
+- [ ] **记住三个停手信号：编译超 30 秒、报错看不懂、只有一处使用**
+- [ ] **知道 `static_assert` 是元编程的调试手段**
+
+## 下一步
+
+[C++20 概念](./concepts) 是现代替代 SFINAE 的方案；
+或者看 [模板与泛型编程](./templates)。

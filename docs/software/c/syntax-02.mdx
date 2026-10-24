@@ -1,0 +1,329 @@
+---
+id: syntax-02
+title: "02 运算符"
+sidebar_position: 3
+description: "语法基础 第 2 部分：运算符"
+---
+
+# 02 运算符
+### 优先级表（从高到低）
+
+| 优先级 | 运算符 | 结合性 |
+| --- | --- | --- |
+| 1 | `()` `[]` `->` `.` `++`(后缀) `--`(后缀) | 左 → 右 |
+| 2 | `!` `~` `++`(前缀) `--`(前缀) `+`(一元) `-`(一元) `*` `&` `sizeof` `_Alignof` `(类型)` | 右 → 左 |
+| 3 | `*` `/` `%` | 左 → 右 |
+| 4 | `+` `-` | 左 → 右 |
+| 5 | `<<` `>>` | 左 → 右 |
+| 6 | `<` `<=` `>` `>=` | 左 → 右 |
+| 7 | `==` `!=` | 左 → 右 |
+| 8 | `&` | 左 → 右 |
+| 9 | `^` | 左 → 右 |
+| 10 | `\|` | 左 → 右 |
+| 11 | `&&` | 左 → 右 |
+| 12 | `\|\|` | 左 → 右 |
+| 13 | `?:` | 右 → 左 |
+| 14 | `=` `+=` `-=` `*=` `/=` `%=` `<<=` `>>=` `&=` `^=` `\|=` | 右 → 左 |
+| 15 | `,`（逗号运算符） | 左 → 右 |
+
+:::warning[两个必背的优先级事实]
+1. **`&` 和 `|` 的优先级低于 `==`**。所以 `if (flags & MASK == MASK)` 会被解析成 `flags & (MASK == MASK)`——**必须写括号**：`if ((flags & MASK) == MASK)`
+2. **`<<` `>>` 的优先级低于 `+`**。`1 << 2 + 1` 是 `1 << 3` = 8，不是 `(1 << 2) + 1` = 5
+:::
+
+### 短路求值
+
+`&&` 和 `||` **保证从左到右求值，且短路**：
+
+```c
+if (p != NULL && p->field == 1) { }   /* p 为 NULL 时不会解引用 */
+if (idx < n || expensive_check()) { } /* idx < n 为真时不调用第二个 */
+```
+
+这不只是优化，**是标准保证的语义**，可以安全依赖。逗号运算符 `,`、三元 `?:` 和逻辑运算符是 C 中**仅有的、有明确求值顺序保证**的几个地方。
+
+### 位移运算符的 UB 清单
+
+实测：
+
+```text
+1 << 30     = 1073741824
+1u << 31    = 2147483648
+1 << 31     = -2147483648
+```
+
+注意 `1 << 31` 对有符号 `int` 而言是 **UB**（结果不能被 `int` 表示）。写代码时位移常量一律加 `u` 后缀：`1u << 31`。
+
+位移的 UB / 实现定义清单：
+
+| 情况 | 分类 | 说明 |
+| --- | --- | --- |
+| 左移位数 >= 位宽 | **UB** | 实测：`shift exponent 32 is too large for 32-bit type 'int'` |
+| 左移负数 | **UB** | `-1 << 1` |
+| 左移有符号数导致结果不可表示 | **UB** | `1 << 31`（32 位 int） |
+| 右移负数 | **实现定义** | gcc/clang 用**算术右移**（补符号位） |
+| 右移位数 >= 位宽 | **UB** | 同左移 |
+
+实测右移负数的实现定义行为：
+
+```text
+(int8_t)-1 >> 1      = -1
+(uint8_t)0xFF >> 1   = 127
+(int)0x80000000 >> 1 = -1073741824
+(unsigned)0x80000000u >> 1 = 1073741824
+```
+
+`(int)0x80000000 >> 1` 得到 `-1073741824` 而不是 `1073741824`——因为**算术右移补符号位**；`0x80000000` 这个字面量本身是 `unsigned int`，不加强转就是逻辑右移、得到 `1073741824`。
+
+要逻辑右移（补 0），**先把操作数转成无符号**。
+
+### 序列点：不要在一个表达式里改同一个变量两次
+
+```c
+int x = 1;
+int y = x++ + x++;
+```
+
+编译器警告：
+
+```text
+warning: multiple unsequenced modifications to 'x' [-Wunsequenced]
+```
+
+实测打印了 `y = 3`，但这**是未定义行为**，值完全没保证：不同编译器、不同优化级别可能给不同结果，也可能给 `2` 或 `4`。
+
+:::danger[序列点规则核心]
+C 标准规定：在两个**序列点**之间，一个对象最多只能被修改一次，且如果被修改，则它的值只能被用于"计算新值"这一个目的。违反即为 UB。
+
+序列点出现在：`;` 结尾、`&&`、`||`、`?:`、逗号运算符、函数调用（**所有实参求值完之后**进入函数体之前）。
+
+**注意函数调用不算"每个实参之间的序列点"**——实参的求值顺序是**未指定**的：
+
+```c
+f(g(), h());   /* g 和 h 谁先调用？未指定，不要依赖 */
+printf("%d %d", i++, i++);   /* 未指定顺序 + 两次修改 = UB */
+```
+:::
+
+## 六、控制流
+
+### 分支
+
+```c
+if (cond1) {
+    /* ... */
+} else if (cond2) {
+    /* ... */
+} else {
+    /* ... */
+}
+```
+
+:::warning[悬空 else（dangling else）]
+`else` 总是绑定到**最近的、未配对的 `if`**，和缩进无关。
+
+实测：
+
+```c
+int a = 1, b = 0;
+if (a)
+    if (b)
+        printf("  inner\n");
+    else
+        printf("  else binds to INNER if (b=%d)\n", b);
+```
+
+输出：
+
+```text
+  else binds to INNER if (b=0)
+```
+
+尽管 `else` 的缩进对齐了外层 `if`，它绑定的仍是内层 `if (b)`。
+
+编译器会警告：
+
+```text
+warning: add explicit braces to avoid dangling else [-Wdangling-else]
+```
+
+**正确做法：永远加花括号**，即使只有一行。这是嵌入式编码规范（MISRA、ESP-IDF 风格）的强制要求。
+:::
+
+### 循环
+
+```c
+while (cond) { }        /* 先判断 */
+do { } while (cond);    /* 后判断，至少执行一次 */
+for (init; cond; iter) { }
+```
+
+C99 起 `for` 的 `init` 部分可以声明变量，其作用域限于循环：
+
+```c
+for (size_t i = 0; i < n; i++) { }   /* i 只在循环内可见 */
+```
+
+`break` 跳出**最近的一层**循环/switch；`continue` 跳到下一次迭代（在 `for` 中会先执行 `iter` 部分）。
+
+:::tip[遍历数组用 `size_t` 不用 `int`]
+```c
+for (size_t i = 0; i < n; i++) { arr[i] = 0; }
+```
+用 `int` 当 `n` 超过 `INT_MAX` 会溢出；用 `size_t` 与 `sizeof` 结果类型一致，不会有符号/无符号混用警告。
+:::
+
+### `goto`
+
+C 有 `goto`，在嵌入式里有一个**正当用途**：统一错误清理路径。
+
+```c
+int init_hw(void) {
+    int ret = 0;
+    if (clk_init() != 0) { ret = -1; goto fail_clk; }
+    if (gpio_init() != 0) { ret = -2; goto fail_gpio; }
+    if (dma_init() != 0) { ret = -3; goto fail_dma; }
+    return 0;
+
+fail_dma:
+    gpio_deinit();
+fail_gpio:
+    clk_deinit();
+fail_clk:
+    return ret;
+}
+```
+
+这是 Linux 内核和很多嵌入式代码的标准写法——**只向下跳转做清理**，不要向上跳（会形成难懂的循环）。
+
+## 七、`switch` 的四个陷阱
+
+`switch` 的语义是：把**控制表达式提升为整型**后与各个 `case` 常量比较，跳转到匹配的标签，`case` 标签本身不产生任何代码——它只是**跳转目标**。
+
+### 陷阱 1：贯穿（fallthrough）
+
+实测代码：
+
+```c
+int v = 1;
+switch (v) {
+    case 1:
+        printf("  case1 runs\n");
+    case 2:
+        printf("  case2 runs (fallthrough!)\n");
+        break;
+    case 3:
+        printf("  case3\n");
+}
+```
+
+输出：
+
+```text
+  case1 runs
+  case2 runs (fallthrough!)
+```
+
+`case 1` 后面没有 `break`，执行流**继续往下掉**进了 `case 2`。`case` 标签不阻断执行。
+
+编译器（`-Wextra -Wimplicit-fallthrough`）会警告：
+
+```text
+C:\cprobe\switch.c:9:9: warning: unannotated fall-through between switch labels [-Wimplicit-fallthrough]
+C:\cprobe\switch.c:9:9: note: insert '__attribute__((fallthrough));' to silence this warning
+```
+
+**每个 case 结尾都要 `break`**，除非你确实要贯穿——那时显式注释或用 `__attribute__((fallthrough));` 标注（C23 有 `[[fallthrough]]`）。
+
+### 陷阱 2：`default` 可以放在任何位置——但不改变匹配逻辑
+
+实测：
+
+```c
+switch (v) {      /* v == 1 */
+    default:
+        printf("  default hit\n");
+        break;
+    case 1:
+        printf("  case1 hit\n");
+}
+```
+
+输出：
+
+```text
+  case1 hit
+```
+
+`default` 写在最前面**不代表它优先**。匹配规则不变：先找匹配的 `case`，找不到才走 `default`。位置只影响"掉进去"的顺序。
+
+但注意：如果 `default` 在前且**没有 `break`**，执行流会掉进后面的 `case`。所以 `default` 放最后是最安全的习惯。
+
+**建议：总是写 `default`。** 即使只是 `break;`，它能防御未预料的值——在嵌入式里这能防止枚举被内存错误改写后走到不可控分支。
+
+### 陷阱 3：`case` 标签后不能直接声明变量
+
+错误写法：
+
+```c
+switch (v) {
+    case 1:
+        int local = 42;    /* 编译错误 / 至少是严重警告 */
+        break;
+}
+```
+
+正确写法——加花括号创建块作用域：
+
+```c
+switch (v) {
+    case 1: {
+        int local = 42;
+        printf("  local=%d\n", local);
+        break;
+    }
+    default:
+        break;
+}
+```
+
+实测输出：
+
+```text
+  local=42
+```
+
+原因是"跳过带初始化的声明"是非法的——跳到 `case 2` 会绕过 `local` 的初始化。加 `{}` 限制作用域即可。
+
+### 陷阱 4：`switch` 只能用于整型
+
+```c
+switch (str) { }         /* 错误：字符串不能用 switch */
+switch (f) { }           /* 错误：浮点不能 */
+switch (ptr) { }         /* 错误：指针不能 */
+```
+
+控制表达式会做**整数提升**，然后与 `case` 的**整型常量表达式**比较。`case` 后面必须是编译期常量，不能是变量。
+
+### 补充：`switch` 能处理负数
+
+实测：
+
+```c
+int n = -5;
+switch (n) {
+    case 1: printf("  one\n"); break;
+    case 2: printf("  two\n"); break;
+    default: printf("  default for %d\n", n);
+}
+```
+
+```text
+  default for -5
+```
+
+负数完全合法，只是没匹配上走了 `default`。
+
+---
+
+**翻页**：[← 上一页](./syntax-01) · [下一页 →](./syntax-03) · [返回目录](./)

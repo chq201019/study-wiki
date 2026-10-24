@@ -1,0 +1,226 @@
+---
+id: design-patterns
+title: 常用设计模式（C++）
+sidebar_position: 23
+description: 工厂、单例、观察者、策略、RAII 在 C++ 里的正确实现与常见误用，以及哪些模式在 C++ 里其实不需要。
+---
+
+# 常用设计模式（C++）
+
+**本课目标**：用 C++ 的正确方式实现常见模式，避免把 Java 习惯硬搬过来。
+
+## 工厂：让创建与使用分离
+
+```cpp
+class Shape {
+public:
+    virtual ~Shape() = default;
+    virtual double area() const = 0;
+};
+
+class Circle : public Shape { /* ... */ };
+class Rect   : public Shape { /* ... */ };
+
+/* 工厂返回 unique_ptr 表达所有权转移 */
+std::unique_ptr<Shape> make_shape(std::string_view kind) {
+    if (kind == "circle") return std::make_unique<Circle>(1.0);
+    if (kind == "rect")   return std::make_unique<Rect>(2.0, 3.0);
+    return nullptr;
+}
+```
+
+:::danger[工厂必须返回智能指针，不能返回裸指针]
+```cpp
+Shape* make_shape(...);                   /* 错：谁负责 delete？ */
+std::unique_ptr<Shape> make_shape(...);   /* 对：语义明确 */
+```
+
+**返回 `unique_ptr` 表示调用方独占**，返回 `shared_ptr` 表示共享，返回裸指针则表示不确定谁负责删除（几乎总是错的）。
+:::
+
+:::tip[C++ 里可以用注册表 + lambda 做动态工厂]
+```cpp
+using Factory = std::function<std::unique_ptr<Shape>()>;
+std::unordered_map<std::string, Factory> g_factories;
+
+void register_shape(const std::string& name, Factory f) {
+    g_factories[name] = std::move(f);
+}
+```
+
+**好处**：新增类型时不用改工厂函数。
+
+**代价**：注册依赖静态初始化，顺序可能出问题。
+:::
+
+## 单例：C++ 里最被滥用的模式
+
+```cpp
+class Config {
+public:
+    static Config& instance() {
+        static Config inst;          /* C++11 起线程安全的局部静态 */
+        return inst;
+    }
+    Config(const Config&) = delete;
+    Config& operator=(const Config&) = delete;
+private:
+    Config() = default;
+};
+```
+
+:::danger[单例的四个真实问题]
+1. **难以测试**：无法注入替代实现
+2. **隐藏依赖**：看函数签名不知道它用了全局状态
+3. **初始化顺序问题**：跨编译单元时不确定
+4. **生命周期**：析构时机不可控
+:::
+
+:::warning[大部分需要单例的场景其实是需要依赖注入]
+```cpp
+/* 错：到处调 Config::instance() */
+void foo() { auto v = Config::instance().get("k"); }
+
+/* 对：把依赖传进来 */
+void foo(const Config& cfg) { auto v = cfg.get("k"); }
+```
+
+**后者的测试不需要任何特殊处理**：传一个假的 Config 就行。
+:::
+
+**真正适合单例的**：日志器、硬件寄存器访问（确实全局唯一且无状态）。
+
+## 观察者：用 weak_ptr 避免悬挂
+
+```cpp
+class Subject {
+public:
+    void subscribe(std::shared_ptr<Observer> o) {
+        observers_.push_back(o);              /* 弱引用 */
+    }
+
+    void notify(int v) {
+        for (auto it = observers_.begin(); it != observers_.end(); ) {
+            if (auto sp = it->lock()) {
+                sp->on_event(v);
+                ++it;
+            } else {
+                it = observers_.erase(it);    /* 自动清理已销毁的 */
+            }
+        }
+    }
+
+private:
+    std::vector<std::weak_ptr<Observer>> observers_;
+};
+```
+
+:::danger[用强引用存观察者会导致对象永不释放]
+**Subject 活着，Observer 的引用计数至少 1，Observer 永远不会被销毁。**
+
+**用 `weak_ptr` 才能让被观察者先死正常工作。**
+:::
+
+:::warning[通知过程中有人退订怎么办]
+**在 notify 里遍历的同时如果观察者调用 unsubscribe，迭代器会失效。**
+
+**解法一**：拷贝一份再遍历。
+
+**解法二**：标记删除，遍历结束后统一清理。
+:::
+
+## 策略：C++ 有两种实现
+
+```cpp
+/* 运行时策略（虚函数） */
+class Compressor {
+public:
+    virtual ~Compressor() = default;
+    virtual std::string compress(std::string_view) = 0;
+};
+
+/* 编译期策略（模板参数） */
+template <typename Compression>
+class Writer { /* 用 Compression::compress(...) */ };
+```
+
+| 维度 | 虚函数 | 模板 |
+| --- | --- | --- |
+| 选择时机 | **运行时**（可读配置） | 编译期 |
+| 性能 | 一次间接调用 | **可内联** |
+| 代码体积 | 一份 | **每种组合一份** |
+
+**要根据配置文件选策略就必须用虚函数**：模板做不到。
+
+## RAII：这才是 C++ 最核心的模式
+
+:::tip[RAII 比其他模式更重要]
+**它不是一个可选的设计技巧，而是 C++ 资源管理的唯一正确方式。**
+
+```cpp
+{
+    std::lock_guard lk(m);          /* 加锁 */
+}                                   /* 自动解锁（含异常路径） */
+```
+:::
+
+**见 [RAII 与资源管理](./raii-extended)。**
+
+## C++ 里其实不需要的模式
+
+| 模式 | 为什么不需要 |
+| --- | --- |
+| **迭代器模式** | 标准库已有，直接实现 begin/end |
+| **模板方法** | 用模板 + 策略组合更灵活 |
+| **享元** | 用 shared_ptr + 对象池 |
+| **单例** | 优先考虑依赖注入 |
+
+:::warning[Java 的设计模式书不能直接照搬到 C++]
+**Java 里需要模式解决的问题，C++ 常常有语言级方案**：
+
+| Java 需要 | C++ 已有 |
+| --- | --- |
+| finalize | **析构函数（确定性）** |
+| try-with-resources | **RAII** |
+| 泛型 + 类型擦除 | **模板（零开销）** |
+| 接口 | **纯虚类 或 concept** |
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 工厂返回裸指针 | 所有权不明 | 返回 unique_ptr |
+| 单例难测试 | 全局状态 | 改依赖注入 |
+| 观察者对象不释放 | 存了 shared_ptr | 改 weak_ptr |
+| notify 中崩溃 | 遍历时修改容器 | 拷贝一份 |
+| 想运行时选策略却用了模板 | 编译期无法决定 | 改虚函数 |
+| 派生类析构不调用 | 基类析构没 virtual | 加 virtual |
+
+:::danger[虚基类的析构必须是 virtual]
+```cpp
+class Base {
+public:
+    ~Base() = default;          /* 错：通过基类指针 delete 不调用派生析构 */
+};
+```
+
+**这会导致派生类的资源泄漏**，而且是静默的。
+:::
+
+## 本课自检
+
+- [ ] **知道工厂应返回 unique_ptr 表达所有权**
+- [ ] 会用注册表 + lambda 做动态工厂
+- [ ] **知道单例的四个问题**
+- [ ] **知道大部分需要单例其实是需要依赖注入**
+- [ ] **知道观察者要用 weak_ptr 否则对象永不释放**
+- [ ] 知道 notify 中要拷贝一份再遍历
+- [ ] 能区分运行时策略与编译期策略
+- [ ] **知道 RAII 是 C++ 最核心的模式**
+- [ ] 知道哪些 GoF 模式在 C++ 里不需要
+- [ ] **知道虚基类析构必须 virtual**
+
+## 下一步
+
+[RAII 与资源管理](./raii-extended) 或 [模板实战模式](./template-practice)。

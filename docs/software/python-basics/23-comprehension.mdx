@@ -1,0 +1,473 @@
+---
+id: 23-comprehension
+title: 23 推导式与常用写法
+sidebar_position: 23
+description: 列表/字典/集合推导式的写法、条件筛选、以及可读性边界——什么时候该用，什么时候不该用。
+---
+
+# 23 推导式与常用写法
+
+**本课目标**：掌握推导式这个 Python 特色写法，同时知道它的可读性边界。
+
+## 从普通循环到推导式
+
+**目的**：把 `[1,2,3]` 变成 `[2,4,6]`。
+
+普通写法：
+
+```python
+result = []
+for x in [1, 2, 3]:
+    result.append(x * 2)
+print(result)
+```
+
+推导式：
+
+```python
+result = [x * 2 for x in [1, 2, 3]]
+print(result)
+```
+
+输出都是：
+
+```text
+[2, 4, 6]
+```
+
+**一行替代四行。**
+
+## 列表推导式的结构
+
+```text
+[x * 2   for x in [1,2,3]]
+ ↑          ↑
+做什么     遍历什么
+```
+
+完整语法：
+
+```text
+[表达式 for 变量 in 可迭代对象 if 条件]
+```
+
+三个部分：
+
+| 部分 | 作用 | 可省略 |
+| --- | --- | --- |
+| 表达式 | 每个元素变成什么 | 不可省 |
+| `for 变量 in 序列` | 从哪来 | 不可省 |
+| `if 条件` | 筛选 | 可省 |
+
+## 加条件筛选
+
+```python
+numbers = [1, 2, 3, 4, 5, 6]
+
+# 只要偶数
+evens = [x for x in numbers if x % 2 == 0]
+print(evens)
+
+# 只要大于 3 的
+big = [x for x in numbers if x > 3]
+print(big)
+```
+
+输出：
+
+```text
+[2, 4, 6]
+[4, 5, 6]
+```
+
+## 加条件变换（if-else）
+
+注意：**`if-else` 在表达式位置，`if` 筛选在末尾**。
+
+```python
+# 表达式里的三元运算
+labels = ["偶" if x % 2 == 0 else "奇" for x in range(4)]
+print(labels)
+```
+
+输出：
+
+```text
+['偶', '奇', '偶', '奇']
+```
+
+:::warning[两种 if 的位置不同，别混]
+```python
+# ① 筛选（末尾）：只保留符合条件的
+[x for x in nums if x > 0]
+
+# ② 变换（前面）：每个都要，但结果分两种
+[x if x > 0 else 0 for x in nums]
+```
+
+**筛选会减少元素个数，变换不会。**
+:::
+
+## 字符串处理实战
+
+```python
+words = ["  Hello ", "World  ", "  Python  "]
+
+# 去掉空格
+cleaned = [w.strip() for w in words]
+print(cleaned)
+
+# 转大写
+upper = [w.strip().upper() for w in words]
+print(upper)
+
+# 只保留长度大于 5 的
+long_words = [w.strip() for w in words if len(w.strip()) > 5]
+print(long_words)
+```
+
+输出：
+
+```text
+['Hello', 'World', 'Python']
+['HELLO', 'WORLD', 'PYTHON']
+['Python']
+```
+
+## 字典推导式
+
+```python
+# 单词 → 长度
+words = ["a", "bb", "ccc"]
+lengths = {w: len(w) for w in words}
+print(lengths)
+```
+
+输出：
+
+```text
+{'a': 1, 'bb': 2, 'ccc': 3}
+```
+
+### 实战：交换键值
+
+```python
+original = {"a": 1, "b": 2}
+flipped = {v: k for k, v in original.items()}
+print(flipped)
+```
+
+输出：
+
+```text
+{1: 'a', 2: 'b'}
+```
+
+### 实战：筛选字典
+
+```python
+scores = {"小明": 85, "小红": 92, "小刚": 78}
+
+# 只要及格的
+passed = {name: s for name, s in scores.items() if s >= 80}
+print(passed)
+```
+
+输出：
+
+```text
+{'小明': 85, '小红': 92}
+```
+
+## 集合推导式
+
+```python
+# 取余数，自动去重
+residues = {x % 3 for x in range(10)}
+print(residues)
+```
+
+输出：
+
+```text
+{0, 1, 2}
+```
+
+### 实战：去重同时转小写
+
+```python
+words = ["Hello", "HELLO", "world", "World"]
+unique = {w.lower() for w in words}
+print(unique)
+```
+
+输出（顺序可能不同，因为集合无序）：
+
+```text
+{'hello', 'world'}
+```
+
+## 嵌套循环的推导式
+
+```python
+pairs = [(i, j) for i in range(2) for j in range(2)]
+print(pairs)
+```
+
+输出：
+
+```text
+[(0, 0), (0, 1), (1, 0), (1, 1)]
+```
+
+等价于：
+
+```python
+pairs = []
+for i in range(2):
+    for j in range(2):
+        pairs.append((i, j))
+```
+
+:::warning[嵌套推导式可读性急剧下降]
+```python
+# 这还能看
+[(i, j) for i in range(3) for j in range(3) if i != j]
+
+# 这就别写了，用普通循环
+[[x*y for y in range(3)] for x in range(3)]
+```
+
+**经验法则：超过一个 for 或一个 if，就改用普通循环。**
+:::
+
+## 生成器表达式：省内存的版本
+
+把方括号换成圆括号：
+
+```python
+gen = (x * 2 for x in range(3))
+print(gen)
+print(list(gen))
+```
+
+输出：
+
+```text
+<generator object <genexpr> at 0x7f...>
+[0, 2, 4]
+```
+
+:::tip[生成器 vs 列表推导式]
+| | 列表推导式 `[...]` | 生成器 `(...)` |
+| --- | --- | --- |
+| 何时计算 | 立刻全部算出来 | 用到一个算一个 |
+| 内存 | 全部存在内存 | 只存当前一个 |
+| 能否重复遍历 | 能 | **不能**（用完就光） |
+
+```python
+gen = (x for x in range(3))
+print(list(gen))    # [0, 1, 2]
+print(list(gen))    # []  ← 已经用完了！
+```
+
+**处理大数据时用生成器**，能省下大量内存：
+
+```python
+# 逐行读 10GB 文件，内存占用极小
+total = sum(len(line) for line in open("huge.log", encoding="utf-8"))
+```
+:::
+
+## 配合 enumerate 和 zip
+
+### enumerate：要下标
+
+```python
+names = ["小明", "小红"]
+
+# 带序号
+numbered = [f"{i}. {n}" for i, n in enumerate(names, start=1)]
+print(numbered)
+```
+
+输出：
+
+```text
+['1. 小明', '2. 小红']
+```
+
+### zip：并行遍历两个列表
+
+```python
+names = ["小明", "小红"]
+scores = [90, 80]
+
+# 配对
+pairs = list(zip(names, scores))
+print(pairs)
+
+# 直接构造字典（超常用）
+score_dict = dict(zip(names, scores))
+print(score_dict)
+```
+
+输出：
+
+```text
+[('小明', 90), ('小红', 80)]
+{'小明': 90, '小红': 80}
+```
+
+:::tip[`dict(zip(a, b))` 是构造字典的利器]
+```python
+keys = ["name", "age", "city"]
+values = ["小明", 18, "北京"]
+
+# 传统写法
+d = {}
+for i in range(len(keys)):
+    d[keys[i]] = values[i]
+
+# zip 写法
+d = dict(zip(keys, values))
+```
+
+**一行顶四行。** 这对「两个等长列表合成字典」的场景非常常见。
+
+注意：`zip` 在长度不等时**以短的为准**，多余部分被丢弃。
+:::
+
+## 可读性边界：什么时候别用
+
+:::danger[推导式不是越长越好]
+```python
+# 这是一行，但谁能一眼看懂？
+result = [f(x) for x in data if x is not None and x > 0
+          and (x % 2 == 0 or x in special) if validate(x)]
+```
+
+**拆成普通循环更好**：
+
+```python
+result = []
+for x in data:
+    if x is None or x <= 0:
+        continue
+    if x % 2 != 0 and x not in special:
+        continue
+    if not validate(x):
+        continue
+    result.append(f(x))
+```
+
+**多几行，但一眼能看出逻辑。**
+:::
+
+判断标准：
+
+| 情况 | 建议 |
+| --- | --- |
+| 单个 for + 单个简单 if | ✅ 用推导式 |
+| 表达式里调用了复杂函数 | ⚠️ 考虑拆开 |
+| 嵌套 for | ❌ 用普通循环 |
+| 多个 if 组合 | ❌ 用普通循环 |
+| 有副作用（print、写文件） | ❌ 绝不用推导式 |
+
+:::warning[推导式里不要有副作用]
+```python
+# ❌ 不要这样
+[print(x) for x in range(3)]
+```
+
+能跑，但会创建一个 `[None, None, None]` 的无用列表，而且**违背了推导式「生成新序列」的本意**。
+
+要遍历执行动作，直接用 `for` 循环。
+:::
+
+## 其他常用简洁写法
+
+### 条件表达式（三元运算）
+
+```python
+age = 20
+status = "成年" if age >= 18 else "未成年"
+print(status)
+```
+
+### 用 any / all 做判断
+
+```python
+numbers = [2, 4, 6]
+
+print(all(x % 2 == 0 for x in numbers))     # 全部是偶数？
+print(any(x > 5 for x in numbers))          # 有大于 5 的吗？
+```
+
+输出：
+
+```text
+True
+True
+```
+
+:::tip[any/all 比手写循环清晰]
+```python
+# 传统写法
+has_big = False
+for x in numbers:
+    if x > 5:
+        has_big = True
+        break
+
+# any 写法
+has_big = any(x > 5 for x in numbers)
+```
+
+而且 `any`/`all` **短路求值**：找到结果立刻停，不会白跑。
+:::
+
+### 用 sum/max/min 配生成器
+
+```python
+scores = [85, 92, 78]
+
+print(sum(scores))
+print(max(scores))
+print(sum(s for s in scores if s >= 80))     # 只加及格的
+```
+
+输出：
+
+```text
+255
+92
+177
+```
+
+## 常见错误
+
+| 错误 | 问题 | 解决 |
+| --- | --- | --- |
+| 筛选和变换的 if 位置搞混 | 结果不对 | 筛选在末尾，变换在前面 |
+| 生成器当列表重复用 | 第二次是空的 | 需要重复用就转 list |
+| 推导式太长 | 难读 | 拆成循环 |
+| 推导式里有 print | 生成 None 列表 | 改用 for 循环 |
+| 嵌套太深 | 完全看不懂 | 坚决用普通循环 |
+| 忘记 zip 以短的为准 | 数据丢失 | 先检查长度 |
+
+## 本课自检
+
+- [ ] 会写列表推导式 `[表达式 for x in 序列 if 条件]`
+- [ ] 分清「筛选的 if」和「变换的 if-else」位置不同
+- [ ] 会写字典推导式和集合推导式
+- [ ] 知道生成器和列表推导式的区别（内存、能否重复用）
+- [ ] 会用 `enumerate` 取下标
+- [ ] 会用 `dict(zip(a, b))` 构造字典
+- [ ] **知道什么时候不该用推导式**
+- [ ] 知道推导式里不该有副作用
+- [ ] 会用 `any` / `all`
+
+## 下一步
+
+[24 阶段实战：通讯录](./24-project-contacts) —— 用类 + 文件把前 10 课串成一个完整应用。

@@ -1,0 +1,269 @@
+---
+id: syntax-04
+title: "04 解包：Python 的标志性甜语法"
+sidebar_position: 5
+description: "语法基础 第 4 部分：解包：Python 的标志性甜语法"
+---
+
+# 04 解包：Python 的标志性甜语法
+```python
+a, b = 1, 2
+print("before:", a, b)
+a, b = b, a                    # 交换，不需要临时变量
+print("after: ", a, b)
+```
+
+```text
+before: 1 2
+after:  2 1
+```
+
+交换能成立，是因为**右侧的元组先被完整构造出来**，再依次赋给左边。
+
+星号解包收集「剩下的」：
+
+```python
+first, *rest = [1, 2, 3, 4]
+print("first:", first, "| rest:", rest)
+
+x, *mid, y = [1, 2, 3, 4]
+print("x:", x, "| mid:", mid, "| y:", y)
+```
+
+```text
+first: 1 | rest: [2, 3, 4]
+x: 1 | mid: [2, 3] | y: 4
+```
+
+`*` 拿到的永远是**列表**，即使只有一个元素或零个元素。
+
+字典合并（3.5+ 的双星号，3.9+ 的 `|`）：
+
+```python
+base = {"a": 1}
+print({**base, "b": 2})
+print(base | {"b": 2})        # 3.9+
+```
+
+```text
+{'a': 1, 'b': 2}
+{'a': 1, 'b': 2}
+```
+
+## 12. f-string 格式化规范
+
+Python 3.6 引入的 f-string 是首选格式化方式——快、可读、内联表达式。
+
+```python
+name = "bob"
+score = 93.4567
+print(f"{name:>10} | {score:.2f} | {score:06.1f}")
+print(f"{1024:x} {1024:#x} {1024:b} {1024:,}")
+print(f"{0.1234:.1%}")
+print(f"{name=} {score=}")          # 3.8+ 调试神器，连变量名一起打印
+print(f"{'lit'!r} {10!s}")
+```
+
+```text
+       bob | 93.46 | 0093.5
+400 0x400 10000000000 1,024
+12.3%
+name='bob' score=93.4567
+'lit' 10
+```
+
+格式规范的通用结构是 `[[fill]align][sign][#][0][width][,][.precision][type]`：
+
+| 部分 | 含义 | 例子 |
+| --- | --- | --- |
+| `>10` | 右对齐，宽 10 | `f"{'bob':>10}"` |
+| `<10` / `^10` | 左对齐 / 居中 | |
+| `.2f` | 保留 2 位小数 | `f"{3.14159:.2f}"` → `3.14` |
+| `06.1f` | 宽 6，补 0，1 位小数 | `0093.5` |
+| `,` | 千分位 | `1,024` |
+| `x` / `b` / `o` | 十六 / 二 / 八进制 | `400` / `10000000000` |
+| `#x` | 带前缀的十六进制 | `0x400` |
+| `.1%` | 百分比 | `12.3%` |
+| `!r` | 用 `repr()` 转换 | `'lit'` |
+| `=` | 3.8+ 自调试 | `name='bob'` |
+
+:::tip[`f"{x=}"` 是调试时最省事的一招]
+调试时不用再写 `print("x =", x)`，直接 `print(f"{x=}")` 就输出 `x=5`。比体感快三倍。
+
+另外，格式化常量应该用 `.format` 或 `%`，但日常用途里 f-string 几乎总是最优选。
+:::
+
+## 13. 输入与输出
+
+```python
+name = input("请输入名字: ")      # 永远返回字符串，需要自己转类型
+print("你好,", name)
+print("a", "b", "c", sep="-", end="!\n")
+```
+
+```text
+请输入名字: bob
+你好, bob
+a-b-c!
+```
+
+`print` 的两个实用参数：
+
+- `sep`：多个值之间的分隔符，默认空格
+- `end`：结尾，默认换行
+
+`input()` **永远返回字符串**。要数字必须转：
+
+```python
+age = int(input("年龄: "))       # 用户输入非数字时抛 ValueError
+```
+
+## 14. 一个完整例子：把这一页串起来
+
+写一个「成绩统计」程序，用上变量、控制流、格式化：
+
+```python
+import sys
+
+
+def parse_score(raw: str) -> int | None:
+    """把输入解析成 0~100 的成绩，失败返回 None。"""
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    if not 0 <= value <= 100:      # 链式比较
+        return None
+    return value
+
+
+def grade(score: int) -> str:
+    if score >= 90:
+        return "A"
+    elif score >= 80:
+        return "B"
+    elif score >= 60:
+        return "C"
+    else:
+        return "D"
+
+
+def main(argv: list[str]) -> int:
+    raw_scores = argv[1:] or ["95", "72", "abc", "88", "101", "55"]
+    scores: list[int] = []
+
+    for i, raw in enumerate(raw_scores, start=1):
+        value = parse_score(raw)
+        if value is None:
+            print(f"  第 {i} 项 {raw!r} 无效，已跳过")
+            continue
+        scores.append(value)
+
+    if not scores:                  # 空列表是假值
+        print("没有有效成绩")
+        return 1
+
+    print(f"\n有效成绩: {scores}")
+    print(f"平均: {sum(scores) / len(scores):.1f}")
+    print(f"最高: {max(scores)}  最低: {min(scores)}")
+
+    for s in sorted(scores, reverse=True):
+        print(f"  {s:>3} -> {grade(s)}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+```
+
+预期输出：
+
+```text
+  第 3 项 'abc' 无效，已跳过
+  第 5 项 '101' 无效，已跳过
+
+有效成绩: [95, 72, 88, 55]
+平均: 77.5
+最高: 95  最低: 55
+   95 -> A
+   88 -> B
+   72 -> C
+   55 -> D
+```
+
+这个例子里有本页的全部要点：链式比较 `0 <= value <= 100`、`is None` 判断、空列表当假值、`enumerate` 带下标、f-string 对齐、`if __name__ == "__main__"`。
+
+## 15. 验证：你应该能预测这些输出
+
+不看答案，先自己在脑子里跑一遍：
+
+```python
+print(1 < 2 < 3)                 # 链式比较
+print([] or {} or "x")           # or 返回操作数
+print(bool("0"), bool([]), bool([0]))
+print(7 // 2, -7 // 2, 7 % 2, -7 % 2)
+print(round(2.5), int(2.9))
+print(0.1 + 0.2 == 0.3)
+```
+
+:::info[答案（先自己算，再对照）]
+```text
+True
+x
+True False True
+3 -4 1 1
+2 2
+False
+```
+
+逐条解释：
+
+1. `1 < 2 < 3` 展开成 `(1 < 2) and (2 < 3)`，为 `True`
+2. `[]` 和 `{}` 都是假值，`or` 一路往后找，返回第一个真值 `"x"`
+3. `"0"` 是非空字符串（真），`[]` 是空容器（假），`[0]` 是含一个元素的列表（真）
+4. `//` 向下取整所以 `-7 // 2 == -4`；`%` 符号跟随除数所以 `-7 % 2 == 1`
+5. `round(2.5)` 银行家舍入取偶数得 `2`；`int(2.9)` 是截断不是四舍五入，得 `2`
+6. `0.1 + 0.2` 得 `0.30000000000000004`，所以用 `==` 比较浮点永远是错的
+:::
+
+## 常见坑
+
+| 现象 | 真实原因 | 解决 |
+| --- | --- | --- |
+| 改了 `y`，`x` 也跟着变 | `y = x` 只是加了个标签，没有复制 | `y = x.copy()` 或 `list(x)`；第 4 页详解深浅拷贝 |
+| `257 is 257` 有时 True 有时 False | 小整数缓存是实现细节 | 比较值一律用 `==`，`is` 只用于 `None` |
+| `0.1 + 0.2 != 0.3` | IEEE 754 二进制浮点固有性质 | `math.isclose()`；金额用 `Decimal` |
+| `count or "无"` 把合法的 `0` 吞了 | `or` 把所有假值一视同仁 | 显式判断 `is None` |
+| `for ... else` 的 `else` 不执行 | 循环里 `break` 了 | `else` 的语义是「没被 break」 |
+| `TabError` 缩进报错 | 混用了 Tab 和空格 | 编辑器设置 Tab 转空格 |
+| 循环里 `s += str(i)` 越来越慢 | 字符串不可变，每次拼接都新建对象 | 用 `"".join(...)` |
+| `zip` 悄悄丢数据 | 以最短的序列为准 | 3.10+ 加 `strict=True` |
+| `input()` 得到的数字比较出错 | `input` 永远返回字符串 | `int(input(...))`，并捕获 `ValueError` |
+| `except:` 让程序 Ctrl+C 停不下来 | 裸 except 捕获了 `KeyboardInterrupt` | 至少写 `except Exception:`，最好捕获具体类型 |
+| 自己的文件 `json.py` 导致标准库失效 | 文件名遮蔽了标准库模块 | 改名；用 `json.__file__` 确认 |
+| `-7 // 2` 得到 `-4` 而不是 `-3` | Python 是向下取整，不是向零截断 | 这是设计如此；要截断用 `int(-7 / 2)` |
+
+## 自检清单
+
+- [ ] 能解释「变量是标签不是盒子」，并说出 `id()` 的作用
+- [ ] 知道 `==` 和 `is` 的区别，以及 `is` 的唯一日常用途
+- [ ] 能背出全部的「假值」有哪些
+- [ ] 知道 `and` / `or` 返回的是操作数而不是布尔值
+- [ ] 能解释 `-7 // 2 == -4` 和 `-7 % 2 == 1` 为什么是这样
+- [ ] 知道为什么不能用 `==` 比较浮点数，以及替代方案
+- [ ] 会用链式比较、`enumerate`、`zip(strict=True)`
+- [ ] 能解释 `for-else` 什么时候执行，并举出实际用途
+- [ ] 知道 `try/except/else/finally` 四个子句各自的分工
+- [ ] 会用星号解包做「取剩余」，知道 `*` 的结果是列表
+- [ ] 能独立写出本节第 14 个例子那样的完整程序
+
+## 下一步
+
+语法骨架有了，现在深入每一种数据类型背后的实现：[内建数据类型](./datatypes)。
+
+**参考链接**：[Python 官方教程](https://docs.python.org/zh-cn/3/tutorial/index.html) · [内建类型文档](https://docs.python.org/zh-cn/3/library/stdtypes.html) · [f-string 格式规范](https://docs.python.org/zh-cn/3/library/string.html#format-specification-mini-language)
+
+---
+
+**翻页**：[← 上一页](./syntax-03) · [返回目录](./)

@@ -1,0 +1,195 @@
+---
+id: chrono
+title: 时间库 chrono
+sidebar_position: 21
+description: duration 与 time_point 的类型陷阱、整数除法截断、steady_clock 为什么不能用来报日期、格式化与解析的 C++20 方案。
+---
+
+# 时间库 chrono
+
+**本课目标**：不再写出"计时得到 0"或"日期差一天"的代码。
+
+## 三个核心概念
+
+| 类型 | 含义 | 例子 |
+| --- | --- | --- |
+| **`duration`** | 一段时间 | `seconds(5)` |
+| **`time_point`** | 一个时刻 | `system_clock::now()` |
+| **`clock`** | 时间的来源 | `system_clock` / `steady_clock` |
+
+## duration 的单位陷阱
+
+:::danger[整数除法会截断到 0]
+```cpp
+auto start = std::chrono::steady_clock::now();
+do_work();
+auto end = std::chrono::steady_clock::now();
+
+/* ❌ 如果 do_work 只花 500 微秒，这里得到 0 */
+auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+```
+
+**`duration_cast` 是截断，不是四舍五入。**
+
+**要微秒就转微秒，或保留原始精度**：
+
+```cpp
+auto us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+```
+:::
+
+:::tip[浮点 duration 能保留小数]
+```cpp
+std::chrono::duration<double, std::milli> ms = end - start;
+std::cout << ms.count() << " ms\n";        // 0.512 ms
+```
+
+**要小数就用浮点 `duration`，别用整数 `duration_cast`。**
+:::
+
+## 两种 clock 的用途
+
+| clock | 单调递增 | 用途 |
+| --- | --- | --- |
+| **`steady_clock`** | ✅ **保证** | **测量耗时** |
+| `system_clock` | ❌（NTP 会调） | 报日期时间 |
+| `high_resolution_clock` | 视实现 | **不推荐直接用** |
+
+:::danger[用 `system_clock` 测耗时会被 NTP 坑]
+```cpp
+/* ❌ 系统时间被 NTP 校正时，耗时可能是负数或巨大值 */
+auto t0 = std::chrono::system_clock::now();
+do_work();
+auto dt = std::chrono::system_clock::now() - t0;
+```
+
+**测耗时一律用 `steady_clock`。**
+:::
+
+:::warning[`high_resolution_clock` 是 `system_clock` 的别名]
+**在很多实现上（GCC/libstdc++），`high_resolution_clock` 就是 `system_clock`** —— 不单调。
+
+**所以它"看起来更精确"，但测耗时同样会被 NTP 坑。**
+
+**测耗时用 `steady_clock`，别用 `high_resolution_clock`。**
+:::
+
+## C++20 的日历与格式化
+
+```cpp
+#include <chrono>
+#include <format>
+
+auto now = std::chrono::system_clock::now();
+std::cout << std::format("{:%Y-%m-%d %H:%M:%S}", now);
+```
+
+:::danger[`std::format` 的时间支持需要较新的标准库]
+**GCC 13+ / Clang 17+ / MSVC 19.29+。**
+
+**降级方案**：
+
+```cpp
+/* C++17：转 time_t 再用 strftime */
+std::time_t t = std::chrono::system_clock::to_time_t(now);
+std::tm tm = *std::localtime(&t);
+char buf[64];
+std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+```
+
+**`localtime` 不是线程安全的** —— 多线程用 `localtime_r`（POSIX）/ `localtime_s`（Windows）。
+:::
+
+```cpp
+/* C++20 日历类型 */
+using namespace std::chrono;
+year_month_day ymd{year{2026}, month{1}, day{15}};
+
+/* 日期加减 */
+auto next_week = sys_days{ymd} + days{7};
+```
+
+## 常用换算
+
+```cpp
+using namespace std::chrono;
+
+/* 秒 → 毫秒 */
+auto ms = duration_cast<milliseconds>(seconds(3));     // 3000
+
+/* 毫秒 → 秒（会截断） */
+auto s = duration_cast<seconds>(milliseconds(3500));   // 3
+
+/* time_point → 时间戳 */
+auto ts = duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
+```
+
+:::warning[时间戳的秒/毫秒混淆]
+```cpp
+auto ts_ms = duration_cast<milliseconds>(
+    system_clock::now().time_since_epoch()).count();      // 13 位
+auto ts_s  = duration_cast<seconds>(
+    system_clock::now().time_since_epoch()).count();      // 10 位
+```
+
+**对接 JS（毫秒）和 Unix（秒）时要格外小心。**
+:::
+
+## 测量耗时的正确模板
+
+```cpp
+template <typename F>
+auto time_it(F&& f) {
+    auto t0 = std::chrono::steady_clock::now();
+    f();
+    auto dt = std::chrono::steady_clock::now() - t0;
+    return std::chrono::duration<double, std::milli>(dt).count();
+}
+
+std::cout << time_it([]{ do_work(); }) << " ms\n";
+```
+
+:::tip[要不要 `DoNotOptimize`]
+**`do_work()` 如果没有副作用，`-O2` 可能把它整个删掉** —— 测出 0 ms。
+
+**Google Benchmark 提供 `DoNotOptimize()` 来阻止优化**；自己写时可以用 `volatile` 或把结果输出。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 计时得到 0 | `duration_cast` 截断 | 转更小单位或浮点 duration |
+| 耗时是负数 | 用了 `system_clock` | 改 `steady_clock` |
+| 测不出时间 | 代码被优化掉 | 用 `DoNotOptimize` 或 volatile |
+| 日期差一天 | 时区/夏令时 | 用 `sys_days` 而非手工加减 |
+| `strftime` 结果错乱 | `localtime` 非线程安全 | 用 `localtime_r` |
+| 格式化编译不过 | 标准库太旧 | 用 `strftime` 降级 |
+| 时间戳差 1000 倍 | 秒/毫秒混淆 | 明确定义单位 |
+
+:::danger[`duration_cast` 对负值会向零取整]
+```cpp
+auto d = duration_cast<seconds>(milliseconds(-1500));
+/* 结果是 -1 秒（不是 -2） */
+```
+
+**这会影响"时间差"的边界计算，金融/计费场景要特别注意。**
+:::
+
+## 本课自检
+
+- [ ] 能区分 `duration` / `time_point` / `clock`
+- [ ] **知道 `duration_cast` 是截断，测短代码会得到 0**
+- [ ] **知道用浮点 `duration` 保留小数**
+- [ ] **知道测耗时必须用 `steady_clock`**
+- [ ] **知道 `high_resolution_clock` 可能在实现上就是 `system_clock`**
+- [ ] 知道 C++20 的 `std::format` 时间支持需要新标准库
+- [ ] 知道 `localtime` 非线程安全
+- [ ] 会换算秒/毫秒/微秒，知道时间戳 10 位 vs 13 位
+- [ ] **知道代码被优化掉会测出 0，需要 `DoNotOptimize`**
+- [ ] **知道 `duration_cast` 对负值向零取整**
+
+## 下一步
+
+[STL 容器选型实战](./container-choice) 或 [C++ 并发](./thread)。

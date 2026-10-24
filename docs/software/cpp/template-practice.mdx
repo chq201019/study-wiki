@@ -1,0 +1,350 @@
+---
+id: template-practice
+title: 模板实战模式
+sidebar_position: 19
+description: CRTP 静态多态、策略模式、类型擦除、标签分派、以及"什么时候别用模板"的三条判据。
+---
+
+# 模板实战模式
+
+**本课目标**：认识四种常用的模板设计模式，知道各自替代了什么。
+
+## 模式一：CRTP（静态多态）
+
+:::info[通过把自己当模板参数传进去，实现编译期多态]
+```cpp
+template <typename Derived>
+class Shape {
+public:
+    double area() const {
+        return static_cast<const Derived*>(this)->area_impl();
+    }
+    void describe() const {
+        std::cout << "area = " << area() << "\n";
+    }
+};
+
+class Circle : public Shape<Circle> {
+public:
+    explicit Circle(double r) : r_(r) {}
+    double area_impl() const { return 3.14159 * r_ * r_; }
+private:
+    double r_;
+};
+
+class Rect : public Shape<Rect> {
+public:
+    Rect(double w, double h) : w_(w), h_(h) {}
+    double area_impl() const { return w_ * h_; }
+private:
+    double w_, h_;
+};
+```
+:::
+
+:::tip[CRTP 替代了什么]
+**替代虚函数**：
+
+| 维度 | 虚函数 | CRTP |
+| --- | --- | --- |
+| 调用开销 | 一次间接跳转（虚表） | **零（可能内联）** |
+| 对象大小 | +8 字节（vptr） | **+0** |
+| 能否运行时多态 | ✅ | ❌ **编译期确定** |
+| 代码体积 | 一份实现 | **每种类型一份（模板实例化）** |
+| 能否放容器 | ✅ `vector<unique_ptr<Base>>` | ❌（不同类型不兼容） |
+:::
+
+:::danger[CRTP 的致命限制：不同类型不能混放]
+```cpp
+std::vector<Shape<Circle>> v;      // 只能放 Circle
+// 想把 Circle 和 Rect 放同一个容器 → 做不到
+```
+
+**要运行时多态（异构容器、插件、动态加载）就必须用虚函数或类型擦除。**
+:::
+
+## 模式二：策略模式（模板参数）
+
+```cpp
+// 策略作为模板参数，编译期绑定
+template <typename Compression>
+class FileWriter {
+public:
+    void write(const std::string& data) {
+        auto compressed = Compression::compress(data);
+        write_raw(compressed);
+    }
+private:
+    void write_raw(const std::string&);
+};
+
+struct NoCompression {
+    static std::string compress(const std::string& s) { return s; }
+};
+
+struct GzipCompression {
+    static std::string compress(const std::string& s) { /* ... */ }
+};
+
+FileWriter<NoCompression>   fast_writer;
+FileWriter<GzipCompression> small_writer;
+```
+
+:::tip[对比虚函数版策略]
+```cpp
+// 运行时版
+class Compressor { public: virtual std::string compress(const std::string&) = 0; };
+std::unique_ptr<Compressor> comp;
+
+// 模板版
+FileWriter<GzipCompression> w;
+```
+
+| | 虚函数 | 模板 |
+| --- | --- | --- |
+| 选择时机 | **运行时**（可读配置） | **编译期**（写死在代码里） |
+| 性能 | 间接调用 | **可内联** |
+| 组合爆炸 | 无 | **每个组合一份代码** |
+:::
+
+:::danger[模板参数组合会导致代码膨胀]
+```cpp
+FileWriter<NoCompression>
+FileWriter<GzipCompression>
+FileWriter<NoCompression, Encrypted>
+FileWriter<GzipCompression, Encrypted>
+// 3 个策略 2 个维度 = 6 份完整实现
+```
+
+**每份都是独立的机器码** —— 嵌入式项目里会撑爆 Flash。
+
+**策略维度多于 2 个时，考虑类型擦除或虚函数**。
+:::
+
+## 模式三：类型擦除
+
+:::info[对外统一接口，对内任意类型]
+```cpp
+class AnyCallable {
+public:
+    template <typename F>
+    AnyCallable(F&& f)
+        : impl_(std::make_unique<Model<std::decay_t<F>>>(std::forward<F>(f))) {}
+
+    void operator()() const { impl_->call(); }
+
+private:
+    struct Concept {
+        virtual ~Concept() = default;
+        virtual void call() const = 0;
+    };
+
+    template <typename F>
+    struct Model : Concept {
+        explicit Model(F f) : f_(std::move(f)) {}
+        void call() const override { f_(); }
+        F f_;
+    };
+
+    std::unique_ptr<Concept> impl_;
+};
+```
+
+**这就是 `std::function` 的原理** —— 用一层虚函数包装任意可调用对象。
+:::
+
+:::tip[标准库里现成的类型擦除]
+| 类型 | 擦除掉了什么 |
+| --- | --- |
+| **`std::function<Sig>`** | 可调用对象的**具体类型** |
+| `std::any` | 任意类型的**具体类型** |
+| `std::shared_ptr<void>` | 指针的**具体类型**（靠 deleter 保正确析构） |
+| `std::span<T>` | 容器的**具体类型**（只保留连续内存视图） |
+| `std::string_view` | 字符串容器的**具体类型** |
+
+**需要"异构容器 + 统一接口"时，先看标准库有没有现成的** —— 大多数情况不需要自己写。
+:::
+
+## 模式四：标签分派
+
+```cpp
+// 用类型标签在编译期选择重载
+struct fast_tag {};
+struct safe_tag {};
+
+template <typename Tag>
+void process_impl(int* p, size_t n, Tag);
+
+template <>
+void process_impl(int* p, size_t n, fast_tag) { /* 不检查边界 */ }
+
+template <>
+void process_impl(int* p, size_t n, safe_tag) { /* 检查边界 */ }
+
+// 对外接口
+template <typename Tag = safe_tag>
+void process(int* p, size_t n) {
+    process_impl(p, n, Tag{});
+}
+```
+
+:::warning[C++17 后优先用 `if constexpr` 而不是标签分派]
+```cpp
+enum class Mode { Fast, Safe };
+
+template <Mode M>
+void process(int* p, size_t n) {
+    if constexpr (M == Mode::Safe) {
+        check_bounds(p, n);
+    }
+    do_work(p, n);
+}
+```
+
+**比标签分派清晰得多，也不需要写多个重载。**
+:::
+
+## 三个真实应用
+
+:::tip[① 编译期字符串（避免运行期哈希）]
+```cpp
+template <size_t N>
+struct FixedString {
+    char data[N]{};
+    constexpr FixedString(const char (&s)[N]) {
+        for (size_t i = 0; i < N; ++i) data[i] = s[i];
+    }
+    constexpr bool operator==(const FixedString&) const = default;
+};
+```
+
+**用途**：把字符串作为模板参数（用来做编译期注册表、类型安全的配置键）。
+:::
+
+:::tip[② 类型安全的单位]
+```cpp
+template <typename Tag, typename T = double>
+class Quantity {
+public:
+    explicit constexpr Quantity(T v) : v_(v) {}
+    constexpr T value() const { return v_; }
+private:
+    T v_;
+};
+
+using Meters = Quantity<struct MeterTag>;
+using Seconds = Quantity<struct SecondTag>;
+
+// Meters m = Seconds{1};       // ❌ 类型不匹配，编译期就报错
+```
+
+**零运行时开销，但把"把秒当米用"这类 bug 变成编译错误。**
+:::
+
+:::tip[③ 编译期注册表]
+```cpp
+// 让类型自己"注册"到一张静态表里
+template <typename... Ts>
+struct Registry {
+    static constexpr size_t size = sizeof...(Ts);
+};
+```
+
+## 什么时候别用模板
+
+:::
+
+:::danger[三条明确的停手判据]
+**① 只有一处使用**
+
+模板的价值是复用。**只用一次的东西写成普通函数/类更好维护。**
+
+**② 错误信息已经看不懂了**
+
+如果一段模板代码出错时你需要在几十层展开里找线索 —— **它太复杂了**。
+
+**③ 编译时间明显变长**
+
+模板爆炸会让编译时间指数增长。**开发迭代慢下来的损失远大于运行时收益。**
+:::
+
+:::warning[可读性永远是第一优先级]
+```cpp
+// 这段很"高级"，但半年后没人敢改
+template <typename... Ts>
+auto process(Ts&&... ts) {
+    return std::apply([&](auto&&... xs) {
+        return ((xs * 2) + ...);
+    }, std::forward_as_tuple(ts...));
+}
+
+// 等价且清晰
+int process(int a, int b) { return a * 2 + b * 2; }
+```
+
+**"聪明"的代码在团队里是负债。**
+:::
+
+:::tip[用 C++20 概念改善可读性]
+```cpp
+// 旧写法：错误信息几百行
+template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
+void f(T x);
+
+// 新写法：报错一行说清
+template <std::integral T>
+void f(T x);
+```
+
+**概念（concepts）显著改善了模板的报错质量** —— 见 [C++20 概念](./concepts)。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 编译时间暴涨 | 模板层层递归 | 用折叠表达式/concepts 替代 |
+| 二进制体积暴涨 | 每种类型一份实例 | 减少模板参数组合或用虚函数 |
+| 报错几百行 | 模板展开 | 用 concepts 约束 |
+| CRTP 类型不能混放 | 无运行时多态 | 改虚函数或类型擦除 |
+| 模板定义放 `.cpp` | 链接时找不到实现 | 放头文件或显式实例化 |
+| 循环依赖 | A 依赖 B 的模板 | 前置声明或抽公共基类 |
+| `if constexpr` 里语法错还报错 | 语法检查不做丢弃 | 保证语法正确 |
+
+:::danger[模板必须放在头文件里（除非显式实例化）]
+```cpp
+// util.h
+template <typename T> T twice(T x);       // 只有声明
+
+// util.cpp
+template <typename T> T twice(T x) { return x * 2; }
+// ❌ 其他 .cpp 链接时找不到实现 → undefined reference
+```
+
+**因为编译器要在"使用处"看到完整定义才能实例化。**
+
+**两种解法**：全部写头文件（常见），或在 `.cpp` 末尾显式实例化：
+
+```cpp
+template int twice<int>(int);
+template double twice<double>(double);
+```
+:::
+
+## 本课自检
+
+- [ ] **理解 CRTP 的原理（把自己当模板参数传给基类）**
+- [ ] **知道 CRTP 是编译期多态，零调用开销**
+- [ ] **知道 CRTP 的不同类型不能放进同一个容器**
+- [ ] 会用模板参数实现编译期策略
+- [ ] **知道策略组合会导致代码膨胀，维度多了要换方案**
+- [ ] 理解类型擦除的原理（虚函数 + 模板包装）
+- [ ] **知道 `std::function` / `std::any` / `span` / `string_view` 都是类型擦除**
+- [ ] 知道 C++17 后应优先用 `if constexpr` 而非标签分派
+- [ ] 会写编译期字符串与类型安全的单位
+- [ ] **记住三条停手判据（只用一次/报错看不懂/编译变慢）**
+- [ ] **知道模板必须放头文件，否则要显式实例化**
+
+## 下一步
+
+[C++20 概念](./concepts) 或 [模板元编程](./metaprogramming)。

@@ -1,0 +1,190 @@
+---
+id: lwip
+title: lwIP 与网络栈
+sidebar_position: 4
+description: socket 模型入门、TCP/UDP 实战与超时纪律、HTTP 客户端、MQTT、协议栈内存调优与连接管理。
+---
+
+# lwIP 与网络栈
+
+设备拿到 IP（上一章）之后，要真正"说话"就得走网络协议。**lwIP** 是 ESP-IDF 内置的轻量级 TCP/IP 协议栈——"轻量"是相对电脑操作系统里那些协议栈而言的，它用很少的内存实现了完整的 TCP/UDP/DNS/DHCP。
+
+**socket（套接字）**是网络编程的通用名词：你可以把它想成"信箱"——程序往 socket 里写数据，协议栈负责按地址投递；对方 socket 收到后取走。**这套 API 是全行业通用的**（电脑上的 Linux/Windows 网络编程用的是几乎一样的接口），学会一次，到处能用。
+
+日常开发里，底下的 socket 大多被封装好的客户端组件替你管了（HTTP 用 `esp_http_client`、MQTT 用 `esp-mqtt`）。但排错和理解超时、连接数这些问题，必须懂底下的 socket 模型——这就是本章的内容。
+
+## 0. 先懂一点 TCP 和 UDP 的区别
+
+| | TCP | UDP |
+| --- | --- | --- |
+| 连接 | 先"握手"建立连接再发 | 拿起就发，不管对方在不在 |
+| 可靠性 | 保证送到、保证顺序（丢了自动重发） | 不保证——丢了就丢了 |
+| 类比 | 挂号信（签收回执） | 传单（撒出去完事） |
+| 适合 | 网页、MQTT、文件传输 | 视频流、游戏包、ESP-NOW 式快报 |
+
+选型一句话：**要"一定送到"用 TCP，要"快和省"且丢一点无所谓用 UDP**。绝大多数字联网应用选 TCP。
+
+## 1. 常用 API 地图
+
+| 头文件 | 提供 |
+| --- | --- |
+| `lwip/sockets.h` | `socket` `bind` `connect` `send` `recv` `listen` `accept` `close` |
+| `lwip/netdb.h` | `gethostbyname` DNS 解析 |
+| `lwip/inet.h` | `htons` `inet_ntoa` 地址换算 |
+| `esp_http_client` | HTTP 客户端（推荐，省事） |
+| `esp_websocket_client` | WebSocket |
+| `esp-mqtt` | MQTT 客户端 |
+
+### TCP 客户端完整示例（手工 HTTP）
+
+```c
+#include <lwip/sockets.h>
+#include <string.h>
+
+int http_get(const char *host, uint16_t port, const char *path) {
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(port);                    // 端口号要转网络字节序（大端）
+    inet_pton(AF_INET, host, &addr.sin_addr);         // 字符串 IP → 结构体
+
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) return -1;
+
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));   // 收超时 5 秒
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));   // 发超时 5 秒
+
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        ESP_LOGE(TAG, "连接失败: errno=%d", errno);
+        close(sock);
+        return -1;
+    }
+
+    char req[256];
+    int req_len = snprintf(req, sizeof(req),
+             "GET %s HTTP/1.1\r\n"
+             "Host: %s\r\n"
+             "Connection: close\r\n"
+             "\r\n", path, host);
+    send(sock, req, req_len, 0);
+
+    char buf[512];
+    int total = 0, n;
+    while ((n = recv(sock, buf + total, sizeof(buf) - total - 1, 0)) > 0) {
+        total += n;
+        if (total >= (int)sizeof(buf) - 1) break;
+    }
+    buf[total] = 0;
+    close(sock);
+    ESP_LOGI(TAG, "收到 %d 字节", total);
+    return total;
+}
+```
+
+:::danger[一定要设置 `SO_RCVTIMEO`/`SO_SNDTIMEO`]
+socket 的 `recv`/`connect` **默认是永久阻塞**——服务器不响应时任务永远卡住，看门狗把整个系统复位。**每个 socket 创建后第一件事就是设超时**。这是网络编程第一铁律。
+:::
+
+### UDP（更简单的选择）
+
+```c
+int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);   // SOCK_DGRAM = UDP
+
+struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(5000) };
+inet_pton(AF_INET, "192.168.1.100", &to.sin_addr);
+sendto(sock, buf, len, 0, (struct sockaddr *)&to, sizeof(to));   // 每包自带地址
+```
+
+UDP 没有 connect/握手，每个包都带目标地址（sendto）。也不需要"断开"——close 就完了。
+
+## 2. HTTP 客户端（推荐）
+
+手写 HTTP 只在理解原理时用，日常直接用封装好的组件：
+
+```c
+esp_http_client_config_t cfg = {
+    .url = "http://example.com/api",
+    .method = HTTP_METHOD_POST,
+    .timeout_ms = 10000,                     // ★ 默认也有超时，但明写更安心
+    .event_handler = http_event_handler,     // 接收数据的回调
+};
+esp_http_client_handle_t c = esp_http_client_init(&cfg);
+esp_http_client_set_header(c, "Content-Type", "application/json");
+esp_http_client_set_post_field(c, body, strlen(body));
+esp_http_client_perform(c);                  // 发出去，响应在回调里收
+esp_http_client_cleanup(c);
+```
+
+**流式接收**（上传数据、设备上报）必须用 `event_handler`，不能等 `perform()` 返回：
+
+```c
+esp_err_t http_event(esp_http_client_event_t *evt) {
+    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data_len > 0) {
+        ESP_LOGI(TAG, "收到 %d 字节", evt->data_len);   // 数据分块到达，边收边处理
+    }
+    return ESP_OK;
+}
+```
+
+## 3. 内存调优：能开多少连接是算出来的
+
+lwIP 的内存由 `CONFIG_LWIP_*` 系列参数控制（menuconfig），直接决定"能开多少并发连接、每个连接的吞吐"：
+
+| 参数 | 默认 | 调整建议 |
+| --- | --- | --- |
+| `CONFIG_LWIP_TCP_SND_BUF_DEFAULT` | 5744 | 上传大数据时调大（吞吐正比） |
+| `CONFIG_LWIP_TCP_WND_DEFAULT` | 5744 | 下载大文件时调大 |
+| `CONFIG_LWIP_TCPIP_RECVMBOX_SIZE` | 64 | 多连接时调大 |
+| `CONFIG_LWIP_MAX_SOCKETS` | 10 | HTTP + MQTT 同时用要 ≥ 10 |
+
+**每个 socket 都吃内存**（收发缓冲）——"连接越多、缓冲越大"= 内存越紧。512KB 内存的设备上，TLS 连接单个就能吃 40KB+。开不动新连接报 `ERR_MEM`，先想是不是这几项顶到了。
+
+## 4. MQTT 客户端
+
+```bash
+idf.py add-dependency "espressif/esp-mqtt"
+```
+
+```c
+esp_mqtt_client_config_t cfg = {
+    .broker.address.uri = "mqtt://broker.com",
+    .credentials.username = "user",
+    .credentials.password = "pass",
+    .session.keepalive = 60,
+};
+esp_mqtt_client_handle_t mqtt = esp_mqtt_client_init(&cfg);
+esp_mqtt_client_register_event(mqtt, MQTT_EVENT_ANY, mqtt_event_handler, NULL);
+esp_mqtt_client_start(mqtt);
+
+// 收发：
+esp_mqtt_client_subscribe(mqtt, "cmd/device1", 1);            // 订阅
+esp_mqtt_client_publish(mqtt, "data/device1", payload, 0, 1, 0);   // 发布
+```
+
+**MQTT 三句话入门**：一切消息发到一个"主题"（topic，如 `data/device1`）；发布者把消息挂到主题上；订阅者盯着主题收消息。中间的邮局叫 broker（服务器）。设备端的典型分工：`data/xxx` 上行传感器数据、`cmd/xxx` 下行命令——收到命令也是事件回调。
+
+IDF 的 MQTT 是**独立任务驱动**的（不像 Arduino 的 PubSubClient 要在 loop 里反复调 `loop()`），断线自动重连——这是它更稳的原因。
+
+### 连接质量监控
+
+```text
+MQTT_EVENT_CONNECTED    → 连上了（重连后要重新订阅！）
+MQTT_EVENT_DISCONNECTED → 断了（记时间，配合退避重连）
+MQTT_EVENT_ERROR        → 读 error_handle->error_type 看是什么错
+```
+
+## 5. 常见故障
+
+| 现象 | 原因 |
+| --- | --- |
+| `connect()` 返回 -1 | DNS 失败或网络不通；检查是否真的拿到 IP（上一章的 IP 事件） |
+| 连上了但收不到数据 | 没设超时，任务阻塞在 recv（铁律） |
+| MQTT 连上就断 | Broker 协议版本不匹配；keepalive 太短；同 clientId 两台设备互踢 |
+| 内存不足开不了连接 | 调 TCP 缓冲参数；减少同时连接数 |
+| 多任务同时用 socket 出错 | socket 不是线程安全的，跨任务共享要加锁（或每任务自己的 socket） |
+| DNS 解析慢 | 用 IP 直连，或缓存解析结果 |
+| HTTP 收到一半断 | 数据大于内部缓冲——用 event_handler 流式收 |
+
+## 下一步
+
+[OTA 升级](./ota)

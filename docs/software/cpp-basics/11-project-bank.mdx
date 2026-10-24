@@ -1,0 +1,321 @@
+---
+id: 11-project-bank
+title: 11 阶段实战：简易银行账户
+sidebar_position: 11
+description: 用抽象类 + 虚函数 + unique_ptr 做一个银行账户系统，涵盖继承、多态、异常和整数金额。
+---
+
+# 11 阶段实战：简易银行账户
+
+**本课目标**：把**抽象类、虚函数、多态、智能指针、异常**串成一个完整程序。
+
+## 要做什么
+
+一个账户管理系统：
+
+- 两种账户：**储蓄**（有 3% 利息）、**活期**（可透支 1000 元）
+- 存款、取款（不同账户规则不同）
+- 统一遍历打印
+- 金额用**整数存"分"**，避免浮点误差
+
+## 第一步：抽象基类
+
+```cpp
+class Account {
+public:
+    Account(std::string owner, long long cents = 0)
+        : owner_(std::move(owner)), cents_(cents) {}
+
+    virtual ~Account() = default;         /* ← 必须有 */
+
+    /* 纯虚：子类必须实现 */
+    virtual const char *type() const = 0;
+
+    /* 虚函数有默认实现：普通账户没利息 */
+    virtual double rate() const { return 0.0; }
+
+    void deposit(long long c) {
+        if (c <= 0) throw std::invalid_argument("金额必须为正");
+        cents_ += c;
+    }
+
+    /* 虚函数：活期要覆盖它来支持透支 */
+    virtual bool withdraw(long long c) {
+        if (c <= 0 || c > cents_) return false;
+        cents_ -= c;
+        return true;
+    }
+
+    void add_interest() {
+        if (rate() > 0.0) {
+            cents_ += static_cast<long long>(cents_ * rate());
+        }
+    }
+
+    long long cents() const { return cents_; }
+    const std::string &owner() const { return owner_; }
+
+protected:                                /* 子类要访问 */
+    std::string owner_;
+    long long cents_;
+};
+```
+
+:::tip[这个设计的三个要点]
+1. **`virtual ~Account() = default;`** —— 有虚函数就必须有虚析构
+2. **`type()` 纯虚** —— 强制每个子类说明自己是什么
+3. **`rate()` 有默认实现** —— 不需要利息的子类不用写
+:::
+
+## 第二步：两个子类
+
+```cpp
+class Savings : public Account {
+public:
+    Savings(std::string o, long long c) : Account(std::move(o), c) {}
+    const char *type() const override { return "储蓄"; }
+    double rate() const override { return 0.03; }      /* 3% */
+};
+
+class Checking : public Account {
+public:
+    Checking(std::string o, long long c) : Account(std::move(o), c) {}
+    const char *type() const override { return "活期"; }
+
+    /* 覆盖取款：允许透支 1000 元 */
+    bool withdraw(long long c) override {
+        if (c <= 0) return false;
+        if (c > cents_ + 100000) return false;         /* 100000 分 = 1000 元 */
+        cents_ -= c;
+        return true;
+    }
+};
+```
+
+**注意：`Checking` 里用 `cents_`，所以基类里它必须是 `protected`。**
+
+## 第三步：多态容器
+
+```cpp
+std::vector<std::unique_ptr<Account>> accounts;
+
+accounts.push_back(std::make_unique<Savings>("Alice", 1000000));
+accounts.push_back(std::make_unique<Checking>("Bob", 50000));
+
+/* 统一遍历，各自执行自己的实现 */
+for (const auto &a : accounts) {
+    std::cout << a->type() << " " << a->owner()
+              << ": " << a->cents() / 100.0 << "\n";
+}
+```
+
+:::danger[不能用 `vector<Account>`]
+```cpp
+std::vector<Account> v;          /* ❌ 抽象类根本不能实例化 */
+std::vector<Account *> v;        /* ⚠️ 能用，但要手动 delete */
+std::vector<std::unique_ptr<Account>> v;   /* ✅ 自动释放 */
+```
+
+**`unique_ptr` 在容器析构时自动 delete 每个元素**——不用写任何清理代码。
+:::
+
+## 完整程序
+
+```cpp
+#include <iostream>
+#include <iomanip>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+class Account {
+public:
+    Account(std::string owner, long long cents = 0)
+        : owner_(std::move(owner)), cents_(cents) {}
+
+    virtual ~Account() = default;
+
+    virtual const char *type() const = 0;
+    virtual double rate() const { return 0.0; }
+
+    void deposit(long long c) {
+        if (c <= 0) throw std::invalid_argument("存款金额必须为正");
+        cents_ += c;
+    }
+
+    virtual bool withdraw(long long c) {
+        if (c <= 0 || c > cents_) return false;
+        cents_ -= c;
+        return true;
+    }
+
+    void add_interest() {
+        if (rate() > 0.0) {
+            cents_ += static_cast<long long>(cents_ * rate());
+        }
+    }
+
+    long long cents() const { return cents_; }
+    const std::string &owner() const { return owner_; }
+
+protected:
+    std::string owner_;
+    long long cents_;
+};
+
+class Savings : public Account {
+public:
+    Savings(std::string o, long long c) : Account(std::move(o), c) {}
+    const char *type() const override { return "储蓄"; }
+    double rate() const override { return 0.03; }
+};
+
+class Checking : public Account {
+public:
+    Checking(std::string o, long long c) : Account(std::move(o), c) {}
+    const char *type() const override { return "活期"; }
+
+    bool withdraw(long long c) override {
+        if (c <= 0) return false;
+        if (c > cents_ + 100000) return false;      /* 可透支 1000 元 */
+        cents_ -= c;
+        return true;
+    }
+};
+
+/* 统一的打印函数：只依赖基类接口 */
+void print_all(const std::vector<std::unique_ptr<Account>> &list) {
+    std::cout << std::fixed << std::setprecision(2);
+    for (const auto &a : list) {
+        std::cout << a->type() << "\t" << a->owner()
+                  << "\t" << a->cents() / 100.0 << " 元\n";
+    }
+}
+
+int main() {
+    std::vector<std::unique_ptr<Account>> accounts;
+
+    accounts.push_back(std::make_unique<Savings>("Alice", 1000000));
+    accounts.push_back(std::make_unique<Checking>("Bob", 50000));
+
+    std::cout << "--- 初始 ---\n";
+    print_all(accounts);
+
+    std::cout << "\n--- 操作 ---\n";
+
+    /* 存款（异常处理） */
+    try {
+        accounts[0]->deposit(200000);
+        std::cout << "Alice 存 2000 元成功\n";
+    } catch (const std::exception &e) {
+        std::cout << "存款失败：" << e.what() << "\n";
+    }
+
+    /* 计息 */
+    accounts[0]->add_interest();
+    std::cout << "Alice 计息后余额 " << accounts[0]->cents() / 100.0 << " 元\n";
+
+    /* 取款：活期可透支 */
+    bool ok = accounts[1]->withdraw(150000);
+    std::cout << "Bob 取 1500 元：" << (ok ? "成功" : "失败") << "\n";
+
+    /* 超额取款 */
+    ok = accounts[1]->withdraw(500000);
+    std::cout << "Bob 再取 5000 元：" << (ok ? "成功" : "失败") << "\n";
+
+    std::cout << "\n--- 最终 ---\n";
+    print_all(accounts);
+
+    /* 出作用域，unique_ptr 自动释放全部 */
+    return 0;
+}
+```
+
+### 运行输出
+
+```text
+--- 初始 ---
+储蓄	Alice	10000.00 元
+活期	Bob	500.00 元
+
+--- 操作 ---
+Alice 存 2000 元成功
+Alice 计息后余额 12360.00 元
+Bob 取 1500 元：成功
+Bob 再取 5000 元：失败
+
+--- 最终 ---
+储蓄	Alice	12360.00 元
+活期	Bob	-1000.00 元
+```
+
+本机实测（与上面一致）：
+
+```text
+Bob 取 1500 结果: 成功 余额 -1000
+储蓄 Alice: 12360.00
+活期 Bob: -1000.00
+```
+
+## 这个程序用到了什么
+
+| 技术 | 用在哪 | 出自 |
+| --- | --- | --- |
+| 抽象基类 + 纯虚函数 | `Account::type() = 0` | [10](./10-inherit) |
+| 虚函数覆盖 | `Checking::withdraw` 支持透支 | [10](./10-inherit) |
+| 虚析构 | `virtual ~Account()` | [10](./10-inherit) |
+| `override` | 所有子类方法 | [10](./10-inherit) |
+| 继承构造函数 | `Savings(...) : Account(...)` | [07](./07-ctor-dtor) |
+| `protected` | 子类访问 `cents_` | [06](./06-class) |
+| `unique_ptr` | 多态容器存对象 | [14](./14-unique-ptr) |
+| `make_unique` | 创建对象 | [14](./14-unique-ptr) |
+| 异常 | 存款金额校验 | 后续课 |
+| `std::move` | 移动字符串参数 | [16](./12-raii) |
+| 整数存金额 | `long long cents_` | [C 第 7 课](../c-basics/07-float) |
+
+## 想自己加的功能
+
+| 挑战 | 提示 |
+| --- | --- |
+| 记录交易流水 | 加一个 `std::vector<Transaction>` 成员 |
+| 加第三种账户（信用卡） | 新写一个子类，`main` 不用改 |
+| 转账功能 | 两个 `Account&` 参数，先取后存 |
+| 按余额排序打印 | 把 `unique_ptr` 收集到 `vector<Account*>` 再 `sort` |
+| 保存到文件 | 每个子类实现自己的 `save()` |
+| 用枚举代替字符串 type | `enum class Type { Savings, Checking }` |
+
+:::tip[试试加第三种账户]
+这是检验你这个设计好坏的最好方式。
+
+**如果加一个新子类不需要改 `Account`、不需要改 `print_all`、不需要改循环**——说明设计对了。
+
+**这就是多态的价值。**
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 基类析构没 virtual | 子类析构不执行 | 只调基类析构 | `virtual ~Account() = default;` |
+| `vector<Account>` | 编译错 | 抽象类不能实例化 | 用 `vector<unique_ptr<Account>>` |
+| 子类访问 `private` 成员 | 编译错 | 私有不可见 | 改 `protected` |
+| 忘写 `override` | 签名错也不报错 | 编译期无法检查 | 一律加 |
+| 用 `double` 存金额 | 结算差几分 | 浮点误差 | 用整数存"分" |
+| `make_unique` 时忘 `new` 语义 | 编译错 | 传构造参数，不传指针 | `make_unique<Savings>("A", 100)` |
+
+## 第二阶段小结
+
+到这里你掌握了 C++ 面向对象的核心：
+
+- **类与对象**：封装、访问控制
+- **构造与析构**：对象生命周期
+- **拷贝语义**：深浅拷贝、Rule of Three
+- **运算符重载**：让自定义类型更自然
+- **继承与多态**：虚函数、抽象类
+
+**接下来进入 C++ 最有价值的部分：RAII 与现代资源管理。**
+
+## 下一步
+
+[12 RAII：C++ 的核心思想](./12-raii) —— 理解为什么 C++ 不用手动 `free`。

@@ -1,0 +1,80 @@
+---
+id: sysprog-04
+title: "04 验证"
+sidebar_position: 5
+description: "系统编程入门 第 4 部分：验证"
+---
+
+# 04 验证
+```bash
+# 1. 用 gdb 追踪系统调用（无 strace 时）
+cat > gdbcmd.txt <<'EOF'
+set pagination off
+catch syscall openat
+run
+bt 1
+continue
+quit
+EOF
+gdb -q -batch -x gdbcmd.txt ./yourprog
+
+# 2. 观察 fd 表
+ls -l /proc/$$/fd
+bash -c 'exec 7</etc/hostname; ls -l /proc/$$/fd | grep " 7 ->"'
+
+# 3. 编译运行本页所有示例
+gcc -O0 -o ep ep.c && ./ep            # LT vs ET 对比
+gcc -O0 -o err err.c && ./err         # errno 演示
+gcc -O0 -o buf2 buf2.c && ./buf2      # 缓冲模式
+
+# 4. 查看资源限制
+ulimit -n        # 最大 fd 数（决定 epoll 上限）
+ulimit -c        # core dump（Debian 默认 0，调试时要改）
+```
+
+## 常见坑
+
+| 症状 | 病根 |
+| --- | --- |
+| `open` 返回 0 被当成失败 | fd 0 是**合法**的（stdin 关闭后 open 会拿到 0）。判错要用 `fd < 0` |
+| 忘了 `open` 的第三个参数 | 用了 `O_CREAT` 就必须传 `mode`，否则权限是随机的 |
+| `read` 返回的数据比请求的少 | **正常**（短读）。要循环读 |
+| 网络程序莫名返回 -1 且 errno=4 | `EINTR`，被信号打断。要么重试，要么用 `SA_RESTART` |
+| printf 输出在程序崩溃时丢失 | 全缓冲未 flush。加 `fflush(stdout)` 或改用 stderr |
+| 重定向到文件后 printf 输出延迟 | 文件是全缓冲，tty 是行缓冲。这是**自动切换**的 |
+| select 报 `fd >= 1024` 的错误 | `FD_SETSIZE` 硬上限 1024。换 epoll |
+| 每次循环重建 fd_set 很麻烦 | select 会**修改**传入的 `fd_set`，必须每次重建。epoll 不需要 |
+| 用 ET 模式下数据读不全 | ET 只通知一次，必须循环读到 `EAGAIN`，且 fd 要设 `O_NONBLOCK` |
+| ET 模式下 read 卡住不动 | fd 是阻塞的，最后一次 read 阻塞了。加 `O_NONBLOCK` |
+| epoll 收到 EPOLLIN 但 read 返回 0 | **对端关闭连接**。要处理 `close` |
+| 多线程下 epoll 同一 fd 被多个线程同时处理 | 用 `EPOLLONESHOT`，处理完再重新注册 |
+| 板子上 mmap 寄存器后行为诡异 | 用户态直操寄存器绕过内核，与其他驱动冲突。应该写驱动 |
+| 想抓系统调用但没装 strace | 用 `gdb -batch -x cmdfile` + `catch syscall`（本文档演示过） |
+| 交叉调试时 syscall 号对不上 | **syscall 号是架构相关的**，x86_64 的 257 在 ARM64 是 56 |
+| 程序崩溃却没有 core 文件 | `ulimit -c` 是 0。先 `ulimit -c unlimited` |
+
+## 自检清单
+
+- [ ] 说出系统调用的作用，以及用户态/内核态的区别
+- [ ] 说出 fd 的本质（进程 fd 表的下标）以及 0/1/2 分别是什么
+- [ ] 写出 `open` 的正确判错方式
+- [ ] 说出 `O_CREAT|O_EXCL` 的用途
+- [ ] 说出 `read` 返回 0 和 -1 分别代表什么
+- [ ] 解释"短读"并写出循环读的代码
+- [ ] 说出 stdio 的三种缓冲模式，以及 stdout 连 tty 和连文件时的差异
+- [ ] 解释"程序崩溃时 printf 输出丢失"的原因和解决方法
+- [ ] 说出 select 的三个缺点
+- [ ] 说出 `FD_SETSIZE` 的值及其含义
+- [ ] 解释 epoll 为什么是 O(就绪数)（红黑树 + 就绪链表 + 回调）
+- [ ] 说出 LT 与 ET 的区别，并解释实测中 ET 只读到 4 字节的原因
+- [ ] 说出使用 ET 模式的两条硬性要求
+- [ ] 说出 `ulimit -n` 和 `ulimit -c` 各自影响什么
+
+## 下一步
+
+- [构建系统](./build-system)——把本页的单文件程序变成多文件工程：Makefile 与 CMake
+- [调试与优化](./debug)——gdb 远程调试、core dump 分析
+
+---
+
+**翻页**：[← 上一页](./sysprog-03) · [返回目录](./)

@@ -1,0 +1,350 @@
+---
+title: 14 阶段实战：猜数字游戏
+sidebar_position: 14
+description: 综合运用前 9 课的内容，从零搭出一个完整可玩的猜数字游戏，并逐步加上范围提示、次数统计和重玩功能。
+id: 14-project-guess
+---
+
+# 14 阶段实战：猜数字游戏
+
+**本课目标**：把前 9 课学的**变量、输入输出、条件、循环、类型转换**串成一个真正能玩的程序。
+
+## 游戏规则
+
+电脑随机想一个 1～100 的数字，你来猜：
+
+- 猜小了 → 提示「小了」
+- 猜大了 → 提示「大了」
+- 猜中 → 结束，告诉你猜了几次
+
+这个游戏麻雀虽小，但用到了前面几乎所有知识点。**能独立写出来，说明第二阶段真的过关了。**
+
+## 第一步：能随机出数字吗
+
+```python
+import random
+
+target = random.randint(1, 100)
+print(target)
+```
+
+运行几次，你会看到每次输出不同的数字（1 到 100 之间，含两端）。
+
+:::tip[`import` 是什么]
+`import random` 的意思是「把 Python 自带的 `random`（随机数）工具包拿过来用」。
+
+Python 自带很多这样的工具包（叫**标准库**），不用安装就能直接用。`random` 只是其中一个，后面第 25 课会讲更多。
+
+`random.randint(a, b)` 返回 a 到 b 之间的**随机整数，包含两端**。
+:::
+
+## 第二步：能读入一次猜测吗
+
+```python
+import random
+
+target = random.randint(1, 100)
+guess = int(input("猜一个 1-100 的数字："))
+
+if guess == target:
+    print("猜对了！")
+elif guess < target:
+    print("小了")
+else:
+    print("大了")
+```
+
+运行一次，能判断大小了。但这样只能猜一次，不够玩。
+
+## 第三步：让它一直猜下去
+
+用 `while True` 配合 `break`：
+
+```python
+import random
+
+target = random.randint(1, 100)
+
+while True:
+    guess = int(input("猜一个 1-100 的数字："))
+
+    if guess == target:
+        print("猜对了！")
+        break
+    elif guess < target:
+        print("小了")
+    else:
+        print("大了")
+```
+
+:::danger[这里有个必须解决的问题]
+如果用户输入的不是数字（比如输入 `abc`），`int()` 会直接崩掉：
+
+```text
+ValueError: invalid literal for int() with base 10: 'abc'
+```
+
+程序崩了就得重开，体验很差。**下一版修掉它。**
+:::
+
+## 第四步：处理非法输入
+
+用 `try/except` 包住转换（[第 20 课](./20-exceptions)会细讲，现在照写）：
+
+```python
+import random
+
+target = random.randint(1, 100)
+
+while True:
+    raw = input("猜一个 1-100 的数字：")
+
+    try:
+        guess = int(raw)
+    except ValueError:
+        print("请输入一个整数！")
+        continue          # 跳回循环开头，重新问
+
+    if guess == target:
+        print("猜对了！")
+        break
+    elif guess < target:
+        print("小了")
+    else:
+        print("大了")
+```
+
+现在输入 `abc` 只会提示「请输入一个整数」，程序继续运行。
+
+## 第五步：加范围提示（体验提升的关键）
+
+只提示「大了/小了」其实帮助有限。**告诉用户当前有效范围**，体验会好很多：
+
+```python
+import random
+
+target = random.randint(1, 100)
+low, high = 1, 100          # 当前可能的范围
+
+while True:
+    raw = input(f"猜一个 {low}-{high} 的数字：")
+
+    try:
+        guess = int(raw)
+    except ValueError:
+        print("请输入一个整数！")
+        continue
+
+    # 超出已确定的范围，提示但不消耗次数
+    if guess < low or guess > high:
+        print(f"超出范围了，请在 {low} 到 {high} 之间猜")
+        continue
+
+    if guess == target:
+        print("猜对了！")
+        break
+    elif guess < target:
+        low = guess + 1      # 缩小范围：比 guess 小都不可能是答案
+        print("小了，再大一点")
+    else:
+        high = guess - 1
+        print("大了，再小一点")
+```
+
+:::tip[为什么 `low = guess + 1` 而不是 `low = guess`]
+因为已经知道 `guess` 本身不是答案（前面判断过了），所以下一轮的最小值应该是 `guess + 1`。
+
+**这个细节让范围收得更快**，玩家少猜几次。
+:::
+
+## 第六步：统计次数
+
+加一个计数器：
+
+```python
+attempts = 0
+
+# 在每次有效猜测后
+attempts += 1
+```
+
+最后输出总次数，并按表现给评价。
+
+## 完整版
+
+把上面所有步骤合起来：
+
+```python
+import random
+
+
+def play_once():
+    """玩一轮，返回猜的次数"""
+    target = random.randint(1, 100)
+    low, high = 1, 100
+    attempts = 0
+
+    print("\n我想好了一个 1~100 的数字，你猜猜看。")
+
+    while True:
+        raw = input(f"[第 {attempts + 1} 次] 请输入 {low}-{high}：")
+
+        try:
+            guess = int(raw)
+        except ValueError:
+            print("  这不是整数，请重新输入")
+            continue
+
+        if guess < low or guess > high:
+            print(f"  超出范围，请输入 {low} 到 {high} 之间的数")
+            continue
+
+        attempts += 1
+
+        if guess == target:
+            print(f"\n  猜对了！答案是 {target}")
+            print(f"  你一共猜了 {attempts} 次")
+            return attempts
+        elif guess < target:
+            low = guess + 1
+            print("  小了，再大一点")
+        else:
+            high = guess - 1
+            print("  大了，再小一点")
+
+
+def rate(attempts):
+    """根据次数给评价"""
+    if attempts <= 3:
+        return "太强了，简直是二分查找本查！"
+    elif attempts <= 6:
+        return "不错，思路很清晰"
+    elif attempts <= 9:
+        return "还行，再练练"
+    else:
+        return "有点慢哦，试试每次猜中间值"
+
+
+def main():
+    print("=" * 40)
+    print("  猜数字游戏")
+    print("=" * 40)
+
+    total_rounds = 0
+    best = None
+
+    while True:
+        attempts = play_once()
+        total_rounds += 1
+
+        print(f"  评价：{rate(attempts)}")
+
+        if best is None or attempts < best:
+            best = attempts
+            print(f"  新纪录！最少 {best} 次")
+
+        again = input("\n再玩一局？(y/n)：").strip().lower()
+        if again != "y":
+            break
+
+    print("\n" + "=" * 40)
+    print(f"  共玩了 {total_rounds} 局")
+    if best is not None:
+        print(f"  最好成绩：{best} 次")
+    print("  谢谢游玩，再见！")
+    print("=" * 40)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 运行示例
+
+```text
+========================================
+  猜数字游戏
+========================================
+
+我想好了一个 1~100 的数字，你猜猜看。
+[第 1 次] 请输入 1-100：50
+  小了，再大一点
+[第 2 次] 请输入 51-100：75
+  小了，再大一点
+[第 3 次] 请输入 76-100：88
+  大了，再小一点
+[第 4 次] 请输入 76-87：82
+  猜对了！答案是 82
+  你一共猜了 4 次
+  评价：不错，思路很清晰
+  新纪录！最少 4 次
+
+再玩一局？(y/n)：n
+
+========================================
+  共玩了 1 局
+  最好成绩：4 次
+  谢谢游玩，再见！
+========================================
+```
+
+## 这段代码用了哪些知识点
+
+回头对照一下，你会发现每个部分都对应前面某一课：
+
+| 代码 | 用到的知识 | 出自 |
+| --- | --- | --- |
+| `target = random.randint(...)` | 变量 + 标准库 | [05](./05-variables)、[25](./25-stdlib) |
+| `int(raw)` | 类型转换 | [06](./06-numbers) |
+| `low, high = 1, 100` | 多变量赋值 | [05](./05-variables) |
+| `if / elif / else` | 条件判断 | [09](./09-if) |
+| `while True` + `break` | 循环与控制 | [10](./10-loops) |
+| `input()` | 输入 | [08](./08-io) |
+| `f"..."` | 字符串格式化 | [07](./07-strings) |
+| `try / except` | 异常处理 | [20](./20-exceptions) |
+| `def play_once()` | 函数 | [15](./15-functions) |
+| `return attempts` | 返回值 | [15](./15-functions) |
+| `if __name__ == "__main__"` | 程序入口 | [18](./18-modules) |
+
+:::tip[先能跑，再优化]
+如果你现在还写不出完整版，**先写第四步那个 20 行的版本**。能跑起来最重要。
+
+完整版里的函数、`rate()` 评价、多轮统计都是「锦上添花」，等学完第 15 课（函数）再回来写会很轻松。
+:::
+
+## 想自己加的功能（练习）
+
+学完这一课，试试加这些功能。**不做也没关系，做了会进步很快**：
+
+| 挑战 | 提示 |
+| --- | --- |
+| 难度选择（1-10 / 1-100 / 1-1000） | 把 100 换成变量 |
+| 限制最多猜 7 次 | 用 `while attempts < 7` |
+| 记录历史猜测并显示 | 用一个列表存每次猜的值 |
+| 提示「离答案很近了」 | 判断 `abs(guess - target) <= 3` |
+| 改成汉字数字版本 | 用 dict 把数字映射成中文 |
+
+## 本课自检
+
+- [ ] 能独立从零写出第四步的版本（不看书）
+- [ ] 理解 `while True` + `break` 的组合用法
+- [ ] 会用 `try/except` 处理非数字输入
+- [ ] 理解 `low = guess + 1` 为什么加 1
+- [ ] 知道 `continue` 在这里的作用（跳过本次，重新问）
+- [ ] 至少完成一个「想自己加的功能」
+
+## 第二阶段小结
+
+**你已经学完了 Python 的基本语法。** 现在你能：
+
+- 存数据（变量、列表、字典）
+- 做判断（if）
+- 做重复（循环）
+- 和用户交互（input/print）
+- 处理错误输入（try/except）
+
+这些是**所有**编程语言的共同基础，换成 C++、Java 也一样。
+
+## 下一步
+
+[15 函数入门](./15-functions) —— 第三阶段开始。学会把代码打包复用，程序就能越写越大而不失控。

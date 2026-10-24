@@ -1,0 +1,288 @@
+---
+id: transition-02
+title: "02 命名空间：替代 `xxx_` 前缀"
+sidebar_position: 3
+description: "从 C 到 C++ 第 2 部分：命名空间：替代 `xxx_` 前缀"
+---
+
+# 02 命名空间：替代 `xxx_` 前缀
+C 里避免名字冲突的办法是加前缀：
+
+```c
+// C 的做法
+int gpio_set_level(int pin, int level);
+int gpio_get_level(int pin);
+int gpio_config(const gpio_config_t* cfg);
+```
+
+C++ 用命名空间：
+
+```cpp
+// C++ 的做法
+namespace gpio {
+    int set_level(int pin, int level);
+    int get_level(int pin);
+    struct config { /* ... */ };
+    int config_init(const config& cfg);
+}
+
+// 调用
+gpio::set_level(2, 1);
+gpio::config c{};
+```
+
+### 嵌套、别名、inline 命名空间
+
+```cpp
+// ns.cpp
+#include <cstdio>
+
+namespace hal {
+    namespace gpio {
+        int read(int pin) { return pin * 2; }
+    }
+    namespace spi {
+        int read(int pin) { return pin * 3; }
+    }
+}
+
+namespace hw = hal::gpio;      // 命名空间别名
+
+int main() {
+    std::printf("hal::gpio::read(7) = %d\n", hal::gpio::read(7));
+    std::printf("hal::spi::read(7)  = %d\n", hal::spi::read(7));
+    std::printf("hw::read(7)        = %d\n", hw::read(7));   // 别名
+
+    using hal::spi::read;      // using 声明：只引入这一个名字
+    std::printf("read(7)            = %d\n", read(7));
+
+    {
+        using namespace hal::gpio;   // using 指令：引入整个命名空间
+        std::printf("inside read(7)   = %d\n", read(7));
+    }
+}
+```
+
+编译运行：
+
+```bash
+g++ -std=c++17 -o ns.exe ns.cpp && ./ns.exe
+```
+
+**实测输出：**
+
+```text
+hal::gpio::read(7) = 14
+hal::spi::read(7)  = 21
+hw::read(7)        = 14
+read(7)            = 21
+inside read(7)     = 21
+```
+
+注意最后两行：`using` 声明和 `using` 指令的效果不同，作用域内同名函数发生了**重载/遮蔽**，结果不一样。
+
+:::danger[永远不要在头文件里写 `using namespace ...`]
+这是 C++ 最常见的反模式之一。在 `.h` 里写 `using namespace std;` 会**把 `std` 的所有名字灌进每个 include 了它的文件**，别人可能因此出现莫名其妙的名字冲突，而且这个冲突改不掉（因为你不能改那个头文件）。
+
+在函数内部、或者 `.cpp` 文件顶部（所有 include 之后）写，是可以接受的。**头文件里一律写全名 `std::xxx`。**
+:::
+
+### 匿名命名空间：替代 C 的 `static`
+
+C 里把函数/变量限制在本文件用 `static`。C++ 推荐用匿名命名空间：
+
+```cpp
+namespace {
+    int helper() { return 42; }   // 只在当前翻译单元可见
+}
+```
+
+好处是它能作用于**类型**（C 的 `static` 不能修饰类型定义），且更明确。
+
+:::info[C++11 起的行为变化]
+C++11 之前匿名命名空间的成员有外部链接；C++11 起是**内部链接**（internal linkage），和 `static` 一致。
+:::
+
+## 4. 重载与默认参数
+
+### 重载：消灭 `func_int` / `func_float`
+
+C 里要写 `abs_int`、`abs_float`、`abs_double`。C++ 直接重载：
+
+```cpp
+// overload.cpp
+#include <cstdio>
+
+int  add(int a, int b)          { std::printf("  int version\n");  return a + b; }
+double add(double a, double b)  { std::printf("  double version\n"); return a + b; }
+
+int main() {
+    std::printf("add(1,2):\n");       auto r1 = add(1, 2);
+    std::printf("add(1.5,2.5):\n");   auto r2 = add(1.5, 2.5);
+    std::printf("add(1,2.5):\n");     auto r3 = add(1, 2.5);   // 提升为 double
+    std::printf("r1=%d r2=%.1f r3=%.1f\n", r1, r2, r3);
+}
+```
+
+**实测输出（去掉下面会说到的歧义那行之后）：**
+
+```text
+add(1,2):
+  int version
+add(1.5,2.5):
+  double version
+r1=3 r2=4.0
+```
+
+:::warning[`add(1, 2.5)` 其实编不过]
+我原本想演示"`int + double` 会提升到 `double` 版本"，但实测这一行是**歧义**：
+
+```text
+overload.cpp:7:48: error: call of overloaded 'add(int, double)' is ambiguous
+```
+
+原因：`add(int,int)` 需要把 `2.5` 转成 `int`（浮点→整型转换），`add(double,double)` 需要把 `1` 转成 `int→double`（整型提升）。**两者都是"转换"，等级相同，谁也不比谁好。**
+
+**这是重载最容易踩的坑：以为编译器会"智能"挑一个。** 解法：
+
+- 加一个 `add(int, double)` 重载
+- 或者改成模板 `template<typename T> T add(T a, T b)`，调用时显式 `add<double>(1, 2.5)`
+- 或者干脆用 C++20 的 `std::common_type_t`
+
+**规则：重载集里的每个函数都应该是"某个参数组合下唯一的最佳匹配"，不要靠转换等级碰运气。**
+:::
+
+**重载决议的三个阶段**（编译器怎么挑函数）：
+
+1. **精确匹配**（类型完全一致）
+2. **提升/转换**（`char`→`int`、`int`→`double`、数组→指针等）
+3. **用户定义的转换**（构造函数、转换运算符）
+
+如果多个候选函数"一样好"，就是**歧义（ambiguous）**，编译报错。
+
+### 默认参数：和重载的取舍
+
+```cpp
+void log(const char* msg, int level = 1, bool newline = true);
+```
+
+规则：
+- **默认参数必须从右往左连续**（不能跳过中间的）
+- 默认参数只在**声明**里写一次（头文件里写，`.cpp` 里不重复）
+
+:::warning[默认参数 vs 重载：别混用]
+同时用重载和默认参数容易产生歧义：
+
+```cpp
+void f(int a);
+void f(int a, int b = 0);
+f(1);   // 歧义！两个都能匹配
+```
+
+优先选一个：**简单场景用默认参数，不同类型的场景用重载。**
+:::
+
+## 5. auto：让编译器写类型
+
+### 基本用法
+
+```cpp
+// auto_demo.cpp
+#include <vector>
+#include <string>
+#include <map>
+#include <cstdio>
+#include <typeinfo>
+
+int main() {
+    auto i = 42;              // int
+    auto d = 3.14;            // double
+    auto s = std::string("hi");
+    auto v = std::vector<int>{1, 2, 3};
+
+    std::map<std::string, int> m{{"a", 1}, {"b", 2}};
+
+    // 没有 auto 的写法
+    std::map<std::string, int>::iterator it_old = m.begin();
+    // 有 auto 的写法
+    auto it_new = m.begin();
+
+    std::printf("i=%d d=%.2f s=%s v.size=%zu\n", i, d, s.c_str(), v.size());
+    std::printf("it_old->first=%s it_new->first=%s\n",
+                it_old->first.c_str(), it_new->first.c_str());
+}
+```
+
+编译运行：
+
+```bash
+g++ -std=c++17 -o auto_demo.exe auto_demo.cpp && ./auto_demo.exe
+```
+
+**实测输出：**
+
+```text
+i=42 d=3.14 s=hi v.size=3
+it_old->first=a it_new->first=a
+```
+
+### auto 的推导规则（和模板一样）
+
+`auto` 用的是**模板实参推导**的规则，所以：
+
+| 写法 | 推导结果 | 说明 |
+| --- | --- | --- |
+| `auto x = expr;` | 值类型，忽略引用和顶层 const | 会拷贝 |
+| `auto& x = expr;` | 保留底层 const 的左值引用 | 不拷贝，可修改 |
+| `const auto& x = expr;` | const 左值引用 | 不拷贝，不可修改 |
+| `auto&& x = expr;` | **转发引用**（万能引用） | 见 [move-semantics](./move-semantics) |
+| `auto* x = expr;` | 指针 | 强调必须是指针 |
+
+```cpp
+// auto_ref.cpp
+#include <cstdio>
+#include <vector>
+
+int main() {
+    std::vector<int> v{1, 2, 3};
+
+    auto    a = v[0];    // int（拷贝）
+    auto&   b = v[0];    // int&（引用，能改 v[0]）
+    const auto& c = v[0];// const int&
+
+    b = 100;
+    std::printf("v[0]=%d  a=%d\n", v[0], a);   // v[0] 变了，a 没变（它是拷贝）
+    std::printf("c=%d\n", c);
+}
+```
+
+**实测输出：**
+
+```text
+v[0]=100  a=1
+c=100
+```
+
+`a` 是拷贝所以还是 1，`c` 是引用所以跟着变成 100。**这就是 `auto` 和 `auto&` 的实际区别。**
+
+:::caution[auto 会丢掉引用和 const]
+`auto x = some_const_ref;` 得到的是**值**，const 和引用都被剥掉。想保留就显式写 `const auto&`。
+
+这条在范围 for 里最容易出错：
+
+```cpp
+for (auto  x : v) { }   // 拷贝每个元素（大对象很贵）
+for (auto& x : v) { }   // 引用，能修改
+for (const auto& x : v) { }  // 只读时用这个
+```
+:::
+
+### 什么时候不该用 auto
+
+- 类型本身是重要文档时（`auto timeout_ms = 500;` 不如 `int timeout_ms = 500;`）
+- 需要隐式转换时（`auto x = 1 / 2;` 是 0，因为你想要 `double` 得写 `1.0/2`）
+- 涉及"必须明确位数"的嵌入式代码（用 `uint32_t` 而不是 `auto`）
+
+---
+
+**翻页**：[← 上一页](./transition-01) · [下一页 →](./transition-03) · [返回目录](./)

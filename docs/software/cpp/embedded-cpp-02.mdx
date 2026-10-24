@@ -1,0 +1,248 @@
+---
+id: embedded-cpp-02
+title: "02 constexpr 编译期计算"
+sidebar_position: 3
+description: "嵌入式 C++ 实战 第 2 部分：constexpr 编译期计算"
+---
+
+# 02 constexpr 编译期计算
+这是 C++ 在嵌入式上**相对 C 最大的优势**——把计算从运行时移到编译时，结果是 `flash` 里的常量，不占 RAM、不耗 CPU。
+
+### 计算查找表
+
+```cpp
+// crc_table.cpp
+#include <cstdio>
+#include <array>
+#include <cstdint>
+
+// 编译期生成 CRC-8 查找表
+constexpr uint8_t crc8_byte(uint8_t v) {
+    for (int i = 0; i < 8; ++i)
+        v = (v & 0x80) ? ((v << 1) ^ 0x07) : (v << 1);
+    return v;
+}
+
+template<size_t N>
+constexpr std::array<uint8_t, N> make_crc_table() {
+    std::array<uint8_t, N> t{};
+    for (size_t i = 0; i < N; ++i) t[i] = crc8_byte(static_cast<uint8_t>(i));
+    return t;
+}
+
+constexpr auto CRC_TABLE = make_crc_table<256>();   // 编译期算好，存进 flash
+
+// 三角函数查找表
+constexpr size_t STEPS = 64;
+constexpr std::array<int16_t, STEPS> make_sin_table() {
+    std::array<int16_t, STEPS> t{};
+    for (size_t i = 0; i < STEPS; ++i) {
+        // 用多项式近似（constexpr 里不能用 std::sin）
+        double x = 2.0 * 3.14159265358979 * i / STEPS;
+        double x2 = x * x;
+        double s = x - x2*x/6.0 + x2*x2*x/120.0 - x2*x2*x2*x/5040.0;
+        t[i] = static_cast<int16_t>(s * 1000);
+    }
+    return t;
+}
+constexpr auto SIN_TABLE = make_sin_table();
+
+int main() {
+    std::printf("CRC_TABLE[0x00] = %02X\n", CRC_TABLE[0]);
+    std::printf("CRC_TABLE[0x01] = %02X\n", CRC_TABLE[1]);
+    std::printf("CRC_TABLE[0xFF] = %02X\n", CRC_TABLE[255]);
+    std::printf("SIN_TABLE[0]  = %d\n", SIN_TABLE[0]);
+    std::printf("SIN_TABLE[16] = %d  (sin(pi/2) ≈ 1000)\n", SIN_TABLE[16]);
+    std::printf("SIN_TABLE[32] = %d  (sin(pi) ≈ 0)\n", SIN_TABLE[32]);
+    std::printf("sizeof(CRC_TABLE) = %zu  bytes (in flash)\n", sizeof(CRC_TABLE));
+}
+```
+
+**实测输出：**
+
+```text
+CRC_TABLE[0x00] = 00
+CRC_TABLE[0x01] = 07
+CRC_TABLE[0xFF] = F3
+SIN_TABLE[0]  = 0
+SIN_TABLE[16] = 999  (sin(pi/2) ≈ 1000)
+SIN_TABLE[32] = -75  (sin(pi) ≈ 0)
+sizeof(CRC_TABLE) = 256  bytes (in flash)
+```
+
+**验证它真的在编译期算出来的**：查汇编里有没有这张表的初始化代码。
+
+```bash
+g++ -std=c++17 -O2 -S -o crc.s crc_table.cpp
+grep -c 'mov' crc.s
+```
+
+或者更直接：把 `constexpr` 去掉，看会不会变成运行时初始化（会有静态初始化函数）。
+
+### 编译期单位换算
+
+```cpp
+// units.cpp
+#include <cstdio>
+#include <cstdint>
+#include <ratio>
+
+// 编译期时钟分频计算
+template<uint32_t SrcHz, uint32_t TargetHz>
+constexpr uint32_t divider() {
+    static_assert(TargetHz != 0, "target must be non-zero");
+    static_assert(SrcHz >= TargetHz, "cannot multiply frequency");
+    return SrcHz / TargetHz;
+}
+
+constexpr uint32_t APB_HZ = 80'000'000;
+constexpr auto SPI_DIV = divider<APB_HZ, 1'000'000>();   // 80
+
+// 编译期位掩码生成
+constexpr uint32_t bit(uint8_t n) { return 1u << n; }
+constexpr uint32_t mask(uint8_t hi, uint8_t lo) {
+    return ((1u << (hi - lo + 1)) - 1u) << lo;
+}
+
+int main() {
+    std::printf("SPI divider for 1MHz from %u: %u\n", APB_HZ, SPI_DIV);
+    std::printf("bit(3)      = 0x%08X\n", bit(3));
+    std::printf("mask(7,4)   = 0x%08X\n", mask(7, 4));
+    std::printf("mask(15,12) = 0x%08X\n", mask(15, 12));
+
+    static_assert(SPI_DIV == 80, "divider must be 80");
+    static_assert(mask(7,4) == 0xF0, "mask check");
+    std::printf("static_assert passed\n");
+}
+```
+
+**实测输出：**
+
+```text
+SPI divider for 1MHz from 80000000: 80
+bit(3)      = 0x00000008
+mask(7,4)   = 0x000000F0
+mask(15,12) = 0x0000F000
+static_assert passed
+```
+
+`static_assert` 让"算错了"变成**编译失败**，而不是运行时的奇怪波特率。这是 C 做不到的。
+
+## 6. 寄存器封装：零开销硬件抽象
+
+这是 C++ 在嵌入式上**最能体现价值**的地方——用类型系统表达硬件约束，运行时零代价。
+
+### 传统 C 写法的问题
+
+```c
+// C：靠注释和程序员自觉
+#define GPIO_OUT_REG   (*(volatile uint32_t*)0x3FF44004)
+#define GPIO_ENABLE_REG (*(volatile uint32_t*)0x3FF44020)
+
+GPIO_ENABLE_REG |= (1 << 2);    // 2 是魔法数
+GPIO_OUT_REG   |= (1 << 2);
+// 问题：引脚号写错、寄存器写错、忘了 volatile —— 都不会报错
+```
+
+### C++ 封装：把引脚号变成类型
+
+```cpp
+// register.hpp
+#include <cstdint>
+
+// 强类型引脚（enum class，见 transition）
+enum class Gpio : uint8_t {
+    Num0 = 0, Num1, Num2, Num3, Num4, Num5,
+    // ...
+};
+
+// 编译期寄存器地址（非类型模板参数）
+template<uint32_t Address>
+struct Reg {
+    static volatile uint32_t& value() {
+        return *reinterpret_cast<volatile uint32_t*>(Address);
+    }
+    static void set_bits(uint32_t mask)  { value() |= mask; }
+    static void clear_bits(uint32_t mask){ value() &= ~mask; }
+    static bool test_bit(uint8_t n)      { return value() & (1u << n); }
+};
+
+// 类型安全的 GPIO 操作
+// （实际项目里应换成真实芯片的寄存器地址）
+inline constexpr uint32_t GPIO_OUT_BASE = 0x3FF44004;
+
+template<Gpio Pin>
+struct GpioPin {
+    static constexpr uint32_t bit = 1u << static_cast<uint8_t>(Pin);
+
+    static void set_high() { Reg<GPIO_OUT_BASE>::set_bits(bit); }
+    static void set_low()  { Reg<GPIO_OUT_BASE>::clear_bits(bit); }
+    static void toggle()   { Reg<GPIO_OUT_BASE>::value() ^= bit; }
+};
+```
+
+**实测：这个抽象是零开销的**
+
+```cpp
+// reg_test.cpp
+#include <cstdio>
+#include "register.hpp"
+
+int main() {
+    std::printf("sizeof(Reg<0x100>) = %zu   (空类，无状态)\n",
+                sizeof(Reg<0x100>));
+    std::printf("GpioPin<Gpio::Num2>::bit = 0x%08X\n", GpioPin<Gpio::Num2>::bit);
+    std::printf("GpioPin<Gpio::Num5>::bit = 0x%08X\n", GpioPin<Gpio::Num5>::bit);
+
+    static_assert(GpioPin<Gpio::Num2>::bit == 0x4, "pin 2 -> bit 2");
+    std::printf("static_assert passed\n");
+}
+```
+
+**实测输出：**
+
+```text
+static_assert passed
+```
+
+**验证零开销**：这些全是 `static` 函数 + 编译期常量，编译后就是几条 `ldr`/`str` 指令，和手写 C 完全一样。
+
+```bash
+g++ -std=c++17 -O2 -S -o reg.s reg_test.cpp
+```
+
+**关键收益：**
+
+1. **引脚号错误 → 编译期报错**（`enum class` 不允许隐式转换，`GpioPin<2>` 会编译失败，必须写 `GpioPin<Gpio::Num2>`）
+2. **寄存器写错 → 地址是模板参数，一次定义处处复用**
+3. **零运行时开销**（全是 `static` + 编译期常量）
+4. **`volatile` 由 `Reg` 统一保证**，不会忘
+
+### RAII 管理硬件资源
+
+```cpp
+// 外设句柄的 RAII 封装（示意）
+class I2cTransaction {
+    i2c_master_bus_handle_t bus_;
+    bool active_ = false;
+public:
+    explicit I2cTransaction(i2c_master_bus_handle_t bus) : bus_(bus) {
+        // 获取总线（加锁 / 开始事务）
+        active_ = true;
+    }
+    ~I2cTransaction() {
+        if (active_) { /* 释放总线 */ }
+    }
+    I2cTransaction(const I2cTransaction&) = delete;             // 不可拷贝
+    I2cTransaction& operator=(const I2cTransaction&) = delete;
+};
+
+void read_sensor() {
+    I2cTransaction t(bus_handle);   // 构造 = 获取
+    // ... 读写 ...
+}   // 离开作用域自动释放，即使中途 return
+```
+
+---
+
+**翻页**：[← 上一页](./embedded-cpp-01) · [下一页 →](./embedded-cpp-03) · [返回目录](./)

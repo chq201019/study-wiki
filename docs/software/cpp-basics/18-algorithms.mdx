@@ -1,0 +1,357 @@
+---
+id: 18-algorithms
+title: 18 STL 算法与 lambda
+sidebar_position: 18
+description: sort/find/count/transform/all_of 等常用算法、lambda 的四种捕获、以及为什么算法加 lambda 比手写循环好。
+---
+
+# 18 STL 算法与 lambda
+
+**本课目标**：会用标准算法替代手写循环，掌握 lambda。
+
+## 为什么用算法
+
+**手写循环的问题**：意图藏在实现里。
+
+```cpp
+/* 这段在干什么？要读几行才知道 */
+int cnt = 0;
+for (size_t i = 0; i < v.size(); i++) {
+    if (v[i] > 4) cnt++;
+}
+```
+
+**用算法**：
+
+```cpp
+int cnt = std::count_if(v.begin(), v.end(),
+                        [](int x) { return x > 4; });
+```
+
+**一眼看出"数出大于 4 的个数"。**
+
+## 最常用的算法
+
+本机实测（`v = {5,2,8,1,9,3}`）：
+
+```text
+排序: 1 2 3 5 8 9
+降序: 9 8 5 3 2 1
+find(8): 找到
+count_if(>4): 3
+accumulate: 28
+max=9
+transform 平方: 81 64 25 9 4 1
+all>0=1  any>8=1
+```
+
+### 排序
+
+```cpp
+std::sort(v.begin(), v.end());                    /* 升序 */
+std::sort(v.begin(), v.end(), [](int a, int b) {
+    return a > b;                                  /* 降序 */
+});
+
+/* 按自定义字段排 */
+std::sort(students.begin(), students.end(),
+          [](const Student &a, const Student &b) {
+              return a.score > b.score;
+          });
+```
+
+:::warning[`sort` 要求随机访问迭代器]
+```cpp
+std::sort(v.begin(), v.end());        /* ✅ vector / deque */
+std::sort(l.begin(), l.end());        /* ❌ list 不支持 */
+l.sort();                             /* ✅ list 用自己的成员函数 */
+```
+
+`std::sort` 用 Introsort（快排+堆排+插入排序），**需要随机访问**。链表只能用 `list::sort`。
+:::
+
+### 查找
+
+```cpp
+std::find(v.begin(), v.end(), 8)        /* 返回迭代器，找不到返回 end() */
+std::find_if(v.begin(), v.end(), [](int x) { return x > 5; })
+std::binary_search(sorted.begin(), sorted.end(), 8)    /* 只返回 bool，要求有序 */
+std::lower_bound(sorted.begin(), sorted.end(), 8)      /* 第一个 >= 8 的位置 */
+```
+
+:::danger[`binary_search` 必须保证区间已排序]
+```cpp
+std::vector<int> v = {5, 2, 8};
+std::binary_search(v.begin(), v.end(), 8);    /* ❌ 结果不可预测 */
+```
+
+**未排序时二分查找的行为是未定义的**——可能找到，可能找不到，没有规律。
+
+**用之前一定先 `sort`。**
+:::
+
+### 统计
+
+```cpp
+std::count(v.begin(), v.end(), 8)                      /* 等于 8 的个数 */
+std::count_if(v.begin(), v.end(), [](int x){ return x > 4; })
+std::accumulate(v.begin(), v.end(), 0)                 /* 求和，初值 0 */
+std::max_element(v.begin(), v.end())                   /* 返回迭代器 */
+std::min_element(v.begin(), v.end())
+```
+
+:::warning[`accumulate` 在 `<numeric>` 里]
+```cpp
+#include <numeric>        /* ← 不是 <algorithm> */
+std::accumulate(...);
+```
+:::
+
+### 变换
+
+```cpp
+std::for_each(v.begin(), v.end(), [](int x) {
+    std::cout << x * 2 << " ";
+});
+
+/* transform：生成新序列 */
+std::vector<int> out;
+std::transform(v.begin(), v.end(), std::back_inserter(out),
+               [](int x) { return x * x; });
+```
+
+:::danger[`back_inserter` 需要 `<iterator>`]
+```cpp
+std::transform(..., std::back_inserter(out), ...);
+```
+
+编译报错：
+
+```text
+error: no member named 'back_inserter' in namespace 'std'
+```
+
+**因为 `back_inserter` 在 `<iterator>` 里，不在 `<algorithm>` 里。**
+
+```cpp
+#include <algorithm>
+#include <iterator>        /* ← 这行不能少 */
+```
+
+（这是实际踩到的坑。）
+:::
+
+:::tip[`back_inserter` 是什么]
+普通迭代器要求**目标容器已经有大小的元素空间**。
+
+`transform` 往空 `out` 里写会越界。`back_inserter` 会把写入转换成 `push_back`，**自动扩容**。
+
+**往空容器里写入时，一律用 `back_inserter`。**
+:::
+
+### 判断
+
+```cpp
+std::all_of(v.begin(), v.end(), [](int x){ return x > 0; })    /* 全部满足 */
+std::any_of(v.begin(), v.end(), [](int x){ return x > 8; })    /* 至少一个 */
+std::none_of(v.begin(), v.end(), [](int x){ return x < 0; })   /* 都不满足 */
+```
+
+:::tip[这三个都是短路求值]
+找到结果就立刻停止遍历，不会白跑完整个容器。
+
+**比手写循环清晰得多**：
+
+```cpp
+/* 手写 */
+bool ok = true;
+for (int x : v) if (x <= 0) { ok = false; break; }
+
+/* 算法 */
+bool ok = std::all_of(v.begin(), v.end(), [](int x){ return x > 0; });
+```
+:::
+
+## lambda 表达式
+
+**lambda = 匿名函数**，就地定义，不用单独写函数。
+
+```cpp
+[](int x) { return x * 2; }
+```
+
+结构：
+
+```text
+[]      (int x)      { return x * 2; }
+↑       ↑            ↑
+捕获    参数          函数体
+```
+
+## 四种捕获方式
+
+```cpp
+int a = 1, b = 2;
+
+[](){ }              /* 不捕获任何外部变量 */
+[a](){ }             /* 按值捕获 a */
+[&a](){ }            /* 按引用捕获 a */
+[=](){ }             /* 按值捕获所有用到的 */
+[&](){ }             /* 按引用捕获所有用到的 */
+[a, &b](){ }         /* 混合 */
+```
+
+本机实测：
+
+```cpp
+int threshold = 5;
+auto cnt = std::count_if(v.begin(), v.end(),
+                         [threshold](int x) { return x > threshold; });
+/* 捕获 threshold=5 计数=2 */
+
+int sum = 0;
+std::for_each(v.begin(), v.end(), [&sum](int x) { sum += x; });
+/* 引用捕获 sum=28 */
+```
+
+| 捕获 | 特点 | 用于 |
+| --- | --- | --- |
+| `[x]` | 复制一份，**只读**（除非加 `mutable`） | 读外部值 |
+| `[&x]` | 引用，能修改外部变量 | 累加、统计 |
+| `[=]` | 复制所有用到的 | 只读场景 |
+| `[&]` | 引用所有用到的 | 修改场景 |
+
+:::danger[`[&]` 捕获局部变量后返回 lambda = 悬垂引用]
+```cpp
+auto make_lambda() {
+    int local = 42;
+    return [&local]() { return local; };      /* ❌ local 已销毁 */
+}
+```
+
+**引用捕获的生命周期必须长于 lambda。**
+
+**返回 lambda 时，用按值捕获 `[local]`。**
+:::
+
+## 用算法替代手写循环的对照
+
+| 手写循环 | 算法写法 |
+| --- | --- |
+| 遍历计数 | `std::count` / `count_if` |
+| 累加 | `std::accumulate` |
+| 找最大值 | `std::max_element` |
+| 判断全满足 | `std::all_of` |
+| 判断存在 | `std::any_of` / `std::find` |
+| 转换生成新容器 | `std::transform` |
+| 排序 | `std::sort` |
+| 删除符合条件的 | `std::erase_if`（C++20） |
+
+## 完整示例
+
+```cpp
+#include <algorithm>
+#include <iostream>
+#include <iterator>
+#include <numeric>
+#include <string>
+#include <vector>
+
+struct Student {
+    std::string name;
+    int score;
+};
+
+int main() {
+    std::vector<Student> list = {
+        {"Alice", 88},
+        {"Bob", 92},
+        {"Carol", 75},
+        {"Dave", 58},
+    };
+
+    /* ① 排序：按分数降序 */
+    std::sort(list.begin(), list.end(),
+              [](const Student &a, const Student &b) {
+                  return a.score > b.score;
+              });
+
+    std::cout << "按分数降序：\n";
+    std::for_each(list.begin(), list.end(), [](const Student &s) {
+        std::cout << "  " << s.name << ": " << s.score << "\n";
+    });
+
+    /* ② 统计及格人数 */
+    int passed = std::count_if(list.begin(), list.end(),
+                               [](const Student &s) { return s.score >= 60; });
+    std::cout << "及格 " << passed << " 人\n";
+
+    /* ③ 求总分和平均 */
+    int total = std::accumulate(
+        list.begin(), list.end(), 0,
+        [](int sum, const Student &s) { return sum + s.score; });
+    std::cout << "总分 " << total
+              << "，平均 " << total / static_cast<double>(list.size()) << "\n";
+
+    /* ④ 提取及格者的名字 */
+    std::vector<std::string> names;
+    std::transform(list.begin(), list.end(), std::back_inserter(names),
+                   [](const Student &s) {
+                       return s.score >= 60 ? s.name : std::string("(不及格)");
+                   });
+
+    std::cout << "名单：";
+    for (const auto &n : names) std::cout << n << " ";
+    std::cout << "\n";
+
+    /* ⑤ 是否全部及格 */
+    bool all_pass = std::all_of(list.begin(), list.end(),
+                                [](const Student &s) { return s.score >= 60; });
+    std::cout << "全部及格？ " << (all_pass ? "是" : "否") << "\n";
+
+    return 0;
+}
+```
+
+输出：
+
+```text
+按分数降序：
+  Bob: 92
+  Alice: 88
+  Carol: 75
+  Dave: 58
+及格 3 人
+总分 313，平均 78.25
+名单：Bob Alice Carol (不及格)
+全部及格？ 否
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 未排序就 `binary_search` | 结果不可预测 | 要求有序 | 先 `sort` |
+| 用 `std::sort` 排 list | 编译错 | 需要随机访问 | `list.sort()` |
+| 忘 `#include <numeric>` | `accumulate` 找不到 | 头文件 | 加上 |
+| 忘 `#include <iterator>` | `back_inserter` 找不到 | 头文件 | 加上 |
+| 往空容器直接 `transform` | 越界崩溃 | 没有空间 | 用 `back_inserter` |
+| `[&]` 捕获局部变量后返回 | 悬垂引用 | 生命周期不够 | 按值捕获 `[x]` |
+| 用 `[x]` 想修改外部 | 编译错 | 按值是只读 | 用 `[&x]` 或 `mutable` |
+
+## 本课自检
+
+- [ ] 会用 `sort`（含自定义比较器）
+- [ ] **知道 `binary_search` 要求已排序**
+- [ ] 知道 `std::sort` 不支持 list
+- [ ] 会用 `find` / `find_if` / `count_if`
+- [ ] 会用 `accumulate`（知道在 `<numeric>`）
+- [ ] 会用 `max_element` / `min_element`
+- [ ] 会用 `transform` + `back_inserter`（知道要 `<iterator>`）
+- [ ] 会用 `all_of` / `any_of` / `none_of`
+- [ ] 掌握 lambda 的四种捕获方式
+- [ ] **知道 `[&]` 捕获后返回 lambda 会悬垂**
+
+## 下一步
+
+[19 阶段实战：学生管理系统](./19-project-students) —— 用 vector + 类 + 算法做完整系统。

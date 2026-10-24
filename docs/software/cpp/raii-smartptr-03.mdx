@@ -1,0 +1,291 @@
+---
+id: raii-smartptr-03
+title: "03 weak_ptr：打破循环引用"
+sidebar_position: 4
+description: "资源管理与智能指针 第 3 部分：weak_ptr：打破循环引用"
+---
+
+# 03 weak_ptr：打破循环引用
+### 循环引用是怎么泄漏的
+
+```cpp
+// cycle.cpp —— 泄漏版
+#include <memory>
+#include <cstdio>
+
+struct B;
+struct A {
+    std::shared_ptr<B> b;
+    ~A() { std::printf("  ~A\n"); }
+};
+struct B {
+    std::shared_ptr<A> a;      // 相互持有 shared_ptr
+    ~B() { std::printf("  ~B\n"); }
+};
+
+int main() {
+    {
+        auto pa = std::make_shared<A>();
+        auto pb = std::make_shared<B>();
+        pa->b = pb;
+        pb->a = pa;
+        std::printf("  pa.use_count=%ld pb.use_count=%ld\n",
+                    pa.use_count(), pb.use_count());
+    }
+    std::printf("--- scope left: 注意看有没有 ~A / ~B 输出\n");
+}
+```
+
+**实测输出：**
+
+```text
+  pa.use_count=2 pb.use_count=2
+--- scope left: 注意看有没有 ~A / ~B 输出
+```
+
+**没有 `~A` / `~B` 输出——两个对象都泄漏了。**
+
+```mermaid
+flowchart LR
+  PA["栈上 pa<br/>(已销毁)"] -->|"曾经指向"| A["对象 A"]
+  A -->|"shared_ptr b"| B["对象 B"]
+  B -->|"shared_ptr a"| A
+  style A fill:#fdd
+  style B fill:#fdd
+```
+
+原因：
+- `pa` 销毁 → A 的计数从 2 变 1（因为 B 还持有它）
+- `pb` 销毁 → B 的计数从 2 变 1（因为 A 还持有它）
+- **两个计数都永远 >= 1，谁也不会被释放**
+
+### 用 weak_ptr 打破
+
+```cpp
+// cycle_fixed.cpp
+#include <memory>
+#include <cstdio>
+
+struct B;
+struct A {
+    std::shared_ptr<B> b;
+    ~A() { std::printf("  ~A\n"); }
+};
+struct B {
+    std::weak_ptr<A> a;        // 改成 weak_ptr：不增加强计数
+    ~B() { std::printf("  ~B\n"); }
+    void use_a() {
+        if (auto sp = a.lock()) {          // lock() 提升为 shared_ptr
+            std::printf("  B can see A, use_count=%ld\n", sp.use_count());
+        } else {
+            std::printf("  A is gone\n");
+        }
+    }
+};
+
+int main() {
+    {
+        auto pa = std::make_shared<A>();
+        auto pb = std::make_shared<B>();
+        pa->b = pb;
+        pb->a = pa;
+        std::printf("  pa.use_count=%ld pb.use_count=%ld\n",
+                    pa.use_count(), pb.use_count());
+        pb->use_a();
+    }
+    std::printf("--- scope left\n");
+}
+```
+
+**实测输出：**
+
+```text
+  pa.use_count=1 pb.use_count=2
+  B can see A, use_count=2
+  ~A
+  ~B
+--- scope left
+```
+
+现在 `pa` 销毁时 A 的计数真的归零 → A 析构 → A 的成员 `b` 析构 → B 的计数归零 → B 析构。**链条被正确解开。**
+
+### weak_ptr 的三个操作
+
+| 操作 | 作用 |
+| --- | --- |
+| `wp.expired()` | 对象是否已销毁（等价于 `use_count() == 0`） |
+| `wp.lock()` | **原子地**返回一个 `shared_ptr`；若对象已销毁返回空 |
+| `wp.use_count()` | 当前强引用计数 |
+
+:::tip[永远用 `lock()` 而不是 `expired()` + `lock()`]
+```cpp
+// 错误：检查和使用之间有竞态（多线程下 expired() 之后对象可能被销毁）
+if (!wp.expired()) { use(*wp.lock()); }
+
+// 正确：lock() 一次完成检查和提升
+if (auto sp = wp.lock()) { use(*sp); }
+```
+:::
+
+### 什么时候用 weak_ptr
+
+1. **打破循环引用**（父子关系中，子持有父用 `weak_ptr`）
+2. **缓存**：缓存持有 `weak_ptr`，对象没人用就自动失效
+3. **观察者模式**：观察者不延长被观察者的生命周期
+
+## 5. 自定义删除器
+
+`unique_ptr` 和 `shared_ptr` 的删除器用法**不一样**，这是容易搞混的点：
+
+- **`unique_ptr`**：删除器是**类型的一部分**（`unique_ptr<T, Deleter>`）
+- **`shared_ptr`**：删除器**不是类型的一部分**（类型擦除，存在控制块里）
+
+```cpp
+// deleter_demo.cpp
+#include <memory>
+#include <cstdio>
+#include <cstdlib>
+
+struct FileCloser {
+    void operator()(std::FILE* f) const {
+        if (f) { std::printf("  [deleter] fclose\n"); std::fclose(f); }
+    }
+};
+
+int main() {
+    std::printf("sizeof(unique_ptr<FILE, FileCloser>) = %zu\n",
+                sizeof(std::unique_ptr<std::FILE, FileCloser>));
+    std::printf("sizeof(unique_ptr<FILE>)             = %zu\n",
+                sizeof(std::unique_ptr<std::FILE>));
+    std::printf("sizeof(shared_ptr<FILE>)             = %zu (删除器在控制块里)\n",
+                sizeof(std::shared_ptr<std::FILE>));
+
+    // unique_ptr: 删除器类型是模板参数
+    std::unique_ptr<std::FILE, FileCloser> uf(std::fopen("deleter_demo.cpp", "r"));
+    std::printf("  unique file ptr = %p\n", (void*)uf.get());
+
+    // shared_ptr: 删除器是构造参数，类型不变
+    std::shared_ptr<std::FILE> sf(std::fopen("deleter_demo.cpp", "r"), FileCloser{});
+    std::printf("  shared file ptr = %p\n", (void*)sf.get());
+
+    // shared_ptr 也可以传 lambda
+    std::shared_ptr<int> si(new int(5), [](int* p) {
+        std::printf("  [lambda deleter] delete %d\n", *p); delete p; });
+
+    // unique_ptr 传 lambda 必须用 decltype
+    auto lam = [](int* p) { delete p; };
+    std::unique_ptr<int, decltype(lam)> ul(new int(6), lam);
+    std::printf("  sizeof(unique_ptr with lambda deleter) = %zu\n", sizeof(ul));
+}
+```
+
+**实测输出：**
+
+```text
+sizeof(unique_ptr<FILE, FileCloser>) = 8
+sizeof(unique_ptr<FILE>)             = 8
+sizeof(shared_ptr<FILE>)             = 16 (删除器在控制块里)
+  unique file ptr = 000001d5d70e2d60
+  shared file ptr = 000001d5d7103640
+  sizeof(unique_ptr with lambda deleter) = 8
+  [lambda deleter] delete 5
+  [deleter] fclose
+  [deleter] fclose
+```
+
+:::info[为什么 unique_ptr 的删除器是类型的一部分？]
+为了**零开销**。把删除器编码进类型，编译器就能内联它、并且空删除器不占空间（EBO）。代价是 `unique_ptr<T, D1>` 和 `unique_ptr<T, D2>` 是**不同类型**，不能互相赋值。
+
+`shared_ptr` 选择类型擦除（存在控制块），代价是多一次间接调用 + 控制块空间，好处是类型统一、可以放进容器。
+
+**这个取舍本身就是 C++ 设计哲学的缩影：能静态决定就静态（零开销），需要运行时灵活才付代价。**
+:::
+
+### 嵌入式场景：管理硬件资源
+
+这是自定义删除器最有价值的地方之一（详见 [嵌入式 C++](./embedded-cpp)）：
+
+```cpp
+// 伪代码示意：ESP-IDF 的 I2C 设备句柄
+using I2cDevice = std::unique_ptr<i2c_master_dev_t, decltype([](i2c_master_dev_t* d){
+    i2c_master_bus_rm_device(d);
+})>;
+
+auto dev = I2cDevice(handle);   // 离开作用域自动移除设备
+```
+
+## 6. 常见坑与误用
+
+### 坑一：同一个裸指针构造多个 shared_ptr
+
+```cpp
+// 错误：两个独立控制块，会 delete 两次
+int* raw = new int(5);
+std::shared_ptr<int> p1(raw);
+std::shared_ptr<int> p2(raw);   // 灾难
+
+// 正确
+auto p1 = std::make_shared<int>(5);
+auto p2 = p1;                    // 共享控制块
+```
+
+### 坑二：shared_ptr 的 this 泄漏
+
+见前面 `enable_shared_from_this` 一节。
+
+### 坑三：混用智能指针和裸指针 ownership
+
+```cpp
+auto p = std::make_unique<Foo>();
+Foo* raw = p.get();
+// ... 某处 delete raw;   → 之后 p 析构时再 delete 一次 → double free
+```
+
+**规则：一旦交给智能指针，就不要再手动 delete。**
+
+### 坑四：把智能指针当"万能药"
+
+`shared_ptr` 用多了是设计问题。**默认用 `unique_ptr`**，只在确实需要共享所有权时才升级到 `shared_ptr`。判断标准：
+
+- 这个资源同时被多处持有、且没有明确的"主人" → `shared_ptr`
+- 有明确的主人/作用域 → `unique_ptr`
+- 只是看看，不拥有 → `T*` 或 `T&`
+
+## 常见坑
+
+| 坑 | 现象 | 解法 |
+| --- | --- | --- |
+| 同一裸指针构造多个 shared_ptr | double delete | 用 `make_shared` + 拷贝 |
+| 相互 shared_ptr | 内存泄漏（永不析构） | 一方改 `weak_ptr` |
+| 误以为 shared_ptr 让对象线程安全 | 数据竞争 | 对象本身仍需加锁 |
+| `wp.expired()` 后再 `lock()` | 竞态 | 直接 `if (auto sp = wp.lock())` |
+| 析构里手动 delete 智能指针管的资源 | double free | 交给智能指针就别管 |
+| 函数参数用 `const unique_ptr<T>&` | 调用方被绑死 | 用 `T&` / `T*` |
+| 构造函数里调 `shared_from_this()` | 抛 `bad_weak_ptr` | 构造完成后再调 |
+| 忘记 `make_unique` 是 C++14 | C++11 下编译失败 | 自己写一个（3 行） |
+| 大对象 + 长期 weak_ptr | 内存滞留 | 用 `shared_ptr(new T)` |
+| `unique_ptr` 带函数指针删除器 | 大小翻倍到 16 | 用无状态 lambda 或空类 |
+
+## 自检清单
+
+- [ ] 说出 `unique_ptr` / `shared_ptr` / `weak_ptr` 各自的实测大小，并解释差异
+- [ ] 画出 `shared_ptr` 的内存布局（对象指针 + 控制块指针 + 控制块内容）
+- [ ] 解释 `make_shared` 的三个优势和一个缺点
+- [ ] 解释循环引用为什么导致泄漏，以及 `weak_ptr` 怎么打破它
+- [ ] 说明为什么 `unique_ptr` 的删除器是类型的一部分而 `shared_ptr` 不是
+- [ ] 说出 `shared_ptr` 线程安全保证的**确切边界**
+- [ ] 为"借用"、"接管所有权"、"共享所有权"各写出正确的参数类型
+- [ ] 知道 `weak_ptr::lock()` 相对 `expired()` + `get()` 的优势
+- [ ] 能用自定义删除器封装一个非内存资源（如 FILE*）
+- [ ] 判断给定场景该用哪种智能指针（或根本不该用）
+
+## 下一步
+
+- 移动语义的底层机制 → [移动语义与完美转发](./move-semantics)
+- 容器内部的资源管理 → [STL 容器](./stl-containers)
+- 智能指针在嵌入式上的取舍 → [嵌入式 C++ 实战](./embedded-cpp)
+- 回到 [C++ 主线导读](./)
+
+---
+
+**翻页**：[← 上一页](./raii-smartptr-02) · [返回目录](./)

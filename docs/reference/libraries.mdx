@@ -1,0 +1,164 @@
+---
+id: libraries
+title: 库与版本清单
+sidebar_position: 6
+description: 官方组件、常用 Arduino 库与版本锁定方法。
+---
+
+# 库与版本清单
+
+## 1. 版本基线
+
+| 项 | 本教程采用 | 说明 |
+| --- | --- | --- |
+| **ESP-IDF** | **v5.5.x** | 本教程锁定此基线；6.x 已发布（stable 已到 6.1），尚未迁移 |
+| **arduino-esp32** | **3.3.x** | 基于 IDF 5.5.x |
+| 硬件 | ESP32-S3-WROOM-1-N16R8 | 16MB Flash / 8MB PSRAM |
+
+**IDF 5.2 → 5.3 → 5.4 → 5.5 之间 API 有变动**（主要是 I2C/SPI 新驱动、ADC oneshot），跨大版本抄代码要先核对 API。
+
+## 2. ESP-IDF 官方组件
+
+### 通信
+
+| 组件 | 用途 |
+| --- | --- |
+| `esp_wifi` | WiFi |
+| `bt` / `nimble` | 蓝牙（Bluedroid / NimBLE） |
+| `esp_http_client` | HTTP 客户端 |
+| `esp_websocket_client` | WebSocket 客户端 |
+| `esp-mqtt` | MQTT 客户端 |
+| `esp_netif` | 网络接口抽象 |
+| `lwip` | TCP/IP 协议栈 |
+| `esp-tls` | TLS 封装（OpenSSL 或 mbedTLS） |
+| `mbedtls` | 加密库 |
+| `esp_rainmaker` | 乐鑫云平台（零代码配网） |
+
+### 外设与驱动
+
+| 组件 | 用途 |
+| --- | --- |
+| `driver` | GPIO / I2C / SPI / UART / LEDC / MCPWM / DAC / I2S / RMT / TWAI / USB |
+| `esp_adc` | ADC oneshot / calibration / continuous |
+| `esp_timer` | 高精度定时器 |
+| `esp_iot` | 摄像头、触摸、LEDC 之外的杂项 |
+
+### 系统
+
+| 组件 | 用途 |
+| --- | --- |
+| `esp_pm` | 电源管理 |
+| `esp_hw_support` | 时钟/复位/GPIO 矩阵底层 |
+| `nvs_flash` | 键值存储 |
+| `esp_partition` | 分区表 API |
+| `app_update` | OTA 核心 |
+| `esp_secure_boot` | 安全启动 |
+| `esp_flash_encrypt` | Flash 加密 |
+| `efuse` | eFuse |
+| `esp_system` | 复位、重启、固件信息 |
+| `esp_timer` | 定时器 |
+| `esp_log` | 日志 |
+| `unity` | 单元测试 |
+| `esp_insights` | 运行数据采集（诊断用） |
+
+### 高级能力
+
+| 组件 | 用途 |
+| --- | --- |
+| `esp-dl` | AI 模型库 |
+| `esp-tflite-micro` | TFLM 推理 |
+| `esp-sr` | 语音唤醒 |
+| `esp_audio_codec` | 音频编解码 |
+| `lvgl` | 图形界面 |
+| `esp_lcd` | LCD 驱动框架 |
+| `esp_jpeg` / `esp_png` | 图像编解码 |
+| `esp-usb` / `tinyusb` | USB 设备 |
+| `esp-modem` | 蜂窝模块 AT 驱动 |
+| `esp-modbus` | Modbus 工业协议 |
+| `esp_modbus` | 同上 |
+| `esp_zigbee` / `esp_wifi` Thread | Zigbee / Thread |
+
+## 3. 第三方常用组件
+
+```bash
+idf.py add-dependency "espressif/esp_modem@^1.0.0"
+idf.py add-dependency "本地路径/my_component"
+```
+
+| 组件 | 用途 |
+| --- | --- |
+| `espressif/esp_codec_dev` | 音频编解码器驱动（ES8311/ES7210 等） |
+| `espressif/esp_video` | 视频采集与编码流水线 |
+| `espressif/esp_modem` | 4G/LTE/NB-IoT 模组驱动 |
+| `espressif/esp_jpeg` | JPEG 编解码 |
+| `lvgl/lvgl` | LVGL 官方镜像 |
+| `pioarduino` 生态 | PlatformIO 用户参考的配置 |
+
+**查组件注册表**：[https://components.espressif.com/](https://components.espressif.com/)
+
+## 4. 常用 Arduino 库
+
+| 库 | 用途 | 备注 |
+| --- | --- | --- |
+| `ESP32Servo` | 舵机 | 支持 S3，注意引脚冲突 |
+| `Adafruit SSD1306` + `Adafruit GFX` | OLED 显示 | 最常用组合 |
+| `Adafruit SH110X` | OLED（1.3 寸常用这个） | 12864 的实际驱动是 SH1106 |
+| `Adafruit BME280` | 温湿度气压 | I2C，精度好 |
+| `Adafruit MPU6050` | 六轴 IMU | |
+| `U8g2` | 单色图形库 | 支持多种屏，字体全 |
+| `TFT_eSPI` | 彩屏（ST7789/ILI9341） | 性能好，配置多 |
+| `PubSubClient` | MQTT 客户端 | **需要手动调 `loop()`** |
+| `ArduinoJson` | JSON 解析 | 嵌入式最常用 |
+| `OneWire` / `DallasTemperature` | DS18B20 温度 | 单总线 |
+| `FastLED` / `Adafruit NeoPixel` | WS2812 灯带 | |
+| `WebServer` | HTTP 服务器 | 配网页面用 |
+| `LittleFS` | 文件系统 | Arduino 侧封装 |
+| `ESP32 Async WebServer` | 异步 HTTP + WebSocket | WiFi 客户端/服务端都有 |
+| `Wire` / `SPI` / `HardwareSerial` | 内置 | 无需安装 |
+
+## 5. 版本锁定
+
+### IDF 项目
+
+```bash
+idf.py add-dependency "组件名@版本"
+idf.py fullclean          # 依赖变化后必须
+```
+
+`dependencies.lock` 记录所有组件的确切版本，**必须提交到 git**。
+
+### Arduino 项目
+
+`platform.txt` 或开发板管理器里固定版本号。团队协作时在 `README` 里写清：
+
+```
+开发板：esp32:esp32:esp32s3
+核心版本：3.3.11
+分区方案：16MB with spiffs
+```
+
+### 配图钉死的做法
+
+用 `arduino-cli` 把核心文件锁进 git：
+
+```bash
+arduino-cli core install esp32:esp32@3.3.11
+arduino-cli lib install "Adafruit SSD1306@2.5.13"
+arduino-cli compile --fqbn esp32:esp32:esp32s3 --libraries . .
+```
+
+## 6. 跨版本迁移
+
+从旧版本 IDF 迁到 5.5：
+
+| 变化 | 处理 |
+| --- | --- |
+| `driver/i2c.h` → `driver/i2c_master.h` | 重写 I2C 代码 |
+| `driver/spi.h` → `driver/spi_master.h` | 重写 SPI 代码 |
+| `adc.h` → `esp_adc/adc_oneshot.h` | 重写 ADC 代码 |
+| `esp_wifi.h` 的事件 API | 基本兼容 |
+| `esp_ota_ops.h` | 基本兼容 |
+| `nvs_flash_init` 行为 | 更严格，建议检查返回值 |
+| 分区表默认变化 | 检查 partitions.csv |
+
+**升级后第一件事**：跑一遍所有单元测试和外设自检，别直接上项目。

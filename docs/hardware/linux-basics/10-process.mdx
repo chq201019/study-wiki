@@ -1,0 +1,357 @@
+---
+id: 10-process
+title: 10 进程管理
+sidebar_position: 10
+description: ps 和 top 看进程、kill 发信号、前台后台切换、以及 kill -9 为什么是最后手段。
+---
+
+# 10 进程管理
+
+**本课目标**：会看进程、会停进程、理解前后台。
+
+## 进程是什么
+
+![Linux 进程状态机：R/S/D/T/Z 五种状态及其转换条件，对应 ps 命令 STAT 列的字母](/img/diagrams/linux-process-states.svg)
+
+
+**进程 = 正在运行的程序实例。**
+
+```bash
+ls              # 执行时创建一个进程，执行完就没了
+```
+
+每个进程有一个 **PID**（进程 ID），还有一个 **PPID**（父进程 ID）。
+
+:::info[所有进程的祖宗是 PID 1]
+本机实测：
+
+```text
+USER  PID %CPU %MEM    VSZ   RSS TTY   STAT START  TIME COMMAND
+root    1  0.0  0.3  24208 12948 ?     Ss   10月13  2:21 /sbin/init
+root    2  0.0  0.0      0     0 ?     S    10月13  0:00 [kthreadd]
+```
+
+**PID 1 是 `init`（现代系统通常是 systemd）**，它是内核启动的第一个进程，所有其他进程都是它的后代。
+
+PID 2 `[kthreadd]` 带方括号表示**内核线程**（不是普通用户进程）。
+:::
+
+## `ps`：看进程快照
+
+```bash
+ps aux              # 所有进程（BSD 风格）
+ps -ef              # 所有进程（System V 风格）
+ps aux | grep nginx # 找特定进程
+```
+
+本机实测两种格式：
+
+```text
+# ps aux
+USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+root           1  0.0  0.3  24208 12948 ?        Ss   10月13   2:21 /sbin/init
+
+# ps -ef
+UID          PID    PPID  C STIME TTY          TIME CMD
+root           1       0  0 10月13 ?      00:02:21 /sbin/init
+```
+
+:::tip[两种风格的区别]
+| 命令 | 特点 |
+| --- | --- |
+| `ps aux` | **有 CPU/内存百分比**，最常用 |
+| `ps -ef` | **有 PPID（父进程）**，看进程树用 |
+:::
+
+### 常用组合
+
+```bash
+ps aux | grep python        # 找 python 进程
+ps -ef --forest             # 树形显示父子关系
+ps aux --sort=-%mem | head  # 按内存排序
+ps aux --sort=-%cpu | head  # 按 CPU 排序
+```
+
+:::warning[`ps aux | grep x` 会把自己也搜出来]
+```bash
+ps aux | grep nginx
+# 结果里有一行 "grep nginx" —— 那是 grep 自己的进程
+```
+
+**规避方法**：
+
+```bash
+ps aux | grep [n]ginx       # 用方括号技巧
+pgrep nginx                 # 直接用 pgrep（更好）
+```
+:::
+
+## `top` / `htop`：实时监控
+
+```bash
+top
+```
+
+本机实测 `top` 在 `/usr/bin/top`。
+
+### top 里的操作键
+
+| 按键 | 作用 |
+| --- | --- |
+| `q` | 退出 |
+| `M` | 按内存排序 |
+| `P` | 按 CPU 排序 |
+| `k` | 杀进程（会问 PID） |
+| `1` | 展开每个 CPU 核心 |
+
+:::tip[`htop` 更友好]
+```bash
+apt install htop
+htop
+```
+
+**彩色、能用鼠标、能直接 F9 杀进程**——比 `top` 好用得多。
+:::
+
+### 看 top 头部
+
+```text
+top - 14:20:01 up 5 days,  3:12,  1 user,  load average: 0.08, 0.12, 0.09
+Tasks: 128 total,   1 running, 127 sleeping,   0 stopped,   0 zombie
+%Cpu(s):  1.2 us,  0.5 sy,  0.0 ni, 98.2 id
+MiB Mem :   3936.0 total,    512.3 free,    982.1 used,   2441.6 buff/cache
+```
+
+| 项 | 含义 |
+| --- | --- |
+| `load average` | **1/5/15 分钟的平均负载** |
+| `zombie` | 僵尸进程数（应该接近 0） |
+| `us` / `sy` / `id` | 用户态 / 内核态 / 空闲 CPU 占比 |
+| `buff/cache` | 缓存（**可回收，不算真占用**） |
+
+:::danger[`load average` 怎么看]
+**经验法则：load 值应该 ≤ CPU 核心数。**
+
+```bash
+nproc               # 看有几个核
+```
+
+4 核机器 load 4.0 表示"满载"，超过就是排队等。
+
+**但 load 高不一定 CPU 忙**——大量磁盘 IO 也会推高 load。
+:::
+
+:::warning[`buff/cache` 占了很多内存不是问题]
+```text
+MiB Mem :   3936.0 total,    512.3 free,    982.1 used,   2441.6 buff/cache
+```
+
+看到 `free` 只有 512 MiB 别慌——**`buff/cache` 是文件缓存，内存不够时内核会自动回收。**
+
+看 `available` 这一项才是真实可用内存。
+:::
+
+## `kill`：发信号
+
+:::danger[`kill` 不是"杀死"，是"发信号"]
+```bash
+kill 1234           # 默认发 SIGTERM（15）
+kill -9 1234        # 发 SIGKILL（9）
+kill -l             # 列出所有信号
+```
+
+进程收到信号后**可以自己决定怎么处理**——这是 `kill` 和"强制终止"的关键区别。
+:::
+
+### 常用信号
+
+| 信号 | 编号 | 含义 | 能否被忽略 |
+| --- | --- | --- | --- |
+| `SIGTERM` | 15 | 请退出（默认） | ✅ 能 |
+| `SIGKILL` | 9 | **强制杀死** | ❌ **不能** |
+| `SIGHUP` | 1 | 挂断（常用于让服务重载配置） | ✅ 能 |
+| `SIGINT` | 2 | 中断（`Ctrl+C`） | ✅ 能 |
+| `SIGSTOP` | 19 | 暂停 | ❌ 不能 |
+
+本机实测信号表：
+
+```text
+ 1) SIGHUP	 2) SIGINT	 3) SIGQUIT	 4) SIGILL	 5) SIGTRAP
+ 6) SIGABRT	 7) SIGBUS	 8) SIGFPE	 9) SIGKILL	10) SIGUSR1
+```
+
+### `kill` vs `kill -9`
+
+:::tip[正确的杀进程顺序]
+```bash
+kill 1234               # ① 先发 SIGTERM，给进程机会清理
+# 等几秒，看是否退出
+kill -9 1234            # ② 还不停才用 SIGKILL
+```
+
+**为什么**：
+
+- `SIGTERM` 能让进程**保存数据、关闭文件、释放锁**
+- `SIGKILL` 是内核直接抹掉进程，**它来不及做任何清理**
+
+**直接 `kill -9` 可能留下损坏的数据文件或没释放的资源。**
+
+（但对于已经卡死、不响应信号的进程，`-9` 是唯一选择。）
+:::
+
+### 按名字杀
+
+```bash
+pkill nginx             # 按进程名
+pkill -f "python app"   # 按完整命令行
+killall nginx           # 同上（部分系统有）
+```
+
+:::danger[`pkill -f` 很容易误杀]
+```bash
+pkill -f python         # ❌ 可能杀掉所有含 python 的进程
+```
+
+**先看会杀谁**：
+
+```bash
+pgrep -a -f python      # 列出匹配的进程和命令行
+```
+:::
+
+## 前台与后台
+
+```bash
+命令 &                  # 直接放到后台运行
+```
+
+本机实测：
+
+```bash
+sleep 30 &
+# 后台 PID=842143
+jobs
+# [1]+  运行中               sleep 30 &
+```
+
+### 常用操作
+
+| 操作 | 命令 |
+| --- | --- |
+| 后台运行 | `命令 &` |
+| 看后台任务 | `jobs` |
+| 暂停当前任务 | `Ctrl+Z` |
+| 暂停转后台 | `bg` |
+| 后台转前台 | `fg` |
+| 指定任务转前台 | `fg %1` |
+
+:::tip[`Ctrl+Z` + `bg` 的妙用]
+长命令跑到一半发现要去做别的：
+
+```text
+Ctrl+Z          # 暂停
+bg              # 转到后台继续跑
+# ... 干别的事 ...
+fg              # 拿回前台
+```
+:::
+
+### `nohup`：退出终端也不停
+
+:::danger[关掉终端后台进程就死了]
+```bash
+./long_task &           # 退出 SSH 后，这个进程通常会被终止
+```
+
+因为终端关闭时会发 `SIGHUP` 给它的子进程。
+:::
+
+```bash
+nohup ./long_task > out.log 2>&1 &
+```
+
+| 部分 | 作用 |
+| --- | --- |
+| `nohup` | 忽略 SIGHUP |
+| `> out.log` | 输出重定向到文件 |
+| `2>&1` | 错误也一起重定向 |
+| `&` | 放后台 |
+
+:::tip[更好的方案：`tmux` / `screen`]
+```bash
+tmux new -s work        # 新建会话
+# ... 干活 ...
+Ctrl+B 然后 D           # 断开（程序继续跑）
+tmux attach -t work     # 重新连上
+```
+
+**`tmux` 能保持完整的终端会话**——重新连上还能看到之前的输出、继续交互。
+
+**跑长任务时比 `nohup` 好用得多。**
+:::
+
+## 找占用端口的进程
+
+```bash
+ss -tlnp                # 看所有监听端口和对应进程
+lsof -i :8080           # 看谁占了 8080
+```
+
+本机实测 `ss -tlnp` 可用。
+
+## 完整示例
+
+```bash
+# ① 看当前有哪些进程
+ps aux | head -5
+
+# ② 起一个后台任务
+sleep 300 &
+SLEEP_PID=$!
+echo "PID = $SLEEP_PID"
+
+# ③ 确认它在
+ps -p $SLEEP_PID
+
+# ④ 看后台任务列表
+jobs
+
+# ⑤ 正常终止
+kill $SLEEP_PID
+
+# ⑥ 确认没了
+ps -p $SLEEP_PID || echo "已退出"
+
+# ⑦ 用 nohup 跑后台
+nohup sleep 60 > /tmp/nohup_test.log 2>&1 &
+echo "nohup PID = $!"
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 直接 `kill -9` | 数据可能损坏 | 进程没机会清理 | 先试 `kill` |
+| `ps aux \| grep x` 多一行 | 看到 grep 自己 | grep 也是进程 | 用 `pgrep` 或 `[x]` |
+| 关终端后进程没了 | 收到 SIGHUP | 终端断开 | `nohup` 或 `tmux` |
+| 杀不掉进程 | 没反应 | 权限不够/僵尸进程 | `sudo kill -9` |
+| `pkill -f python` 杀多了 | 误杀其他进程 | 匹配太宽 | 先 `pgrep -a` 确认 |
+| 看 `free` 少就以为内存不足 | —— | `buff/cache` 可回收 | 看 `available` |
+
+## 本课自检
+
+- [ ] 知道 PID 和 PPID，知道 PID 1 是 init/systemd
+- [ ] 会用 `ps aux` 和 `ps -ef`，知道两者区别
+- [ ] 会用 `top`（`M` `P` `k` `q`）
+- [ ] **知道 `load average` 要跟 CPU 核心数比较**
+- [ ] **知道 `buff/cache` 是可回收内存，不是真占用**
+- [ ] 会用 `kill` 发信号，知道常用信号编号
+- [ ] **知道 `SIGTERM` 能被忽略、`SIGKILL` 不能**
+- [ ] **知道该先 `kill` 再 `kill -9`**
+- [ ] 会用 `&`、`jobs`、`fg`、`bg`、`Ctrl+Z`
+- [ ] 会用 `nohup`，知道 `tmux` 更好
+- [ ] 会用 `ss -tlnp` 找占端口的进程
+
+## 下一步
+
+[11 软件安装](./11-packages) —— 包管理器怎么用，为什么它比下载 exe 好。

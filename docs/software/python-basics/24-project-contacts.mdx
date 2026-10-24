@@ -1,0 +1,377 @@
+---
+id: 24-project-contacts
+title: 24 阶段实战：通讯录
+sidebar_position: 24
+description: 用类 + 文件持久化做一个完整的通讯录：增删改查、保存到 JSON、菜单循环，关机数据不丢。
+---
+
+# 24 阶段实战：通讯录
+
+**本课目标**：把**类、文件、异常、循环、字典**全部用上，做出一个真正有用的小程序。
+
+## 要做什么
+
+一个命令行通讯录，支持：
+
+- 查看所有联系人
+- 添加
+- 搜索
+- 修改
+- 删除
+- **数据保存到文件，关掉再开还在**
+
+麻雀虽小，但这是**所有管理系统**的雏形。学会它，做更复杂的系统只是加功能。
+
+## 数据设计
+
+一个联系人有什么？
+
+| 字段 | 说明 |
+| --- | --- |
+| `name` | 姓名 |
+| `phone` | 电话 |
+| `email` | 邮箱 |
+
+## 第一步：先定 Contact 类
+
+```python
+class Contact:
+    """一个联系人"""
+
+    def __init__(self, name, phone, email=""):
+        self.name = name
+        self.phone = phone
+        self.email = email
+
+    def to_dict(self):
+        """转成字典，方便存 JSON"""
+        return {"name": self.name, "phone": self.phone, "email": self.email}
+
+    @classmethod
+    def from_dict(cls, d):
+        """从字典创建对象"""
+        return cls(d["name"], d["phone"], d.get("email", ""))
+
+    def __str__(self):
+        email = self.email or "（无邮箱）"
+        return f"{self.name:<8} {self.phone:<14} {email}"
+```
+
+:::tip[为什么要 to_dict / from_dict]
+JSON 只能存「基本类型」（字符串、数字、列表、字典），**不能直接存自定义对象**。
+
+所以要：
+
+- 存之前：对象 → 字典（`to_dict`）
+- 读之后：字典 → 对象（`from_dict`）
+
+这个「序列化 / 反序列化」的配对是标准做法。
+
+`@classmethod` 是「类方法」，第一个参数是类本身（`cls`）而不是实例，所以能创建对象。
+:::
+
+## 第二步：通讯录管理类
+
+```python
+import json
+from pathlib import Path
+
+
+class ContactBook:
+    """通讯录：管理一堆联系人，并负责存取文件"""
+
+    def __init__(self, path="contacts.json"):
+        self.path = Path(path)
+        self.contacts = []
+        self.load()
+
+    def load(self):
+        """从文件读取"""
+        if not self.path.exists():
+            self.contacts = []
+            return
+        try:
+            text = self.path.read_text(encoding="utf-8")
+            data = json.loads(text)
+            self.contacts = [Contact.from_dict(d) for d in data]
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"⚠ 文件格式异常，将以空通讯录启动：{e}")
+            self.contacts = []
+
+    def save(self):
+        """保存到文件"""
+        data = [c.to_dict() for c in self.contacts]
+        text = json.dumps(data, ensure_ascii=False, indent=2)
+        self.path.write_text(text, encoding="utf-8")
+```
+
+:::warning[`ensure_ascii=False` 不能忘]
+```python
+json.dumps({"name": "小明"})                        # '{"name": "\\u5c0f\\u660e"}'
+json.dumps({"name": "小明"}, ensure_ascii=False)    # '{"name": "小明"}'
+```
+
+不加这个参数，中文会被转成 `\uXXXX` 转义序列。虽然**还能正确读回**，但文件打开后完全没法看，也没法手动编辑。
+:::
+
+### 增删改查
+
+```python
+    def add(self, contact):
+        if self.find(contact.name):
+            raise ValueError(f"「{contact.name}」已存在")
+        self.contacts.append(contact)
+        self.save()
+
+    def find(self, name):
+        """按姓名精确查找，返回 Contact 或 None"""
+        for c in self.contacts:
+            if c.name == name:
+                return c
+        return None
+
+    def search(self, keyword):
+        """模糊搜索，返回列表"""
+        return [c for c in self.contacts
+                if keyword in c.name or keyword in c.phone]
+
+    def update(self, name, **fields):
+        c = self.find(name)
+        if not c:
+            raise ValueError(f"找不到「{name}」")
+        for key, value in fields.items():
+            if not hasattr(c, key):
+                raise ValueError(f"没有字段 {key}")
+            setattr(c, key, value)
+        self.save()
+        return c
+
+    def delete(self, name):
+        c = self.find(name)
+        if not c:
+            raise ValueError(f"找不到「{name}」")
+        self.contacts.remove(c)
+        self.save()
+```
+
+:::tip[`**fields` 和 `setattr` 的配合]
+`update("小明", phone="139...")` 里的 `**fields` 会收集成 `{"phone": "139..."}`。
+
+然后循环调用 `setattr(c, "phone", "139...")`，等价于 `c.phone = "139..."`。
+
+**好处**：可以只改想改的字段，不用把三个字段都传一遍。
+
+`hasattr` 先检查字段是否存在，避免手滑写成 `updata("小明", phnoe="x")` 时静默创建一个无用属性。
+:::
+
+## 第三步：命令行菜单
+
+```python
+def main():
+    book = ContactBook("contacts.json")
+
+    menu = """
+========= 通讯录 =========
+  1. 查看全部
+  2. 添加
+  3. 搜索
+  4. 修改
+  5. 删除
+  0. 退出
+=========================="""
+
+    while True:
+        print(menu)
+        choice = input("请选择：").strip()
+
+        if choice == "1":
+            if not book.contacts:
+                print("通讯录是空的\n")
+                continue
+            print(f"\n共 {len(book.contacts)} 个联系人：")
+            for c in book.contacts:
+                print("  " + str(c))
+            print()
+
+        elif choice == "2":
+            name = input("姓名：").strip()
+            if not name:
+                print("姓名不能为空\n")
+                continue
+            phone = input("电话：").strip()
+            email = input("邮箱（可空）：").strip()
+            try:
+                book.add(Contact(name, phone, email))
+                print(f"✓ 已添加「{name}」\n")
+            except ValueError as e:
+                print(f"✗ {e}\n")
+
+        elif choice == "3":
+            kw = input("搜索（姓名或电话）：").strip()
+            results = book.search(kw)
+            if results:
+                print(f"\n找到 {len(results)} 条：")
+                for c in results:
+                    print("  " + str(c))
+            else:
+                print("没有找到")
+            print()
+
+        elif choice == "4":
+            name = input("要修改谁：").strip()
+            c = book.find(name)
+            if not c:
+                print(f"✗ 找不到「{name}」\n")
+                continue
+            print(f"当前：{c}")
+            phone = input(f"新电话（回车保持 {c.phone}）：").strip()
+            email = input(f"新邮箱（回车保持 {c.email}）：").strip()
+            fields = {}
+            if phone:
+                fields["phone"] = phone
+            if email:
+                fields["email"] = email
+            if fields:
+                book.update(name, **fields)
+                print("✓ 已修改\n")
+            else:
+                print("没有改动\n")
+
+        elif choice == "5":
+            name = input("要删除谁：").strip()
+            confirm = input(f"确认删除「{name}」？(y/n)：").strip().lower()
+            if confirm == "y":
+                try:
+                    book.delete(name)
+                    print(f"✓ 已删除「{name}」\n")
+                except ValueError as e:
+                    print(f"✗ {e}\n")
+            else:
+                print("已取消\n")
+
+        elif choice == "0":
+            print("再见！")
+            break
+
+        else:
+            print("无效选项，请输入 0-5\n")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## 运行示例
+
+```text
+========= 通讯录 =========
+  1. 查看全部
+  2. 添加
+  3. 搜索
+  4. 修改
+  5. 删除
+  0. 退出
+==========================
+请选择：2
+姓名：小明
+电话：13800138000
+邮箱（可空）：ming@example.com
+✓ 已添加「小明」
+
+请选择：1
+
+共 1 个联系人：
+  小明       13800138000    ming@example.com
+
+请选择：0
+再见！
+```
+
+再运行一次，**数据还在**——因为已经写进了 `contacts.json`。
+
+文件内容长这样：
+
+```json
+[
+  {
+    "name": "小明",
+    "phone": "13800138000",
+    "email": "ming@example.com"
+  }
+]
+```
+
+## 这个程序用到了什么
+
+| 功能 | 用到的知识 | 出自 |
+| --- | --- | --- |
+| `class Contact` | 类与对象 | [21](./21-class) |
+| `__init__` / `__str__` | 魔术方法 | [21](./21-class) |
+| `json.dumps/loads` | 标准库 | [25](./25-stdlib) |
+| `Path.read_text/write_text` | pathlib | [19](./19-files) |
+| `try/except` | 异常处理 | [20](./20-exceptions) |
+| `raise ValueError` | 主动抛错 | [20](./20-exceptions) |
+| `while True` + `break` | 菜单循环 | [10](./10-loops) |
+| `if/elif` 多分支 | 条件判断 | [09](./09-if) |
+| `**fields` + `setattr` | 参数进阶 | [16](./16-functions-advanced) |
+| 列表推导式 | 筛选 | [23](./23-comprehension) |
+| `f"{name:<8}"` | 字符串对齐 | [07](./07-strings) |
+
+**一个小小的通讯录，把前 20 课几乎全用上了。** 这就是为什么必须把基础学扎实——真实程序就是这样组合起来的。
+
+:::tip[为什么这里用「类 + JSON」而不是直接用字典]
+对比一下如果全用字典：
+
+```python
+contacts = []      # [{"name":..., "phone":...}, ...]
+```
+
+也能做，而且更简单。但用类的好处：
+
+1. `contact.name` 比 `contact["name"]` 安全（写错属性名报错，写错键名要到运行时）
+2. 校验逻辑可以放在类里（比如 `add` 时检查重名）
+3. 以后加功能（比如「给联系人分组」）有地方放
+
+**小脚本用字典就够，需要长期维护的用类。** 知道两者的取舍比死守一种写法更重要。
+:::
+
+## 想自己加的功能
+
+做完基础版，试试这些（**做了才算真会**）：
+
+| 挑战 | 提示 |
+| --- | --- |
+| 按姓名排序显示 | `sorted(contacts, key=lambda c: c.name)` |
+| 导出为 CSV | 用 `csv` 模块（[19 课](./19-files)） |
+| 加「分组」字段 | 改 `Contact` 加参数 |
+| 电话格式校验 | 用 `re` 正则（[26 课](./26-regex)） |
+| 支持从备份文件恢复 | 加一个「导入」菜单项 |
+| 每次操作记录日志 | 用 `logging` 模块 |
+| 改成保存到 SQLite | 进阶内容，可先放着 |
+
+## 本课自检
+
+- [ ] 能独立写出 `Contact` 类的 `to_dict` / `from_dict`
+- [ ] 理解为什么要序列化（JSON 存不了对象）
+- [ ] 知道 `ensure_ascii=False` 的作用
+- [ ] 会写 `ContactBook` 的增删改查
+- [ ] 理解 `**fields` + `setattr` 的用法
+- [ ] 程序重启后数据还在
+- [ ] 至少完成了 1 个「想自己加的功能」
+
+## 第三阶段小结
+
+你现在会：
+
+- **函数**：把逻辑打包复用
+- **作用域**：知道变量在哪能用
+- **模块**：会拆文件、用别人的库
+- **文件**：数据能持久化
+- **异常**：程序不会因为一个错误就崩
+- **类**：能组织复杂的数据+行为
+
+**这些能力已经够写真正有用的工具了。**
+
+## 下一步
+
+[25 常用标准库速成](./25-stdlib) —— 第四阶段开始，学会用现成的轮子，不要什么都自己造。

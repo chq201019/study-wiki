@@ -1,0 +1,262 @@
+---
+id: tools-find
+title: find 与 xargs
+sidebar_position: 23
+description: find 的时间与类型筛选、-exec 与 xargs 的取舍、文件名有空格时的正确写法、删除文件的两种安全做法。
+---
+
+# find 与 xargs
+
+**本课目标**：会按条件找文件，会安全地把结果交给下一条命令。
+
+## `find` 的基本形态
+
+```bash
+find 起始目录 条件 动作
+```
+
+```bash
+find . -name '*.py'                    # 按名字
+find . -iname '*.PY'                   # 忽略大小写
+find . -type f                         # 只文件（d=目录 l=链接）
+find . -type d -name '__pycache__'     # 找目录
+find /var/log -type f -size +100M      # 大于 100M
+find . -mtime -7                       # 7 天内修改过
+find . -mmin -60                       # 60 分钟内修改过
+find . -newer ref.txt                  # 比 ref.txt 新
+find . -empty                          # 空文件/空目录
+find . -perm -u+x                      # 有执行权限
+```
+
+:::info[时间参数的 `+` / `-` 含义]
+| 写法 | 含义 |
+| --- | --- |
+| `-mtime -7` | **7 天内**（小于 7 天） |
+| `-mtime +7` | **7 天前**（大于 7 天） |
+| `-mtime 7` | 恰好第 7 天那一天 |
+
+**`-mtime` 按 24 小时取整**，所以"今天"的范围并不精确。要精确到分钟用 `-mmin`。
+:::
+
+:::warning[`-size` 的单位和取整]
+```bash
+find . -size +100M        # 大于 100 MiB
+find . -size +100k        # 大于 100 KiB
+find . -size 100c         # 恰好 100 字节（c = 字节）
+```
+
+**`-size` 默认按块向上取整**，`-size 1k` 可能匹配到 1 字节的文件。
+
+**要精确就加 `c`（字节）**。
+:::
+
+## 组合条件
+
+```bash
+# 与（默认）
+find . -name '*.log' -size +10M
+
+# 或
+find . \( -name '*.log' -o -name '*.tmp' \)
+
+# 非
+find . ! -name '*.pyc'
+
+# 复杂组合：括号要转义，两端留空格
+find . -type f \( -name '*.c' -o -name '*.h' \) ! -path './build/*'
+```
+
+:::danger[`\(` 和 `\)` 必须转义且有空格]
+```bash
+find . \( -name '*.log' -o -name '*.tmp' \)     # ✅
+find . \(-name '*.log' -o -name '*.tmp'\)       # ❌ shell 会当语法错误/传错参数
+```
+
+**`(` 和 `)` 在 shell 里是特殊字符，必须反斜杠转义并与内部表达式留空格。**
+:::
+
+## 动作：`-print` / `-delete` / `-exec`
+
+```bash
+find . -name '*.pyc' -delete                     # 直接删（⚠️ 无法恢复）
+find . -name '*.tmp' -print                      # 默认动作就是 print
+find . -name '*.log' -exec wc -l {} \;           # 每个文件调一次
+find . -name '*.log' -exec wc -l {} +            # 尽量批量传参（快得多）
+```
+
+:::danger[`\;` 与 `+` 的性能差异巨大]
+```bash
+find . -name '*.c' -exec grep TODO {} \;      # 每个文件启动一次 grep（几千个文件 = 几秒）
+find . -name '*.c' -exec grep TODO {} +       # 一次传一批（毫秒级）
+```
+
+**`\;` 是"每个文件执行一次命令"，`+` 是"把所有文件作为参数传一次"。**
+
+**能写 `+` 就不要写 `\;`。**
+:::
+
+:::warning[`{}` 的位置不限于末尾]
+```bash
+find . -name '*.c' -exec cp {} /backup/ \;
+find . -name '*.c' -exec sh -c 'echo "== $1"; cat "$1"' _ {} \;
+```
+
+**用 `sh -c` 时注意 `$0` 是占位符**（上面那个 `_`），真正的参数从 `$1` 开始。
+:::
+
+## `find | xargs`：什么时候更合适
+
+```bash
+find . -name '*.log' -print0 | xargs -0 wc -l
+find . -name '*.tmp' -print0 | xargs -0 rm -f
+```
+
+:::danger[文件名有空格/换行时必须用 `-print0` + `-0`]
+```bash
+# ❌ 文件名 "my file.txt" 会被拆成两个参数
+find . -name '*.txt' | xargs rm
+
+# ✅ NUL 分隔，任何文件名都安全
+find . -name '*.txt' -print0 | xargs -0 rm
+```
+
+**这是 `find | xargs` 的头号 bug。** 而且文件名里**可以有换行符**（合法），只有 NUL 分隔才彻底安全。
+:::
+
+| 场景 | 推荐 |
+| --- | --- |
+| 只是打印/删除 | `find ... -print` / `-delete` |
+| 对每个文件跑同一命令 | **`-exec ... +`** |
+| 需要 `xargs` 的并行（`-P`） | `-print0 \| xargs -0 -P4` |
+| 需要 `xargs` 的替换位置 | `-print0 \| xargs -0 -I{} mv {} /dst` |
+
+```bash
+# 并行处理（4 个并发）
+find . -name '*.png' -print0 | xargs -0 -P4 -n1 optipng
+
+# 指定替换位置
+find . -name '*.bak' -print0 | xargs -0 -I{} mv {} {}.old
+```
+
+:::warning[`xargs` 不加命令时默认是 `echo`]
+```bash
+echo a b c | xargs          # a b c
+echo a b c | xargs -n1      # 每行一个
+```
+
+**排查时先 `xargs` 不带命令跑一遍，看参数是怎么切的** —— 这能立刻暴露空格问题。
+:::
+
+## 删除文件的安全做法
+
+:::danger[删除前一定先看一遍]
+```bash
+# ① 先列出
+find . -name '*.tmp' -print
+
+# ② 确认无误后再删
+find . -name '*.tmp' -delete
+```
+
+**`-delete` 不经过回收站，删错就没了。**
+
+**更安全的做法：`-print` 和 `-delete` 写到一起，靠眼睛确认**：
+
+```bash
+find . -name '*.tmp' -print -delete
+```
+:::
+
+:::warning[别在根目录附近用 `-delete`]
+```bash
+find / -name '*.log' -delete         # ❌ 灾难
+```
+
+**一个手滑的通配符就能清掉系统日志。**
+
+**规矩**：
+
+- 起始目录写具体（`/var/log/app` 而不是 `/`）
+- 先 `-print` 验证
+- 重要操作前 `--dry-run` 式预览
+:::
+
+## 实用例子
+
+```bash
+# 找出最近 7 天修改过的大文件
+find /var -type f -mtime -7 -size +50M -exec ls -lh {} + 2>/dev/null
+
+# 清理 30 天前的备份
+find /backup -name '*.tar.gz' -mtime +30 -print -delete
+
+# 找重复的空目录并删除
+find . -type d -empty -delete
+
+# 找出没有对应 .c 的 .h（孤儿头文件）
+for h in $(find . -name '*.h'); do
+  [ -f "${h%.h}.c" ] || echo "no impl: $h"
+done
+
+# 统计各扩展名文件数
+find . -type f -printf '%f\n' | sed 's/.*\.//' | sort | uniq -c | sort -rn
+
+# 找出权限过宽的目录
+find /var/www -type d -perm -o+w
+```
+
+:::tip[`-printf` 比 `-exec ls` 快得多]
+```bash
+find . -type f -printf '%s %p\n' | sort -rn | head -10      # 最大的 10 个文件
+```
+
+**`-printf` 是 GNU find 的扩展**（BSD/macOS 没有），但 Linux 上非常实用。
+
+**`%s` 大小、`%p` 路径、`%f` 文件名、`%TY-%Tm-%Td` 修改日期**。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 文件名带空格时出错 | 没 `-print0`/`-0` | `find -print0 \| xargs -0` |
+| 括号条件语法错 | 没转义 | `\( ... \)` |
+| `-exec` 很慢 | 用了 `\;` | 改 `+` |
+| `-mtime -7` 结果不对 | 它按 24h 取整 | 要精确用 `-mmin` |
+| `-size +100M` 匹配到小文件 | 按块取整 | 加 `c` 用字节 |
+| `-delete` 删错了 | 没先 `-print` | 先预览 |
+| macOS 上 `-printf` 报错 | GNU 扩展 | 用 `-exec stat` |
+| 符号链接被跟进去 | 默认不跟，`-L` 才跟 | 注意 `-L` |
+
+:::danger[`find . -name '*.log' \| xargs rm` 在空结果时的问题]
+```bash
+find . -name 'nonexistent*' | xargs rm
+# rm: missing operand        ← 没有参数，rm 报错
+```
+
+**加 `-r`（GNU）让空输入不执行**：
+
+```bash
+find . -name 'nonexistent*' -print0 | xargs -0 -r rm
+```
+
+**或者干脆用 `-delete`**（它天然处理空结果）。
+:::
+
+## 本课自检
+
+- [ ] 会用 `-name` / `-type` / `-size` / `-mtime` / `-newer`
+- [ ] **知道 `-mtime -7` 是 7 天内，`+7` 是 7 天前**
+- [ ] 知道 `-mtime` 按 24h 取整，精确用 `-mmin`
+- [ ] **会用 `\( ... \)` 组合条件（必须转义且留空格）**
+- [ ] **知道 `-exec ... +` 比 `\;` 快一个数量级**
+- [ ] **知道文件名有空格/换行必须用 `-print0` + `xargs -0`**
+- [ ] 会用 `xargs -P` 并行、`-I{}` 指定替换位置
+- [ ] **知道删除前要先 `-print` 验证**
+- [ ] 知道 `-delete` 不经过回收站
+- [ ] 会用 `-printf` 快速列出大小/时间（GNU 扩展）
+- [ ] **知道 xargs 空输入要加 `-r`**
+
+## 下一步
+
+[进程与信号工具](./tools-process) 或 [文本处理三剑客](./tools-text)。

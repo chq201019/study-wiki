@@ -1,0 +1,276 @@
+---
+id: 18-freertos
+title: 18 FreeRTOS 入门
+sidebar_position: 18
+description: 为什么裸机写大程序会崩、CubeMX 里怎么加 FreeRTOS、任务优先级与栈、和 ESP32 的写法对照。
+---
+
+# 18 FreeRTOS 入门
+
+**本课目标**：用 RTOS 把程序拆成多个"同时运行"的任务。
+
+## 裸机的问题
+
+:::danger[一个 `while(1)` 里塞所有事，很快会崩]
+```c
+while (1) {
+    read_sensor();       /* 要 20ms */
+    update_display();    /* 要 30ms */
+    handle_button();     /* 要 5ms */
+    send_data();         /* 要 100ms ← 网络 */
+}
+```
+
+**问题**：
+
+1. **`send_data` 卡 100ms 时，按键完全没响应**
+2. **所有逻辑耦合在一起**，改一处影响全部
+3. **没法做优先级**（网络慢不该拖累按键）
+
+**这就是需要 RTOS 的地方。**
+:::
+
+## RTOS 带来什么
+
+![FreeRTOS 任务状态机：Running / Ready / Blocked / Suspended 的转换条件](/img/diagrams/freertos-states.svg)
+
+
+**RTOS = Real-Time Operating System（实时操作系统）**
+
+| 能力 | 说明 |
+| --- | --- |
+| **多任务** | 每个任务独立写，看起来同时跑 |
+| **优先级** | 按键任务可以比网络任务优先 |
+| **任务间通信** | 队列、信号量 |
+| **延时不影响别人** | 一个任务 `vTaskDelay` 时别人能跑 |
+
+:::tip[和 ESP32 的关系]
+**ESP-IDF 本身就是基于 FreeRTOS 的**——`app_main` 就是一个任务。
+
+所以在 ESP32 上写的东西，**概念完全通用**，只是 API 名字略有差异。
+
+| | ESP32（ESP-IDF） | STM32（CubeMX + FreeRTOS） |
+| --- | --- | --- |
+| 入口 | `app_main()` 自动是任务 | `main()` 里 `osKernelStart()` |
+| 建任务 | `xTaskCreate` | `osThreadNew` 或 `xTaskCreate` |
+| 延时 | `vTaskDelay` | `osDelay` 或 `vTaskDelay` |
+| 优先级 | 数字**大**优先 | 数字**小**优先（⚠️ 注意） |
+:::
+
+## CubeMX 里加 FreeRTOS
+
+1. 左侧 **Middleware → FREERTOS**
+2. **Interface** 选 **CMSIS_V2**（推荐）或 CMSIS_V1
+3. 下方 **Tasks and Queues** 标签 → 点 **Add** 加任务
+
+| 参数 | 说明 |
+| --- | --- |
+| **Task Name** | 任务名（会生成函数出口） |
+| **Priority** | **osPriorityNormal**（默认） |
+| **Stack Size** | 栈大小（**单位是字，1 字 = 4 字节**） |
+| **Entry Function** | 生成的函数名 |
+
+:::danger[FreeRTOS 的优先级方向和 STM32 中断相反]
+| 场景 | 数字大 | 数字小 |
+| --- | --- | --- |
+| **STM32 中断（NVIC）** | 低优先级 | **高优先级** |
+| **FreeRTOS 任务** | **高优先级** | 低优先级 |
+
+**这是最容易记混的地方。**
+
+**用 CMSIS_V2 的话**，用 `osPriorityHigh` / `osPriorityNormal` 这类枚举名，避免直接写数字。
+:::
+
+:::warning[Stack Size 单位是「字」不是「字节」]
+```text
+CubeMX 里填 128  →  实际 128 × 4 = 512 字节
+```
+
+**这和 ESP-IDF 相反**（ESP-IDF 用字节）。
+
+**所以 CubeMX 里填 128 的栈其实只有 512 字节，很容易不够。**
+
+**建议起步填 256~512**（即 1~2 KB）。
+:::
+
+## 最简单的例子
+
+CubeMX 生成后，`main()` 会变成：
+
+```c
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_USART1_UART_Init();
+
+    /* 创建任务 */
+    osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+
+    /* 启动调度器（不返回） */
+    osKernelStart();
+
+    while (1) { }        /* 永远到不了这里 */
+}
+```
+
+**你自己的任务函数**：
+
+```c
+void StartDefaultTask(void *argument)
+{
+    for (;;)
+    {
+        HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+        osDelay(500);        /* 相当于 vTaskDelay(500ms) */
+    }
+}
+```
+
+:::danger[`osKernelStart()` 不返回]
+启动调度器后，**`main()` 就永远不会继续执行了**。
+
+**所以在它之后写任何代码都是死代码。**
+
+**所有逻辑都要放在任务里。**
+:::
+
+## 两个任务的例子
+
+CubeMX 里加两个任务：
+
+**任务 1：闪灯（高优先级）**
+
+```c
+void LedTask(void *argument)
+{
+    for (;;)
+    {
+        HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+        osDelay(500);
+    }
+}
+```
+
+**任务 2：打印计数（普通优先级）**
+
+```c
+void PrintTask(void *argument)
+{
+    uint32_t cnt = 0;
+    for (;;)
+    {
+        printf("计数 %lu\r\n", cnt++);
+        osDelay(1000);
+    }
+}
+```
+
+:::tip[现象：灯闪和打印"同时"发生]
+**因为 RTOS 在两者间快速切换。**
+
+**关键点**：`osDelay` 会让出 CPU——**一个任务在延时期间，另一个任务能跑**。
+
+**这就是和裸机 `HAL_Delay` 的本质区别**（裸机延时是"空转等待"）。
+:::
+
+## 队列：任务间传数据
+
+```c
+/* CubeMX 里加一个 Queue：长度 10，item size 4 字节 */
+
+/* 发送方 */
+uint32_t value = 123;
+osMessageQueuePut(myQueueHandle, &value, 0, 0);
+
+/* 接收方 */
+uint32_t got;
+if (osMessageQueueGet(myQueueHandle, &got, NULL, osWaitForever) == osOK) {
+    printf("收到 %lu\r\n", got);
+}
+```
+
+（[ESP32 第 21 课](../esp-basics/21-queue)讲的数据竞争和队列原理完全通用。）
+
+## 常见坑
+
+:::danger[坑一：栈太小]
+**FreeRTOS 任务栈很小**（默认可能只有 128 字 = 512 字节）。
+
+**在任务里用 `printf` 就可能溢出**——`printf` 内部要几百字节缓冲。
+
+**建议**：
+
+| 任务类型 | 建议栈（字） |
+| --- | --- |
+| 只操作 GPIO | 128 |
+| 带 `printf` | **256~512** |
+| 串口/网络处理 | 512~1024 |
+
+**栈溢出表现**：随机崩溃、HardFault、`vApplicationStackOverflowHook` 被调用。
+:::
+
+:::danger[坑二：在中断里用非 FromISR 版本]
+```c
+/* 在中断回调里 */
+osMessageQueuePut(q, &v, 0, 0);        /* ⚠️ 可能破坏内核状态 */
+```
+
+**正解**：用 `osMessageQueuePut` 的中断安全形式，或底层 `xQueueSendFromISR`。
+
+（CMSIS-RTOS2 的 `osMessageQueuePut` 实际上内部会检测上下文，但**最好还是用明确的 FromISR 版本**。）
+:::
+
+:::danger[坑三：任务里死循环不让出 CPU]
+```c
+void MyTask(void *argument)
+{
+    for (;;)
+    {
+        /* 一直在忙，没有 osDelay */
+        HAL_GPIO_ReadPin(...);
+    }
+}
+```
+
+**如果这个任务优先级最高，低优先级任务永远得不到 CPU。**
+
+**规矩：每个任务循环里必须有 `osDelay`（或阻塞等待）。**
+:::
+
+## 和 ESP32 写法对照
+
+| 想做的事 | ESP32 | STM32 + CubeMX |
+| --- | --- | --- |
+| 建任务 | `xTaskCreate(func, "n", 4096, NULL, 5, NULL)` | CubeMX 里 Add，或 `osThreadNew` |
+| 延时 | `vTaskDelay(pdMS_TO_TICKS(500))` | `osDelay(500)` |
+| 栈单位 | **字节** | **字（×4）** |
+| 优先级 | 数字大优先，默认 5 | 用 `osPriorityXxx` 枚举 |
+| 队列 | `xQueueCreate` | CubeMX 里 Add Queue |
+| 互斥锁 | `xSemaphoreCreateMutex` | `osMutexNew` |
+| 启动 | 自动（`app_main`） | **手动 `osKernelStart()`** |
+
+:::tip[学过 ESP32 的话，这一课基本是"换个名字"]
+**核心概念完全一样**：任务不能返回、要有延时让出 CPU、栈会溢出、共享数据要用队列。
+
+**唯一要特别注意的是"栈单位是字"和"优先级方向相反"。**
+:::
+
+## 本课自检
+
+- [ ] 理解裸机 `while(1)` 塞所有事的问题
+- [ ] 知道 RTOS 提供多任务、优先级、任务间通信
+- [ ] 会在 CubeMX 的 Middleware 里加 FREERTOS
+- [ ] **知道 `osKernelStart()` 不返回**
+- [ ] 会用 `osDelay` 代替 `HAL_Delay`
+- [ ] **知道 FreeRTOS 任务优先级数字大=高（和 NVIC 相反）**
+- [ ] **知道 CubeMX 的 Stack Size 单位是「字」不是字节**
+- [ ] 知道 `printf` 需要大栈（256+ 字）
+- [ ] 会用 `osMessageQueuePut/Get` 传数据
+- [ ] **知道每个任务循环必须有延时，否则饿死别人**
+- [ ] 能和 ESP32 的写法对照起来
+
+## 下一步
+
+[19 低功耗模式](./19-lowpower) —— 让电池撑更久。

@@ -1,0 +1,311 @@
+---
+id: 21-queue
+title: 21 队列与信号量
+sidebar_position: 21
+description: 任务间为什么不能直接共享变量、队列怎么传数据、信号量怎么同步，以及死锁与优先级反转。
+---
+
+# 21 队列与信号量
+
+**本课目标**：会安全地在任务间传数据、做同步。
+
+## 为什么不能直接共享变量
+
+:::danger[两个任务同时读写一个变量会出事]
+```c
+int counter = 0;              /* 全局变量 */
+
+void task_a(void *arg) {
+    while (1) { counter++; vTaskDelay(1); }
+}
+
+void task_b(void *arg) {
+    while (1) { counter++; vTaskDelay(1); }
+}
+```
+
+**`counter++` 不是原子操作**——它实际是"读 → 加 → 写"三步。
+
+**如果两个任务在这三步中间被切换**，就会丢更新（最终值小于实际次数）。
+
+这叫**数据竞争（race condition）**，是并发编程的头号 bug，**而且现象随机、极难复现**。
+:::
+
+## 队列：任务间传数据
+
+**队列 = 一个线程安全的 FIFO 缓冲区。**
+
+```mermaid
+flowchart LR
+  A["生产者任务<br/>xQueueSend"] --> Q["队列<br/>[][][][]"]
+  Q --> B["消费者任务<br/>xQueueReceive"]
+```
+
+### 创建和使用
+
+```c
+#include "freertos/queue.h"
+
+static QueueHandle_t s_queue;
+
+/* ① 创建：能放 10 个 int */
+s_queue = xQueueCreate(10, sizeof(int));
+
+/* ② 发送（生产者） */
+int value = 42;
+if (xQueueSend(s_queue, &value, pdMS_TO_TICKS(100)) != pdTRUE) {
+    /* 队列满了，100ms 内没发出去 */
+}
+
+/* ③ 接收（消费者） */
+int got;
+if (xQueueReceive(s_queue, &got, portMAX_DELAY) == pdTRUE) {
+    /* 拿到了 got */
+}
+```
+
+:::tip[`portMAX_DELAY` 是"永久等待"]
+```c
+xQueueReceive(q, &got, portMAX_DELAY);      /* 一直等到有数据 */
+xQueueReceive(q, &got, 0);                  /* 不等待，立刻返回 */
+xQueueReceive(q, &got, pdMS_TO_TICKS(100)); /* 最多等 100ms */
+```
+
+**消费者通常用 `portMAX_DELAY`，生产者用有限超时**（免得卡死）。
+:::
+
+:::danger[队列传的是「值」不是「指针」]
+```c
+xQueueCreate(10, sizeof(int));      /* 每个元素 4 字节 */
+xQueueSend(q, &value, 0);           /* 复制 int 的内容进去 */
+```
+
+**队列会复制整个元素**，所以：
+
+- **传大结构体很占内存**（10 个 × 1KB = 10KB）
+- **传指针要小心生命周期**（接收方拿到指针时，原数据可能已经失效）
+
+**小数据直接传值；大数据传指针但要保证内存在接收完成前有效。**
+:::
+
+## 完整示例：中断 → 任务
+
+```c
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+
+static const char *TAG = "queue";
+#define BTN_GPIO 0
+
+static QueueHandle_t s_btn_queue;
+
+/* ISR 里只发队列（第 11 课讲过） */
+static void IRAM_ATTR btn_isr(void *arg)
+{
+    BaseType_t woken = pdFALSE;
+    uint32_t ev = 1;
+    xQueueSendFromISR(s_btn_queue, &ev, &woken);
+    if (woken) portYIELD_FROM_ISR();
+}
+
+/* 任务里做真正的事 */
+static void btn_task(void *arg)
+{
+    uint32_t ev;
+    while (1) {
+        if (xQueueReceive(s_btn_queue, &ev, portMAX_DELAY) == pdTRUE) {
+            ESP_LOGI(TAG, "按键事件 %lu", (unsigned long)ev);   /* 这里可以打印 */
+        }
+    }
+}
+
+void app_main(void)
+{
+    s_btn_queue = xQueueCreate(10, sizeof(uint32_t));
+
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << BTN_GPIO),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .intr_type    = GPIO_INTR_NEGEDGE,
+    };
+    gpio_config(&cfg);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(BTN_GPIO, btn_isr, NULL);
+
+    xTaskCreate(btn_task, "btn", 3072, NULL, 6, NULL);
+}
+```
+
+:::tip[这就是 ISR + 队列的标准模式]
+```
+ISR（不能打印） → 发队列 → 任务（可以打印、可以耗时）
+```
+
+**所有"中断里想做的事"都应该这样转到任务里做。**
+:::
+
+## 信号量：做同步而不是传数据
+
+队列传数据，**信号量只传"事件发生了"这个信号**。
+
+| 类型 | 作用 |
+| --- | --- |
+| **二值信号量** | 只有 0/1，用于"通知一次" |
+| **计数信号量** | 可累加，用于"资源有 N 个" |
+| **互斥锁（Mutex）** | 保护共享资源，**带优先级继承** |
+
+### 二值信号量
+
+```c
+SemaphoreHandle_t sem = xSemaphoreCreateBinary();
+
+/* 给出信号 */
+xSemaphoreGive(sem);
+/* 或者从 ISR */
+xSemaphoreGiveFromISR(sem, &woken);
+
+/* 等待信号 */
+if (xSemaphoreTake(sem, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    /* 收到信号了 */
+} else {
+    /* 超时 */
+}
+```
+
+### 互斥锁：保护共享资源
+
+```c
+SemaphoreHandle_t mutex = xSemaphoreCreateMutex();
+
+void safe_increment(void)
+{
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    counter++;                          /* 临界区 */
+    xSemaphoreGive(mutex);
+}
+```
+
+:::danger[临界区里不要做耗时操作]
+```c
+xSemaphoreTake(mutex, portMAX_DELAY);
+ESP_LOGI(TAG, "开始");            /* ❌ 打印很慢 */
+do_heavy_work();                  /* ❌ 几秒钟 */
+xSemaphoreGive(mutex);
+```
+
+**别人会一直等锁，整个系统卡住。**
+
+**规矩：临界区只包住那几个必须原子的语句。**
+:::
+
+## 互斥锁 vs 二值信号量
+
+:::tip[关键区别：优先级继承]
+假设低优先级任务 L 拿着锁，高优先级任务 H 想拿：
+
+**用二值信号量**：
+
+```text
+L 拿锁 → H 想拿，阻塞 → 中优先级任务 M 抢走 CPU → L 得不到执行 → 锁一直不放
+→ H 被 M 无限期阻塞（优先级反转）
+```
+
+**用互斥锁**：L 的优先级会被**临时提升**到 H 的级别，赶紧干完放锁。
+
+| | 二值信号量 | 互斥锁 |
+| --- | --- | --- |
+| 用途 | 事件通知 | **保护共享资源** |
+| 优先级继承 | ❌ | ✅ |
+| 谁能 Give | 任何任务 | **只有 Take 的那个任务** |
+
+**保护共享资源一律用 Mutex，不要用二值信号量。**
+:::
+
+## 死锁：两个任务互相等
+
+:::danger[死锁的经典场景]
+```c
+/* 任务 A */
+xSemaphoreTake(mutex1, ...);
+xSemaphoreTake(mutex2, ...);      /* 等 mutex2 */
+...
+/* 任务 B */
+xSemaphoreTake(mutex2, ...);
+xSemaphoreTake(mutex1, ...);      /* 等 mutex1 */
+```
+
+**A 拿着 1 等 2，B 拿着 2 等 1 —— 永远等下去。**
+:::
+
+| 预防办法 | 说明 |
+| --- | --- |
+| **固定加锁顺序** | 所有任务都先锁 1 再锁 2 |
+| **用超时** | `xSemaphoreTake(m, timeout)` 超时就放弃并回滚 |
+| **尽量减少嵌套锁** | 一把锁能解决就别用两把 |
+| **锁的持有时间越短越好** | 减少冲突窗口 |
+
+## 三种同步对象怎么选
+
+| 需求 | 用什么 |
+| --- | --- |
+| 任务间传数据 | **队列** |
+| 通知"事件发生了" | **二值信号量 / 任务通知** |
+| 保护共享变量/外设 | **互斥锁** |
+| 中断通知任务 | **队列或任务通知**（用 `FromISR` 版本） |
+
+:::tip[任务通知比信号量更快]
+```c
+/* 轻量级替代（更快、更省内存） */
+vTaskNotifyGiveFromISR(task_handle, &woken);
+ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+```
+
+**只有一个接收者时，任务通知比信号量效率高**（不用额外分配对象）。
+
+**FreeRTOS 官方推荐优先用它。**
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 直接共享变量 | 数据偶发错误 | 数据竞争 | 用队列/锁 |
+| 队列传大结构体 | 内存不够 | 队列复制元素 | 改传指针 |
+| 保护资源用二值信号量 | 偶发优先级反转 | 无优先级继承 | 改用 Mutex |
+| 临界区太长 | 系统卡顿 | 持锁太久 | 缩小临界区 |
+| 加锁顺序不一致 | 死锁 | 交叉等待 | 统一顺序 |
+| ISR 里用非 FromISR 版 | 崩溃 | 内核状态破坏 | 换 `FromISR` |
+| `Give` 次数不配对 | 信号量计数错 | 多给/少给 | 检查配对 |
+
+## 本课自检
+
+- [ ] **理解为什么不能直接共享变量（数据竞争）**
+- [ ] 会 `xQueueCreate` / `xQueueSend` / `xQueueReceive`
+- [ ] **知道队列传的是值（会复制）**
+- [ ] 会用 `xQueueSendFromISR` 在中断里发队列
+- [ ] 知道队列/信号量/互斥锁各自的用途
+- [ ] **知道保护共享资源要用 Mutex 而不是二值信号量**
+- [ ] 理解优先级继承
+- [ ] **知道死锁怎么产生、怎么预防**
+- [ ] 知道临界区要短
+- [ ] 知道任务通知比信号量更快
+
+## 第四阶段小结
+
+你现在掌握了 ESP32 的"系统级"能力：
+
+| 能力 | 用什么 |
+| --- | --- |
+| 多任务并发 | `xTaskCreate` |
+| 任务间传数据 | 队列 |
+| 保护共享资源 | 互斥锁 |
+| 中断通知任务 | `FromISR` API |
+| 断电保存配置 | NVS（下一课） |
+
+## 下一步
+
+[22 NVS 保存配置](./22-nvs) —— 让数据断电不丢。

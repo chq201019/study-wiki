@@ -1,0 +1,268 @@
+---
+id: tools-journal
+title: 日志与 journalctl
+sidebar_position: 25
+description: journalctl 的常用过滤、持久化日志为什么重启就没了、按服务/优先级/时间查、以及 syslog 与 journald 的关系。
+---
+
+# 日志与 journalctl
+
+**本课目标**：会在几百万行日志里精确定位一条。
+
+## 基本查询
+
+```bash
+journalctl                       # 全部（从最旧开始，按 q 退出）
+journalctl -f                    # 实时跟踪（tail -f）
+journalctl -n 100                # 最近 100 行
+journalctl -b                    # 本次启动以来
+journalctl -b -1                 # 上一次启动
+journalctl --since "10 min ago"
+journalctl --since "2026-01-01" --until "2026-01-02"
+journalctl -p err                # 优先级 err 及以上
+journalctl -u nginx              # 某个服务
+journalctl -u nginx -f           # 实时跟某个服务
+journalctl -k                    # 只看内核消息（= dmesg）
+journalctl _PID=1234             # 按 PID
+journalctl /usr/sbin/sshd        # 按可执行文件
+```
+
+:::tip[`-b` 系列是排查"重启后"的第一手信息]
+```bash
+journalctl -b -1 -p err          # 上次启动的错误
+journalctl --list-boots          # 列出所有启动记录
+```
+
+**"机器为什么重启了" → `journalctl -b -1` 看上次启动末尾。**
+:::
+
+## 优先级过滤
+
+| `-p` 值 | 含义 |
+| --- | --- |
+| `emerg` | 系统不可用 |
+| `alert` | 需立即处理 |
+| `crit` | 严重 |
+| `err` | **错误** |
+| `warning` | 警告 |
+| `notice` | 注意 |
+| `info` | 信息（默认） |
+| `debug` | 调试 |
+
+```bash
+journalctl -p err -b             # 本次启动的所有错误
+journalctl -p warning..err       # 范围
+```
+
+:::warning[`-p err` 只显示该级别及更严重的]
+**它不会显示 warning** —— 因为数值上 err 比 warning 更严重（数值更小）。
+
+**想看 warning 及以上**：`-p warning`。
+:::
+
+## 持久化：为什么重启后日志没了
+
+:::danger[journald 默认只在内存里]
+**默认 `Storage=auto`，而 `/var/log/journal` 不存在时就会退化成"只写 `/run/log/journal`"（tmpfs，重启即失）。**
+:::
+
+```bash
+# 开启持久化
+sudo mkdir -p /var/log/journal
+sudo systemd-tmpfiles --create --prefix /var/log/journal
+sudo systemctl restart systemd-journald
+```
+
+或者改配置：
+
+```ini
+# /etc/systemd/journald.conf
+[Journal]
+Storage=persistent
+SystemMaxUse=500M
+SystemMaxFileSize=50M
+MaxRetentionSec=1month
+```
+
+```bash
+journalctl --disk-usage          # 看当前占用
+journalctl --vacuum-size=200M    # 收缩到 200M
+journalctl --vacuum-time=7d      # 只保留 7 天
+```
+
+:::tip[`--vacuum` 是安全的清理方式]
+**它只删除"已归档的旧日志文件"，不会影响正在写的。**
+
+**比 `rm -rf /var/log/journal/*` 安全得多**（后者会破坏 journal 的索引）。
+:::
+
+## syslog 与 journald 的关系
+
+:::info[两套东西并存]
+```text
+应用 → syslog(3) / stderr
+         ↓
+     journald（systemd 的日志守护）
+         ↓ 可选转发
+     /var/log/syslog（rsyslog 或 systemd-journald 的 ForwardToSyslog）
+```
+
+**现代 Debian/Ubuntu 上**：journald 收到日志，同时转发给 rsyslog 写传统文本文件。
+:::
+
+```bash
+# 看是否转发
+grep -E 'ForwardToSyslog|Storage' /etc/systemd/journald.conf
+```
+
+:::warning[同一个服务可能在两处都有日志]
+**排查时如果发现 `journalctl -u x` 和 `/var/log/syslog` 内容不完全一致** —— 这是正常的（过滤规则/时间精度不同）。
+
+**以 `journalctl -u` 为准**（它带结构化字段）。
+:::
+
+## 结构化字段
+
+**journald 的每条日志除了文本，还有字段**：
+
+```bash
+journalctl -o verbose -n 1       # 看一条日志的全部字段
+```
+
+```text
+_PID=1234
+_UID=0
+_COMM=nginx
+_SYSTEMD_UNIT=nginx.service
+PRIORITY=6
+MESSAGE=...
+```
+
+**可以按这些字段过滤**：
+
+```bash
+journalctl _COMM=nginx
+journalctl _SYSTEMD_UNIT=nginx.service
+journalctl _UID=1000
+journalctl -F _COMM              # 列出所有出现过的值
+```
+
+:::tip[`-F` 是探索日志字段的好工具]
+```bash
+journalctl -F _COMM | head -20       # 有哪些程序在打日志
+journalctl -F PRIORITY               # 出现过哪些级别
+```
+:::
+
+## 输出格式
+
+```bash
+journalctl -o short-iso          # ISO 时间戳（推荐，便于比对）
+journalctl -o json-pretty        # JSON
+journalctl -o cat                # 只有消息，无元数据（干净）
+journalctl -o verbose            # 全部字段
+```
+
+:::danger[时间戳默认格式没有年份也不带时区]
+```bash
+journalctl -o short-iso -u nginx
+# 2026-01-15T10:23:45+0800 ...
+```
+
+**排查跨时区/跨年的问题必须用 `-o short-iso`**，否则无法和其他系统日志对齐。
+:::
+
+## 实用组合
+
+```bash
+# 某个服务今天的所有错误
+journalctl -u myapp --since today -p err
+
+# 某次崩溃前后的上下文
+journalctl -u myapp --since "10 min ago" --until "5 min ago"
+
+# 找 OOM
+journalctl -k | grep -i 'killed process'
+
+# 找重启原因
+journalctl -b -1 | tail -30
+last -x | head                            # 重启/关机历史
+
+# 导出给他人分析
+journalctl -u myapp --since "1 hour ago" -o short-iso > /tmp/log.txt
+```
+
+:::tip[排查服务的固定套路]
+```bash
+systemctl status myapp                  # 1. 看状态与退出码
+journalctl -u myapp -n 50 --no-pager    # 2. 看最近日志
+journalctl -u myapp -p err -b           # 3. 本次启动的所有错误
+systemctl cat myapp                     # 4. 看实际生效的配置
+```
+:::
+
+## 程序的日志该打给谁
+
+:::info[三种选择]
+| 方式 | 优点 | 缺点 |
+| --- | --- | --- |
+| ** stdout/stderr** | **最简单，systemd 自动收进 journal** | 无结构 |
+| syslog | 有设施/级别字段 | 要链接 |
+| **直接写文件** | 完全自控 | 要自己管轮转 |
+:::
+
+:::danger[**在 systemd 下优先用 stdout/stderr**]
+```ini
+[Service]
+StandardOutput=journal
+StandardError=journal
+```
+
+**不要让程序自己写 `/var/log/xxx.log` 再配 logrotate** —— 那是 sysvinit 时代的做法。
+
+**交给 journald 的好处**：自动轮转、自动结构化（带 PID/单位名）、`-u` 直接过滤。
+
+**代价**：要 `journalctl` 才能看（但可以 `ForwardToSyslog` 兼顾）。
+:::
+
+:::warning[stdout 被缓冲导致"日志不出现"]
+**程序连管道时 stdout 变成全缓冲**，日志会攒着不输出。
+
+```ini
+[Service]
+Environment=PYTHONUNBUFFERED=1
+```
+
+**或者程序里显式 flush / 用行缓冲。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 重启后日志没了 | 非持久化 | 建 `/var/log/journal` |
+| `-p err` 看不到 warning | 级别语义 | 用 `-p warning` |
+| 清理后 journal 坏了 | `rm -rf` 日志目录 | 用 `--vacuum-*` |
+| 时间对不上 | 默认时间戳无年份/时区 | `-o short-iso` |
+| 日志里没有某服务的 | 它自己写文件了 | 改 stdout 或查自己的文件 |
+| 日志不实时出现 | stdout 全缓冲 | `PYTHONUNBUFFERED=1` |
+| 磁盘被日志吃满 | 没设上限 | `SystemMaxUse=` |
+| 找不到重启原因 | 没看上次启动 | `journalctl -b -1` |
+
+## 本课自检
+
+- [ ] 会用 `-u` / `-b` / `-n` / `-f` / `--since`
+- [ ] **知道 `-b -1` 看上次启动（排查重启原因）**
+- [ ] **知道 `-p err` 不含 warning（级别语义）**
+- [ ] **知道 journald 默认非持久，重启丢日志**
+- [ ] 会用 `journalctl --disk-usage` 和 `--vacuum-size/time`
+- [ ] **知道 `--vacuum` 比 `rm -rf` 安全**
+- [ ] 理解 journald 与 syslog 的并存关系
+- [ ] 会用 `-o verbose` 看结构化字段、`-F` 列出字段值
+- [ ] **知道排查跨时区问题要用 `-o short-iso`**
+- [ ] **知道 systemd 下程序应写 stdout 而非自己写文件**
+- [ ] 知道 stdout 全缓冲会导致日志延迟
+
+## 下一步
+
+[进程与信号工具](./tools-process) 或 [系统故障排查](./troubleshoot)。

@@ -1,0 +1,401 @@
+---
+id: typing
+title: 类型注解与静态检查
+sidebar_position: 12
+description: 注解在运行时到底做了什么（实测）、list[int] 与 List[int] 居然不相等、runtime_checkable Protocol 只查方法名、mypy 严格度分级与渐进式引入策略。
+---
+
+# 类型注解与静态检查
+
+**本课目标**：会用注解表达意图，会用 mypy 在运行前抓错。
+
+## 注解在运行时到底做了什么
+
+:::danger[先说结论：注解默认"什么都不做"]
+```python
+def add(x: int, y: int) -> int:
+    return x + y
+
+print(add("a", "b"))        # 输出 ab，不报错
+```
+
+**Python 不会因为类型不符而拒绝调用。** 注解是给"工具"看的，不是给解释器看的。
+:::
+
+**但它确实会被求值一次**——除非你把注解写成字符串，那样就原样留着（本机实测 Python 3.11.9）：
+
+```python
+def f(x: "int") -> "str":
+    return str(x)
+
+print(f.__annotations__)
+# {'x': 'int', 'return': 'str'}      ← 字符串原样躺着
+```
+
+:::tip[`get_type_hints` 才会把字符串解析成真类型]
+```python
+import typing
+print(typing.get_type_hints(f))
+# {'x': <class 'int'>, 'return': <class 'str'>}
+```
+
+**为什么会有字符串形式？为了支持前向引用**——一个类还没定义完，方法签名里就要引用它自己：
+
+```python
+class Node:
+    def set_next(self, n: "Node") -> None:    # 这里必须用字符串
+        self.next = n
+```
+:::
+
+:::warning[注解在"定义时"求值，未定义的名字会直接报错]
+```python
+def g(x: Undefined) -> None: ...
+# NameError: name 'Undefined' is not defined      ← 实测确实报错
+```
+
+**这就是为什么需要 `from __future__ import annotations`**：
+
+```python
+from __future__ import annotations
+
+def g(x: Undefined) -> None: ...     # 现在不报错了（全部推迟成字符串）
+```
+
+**或者用字符串手写前向引用。**
+
+**Python 3.14 起注解默认延迟求值**，但这个特性在 3.11 上还没有。
+:::
+
+## 基础写法
+
+```python
+# 变量注解
+count: int = 0
+names: list[str] = []
+
+# 函数签名
+def greet(name: str, times: int = 1) -> str:
+    return f"hello {name}" * times
+
+# 可选（三种等价写法，推荐最后一种）
+from typing import Optional
+def find(k: Optional[str]) -> Optional[int]: ...
+def find(k: str | None) -> int | None: ...      # Python 3.10+
+```
+
+:::warning[`Optional[X]` 不等于"可以省略这个参数"]
+```python
+def f(x: Optional[int] = None): ...
+```
+
+**`Optional[int]` 的含义是 `int | None`** ——这个参数可以有 `None` 值。
+
+**它和"参数可以不传"是两回事**，后者由 `= None` 这个默认值表达。
+:::
+
+### 容器类型的现代写法
+
+```python
+list[int]          # Python 3.9+
+dict[str, int]
+tuple[int, str]
+set[bytes]
+```
+
+:::danger[`list[int]` 和 `typing.List[int]` 居然不相等（实测）]
+```python
+import typing
+print(list[int] == typing.List[int])
+# False      ← 本机实测 Python 3.11.9
+```
+
+**它们是两套不同的实现**：
+
+- `list[int]` → `types.GenericAlias`（内置类型的参数化）
+- `typing.List[int]` → `typing._GenericAlias`（typing 模块的包装）
+
+**功能上都能用于注解，mypy 都认**，但比较/字符串化结果不同：
+
+```python
+print(str(list[int]))          # list[int]
+print(str(typing.List[int]))   # typing.List[int]
+```
+
+**新代码统一用内置写法 `list[int]`** —— 更短，且不需要 import。
+:::
+
+## 让类型更精确的几种工具
+
+### `Literal`：限定字面量取值
+
+```python
+from typing import Literal
+
+def set_mode(m: Literal["r", "w", "a"]) -> None: ...
+
+set_mode("r")       # OK
+set_mode("x")       # mypy: 类型不匹配
+```
+
+**比用 `str` 精确得多**，尤其适合配置参数、状态名。
+
+### `TypedDict`：给字典定结构
+
+```python
+from typing import TypedDict
+
+class User(TypedDict):
+    name: str
+    age: int
+
+u: User = {"name": "a", "age": 1}
+```
+
+:::warning[`TypedDict` 在运行时就是个普通 dict]
+```python
+u = User(name="a", age=1)
+print(type(u))       # <class 'dict'>      ← 实测
+```
+
+**它不做任何运行时校验**：
+
+```python
+User(name="a", age="not an int")    # 运行时完全正常，mypy 才报错
+```
+
+**需要运行时校验要用 `pydantic` 或手动检查。**
+:::
+
+### `Protocol`：结构化类型（鸭子类型的静态版）
+
+```python
+from typing import Protocol
+
+class Closeable(Protocol):
+    def close(self) -> None: ...
+
+def cleanup(obj: Closeable) -> None:
+    obj.close()
+
+# 任何有 close() 的类都能传，不需要继承
+class MyConn:
+    def close(self) -> None: print("closed")
+
+cleanup(MyConn())       # mypy 通过
+```
+
+:::danger[`@runtime_checkable` 只检查方法"存在"，不检查签名（实测）]
+```python
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class HasLen(Protocol):
+    def __len__(self) -> int: ...
+
+class Bad:
+    def __len__(self) -> str:       # 返回类型是错的！
+        return "x"
+
+print(isinstance(Bad(), HasLen))
+# True      ← 本机实测，居然是 True
+```
+
+**因为 `isinstance` 只看属性名在不在，没有办法检查类型签名。**
+
+**所以**：
+
+- `runtime_checkable` 只能用来做"这里的对象有没有这个方法"的粗判断
+- **真正的类型正确性只有 mypy 能查**
+:::
+
+## 泛型：`TypeVar` 与 `Generic`
+
+```python
+from typing import TypeVar, Generic
+
+T = TypeVar("T")
+
+def first(items: list[T]) -> T:
+    return items[0]
+
+reveal_type(first([1, 2]))          # mypy 显示 int
+reveal_type(first(["a"]))           # mypy 显示 str
+```
+
+:::tip[`TypeVar` 绑定能保住"输入输出同类型"的关系]
+```python
+def first_bad(items: list) -> object:     # ❌ 丢失了类型关系
+    return items[0]
+
+def first_good(items: list[T]) -> T:      # ✅ 输入什么类型，输出就什么类型
+    return items[0]
+```
+
+**这是泛型的核心价值**：不是"能接受任何类型"，而是**"保持类型关系"**。
+:::
+
+```python
+# 带约束的 TypeVar
+TNum = TypeVar("TNum", int, float)          # 只能是 int 或 float
+
+# 带上界的 TypeVar
+TClose = TypeVar("TClose", bound="Closeable")
+```
+
+## 用 mypy 检查
+
+```bash
+pip install mypy
+mypy your_module.py
+```
+
+:::tip[严格度是分级的，可以渐进引入]
+```bash
+# 最松（默认）
+mypy .
+
+# 中等
+mypy --strict .
+
+# 只检查部分选项
+mypy --disallow-untyped-defs --check-untyped-defs .
+```
+
+**`--strict` 打开了一堆检查**，老代码通常过不了。
+
+**推荐渐进策略**：
+
+1. 先只对新代码开严格检查
+2. 老代码逐步补注解
+3. 每次 CI 只保证"没有新增错误"
+
+```ini
+# mypy.ini
+[mypy]
+python_version = 3.11
+warn_unused_ignores = True
+warn_redundant_casts = True
+
+# 新模块严格
+[mypy-myproject.newmodule.*]
+strict = True
+
+# 老模块放松
+[mypy-myproject.legacy.*]
+ignore_errors = True
+```
+:::
+
+:::danger[`Any` 会让检查"悄悄失效"]
+```python
+def f(x) -> Any: ...        # 没注解 = 隐式 Any
+def g(x: Any) -> int: ...
+```
+
+**一个 `Any` 传染下去，整条调用链都失去检查。**
+
+**`--strict` 里的 `disallow_any_explicit` / `disallow_untyped_defs` 就是治这个的。**
+
+**过渡期可以用 `--disallow-untyped-defs` 逼自己补上参数类型。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 注解报 `NameError` | 引用了尚未定义的类型 | 加引号或用 `from __future__ import annotations` |
+| `list[int] != List[int]` | 两套不同实现 | 统一用 `list[int]` |
+| `isinstance` 判断 Protocol 不准 | 只查方法名不查签名 | 只能做粗判断，靠 mypy 保证 |
+| `TypedDict` 没校验 | 运行时就是 dict | 需要校验用 pydantic |
+| mypy 报一堆错 | 老代码没注解 | 用 `mypy.ini` 分模块放宽 |
+| 加了 `Any` 后不报错了 | 检查被绕过 | 尽量别用 `Any`，用 `object` 或具体类型 |
+| 可变默认参数被共享 | 经典 Python 坑 | 用 `None` + 内部创建 |
+
+:::danger[可变默认参数：注解救不了你]
+```python
+def add_item(x, items: list = []):      # ❌ 所有调用共享同一个 list
+    items.append(x)
+    return items
+
+print(add_item(1))      # [1]
+print(add_item(2))      # [1, 2]  ← 不是 [2]！
+```
+
+**正确写法**：
+
+```python
+def add_item(x, items: list | None = None):
+    if items is None:
+        items = []
+    items.append(x)
+    return items
+```
+
+**mypy 有 `--strict` 里的 `no_implicit_optional` 相关检查，但这个坑主要是运行时语义问题。**
+:::
+
+:::warning[dataclass 的 `default_factory` 要显式写]
+```python
+from dataclasses import dataclass, field
+
+@dataclass
+class A:
+    items: list = field(default_factory=list)     # ✅ 每个实例独立
+```
+
+**写成 `items: list = []` 会直接报错**（dataclass 会禁止可变默认值）。
+
+**实测确认**：`D().items is not D().items` → `True`（每个实例拿到新的 list）。
+:::
+
+## 注解值得写吗
+
+:::tip[三个明确的收益]
+**① IDE 补全和跳转准确率大幅提升**
+
+没有注解时 IDE 只能靠猜，有注解后属性和方法都能直接补全。
+
+**② 重构时能提前发现漏改**
+
+改了函数签名，mypy 会列出所有调用点。
+
+**③ 注解本身就是最好的文档**
+
+```python
+def parse(s: str, strict: bool = False) -> dict[str, int] | None:
+    ...
+```
+
+**比一行注释信息量更大，而且不会和代码脱节。**
+:::
+
+:::warning[代价]
+- 写注解要时间
+- 老代码全量补注解成本高
+- mypy 有时会"过于聪明"报假错（用 `# type: ignore` 但要加原因）
+
+**判断标准**：**团队 ≥2 人、项目要活过半年、有 CI —— 就值得上。**
+:::
+
+## 本课自检
+
+- [ ] **知道注解默认不在运行时校验，`add("a","b")` 不会报错**
+- [ ] 知道 `__annotations__` 里前向引用是字符串，`get_type_hints` 才解析
+- [ ] **知道注解在定义时求值，未定义的类型名会 `NameError`**
+- [ ] 会用 `from __future__ import annotations` 延迟求值
+- [ ] 知道 `Optional[X]` 是 `X | None`，不是"参数可省略"
+- [ ] **知道 `list[int] != typing.List[int]`（实测 False）**
+- [ ] 会用 `Literal` 限定字面量
+- [ ] **知道 `TypedDict` 运行时就是 dict，不做校验**
+- [ ] 理解 `Protocol` 是结构化类型
+- [ ] **知道 `@runtime_checkable` 只查方法名不查签名（实测返回 True）**
+- [ ] 会用 `TypeVar` 保持类型关系
+- [ ] 知道 `Any` 会让检查传染性失效
+- [ ] 会用 `mypy.ini` 分模块渐进引入
+- [ ] **知道可变默认参数是运行时问题，注解救不了**
+
+## 下一步
+
+[演示与脚本工程化](./engineering) 有更完整的项目组织方式；
+或者看 [上下文管理器与 with](./adv-03-context)。

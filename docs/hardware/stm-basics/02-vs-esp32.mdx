@@ -1,0 +1,265 @@
+---
+id: 02-vs-esp32
+title: 02 和 ESP32 的关键区别
+sidebar_position: 2
+description: 会 ESP32 的人学 STM32 最容易翻车的六件事——工具链、入口函数、库体系、时钟、引脚复用、动态分配。
+---
+
+# 02 和 ESP32 的关键区别
+
+**本课目标**：把 ESP32 的经验安全地迁移过来，避开最常见的翻车点。
+
+:::tip[如果你没学过 ESP32]
+这一课可以跳过，直接看 [03 型号怎么选](./03-choose-board)。
+
+**但如果你看过本站的 [ESP32 零基础](../esp-basics/)**，这一课能省你几天时间。
+:::
+
+## 一句话概括
+
+**ESP32 是"把复杂度藏起来"的芯片，STM32 是"把复杂度摊开给你"的芯片。**
+
+| | ESP32 | STM32 |
+| --- | --- | --- |
+| 入口 | `void app_main(void)` | `int main(void)` + `while(1)` |
+| 工程 | `idf.py create` + 两个 CMakeLists | **CubeMX 图形化生成** |
+| 烧录 | 一根 USB 线 | **ST-Link + SWD 四根线** |
+| 库 | ESP-IDF（一家） | HAL / LL / 标准库 / 寄存器（四选一） |
+| 时钟 | 基本自动 | **必须自己配时钟树** |
+| 引脚 | 较随意 | **必须查复用表** |
+| 内存 | 512 KB SRAM | **20~320 KB** |
+
+## 区别一：入口函数和程序结构
+
+**ESP32**：
+
+```c
+void app_main(void)
+{
+    /* 这就是全部。返回后 FreeRTOS 继续跑 */
+    while (1) { /* 你的循环 */ }
+}
+```
+
+**STM32（CubeMX 生成的 `main.c` 结构）**：
+
+```c
+int main(void)
+{
+    HAL_Init();                 /* ① HAL 库初始化 */
+    SystemClock_Config();       /* ② 配时钟树到 72MHz */
+    MX_GPIO_Init();             /* ③ 各外设初始化（CubeMX 生成） */
+    MX_USART1_UART_Init();
+
+    while (1)                   /* ④ 你的主循环 */
+    {
+        /* 业务逻辑 */
+    }
+}
+```
+
+:::danger[STM32 的 `main()` 永远不返回]
+```c
+int main(void)
+{
+    /* ... */
+    while (1) { }
+    /* 这行永远执行不到，但编译器要求有 return */
+}
+```
+
+**没有 OS 接管，`main` 返回就是硬件错误。**
+
+（用了 FreeRTOS 之后，`main` 里会调 `osKernelStart()`，也不返回。）
+:::
+
+## 区别二：工具链完全不同
+
+| 步骤 | ESP32 | STM32 |
+| --- | --- | --- |
+| 建工程 | `idf.py create-project` | **CubeMX 图形界面点选** |
+| 改配置 | `idf.py menuconfig`（文本菜单） | **CubeMX（图形引脚图）** |
+| 编译烧录 | `idf.py build flash monitor` | **CubeIDE 点按钮 / `make` + ST-Link** |
+| 看日志 | 串口（USB 转串口芯片） | **串口（需要自己接 USB-TTL）** |
+| 调试 | 加打印为主 | **SWD 单步/断点** |
+
+:::warning[STM32 的串口要自己接]
+ESP32 板上有 USB 转串口芯片，**插 USB 就能看串口输出**。
+
+**很多 STM32 最小系统板（如蓝板）没有 USB 转串口芯片**，必须：
+
+```text
+STM32 的 PA9(TX) → USB-TTL 模块的 RX
+STM32 的 PA10(RX) → USB-TTL 模块的 TX
+GND → GND
+（USB-TTL 插电脑）
+```
+
+**所以要额外买一个 USB-TTL 模块（几元钱）。**
+
+（有些开发板自带，买之前看清楚。）
+:::
+
+## 区别三：库有四套，不是一套
+
+:::danger[这是 ESP32 用户最容易困惑的地方]
+**"STM32 怎么写代码"没有唯一答案**——有四套库并存：
+
+| 库 | 特点 | 适合 |
+| --- | --- | --- |
+| **HAL** | ST 官方主推、CubeMX 生成、抽象度高 | **新手（本线用它）** |
+| **LL** | 轻量、接近寄存器、效率高 | 有经验后追求性能 |
+| **标准外设库** | 老（F1 时代），已停更 | 维护老项目 |
+| **直接写寄存器** | 最底层、最可控 | 极致优化/学习原理 |
+
+```c
+/* 同样是点灯，三种写法 */
+HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);        /* HAL */
+LL_GPIO_SetOutputPin(GPIOC, LL_GPIO_PIN_13);                 /* LL */
+GPIOC->BSRR = GPIO_BSRR_BS13;                                /* 寄存器 */
+```
+
+**新手一律用 HAL**——虽然啰嗦，但不容易配错。
+:::
+
+## 区别四：时钟必须自己配
+
+:::danger[ESP32 的时钟基本不用管，STM32 不管就慢得离谱]
+**STM32 上电默认用内部 RC 振荡器（HSI，8 MHz）。**
+
+如果你不配时钟树：
+
+- CPU 只跑 8 MHz（不是标称的 72 MHz）
+- 所有定时器、串口波特率、延时全部不准
+- **你的 `HAL_Delay(1000)` 可能实际是 9 秒**
+
+**CubeMX 会自动生成 `SystemClock_Config()`，把时钟配到 72 MHz。**
+
+**所以：一定要用 CubeMX，或者自己搞懂时钟树。**
+:::
+
+| 时钟源 | 频率 | 特点 |
+| --- | --- | --- |
+| HSI（内部 RC） | 8 MHz（F103） | 上电默认、精度差 |
+| **HSE（外部晶振）** | 8 MHz（蓝板） | 经 PLL 倍频到 72 MHz |
+| LSI | 约 40 kHz | 看门狗/RTC 用 |
+| LSE | 32.768 kHz | RTC 精确走时 |
+
+（[第 10 课](./10-clock)详细讲时钟树。）
+
+## 区别五：引脚必须查复用表
+
+:::danger[ESP32 的 GPIO 比较"随便"，STM32 不是]
+STM32 的每个引脚**能当什么用是固定的**（由芯片内部复用器决定）。
+
+```text
+PA9  可以是：USART1_TX / TIM1_CH2 / I2C?（不一定）
+PB6  可以是：USART1_TX / I2C1_SCL / TIM4_CH1
+PC13 只能是：普通 GPIO（蓝板的 LED）
+```
+
+**而且外设要"开时钟"才能用**：
+
+```c
+__HAL_RCC_GPIOA_CLK_ENABLE();      /* 不开时钟，配置 GPIOA 无效 */
+__HAL_RCC_USART1_CLK_ENABLE();
+```
+:::
+
+:::warning[不开外设时钟是"不工作"的头号原因]
+```c
+/* 忘了开 GPIOA 时钟 */
+HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);   /* 完全没反应 */
+```
+
+**代码编译通过、烧录成功、就是没输出。**
+
+**CubeMX 会自动开好时钟**——这是用它的重要理由。
+:::
+
+**查复用关系**：用 CubeMX 的引脚图，或查芯片数据手册的 "Alternate function mapping" 表。
+
+## 区别六：内存要抠
+
+| | ESP32 | STM32F103 |
+| --- | --- | --- |
+| SRAM | 512 KB | **20 KB** |
+| 堆 | 约 300 KB 可用 | **几 KB**（HAL 吃掉不少） |
+
+:::danger[STM32 上别用 `malloc`]
+```c
+char *buf = malloc(1024);      /* ⚠️ 20KB 内存里挖一块 */
+```
+
+**问题**：
+
+1. 堆本来就小（可能只剩 2~5 KB）
+2. 频繁分配会碎片化
+3. `malloc` 失败返回 NULL，不检查就崩
+
+**STM32 的主流做法：全部静态分配**（全局数组、`static` 变量）。
+
+```c
+static char buf[256];          /* ✅ 编译期确定，不占堆 */
+```
+
+（[第 20 课](./20-next)会讲内存布局。）
+:::
+
+## 一张迁移对照表
+
+| 你想做的事 | ESP32 | STM32 |
+| --- | --- | --- |
+| 程序入口 | `app_main()` | `main()` + `while(1)` |
+| 延时 | `vTaskDelay(pdMS_TO_TICKS(ms))` | **`HAL_Delay(ms)`** |
+| 点灯 | `gpio_set_level(pin, 1)` | `HAL_GPIO_WritePin(port, pin, SET)` |
+| 翻转 | 读+写 | `HAL_GPIO_TogglePin(port, pin)` |
+| 读引脚 | `gpio_get_level(pin)` | `HAL_GPIO_ReadPin(port, pin)` |
+| 串口打印 | `printf`（默认到串口） | **要自己重定向 `printf`** |
+| 配引脚 | 代码里 `gpio_set_direction` | **CubeMX 图形化 / `HAL_GPIO_Init`** |
+| 定时器 | `esp_timer` | `HAL_TIM_Base_Start_IT` |
+| PWM | `ledc_set_duty` | `HAL_TIM_PWM_Start` + `__HAL_TIM_SET_COMPARE` |
+| ADC | `adc_oneshot_read` | `HAL_ADC_Start` + `HAL_ADC_GetValue` |
+
+:::tip[注意 STM32 的 GPIO 要"端口 + 引脚"两个参数]
+```c
+/* ESP32：一个引脚号搞定 */
+gpio_set_level(4, 1);
+
+/* STM32：端口 + 引脚 */
+HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
+/*             ↑端口    ↑引脚号        ↑电平 */
+```
+
+**端口是 `GPIOA`~`GPIOG`，引脚是 `GPIO_PIN_0`~`GPIO_PIN_15`。**
+
+**为什么分端口**：STM32 引脚多（64~144 个），按 16 个一组分成 A/B/C… 端口。**`PA5` = 端口 A 的第 5 脚**。
+:::
+
+## 六条翻车清单
+
+:::danger[从 ESP32 转 STM32 最容易犯的错]
+1. **以为插 USB 就能烧录** → 需要 ST-Link
+2. **以为插 USB 就能看串口** → 很多板要外接 USB-TTL
+3. **`HAL_Delay(1000)` 不是 1 秒** → 时钟没配对（第一次用 CubeMX 就不会有这问题）
+4. **配了 GPIO 但没反应** → 忘了开外设时钟
+5. **`malloc` 后崩溃** → 内存太小 / 碎片化
+6. **以为有 WiFi** → 完全没有，要外挂 ESP8266/ESP32 模块
+:::
+
+## 本课自检
+
+- [ ] 知道 STM32 入口是 `main()` + `while(1)`，且永不返回
+- [ ] **知道 STM32 需要 ST-Link 烧录，不是直接 USB**
+- [ ] **知道很多板看串口要外接 USB-TTL**
+- [ ] **知道有四套库（HAL/LL/标准库/寄存器），新手用 HAL**
+- [ ] **知道时钟必须配，否则跑在 8MHz 而不是 72MHz**
+- [ ] **知道外设要开时钟才能用**
+- [ ] 知道引脚功能是固定的，要查复用表
+- [ ] **知道 SRAM 只有 20KB，别用 `malloc`**
+- [ ] 会 STM32 的 GPIO 写法（端口 + 引脚）
+- [ ] 记住六条翻车清单
+
+## 下一步
+
+[03 型号怎么选](./03-choose-board) —— 买哪块板子、哪种 ST-Link。

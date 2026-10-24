@@ -1,0 +1,298 @@
+---
+id: 10-adc
+title: 10 ADC 读模拟量
+sidebar_position: 10
+description: ADC 是什么、12 位分辨率怎么换算电压、校准为什么必要、多值平均去噪，以及 ESP32 ADC 的真实局限。
+---
+
+# 10 ADC 读模拟量
+
+**本课目标**：读电位器、光敏电阻这类连续变化的信号，并知道 ESP32 ADC 的坑。
+
+## ADC 是什么
+
+**ADC = 模拟转数字（Analog to Digital Converter）**
+
+微控制器只懂 0 和 1，但现实世界的电压是连续变化的。
+
+```text
+真实电压 0V ~ 3.3V（连续）
+        ↓  ADC 采样
+数字值 0 ~ 4095（12 位）
+```
+
+**ADC 把"连续电压"变成"离散数字"。**
+
+## 12 位分辨率怎么换算
+
+ESP32 的 ADC 是 **12 位**：
+
+```text
+2^12 = 4096 个档位     → 数字范围 0 ~ 4095
+参考电压 3.3V
+每一档 = 3.3V / 4096 ≈ 0.806 mV
+```
+
+**换算公式**：
+
+```text
+电压 = 数字值 × 3.3 / 4095
+```
+
+本机示例：
+
+| 数字值 | 电压（约） | 含义 |
+| --- | --- | --- |
+| 0 | 0.00 V | 接地 |
+| 1024 | 0.83 V | 约 1/4 |
+| 2048 | 1.65 V | 约一半 |
+| 4095 | 3.30 V | 满量程（理想值） |
+
+:::note[3.3V 是理论满量程，实际到 3.1V 就饱和了]
+上面的 3.3V 是按 **VDDA 供电电压**算的理想满量程。但 S3 的 ADC 在 11dB/12dB 衰减档下，**有效量程上限是 3100mV**（见下方[代码注释](#)与本页后面几节）——输入超过约 3.1V 时读数就停在 4095，不会继续涨。
+
+所以实操里：
+
+- **按 3.3V 算**：理解原理、算每格多大（约 0.8mV）
+- **按 3.1V 校**：真要读准确电压，用校准 API 或实测标定，别拿 4095×3.3/4095 当真理
+
+:::
+
+:::warning[用 4095 还是 4096 除]
+```c
+voltage = raw * 3.3f / 4095.0f;    /* 常用，让 4095 对应满量程 */
+voltage = raw * 3.3f / 4096.0f;    /* 理论上更"标准" */
+```
+
+两者差 0.02%，**实际影响可以忽略**。用 4095 更直观（最大值对应满电压）。
+:::
+
+## ESP-IDF 的 ADC API
+
+本机 ESP-IDF v5.3.5 的实际 API（`esp_adc/adc_oneshot.h`）：
+
+```c
+esp_err_t adc_oneshot_new_unit(const adc_oneshot_unit_init_cfg_t *init_config,
+                               adc_oneshot_unit_handle_t *ret_unit);
+esp_err_t adc_oneshot_config_channel(adc_oneshot_unit_handle_t handle,
+                                     adc_channel_t channel,
+                                     const adc_oneshot_chan_cfg_t *config);
+esp_err_t adc_oneshot_read(adc_oneshot_unit_handle_t handle,
+                           adc_channel_t chan, int *out_raw);
+esp_err_t adc_oneshot_get_calibrated_result(adc_oneshot_unit_handle_t handle,
+                                            adc_cali_handle_t cali_handle,
+                                            adc_channel_t chan, int *cali_result);
+```
+
+:::info[`oneshot` 是什么意思]
+**"单次读取"模式**：你叫它读一次，它读一次。
+
+另一种是 **连续模式（DMA）**，适合高速采样（音频、振动）。
+
+**大部分场景用 oneshot 就够。**
+:::
+
+## 完整示例：读电位器
+
+```c
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_log.h"
+
+static const char *TAG = "adc";
+
+#define ADC_UNIT     ADC_UNIT_1
+#define ADC_CHANNEL  ADC_CHANNEL_6      /* S3 上对应 GPIO7（经典 ESP32 才是 GPIO34） */
+
+void app_main(void)
+{
+    /* ① 创建 ADC 单元 */
+    adc_oneshot_unit_handle_t adc;
+    adc_oneshot_unit_init_cfg_t init_cfg = {
+        .unit_id = ADC_UNIT,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_cfg, &adc));
+
+    /* ② 配置通道：衰减 + 位宽 */
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten    = ADC_ATTEN_DB_12,     /* 12dB 衰减 → 可测到约 3.1V */
+        .bitwidth = ADC_BITWIDTH_12,     /* 12 位 */
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc, ADC_CHANNEL, &chan_cfg));
+
+    /* ③ 循环读取 */
+    while (1) {
+        int raw = 0;
+        ESP_ERROR_CHECK(adc_oneshot_read(adc, ADC_CHANNEL, &raw));
+        float voltage = raw * 3.3f / 4095.0f;
+
+        ESP_LOGI(TAG, "原始 %4d, 电压 %.3f V", raw, voltage);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+```
+
+:::danger[衰减（atten）不设对，量程就不对]
+| 衰减 | 可测范围（约） |
+| --- | --- |
+| `ADC_ATTEN_DB_0` | 0 ~ 1.1 V |
+| `ADC_ATTEN_DB_2_5` | 0 ~ 1.5 V |
+| `ADC_ATTEN_DB_6` | 0 ~ 2.2 V |
+| **`ADC_ATTEN_DB_12`** | **0 ~ 3.3 V** |
+
+**默认不设衰减只能测到 1.1V**——超过就饱和在 4095。
+
+**测 0~3.1V 一律用 `ADC_ATTEN_DB_12`**（S3 有效量程上限 3100mV）。
+:::
+
+:::warning[超过 3.3V 会烧引脚]
+ADC 引脚**最大只能承受 3.3V**（有些手册写 3.6V 是极限）。
+
+**测电池电压（比如 12V）必须先分压**：
+
+```text
+12V ──[R1 100k]──┬──[R2 10k]── GND
+                 │
+               ADC 引脚    → 测得约 1.09V（12 × 10/110）
+```
+
+**换算**：真实电压 = ADC 电压 × (R1+R2)/R2
+:::
+
+## 校准：为什么「读出来不准」
+
+:::danger[ESP32 的 ADC 是非线性的]
+理想 ADC 是直线，**ESP32 的实际曲线是弯的**，尤其两端误差大。
+
+**典型误差可达 ±6%**（不做校准）。
+
+**这导致**：用 `raw * 3.3 / 4095` 算出的电压，和万用表测的差不少。
+:::
+
+**解决办法：用校准功能**
+
+```c
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+
+adc_cali_handle_t cali;
+adc_cali_curve_fitting_config_t cali_cfg = {
+    .unit_id  = ADC_UNIT,
+    .atten    = ADC_ATTEN_DB_12,
+    .bitwidth = ADC_BITWIDTH_12,
+};
+ESP_ERROR_CHECK(adc_cali_create_scheme_curve_fitting(&cali_cfg, &cali));
+
+/* 读校准后的毫伏值 */
+int mv = 0;
+adc_oneshot_get_calibrated_result(adc, cali, ADC_CHANNEL, &mv);
+ESP_LOGI(TAG, "校准后 %d mV", mv);
+```
+
+:::tip[校准后能到多少精度]
+**校准后典型误差约 ±1~2%**——够日常用。
+
+**但想做到 0.1% 精度，ESP32 做不到**——那是 STM32 外接专用 ADC 的领域。
+:::
+
+## 多值平均：降低噪声
+
+```c
+#define SAMPLES  16
+
+static int adc_read_avg(adc_oneshot_unit_handle_t adc)
+{
+    int sum = 0;
+    for (int i = 0; i < SAMPLES; i++) {
+        int raw = 0;
+        adc_oneshot_read(adc, ADC_CHANNEL, &raw);
+        sum += raw;
+    }
+    return sum / SAMPLES;
+}
+```
+
+:::tip[平均值能把噪声降 √N 倍]
+16 次平均 → 噪声降到约 1/4。
+
+**代价**：采样变慢（16 次读）。
+
+**折中**：8~16 次对大多数应用够用。
+:::
+
+### 更稳的做法：去掉极值再平均
+
+```c
+/* 去掉最大最小各一次，剩下的取平均 → 抑制尖峰干扰 */
+```
+
+## ESP32 ADC 的真实局限
+
+:::warning[这几条要知道，别把它当精密仪器]
+| 局限 | 表现 |
+| --- | --- |
+| **非线性** | 两端误差大（校准能改善） |
+| **噪声较大** | 读数跳动能有几十 |
+| **输入阻抗低** | 高阻信号源测不准 |
+| **WiFi 干扰** | **开 WiFi 时 ADC2 不可用/误差增大** |
+| **通道受限** | ADC2 与 WiFi 冲突，只能用 ADC1 |
+
+**规矩：**
+
+- **要精度 → 用 ADC1，别开 WiFi，加校准**
+- **要真正的精密测量 → 换 STM32 或外接 ADS1115**
+:::
+
+:::danger[ADC2 和 WiFi 冲突是硬限制]
+ESP32 的 **ADC2 和 WiFi 共用硬件**。
+
+**WiFi 工作时，ADC2 读不到值（返回错误）。**
+
+**所以联网项目要用 ADC，一律选 ADC1 的通道。**
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 没设衰减 | 一直是 4095 | 量程只有 1.1V | `ADC_ATTEN_DB_12` |
+| 接超过 3.3V | 读数饱和/烧引脚 | 超量程 | 先分压 |
+| 用 ADC2 又开 WiFi | 读失败 | 硬件冲突 | 换 ADC1 |
+| 不做校准 | 电压偏差大 | 非线性 | 用 cali |
+| 单次读数就用 | 数值乱跳 | 噪声 | 多值平均 |
+| 引脚号当通道号 | 读错通道 | 概念混淆 | 查对应表 |
+
+:::tip[引脚号和 ADC 通道号不是一回事]
+```c
+/* S3 上 GPIO7 → ADC1_CHANNEL_6，不是 ADC_CHANNEL_7 */
+adc_oneshot_config_channel(adc, ADC_CHANNEL_6, &cfg);
+```
+
+**对应关系查手册**（不同型号不一样）。
+
+也可以用 API 反查：
+
+```c
+adc_unit_t unit;
+adc_channel_t ch;
+adc_oneshot_io_to_channel(7, &unit, &ch);     /* S3: GPIO7 → 通道 6 */
+```
+:::
+
+## 本课自检
+
+- [ ] 理解 ADC 把连续电压变成离散数字
+- [ ] **会算 12 位对应 0~4095，每档约 0.8mV**
+- [ ] 会用 `adc_oneshot_new_unit` / `config_channel` / `read`
+- [ ] **知道衰减不设对量程就只有 1.1V**
+- [ ] **知道超过 3.3V 会烧，高电压要先分压**
+- [ ] 知道 ESP32 ADC 非线性、误差可达 ±6%
+- [ ] 会用校准（curve fitting）把误差降到 1~2%
+- [ ] 会用多值平均降噪
+- [ ] **知道 ADC2 与 WiFi 冲突，联网项目用 ADC1**
+- [ ] 知道引脚号和通道号不是一回事
+
+## 下一步
+
+[11 定时器与中断](./11-timer) —— 让某件事精确地"每隔 X 微秒"发生一次。

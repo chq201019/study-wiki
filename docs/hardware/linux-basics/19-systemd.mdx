@@ -1,0 +1,330 @@
+---
+id: 19-systemd
+title: 19 systemd 服务管理
+sidebar_position: 19
+description: systemctl 常用命令、写一个自己的 service 单元、开机自启，以及服务起不来的排查方法。
+---
+
+# 19 systemd 服务管理
+
+**本课目标**：会用 `systemctl` 管服务，能自己写一个 service 让程序常驻。
+
+## systemd 是什么
+
+**systemd 是现代 Linux 的初始化系统**（PID 1）。
+
+它负责：
+
+- 开机启动服务
+- 管理服务生命周期（启动/停止/重启）
+- 挂了自动重启
+- 收集日志（journald）
+
+本机实测版本：
+
+```text
+systemd 257 (257.13-1~deb13u1)
+```
+
+## `systemctl` 常用命令
+
+```bash
+systemctl status nginx          # 看状态（最常用）
+systemctl start nginx           # 启动
+systemctl stop nginx            # 停止
+systemctl restart nginx         # 重启
+systemctl reload nginx          # 重载配置（不中断服务）
+systemctl enable nginx          # 开机自启
+systemctl disable nginx         # 取消自启
+```
+
+:::tip[`enable` 和 `start` 是两件事]
+```bash
+systemctl start nginx           # 现在就启动，但重启后不会自动起
+systemctl enable nginx          # 设置开机自启，但现在还没起
+systemctl enable --now nginx    # ✅ 两个一起做
+```
+
+**"我启动了怎么重启就没了"——就是因为没 `enable`。**
+:::
+
+### 看列表
+
+```bash
+systemctl list-units --type=service --state=running    # 正在运行的服务
+systemctl list-units --failed                         # 失败的
+systemctl list-unit-files --state=enabled             # 开机自启的
+```
+
+本机实测（正在运行的服务）：
+
+```text
+  UNIT                      LOAD   ACTIVE SUB     DESCRIPTION
+  1panel-agent.service      loaded active running 1Panel, a modern open source linux panel
+  1panel-core.service       loaded active running 1Panel, a modern open source linux panel
+  cloudflared.service       loaded active running Cloudflare Tunnel client
+  cron.service              loaded active running Regular background program processing daemon
+```
+
+### 看系统整体状态
+
+```bash
+systemctl is-system-running
+```
+
+本机实测输出：`degraded`
+
+:::info[`degraded` 是什么意思]
+表示**系统基本正常，但有某个单元失败了**。
+
+```bash
+systemctl --failed              # 看是谁失败了
+```
+
+（`running` 是完全正常；`degraded` 有个别失败；`starting`/`maintenance` 更严重。）
+:::
+
+## 看服务状态输出
+
+```bash
+systemctl status nginx
+```
+
+```text
+● nginx.service - A high performance web server
+     Loaded: loaded (/lib/systemd/system/nginx.service; enabled; preset: enabled)
+     Active: active (running) since ...
+   Main PID: 1234 (nginx)
+      Tasks: 3 (limit: 4500)
+     Memory: 8.2M
+        CPU: 120ms
+     CGroup: /system.slice/nginx.service
+             ├─1234 nginx: master process
+             └─1235 nginx: worker process
+```
+
+| 项 | 含义 |
+| --- | --- |
+| `Loaded` | 单元文件路径 + **是否 enabled** |
+| `Active` | **active (running)** 正常；`failed` 有问题 |
+| `Main PID` | 主进程 |
+| `Memory` / `CPU` | 资源消耗 |
+
+## 写自己的 service
+
+假设你有个程序 `/opt/myapp/app`，希望它常驻、挂了自动重启、开机自启。
+
+### 创建单元文件
+
+```bash
+sudo nano /etc/systemd/system/myapp.service
+```
+
+```ini
+[Unit]
+Description=My Application
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/myapp
+ExecStart=/opt/myapp/app --port 8080
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 各段说明
+
+:::tip[`[Unit]` 段]
+| 项 | 作用 |
+| --- | --- |
+| `Description` | 描述（`status` 里显示） |
+| `After=network.target` | **在网络栈初始化之后再启动**（注意它≠网络已可用，要等拿到 IP 得用 `network-online.target`） |
+| `Requires` | 强依赖（被依赖的不起，这个也不起） |
+| `Wants` | 弱依赖（被依赖的失败也继续） |
+:::
+
+:::tip[`[Service]` 段（核心）]
+| 项 | 作用 |
+| --- | --- |
+| `Type=simple` | 默认，**前台运行**的程序用这个 |
+| `User` / `Group` | **以哪个用户运行**（安全关键） |
+| `WorkingDirectory` | 工作目录（**相对路径的基准**） |
+| `ExecStart` | **启动命令**（必须绝对路径） |
+| `Restart=on-failure` | 失败时自动重启 |
+| `RestartSec=5` | 重启前等 5 秒 |
+| `Environment` | 环境变量 |
+:::
+
+:::danger[`ExecStart` 必须用绝对路径]
+```ini
+ExecStart=app              # ❌ systemd 不查 PATH，直接失败
+ExecStart=/opt/myapp/app   # ✅
+```
+:::
+
+:::warning[`Type` 选错服务就"起不来"]
+| `Type` | 用于 |
+| --- | --- |
+| `simple` | **前台不退出的程序**（最常见） |
+| `forking` | 自己 daemon 化（fork 后父进程退出） |
+| `oneshot` | 执行完就结束的任务 |
+
+**大部分程序用 `simple`。** 写成 `forking` 但程序没 fork，会导致 systemd 一直等不到"启动完成"。
+:::
+
+### 启用
+
+```bash
+sudo systemctl daemon-reload          # 改完单元文件必须做！
+sudo systemctl enable --now myapp     # 自启 + 立即启动
+systemctl status myapp
+```
+
+:::danger[改完单元文件一定要 `daemon-reload`]
+```bash
+sudo nano /etc/systemd/system/myapp.service
+sudo systemctl restart myapp          # ❌ 可能还是跑旧配置
+sudo systemctl daemon-reload          # ✅ 先重载
+sudo systemctl restart myapp
+```
+
+**systemd 缓存了单元文件**，不 reload 就看不到你的修改。
+
+**这是"我明明改了配置怎么没效果"的头号原因。**
+:::
+
+## 排查服务起不来
+
+:::tip[四步定位]
+```bash
+# ① 看状态和最后的错误
+systemctl status myapp
+
+# ② 看完整日志
+journalctl -u myapp -n 50 --no-pager
+
+# ③ 实时跟踪（改了配置再重启，看新日志）
+journalctl -u myapp -f
+
+# ④ 手动跑 ExecStart 那条命令，看真实报错
+sudo -u www-data /opt/myapp/app --port 8080
+```
+:::
+
+| 常见原因 | 表现 | 解决 |
+| --- | --- | --- |
+| `ExecStart` 路径错 | status 显示 `No such file` | 检查绝对路径 |
+| 没执行权限 | `Permission denied` | `chmod +x` |
+| 用户不对 | 文件读不到/端口绑不了 | 改 `User=` |
+| 端口被占 | `Address already in use` | `ss -tlnp \| grep 端口` |
+| 缺环境变量 | 程序报配置缺失 | `Environment=` |
+| 工作目录不对 | 读不到相对路径文件 | `WorkingDirectory=` |
+| 改了配置没 reload | 行为没变 | `daemon-reload` |
+
+:::danger[`systemctl status` 里的日志是截断的]
+`status` 只显示最后几行。**完整日志必须用 `journalctl -u 服务名`。**
+
+`status` 看不到错误时，别以为没错误——去看 journal。
+:::
+
+## 其他常用操作
+
+```bash
+systemctl mask nginx            # 彻底禁用（比 disable 更强，连手动启动都不行）
+systemctl unmask nginx
+systemctl cat nginx             # 看单元文件内容
+systemctl show nginx            # 看所有属性
+systemctl list-dependencies nginx   # 看依赖关系
+```
+
+## 完整示例
+
+**做一个每 10 秒写时间戳的服务：**
+
+```bash
+# ① 准备脚本
+sudo mkdir -p /opt/ticker
+sudo tee /opt/ticker/tick.sh > /dev/null << 'EOF'
+#!/bin/bash
+while true; do
+    echo "$(date '+%F %T') tick"
+    sleep 10
+done
+EOF
+sudo chmod +x /opt/ticker/tick.sh
+
+# ② 写单元文件
+sudo tee /etc/systemd/system/ticker.service > /dev/null << 'EOF'
+[Unit]
+Description=Ticker demo
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/ticker/tick.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ③ 启用
+sudo systemctl daemon-reload
+sudo systemctl enable --now ticker
+
+# ④ 验证
+systemctl status ticker
+journalctl -u ticker -n 5 --no-pager
+
+# ⑤ 清理
+sudo systemctl disable --now ticker
+sudo rm /etc/systemd/system/ticker.service /opt/ticker/tick.sh
+sudo systemctl daemon-reload
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `start` 后没 `enable` | 重启后没了 | 没设自启 | `enable --now` |
+| 改了 unit 没生效 | 行为照旧 | 没 reload | `daemon-reload` |
+| `ExecStart` 用相对路径 | 启动失败 | 不查 PATH | 绝对路径 |
+| `Type=forking` 但程序不 fork | 一直 starting | 类型不匹配 | 改 `simple` |
+| 只看 `status` 就放弃 | 看不到错误 | 日志被截断 | `journalctl -u` |
+| 用 root 跑服务 | 安全风险 | 图省事 | 改 `User=` |
+
+:::danger[别用 root 跑业务服务]
+```ini
+User=root              # ❌ 服务被攻破 = 整个系统沦陷
+User=www-data          # ✅ 低权限，被攻破影响有限
+```
+
+**只有确实需要硬件/特权端口的服务才用 root。**
+:::
+
+## 本课自检
+
+- [ ] 知道 systemd 是 PID 1，负责服务管理
+- [ ] 会 `start` / `stop` / `restart` / `status`
+- [ ] **知道 `enable`（自启）和 `start`（现在启动）是两件事**
+- [ ] 会用 `enable --now` 一步做完
+- [ ] 会写 `[Unit]` `[Service]` `[Install]` 三段
+- [ ] **知道 `ExecStart` 必须是绝对路径**
+- [ ] **知道 Type 常用 `simple`**
+- [ ] 知道要设 `User=` 降低权限
+- [ ] **知道改完 unit 必须 `daemon-reload`**
+- [ ] 会用 `journalctl -u 服务名` 看完整日志
+- [ ] 知道 `status` 的日志是截断的
+- [ ] 会 `list-units --failed` 查失败的服务
+
+## 下一步
+
+[20 日志与排错](./20-logs) —— `journalctl` 和 `dmesg`，出问题时去哪看。

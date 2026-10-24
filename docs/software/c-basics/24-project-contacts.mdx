@@ -1,0 +1,424 @@
+---
+id: 24-project-contacts
+title: 24 阶段实战：通讯录
+sidebar_position: 24
+description: 用结构体 + 链表 + 动态内存做一个完整的通讯录：增删改查、重名检测，关机不崩、用完不泄漏。
+---
+
+# 24 阶段实战：通讯录
+
+**本课目标**：把结构体、指针、链表、动态内存**全部串起来**，做出一个完整可用的程序。
+
+## 要做什么
+
+一个命令行通讯录，支持：
+
+- 查看全部联系人
+- 添加（自动检测重名）
+- 查找
+- 删除
+- 退出时释放全部内存
+
+**这个程序麻雀虽小，但包含了 C 里最容易出错的几件事：指针操作、内存管理、字符串处理。**
+
+## 第一步：定义数据结构
+
+```c
+typedef struct Contact {
+    char name[32];
+    char phone[16];
+    struct Contact *next;        /* 链表指针 */
+} Contact;
+```
+
+:::warning[`struct Contact *next` 不能写成 `Contact *next`]
+```c
+typedef struct Contact {
+    char name[32];
+    Contact *next;               /* ❌ 别名还没生效 */
+    struct Contact *next;        /* ✅ */
+} Contact;
+```
+
+`Contact` 这个别名要到整个 `typedef` 结束才存在，结构体内部只能用 `struct Contact`。
+:::
+
+## 第二步：添加（带重名检测）
+
+```c
+Contact *book_add(Contact *head, const char *name, const char *phone) {
+    /* ① 先检查重名 */
+    for (Contact *c = head; c != NULL; c = c->next) {
+        if (strcmp(c->name, name) == 0) {
+            return head;                 /* 已存在，不添加 */
+        }
+    }
+
+    /* ② 分配新节点 */
+    Contact *n = malloc(sizeof(Contact));
+    if (n == NULL) return head;          /* 分配失败 */
+
+    /* ③ 安全地复制字符串 */
+    strncpy(n->name, name, sizeof(n->name) - 1);
+    n->name[sizeof(n->name) - 1] = '\0';
+
+    strncpy(n->phone, phone, sizeof(n->phone) - 1);
+    n->phone[sizeof(n->phone) - 1] = '\0';
+
+    /* ④ 头插 */
+    n->next = head;
+    return n;
+}
+```
+
+:::danger[`strncpy` 之后必须手动补 `\0`]
+```c
+strncpy(n->name, name, sizeof(n->name) - 1);
+n->name[sizeof(n->name) - 1] = '\0';      /* ← 这行不能省 */
+```
+
+如果 `name` 长度 ≥ 31，`strncpy` 不会补结束符，后面 `strcmp` / `printf` 就会读到越界内存。
+
+**这是第 13 课讲过的坑，这里实际用上了。**
+:::
+
+## 第三步：查找
+
+```c
+Contact *book_find(Contact *head, const char *name) {
+    for (Contact *c = head; c != NULL; c = c->next) {
+        if (strcmp(c->name, name) == 0) {
+            return c;                    /* 返回节点指针 */
+        }
+    }
+    return NULL;                         /* 没找到 */
+}
+```
+
+**返回节点指针**（不是下标、不是值），这样调用者还能拿到 `phone` 等信息。
+
+## 第四步：删除（用二级指针）
+
+```c
+Contact *book_delete(Contact *head, const char *name) {
+    Contact **pp = &head;                /* 指向"当前节点的指针" */
+
+    while (*pp != NULL) {
+        if (strcmp((*pp)->name, name) == 0) {
+            Contact *dead = *pp;
+            *pp = dead->next;            /* 跳过它 */
+            free(dead);                  /* 释放内存 */
+            /* 注意：pp 不前进，因为新的 *pp 也要检查 */
+        } else {
+            pp = &(*pp)->next;           /* 前进到下一个指针位置 */
+        }
+    }
+    return head;
+}
+```
+
+:::tip[为什么要用 `Contact **pp`]
+如果不用二级指针，**头节点要单独处理**：
+
+```c
+/* 朴素写法：头节点特殊照顾 */
+if (head != NULL && strcmp(head->name, name) == 0) {
+    Contact *d = head;
+    head = head->next;
+    free(d);
+}
+/* 然后才处理中间节点... */
+```
+
+用 `Contact **pp = &head` 之后：
+
+- 第一次 `*pp` 就是 `head` 本身
+- 后续 `*pp` 是前驱节点的 `next`
+
+**`*pp = dead->next` 这一句对头节点和中间节点都成立**——同一份代码搞定。
+:::
+
+## 第五步：统计与打印
+
+```c
+int book_count(const Contact *head) {
+    int n = 0;
+    for (const Contact *c = head; c != NULL; c = c->next) n++;
+    return n;
+}
+
+void book_print(const Contact *head) {
+    if (head == NULL) {
+        printf("  （通讯录为空）\n");
+        return;
+    }
+    printf("  %-12s %s\n", "姓名", "电话");
+    printf("  ------------------------\n");
+    for (const Contact *c = head; c != NULL; c = c->next) {
+        printf("  %-12s %s\n", c->name, c->phone);
+    }
+}
+```
+
+**参数用 `const Contact *`**——只读，且避免复制整个结构体。
+
+## 第六步：释放整个链表
+
+:::danger[释放顺序不能错]
+```c
+void book_free(Contact *head) {
+    while (head != NULL) {
+        Contact *next = head->next;      /* ① 先存下一个 */
+        free(head);                      /* ② 再释放当前 */
+        head = next;                     /* ③ 前进 */
+    }
+}
+```
+
+**如果写成 `free(head); head = head->next;` 就崩了**——`head` 已经被释放，读它的 `next` 是未定义行为。
+:::
+
+## 完整程序
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct Contact {
+    char name[32];
+    char phone[16];
+    struct Contact *next;
+} Contact;
+
+Contact *book_add(Contact *head, const char *name, const char *phone) {
+    for (Contact *c = head; c != NULL; c = c->next) {
+        if (strcmp(c->name, name) == 0) return head;
+    }
+    Contact *n = malloc(sizeof(Contact));
+    if (n == NULL) return head;
+
+    strncpy(n->name, name, sizeof(n->name) - 1);
+    n->name[sizeof(n->name) - 1] = '\0';
+    strncpy(n->phone, phone, sizeof(n->phone) - 1);
+    n->phone[sizeof(n->phone) - 1] = '\0';
+
+    n->next = head;
+    return n;
+}
+
+Contact *book_find(Contact *head, const char *name) {
+    for (Contact *c = head; c != NULL; c = c->next) {
+        if (strcmp(c->name, name) == 0) return c;
+    }
+    return NULL;
+}
+
+Contact *book_delete(Contact *head, const char *name) {
+    Contact **pp = &head;
+    while (*pp != NULL) {
+        if (strcmp((*pp)->name, name) == 0) {
+            Contact *dead = *pp;
+            *pp = dead->next;
+            free(dead);
+        } else {
+            pp = &(*pp)->next;
+        }
+    }
+    return head;
+}
+
+int book_count(const Contact *head) {
+    int n = 0;
+    for (const Contact *c = head; c != NULL; c = c->next) n++;
+    return n;
+}
+
+void book_print(const Contact *head) {
+    if (head == NULL) {
+        printf("  （通讯录为空）\n");
+        return;
+    }
+    printf("  %-12s %s\n", "姓名", "电话");
+    printf("  --------------------------\n");
+    for (const Contact *c = head; c != NULL; c = c->next) {
+        printf("  %-12s %s\n", c->name, c->phone);
+    }
+}
+
+void book_free(Contact *head) {
+    while (head != NULL) {
+        Contact *next = head->next;
+        free(head);
+        head = next;
+    }
+}
+
+/* 读取一行，去掉换行符 */
+static void read_line(char *buf, size_t size) {
+    if (fgets(buf, (int)size, stdin) == NULL) {
+        buf[0] = '\0';
+        return;
+    }
+    size_t len = strlen(buf);
+    if (len > 0 && buf[len - 1] == '\n') {
+        buf[len - 1] = '\0';
+    }
+}
+
+int main(void) {
+    Contact *book = NULL;
+    char line[64];
+    char name[32];
+    char phone[16];
+
+    printf("===== 通讯录 =====\n");
+
+    /* 演示：批量添加 */
+    book = book_add(book, "Alice", "13800138000");
+    book = book_add(book, "Bob",   "13900139000");
+    book = book_add(book, "Carol", "13700137000");
+    book = book_add(book, "Alice", "000");        /* 重名，会被忽略 */
+
+    printf("\n共 %d 条：\n", book_count(book));
+    book_print(book);
+
+    /* 查找 */
+    printf("\n查找 Alice：%s\n", book_find(book, "Alice") ? "找到" : "未找到");
+    printf("查找 Dave： %s\n", book_find(book, "Dave")  ? "找到" : "未找到");
+
+    /* 删除 */
+    book = book_delete(book, "Bob");
+    printf("\n删除 Bob 后共 %d 条：\n", book_count(book));
+    book_print(book);
+
+    /* 交互式再添加一条 */
+    printf("\n输入新联系人姓名（直接回车跳过）：");
+    read_line(name, sizeof(name));
+    if (name[0] != '\0') {
+        printf("输入电话：");
+        read_line(phone, sizeof(phone));
+        book = book_add(book, name, phone);
+        printf("添加后共 %d 条：\n", book_count(book));
+        book_print(book);
+    }
+
+    /* 释放 */
+    book_free(book);
+    printf("\n内存已全部释放\n");
+
+    (void)line;
+    return 0;
+}
+```
+
+### 运行示例
+
+```text
+===== 通讯录 =====
+
+共 3 条：
+  姓名         电话
+  --------------------------
+  Carol        13700137000
+  Bob          13900139000
+  Alice        13800138000
+
+查找 Alice：找到
+查找 Dave： 未找到
+
+删除 Bob 后共 2 条：
+  姓名         电话
+  --------------------------
+  Carol        13700137000
+  Alice        13800138000
+
+输入新联系人姓名（直接回车跳过）：Dave
+输入电话：13600136000
+添加后共 3 条：
+  姓名         电话
+  --------------------------
+  Dave         13600136000
+  Carol        13700137000
+  Alice        13800138000
+
+内存已全部释放
+```
+
+:::tip[为什么用 `fgets` 而不是 `scanf("%s")`]
+```c
+scanf("%s", name);          /* ⚠️ 不检查长度，可能溢出；遇到空格就停 */
+fgets(name, sizeof(name), stdin);   /* ✅ 限制长度，能读整行 */
+```
+
+`fgets` 会保留换行符，所以要手动去掉（见 `read_line` 函数）。
+
+**这是第 13 课讲过的安全问题，项目里必须用安全版本。**
+:::
+
+## 这个程序用到了什么
+
+| 技术 | 用途 | 出自 |
+| --- | --- | --- |
+| `struct` | 组织联系人数据 | [21](./21-struct) |
+| 自引用结构体 | `struct Contact *next` | [22](./22-struct-pointer) |
+| `malloc` / `free` | 动态创建节点 | [20](./20-malloc) |
+| 链表遍历 | 查找、打印、统计 | [22](./22-struct-pointer) |
+| 二级指针 | 统一删除逻辑 | [22](./22-struct-pointer) |
+| `strcmp` | 比较姓名 | [13](./13-string) |
+| `strncpy` + 补 `\0` | 安全复制字符串 | [13](./13-string) |
+| `fgets` | 安全读输入 | [25](./25-files) |
+| `typedef` | 简化类型名 | [23](./23-enum-union) |
+| `const` 指针参数 | 只读、避免复制 | [17](./17-pointers) |
+
+**一个通讯录，把第三阶段的知识全部用上了。**
+
+## 想自己加的功能
+
+| 挑战 | 提示 |
+| --- | --- |
+| 按姓名排序后打印 | 把节点指针收集到数组，用 `qsort`（第 19 课） |
+| 保存到文件 | 用 `fprintf` 逐行写，启动时读回来（第 25 课） |
+| 支持模糊搜索 | `strstr(c->name, keyword)` |
+| 电话格式校验 | 检查长度和是否全数字 |
+| 改成双向链表 | 每个节点加 `prev` 指针 |
+| 用动态数组替代链表 | 对比两者的性能差异 |
+
+:::tip[一道值得做的练习]
+**把链表改成动态数组**（`Contact *arr` + `count` + `capacity`）。
+
+你会发现：
+
+- 查找更快（内存连续，cache 友好）
+- 但删除要挪数据
+- 满了要 `realloc` 扩容
+
+**这是"数据结构选型"最直观的体验**，比看任何理论都有效。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `Contact *next` 编译错 | 别名未生效 | typedef 内部 | `struct Contact *next` |
+| 新节点 `next` 没设 | 遍历崩溃 | 垃圾指针 | 设为 `head` 或 `NULL` |
+| `strncpy` 后不补 `\0` | 打印乱码 | 不保证补零 | 手动加 |
+| free 后读 `->next` | 崩溃 | 内存已归还 | 先存 next |
+| 忘 `free` | 内存泄漏 | 没释放 | 写 `book_free` |
+| `scanf("%s")` 溢出 | 崩溃/漏洞 | 不检查长度 | 用 `fgets` |
+| 空链表没判断 | 崩溃 | `head` 是 NULL | 开头判空 |
+
+## 第三阶段小结
+
+你现在掌握了 C 最核心的能力：
+
+- **指针**：地址、解引用、指针运算
+- **动态内存**：`malloc` / `free`，不泄漏
+- **结构体**：组织复杂数据、内存对齐
+- **链表**：动态数据结构、二级指针
+
+**这是 C 区别于其他语言的地方，也是"会 C"和"懂 C"的分界线。**
+
+## 下一步
+
+[25 文件读写](./25-files) —— 让数据能保存下来，程序才算完整。

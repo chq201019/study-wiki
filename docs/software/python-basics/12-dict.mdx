@@ -1,0 +1,402 @@
+---
+title: 12 字典 dict
+sidebar_position: 12
+description: 键值对的概念、增删改查、get 方法、遍历方式、嵌套字典，以及键必须可哈希的原因。
+id: 12-dict
+---
+
+# 12 字典 dict
+
+**本课目标**：会用字典存「名字对应值」的数据，掌握 6 种遍历方式和 get 的安全用法。
+
+## 字典是什么
+
+**字典 = 一堆「键 → 值」的对应关系。**
+
+生活里到处都是这种结构：姓名→电话、商品→价格、单词→释义。
+
+```python
+student = {
+    "name": "小明",
+    "age": 18,
+    "score": 95,
+}
+print(student)
+```
+
+输出：
+
+```text
+{'name': '小明', 'age': 18, 'score': 95}
+```
+
+结构：`{键1: 值1, 键2: 值2, ...}`
+
+:::tip[字典 vs 列表怎么选]
+| 场景 | 用哪个 |
+| --- | --- |
+| 一堆同类的东西，顺序重要 | **列表** `[a, b, c]` |
+| 用名字去查值 | **字典** `{"name": x}` |
+| 只关心「有没有」 | **集合** `{a, b, c}` |
+
+例：存 100 个学生的成绩
+
+```python
+scores_list = [85, 92, 78]           # 列表：不知道谁是多少分
+scores_dict = {"小明": 85, "小红": 92}  # 字典：一看就知道
+```
+:::
+
+## 取值
+
+```python
+student = {"name": "小明", "age": 18}
+
+print(student["name"])     # 小明
+print(student["age"])      # 18
+```
+
+:::danger[用 [] 取不存在的键会报错]
+```python
+print(student["score"])    # KeyError: 'score'
+```
+
+**KeyError 是字典最常见的错误**。不确定键是否存在时，用 `get()`（见下）。
+:::
+
+## 安全取值：get
+
+```python
+student = {"name": "小明"}
+
+print(student.get("name"))         # 小明
+print(student.get("score"))        # None   不报错
+print(student.get("score", 0))     # 0      给了默认值
+```
+
+:::tip[get 的价值]
+```python
+# 危险写法
+if "score" in student:
+    s = student["score"]
+else:
+    s = 0
+
+# 简洁写法
+s = student.get("score", 0)
+```
+
+**一行顶五行**，而且不会漏掉分支。这是字典最实用的方法。
+:::
+
+## 增加与修改
+
+```python
+student = {"name": "小明"}
+
+student["age"] = 18            # 键不存在 → 新增
+student["age"] = 19            # 键已存在 → 修改
+student.update({"score": 95, "class": "一班"})   # 批量新增
+
+print(student)
+```
+
+输出：
+
+```text
+{'name': '小明', 'age': 19, 'score': 95, 'class': '一班'}
+```
+
+:::info[字典的「赋值」规则]
+`d[键] = 值` 的行为取决于键是否存在：
+
+- **不存在** → 新增这一对
+- **已存在** → 覆盖旧值
+
+不需要像列表那样分 `append` 和 `[i] = x`。
+:::
+
+## 删除
+
+```python
+student = {"name": "小明", "age": 18, "score": 95}
+
+del student["age"]                  # 按 key 删除
+print(student)
+
+score = student.pop("score")        # 删除并返回值
+print(score, student)
+
+student.clear()                     # 清空
+print(student)
+```
+
+输出：
+
+```text
+{'name': '小明', 'score': 95}
+95 {'name': '小明'}
+{}
+```
+
+**`pop()` 可以给默认值**，避免 KeyError：
+
+```python
+student.pop("不存在的键", "默认值")
+```
+
+## 判断键是否存在
+
+```python
+student = {"name": "小明"}
+
+print("name" in student)        # True
+print("age" in student)         # False
+```
+
+用 `in` 判断的是**键**，不是值。
+
+```python
+print("小明" in student)        # False！
+```
+
+:::warning[`in` 检查的是键不是值]
+想检查值，用：
+
+```python
+print("小明" in student.values())    # True
+```
+:::
+
+## 获取所有键、值、键值对
+
+```python
+student = {"name": "小明", "age": 18}
+
+print(list(student.keys()))
+print(list(student.values()))
+print(list(student.items()))
+```
+
+输出：
+
+```text
+['name', 'age']
+['小明', 18]
+[('name', '小明'), ('age', 18)]
+```
+
+## 六种遍历方式
+
+```python
+d = {"a": 1, "b": 2, "c": 3}
+```
+
+### ① 遍历键（默认）
+
+```python
+for k in d:
+    print(k, d[k])
+```
+
+### ② 显式遍历键
+
+```python
+for k in d.keys():
+    print(k)
+```
+
+### ③ 遍历值
+
+```python
+for v in d.values():
+    print(v)
+```
+
+### ④ 遍历键值对（最常用）
+
+```python
+for k, v in d.items():
+    print(f"{k} = {v}")
+```
+
+### ⑤ 带下标
+
+```python
+for i, (k, v) in enumerate(d.items(), start=1):
+    print(f"{i}. {k} = {v}")
+```
+
+### ⑥ 按值排序后遍历
+
+```python
+for k, v in sorted(d.items(), key=lambda item: item[1], reverse=True):
+    print(k, v)
+```
+
+:::tip[日常 90% 的情况用 items()]
+```python
+for k, v in d.items():
+    ...
+```
+
+这是最常用、最清晰的写法。要同时拿到键和值就用它。
+:::
+
+## 嵌套字典
+
+字典里可以放字典，用来表示复杂结构：
+
+```python
+students = {
+    "小明": {"age": 18, "score": 95},
+    "小红": {"age": 17, "score": 92},
+}
+
+print(students["小明"]["score"])      # 95
+
+for name, info in students.items():
+    print(f"{name}: {info['age']}岁，{info['score']}分")
+```
+
+输出：
+
+```text
+95
+小明: 18岁，95分
+小红: 17岁，92分
+```
+
+:::tip[嵌套取值用 get 链式调用]
+```python
+# 危险：任一层缺失都报错
+score = students["小刚"]["score"]
+
+# 安全
+score = students.get("小刚", {}).get("score", 0)
+```
+
+`get("小刚", {})` 返回空字典，再 `.get("score", 0)` 返回 0。**多层数据一定要这么写。**
+:::
+
+## 键的要求：必须可哈希
+
+```python
+d = {}
+d["字符串"] = 1
+d[42] = 2
+d[(1, 2)] = 3        # 元组可以
+print(d)
+```
+
+输出：
+
+```text
+{'字符串': 1, 42: 2, (1, 2): 3}
+```
+
+但**列表不能做键**：
+
+```python
+d[[1, 2]] = 4
+```
+
+报错：
+
+```text
+TypeError: unhashable type: 'list'
+```
+
+:::tip[深入一点：为什么列表不能做键]
+字典查找键靠的是**哈希**：把键算成一个数字，按数字定位。
+
+而**哈希要求对象内容不变**。列表可以随时增删改，内容一变哈希值就变，字典就再也找不到这个键了。
+
+所以**只能用不可变类型做键**：字符串、数字、元组（元组内的元素也必须不可变）。
+
+**第一遍看不懂可跳过**，记住结论：**用列表做键会报 unhashable 错误**。
+:::
+
+## 字典的顺序
+
+Python 3.7+ 起，**字典保证按插入顺序遍历**：
+
+```python
+d = {"b": 1, "a": 2}
+print(list(d.keys()))
+```
+
+输出：
+
+```text
+['b', 'a']
+```
+
+（按加入的顺序，不是按字母排序。）
+
+## 常用操作速查
+
+```python
+d = {"a": 1, "b": 2}
+
+print(len(d))                    # 2
+print(d.keys())                  # dict_keys(['a', 'b'])
+
+# 合并两个字典（Python 3.9+）
+d1 = {"a": 1}
+d2 = {"b": 2}
+merged = d1 | d2
+print(merged)                    # {'a': 1, 'b': 2}
+
+# 统计词频（经典用法）
+words = ["apple", "banana", "apple"]
+counts = {}
+for w in words:
+    counts[w] = counts.get(w, 0) + 1
+print(counts)                    # {'apple': 2, 'banana': 1}
+```
+
+:::tip[`counts.get(w, 0) + 1` 这个模式要记住]
+**统计出现次数**是极常见的需求，这个写法（get 拿默认值 0 再加 1）必须记住。
+
+更简洁的方式是 `collections.Counter`，但那是进阶内容。
+:::
+
+## 常见错误
+
+| 错误 | 报错 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `d["不存在"]` | KeyError | 键不存在 | 用 `get(k, 默认值)` |
+| `d[[1,2]]` | TypeError unhashable | 列表不可哈希 | 换成元组 |
+| `"值" in d` 期望查值 | 返回 False | in 查的是键 | `in d.values()` |
+| `for k in d: print(k, d[k])` 报错 | 一般不报错 | —— | 更推荐 `d.items()` |
+| 修改字典时遍历 | RuntimeError | 遍历中改变大小 | 遍历副本 `list(d.items())` |
+| 深浅拷贝混淆 | 改副本影响原字典 | 同上节的浅拷贝问题 | `copy.deepcopy()` |
+
+:::danger[不要在遍历字典时增删键]
+```python
+d = {"a": 1, "b": 2}
+for k in d:
+    if k == "a":
+        del d[k]      # RuntimeError: dictionary changed size during iteration
+```
+
+**正确做法**：遍历 `list(d)` 或 `list(d.items())` 的副本。
+:::
+
+## 本课自检
+
+- [ ] 会创建字典、用 `d[key]` 取值
+- [ ] 知道取不存在的键会 KeyError
+- [ ] 熟练用 `get(key, 默认值)`
+- [ ] 会增删改：`d[k]=v`、`del`、`pop`、`update`
+- [ ] 知道 `in` 检查的是键
+- [ ] 会用 `keys()` / `values()` / `items()` 遍历
+- [ ] 会处理嵌套字典，用 `get().get()` 链式安全取值
+- [ ] 知道列表不能做键
+- [ ] 会写 `counts.get(w, 0) + 1` 统计词频
+- [ ] 知道不能边遍历边增删
+
+## 下一步
+
+[13 元组与集合](./13-tuple-set) —— 补齐最后两种容器，你的数据结构工具箱就完整了。

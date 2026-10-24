@@ -1,0 +1,302 @@
+---
+id: advanced-02
+title: "02 constexpr：编译期计算"
+sidebar_position: 3
+description: "进阶特性 第 2 部分：constexpr：编译期计算"
+---
+
+# 02 constexpr：编译期计算
+### 演进
+
+| 版本 | 能力 |
+| --- | --- |
+| **C++11** | `constexpr` 函数体只能是**一条 return 语句** |
+| **C++14** | 放宽：可以有变量、循环、多个语句 |
+| **C++17** | `constexpr` lambda、`if constexpr` |
+| **C++20** | `consteval`（强制编译期）、`constinit`（强制编译期初始化）、`constexpr` 容器（vector/string）、虚函数调用、`try-catch` |
+| **C++23** | 进一步放宽（如 `constexpr` 里的静态变量） |
+
+### 基本用法
+
+```cpp
+// constexpr_demo.cpp
+#include <cstdio>
+#include <array>
+
+// C++14：可以是复杂函数体
+constexpr int factorial(int n) {
+    int r = 1;
+    for (int i = 2; i <= n; ++i) r *= i;
+    return r;
+}
+
+// 编译期斐波那契
+constexpr long long fib(int n) {
+    return n <= 1 ? n : fib(n - 1) + fib(n - 2);
+}
+
+// constexpr 变量必须在编译期可求值
+constexpr int f10 = factorial(10);
+constexpr long long fib30 = fib(30);
+
+// C++20：constexpr 容器
+#if __cplusplus >= 202002L
+constexpr int vector_sum() {
+    std::array<int, 5> a{1,2,3,4,5};
+    int s = 0;
+    for (int x : a) s += x;
+    return s;
+}
+constexpr int vs = vector_sum();
+#endif
+
+int main() {
+    std::printf("factorial(10) = %d\n", f10);
+    std::printf("fib(30)       = %lld\n", fib30);
+    std::printf("factorial(5) at runtime = %d\n", factorial(5));
+
+    // 证明它是编译期算出来的：用在需要常量表达式的地方
+    std::array<int, factorial(5)> arr{};      // 数组大小必须是常量
+    std::printf("array size    = %zu\n", arr.size());
+
+    static_assert(factorial(5) == 120, "must be 120");
+    std::printf("static_assert passed\n");
+}
+```
+
+**实测输出：**
+
+```text
+factorial(10) = 3628800
+fib(30)       = 832040
+factorial(5) at runtime = 120
+array size    = 120
+static_assert passed
+```
+
+### 证明它真的是编译期算的
+
+最硬的证据：**看汇编里有没有这个函数调用**。
+
+```bash
+g++ -std=c++17 -O2 -S -o constexpr.s constexpr_demo.cpp
+grep -c 'call' constexpr.s
+```
+
+**更直接的测试：把结果当模板参数用**（模板参数必须是编译期常量）：
+
+```cpp
+// constexpr_proof.cpp
+#include <cstdio>
+
+constexpr int fib(int n) { return n <= 1 ? n : fib(n-1) + fib(n-2); }
+
+// 用编译期计算结果作为非类型模板参数 —— 只有编译期常量才能这么做
+template<int N> struct Tag { static constexpr int value = N; };
+
+int main() {
+    Tag<fib(20)> t;              // 必须编译期求值
+    std::printf("fib(20) as template arg = %d\n", t.value);
+
+    int runtime_n = 10;
+    std::printf("fib(runtime) = %d\n", fib(runtime_n));   // 同一函数，运行时调用
+}
+```
+
+**实测输出：**
+
+```text
+fib(20) as template arg = 6765
+fib(runtime) = 55
+```
+
+**同一个 `fib` 函数，既能编译期求值也能运行时求值**——取决于上下文是否需要常量。这是 `constexpr` 的关键特性。
+
+### C++20 的 consteval 与 constinit
+
+```cpp
+// eval_init.cpp
+#include <cstdio>
+
+constexpr int maybe_compiletime(int n) { return n * 2; }   // 可编译期，也可运行时
+
+consteval int must_be_compiletime(int n) { return n * 3; }  // C++20：必须编译期求值
+
+constinit int global_counter = 100;    // C++20：必须在编译期完成初始化
+
+int main() {
+    constexpr int a = maybe_compiletime(5);
+    int b = maybe_compiletime(5);              // 也行（运行时）
+    std::printf("a=%d b=%d\n", a, b);
+
+    constexpr int c = must_be_compiletime(5);
+    std::printf("c=%d\n", c);
+
+    // int d = must_be_compiletime(5);  // 编译错误！consteval 必须产生常量
+    // int e = must_be_compiletime(some_runtime_value);  // 同样错误
+
+    std::printf("global_counter=%d\n", global_counter);
+}
+```
+
+**实测输出：**
+
+```text
+a=10 b=10
+c=15
+global_counter=100
+```
+
+**取消注释那两行的真实错误：**
+
+```text
+(consteval 函数用运行时值调用时的错误）
+error: call to consteval function 'must_be_compiletime(...)' is not a constant expression
+```
+
+三个关键字的区别：
+
+| 关键字 | 修饰 | 含义 | 版本 |
+| --- | --- | --- | --- |
+| `constexpr` | 变量 / 函数 | **可以**在编译期求值（但不强制） | C++11 |
+| `consteval` | 函数 | **必须**在编译期求值，否则编译错误 | C++20 |
+| `constinit` | 变量 | 必须在编译期完成**初始化**（但之后可以改） | C++20 |
+
+:::tip[constinit 解决什么问题]
+**静态初始化顺序灾难**（Static Initialization Order Fiasco）：不同编译单元的全局变量初始化顺序未定义，一个全局变量可能用到另一个**还没初始化**的全局变量。
+
+`constinit` 强制变量在编译期初始化（之后是常量初始化阶段，早于动态初始化），从根上避免这个问题。
+
+```cpp
+constinit int g_config = 42;    // 编译期初始化，绝对安全
+int g_other = g_config;         // 如果 g_config 没加 constinit，这里顺序未定义
+```
+:::
+
+## 3. decltype 与类型推导
+
+### decltype 的规则
+
+`decltype(expr)` 返回表达式的**声明类型**，规则比 `auto` 更"忠实"：
+
+| 表达式 | `decltype` 结果 | 说明 |
+| --- | --- | --- |
+| `decltype(x)`（变量名） | `x` 的声明类型（**保留 const 和引用**） | |
+| `decltype((x))`（加括号） | `T&`（**左值表达式**） | 括号让它变成表达式而非名字 |
+| `decltype(f())`（返回 `T`） | `T`（prvalue） | |
+| `decltype(f())`（返回 `T&`） | `T&` | 保留引用 |
+
+```cpp
+// decltype_demo.cpp
+#include <cstdio>
+#include <type_traits>
+#include <vector>
+
+int  g_int = 0;
+int& ret_ref()  { return g_int; }
+int  ret_val()  { return g_int; }
+
+int main() {
+    int x = 5;
+    const int cx = 10;
+    int& rx = x;
+
+    std::printf("decltype(x)        is int?        %d\n",
+                std::is_same_v<decltype(x), int>);
+    std::printf("decltype((x))      is int&?       %d\n",
+                std::is_same_v<decltype((x)), int&>);
+    std::printf("decltype(cx)       is const int?  %d\n",
+                std::is_same_v<decltype(cx), const int>);
+    std::printf("decltype(rx)       is int&?       %d\n",
+                std::is_same_v<decltype(rx), int&>);
+    std::printf("decltype(ret_ref())is int&?       %d\n",
+                std::is_same_v<decltype(ret_ref()), int&>);
+    std::printf("decltype(ret_val())is int?        %d\n",
+                std::is_same_v<decltype(ret_val()), int>);
+
+    // 对比 auto：auto 会剥掉引用和顶层 const
+    auto a = rx;            // int
+    decltype(rx) b = rx;    // int&
+    std::printf("auto a       is int?  %d\n", std::is_same_v<decltype(a), int>);
+    std::printf("decltype(rx) is int&? %d\n", std::is_same_v<decltype(b), int&>);
+}
+```
+
+**实测输出：**
+
+```text
+decltype(x)        is int?        1
+decltype((x))      is int&?       1
+decltype(cx)       is const int?  1
+decltype(rx)       is int&?       1
+decltype(ret_ref())is int&?       1
+decltype(ret_val())is int?        1
+auto a       is int?  1
+decltype(rx) is int&? 1
+```
+
+### decltype(auto)（C++14）
+
+`auto` 做返回类型推导时会剥掉引用，`decltype(auto)` 则完全保留：
+
+```cpp
+// decltype_auto.cpp
+#include <cstdio>
+#include <type_traits>
+#include <vector>
+
+int  g = 0;
+
+auto          f_auto()  { return g; }          // 返回 int（拷贝）
+decltype(auto) f_decl() { return g; }          // 返回 int（g 是 int）
+
+auto          r_auto()  { return (g); }        // 返回 int（剥掉引用！危险）
+decltype(auto) r_decl() { return (g); }        // 返回 int&（保留）
+
+int main() {
+    std::printf("f_auto  -> int?   %d\n", std::is_same_v<decltype(f_auto()), int>);
+    std::printf("f_decl  -> int?   %d\n", std::is_same_v<decltype(f_decl()), int>);
+    std::printf("r_auto  -> int?   %d  (auto 剥掉了引用)\n",
+                std::is_same_v<decltype(r_auto()), int>);
+    std::printf("r_decl  -> int&?  %d\n", std::is_same_v<decltype(r_decl()), int&>);
+
+    // 典型陷阱：返回容器元素的引用
+    std::vector<int> v{1,2,3};
+    auto get_auto  = [&v]() -> auto          { return v[0]; };   // int（拷贝）
+    auto get_decl  = [&v]() -> decltype(auto) { return v[0]; };  // int&（引用！）
+    std::printf("get_auto -> int?  %d\n", std::is_same_v<decltype(get_auto()), int>);
+    std::printf("get_decl -> int&? %d\n", std::is_same_v<decltype(get_decl()), int&>);
+}
+```
+
+**实测输出：**
+
+```text
+f_auto  -> int?   1
+f_decl  -> int?   1
+r_auto  -> int?   1  (auto 剥掉了引用)
+r_decl  -> int&?  1
+get_auto -> int?  1
+get_decl -> int&? 1
+```
+
+:::danger[decltype(auto) 的悬空引用风险]
+`decltype(auto)` 保留引用，也就可能返回**局部变量的引用**：
+
+```cpp
+decltype(auto) bad() {
+    int local = 42;
+    return local;      // 返回 int（局部变量是 prvalue，OK）
+}
+decltype(auto) worse() {
+    int local = 42;
+    return (local);    // 返回 int& —— 悬空引用！
+}
+```
+
+**用 `decltype(auto)` 时要格外小心返回的是什么。**
+:::
+
+---
+
+**翻页**：[← 上一页](./advanced-01) · [下一页 →](./advanced-03) · [返回目录](./)

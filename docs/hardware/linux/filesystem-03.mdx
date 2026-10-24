@@ -1,0 +1,206 @@
+---
+id: filesystem-03
+title: "03 分区：MBR vs GPT"
+sidebar_position: 4
+description: "文件系统与存储 第 3 部分：分区：MBR vs GPT"
+---
+
+# 03 分区：MBR vs GPT
+### 6.1 对比
+
+| | **MBR** | **GPT** |
+| --- | --- | --- |
+| 全称 | Master Boot Record | GUID Partition Table |
+| 最大磁盘 | **2 TB** | 极大（≈ 9.4 ZB） |
+| 主分区数 | **4 个**（或 3 主 + 1 扩展，扩展里再分逻辑分区） | **128 个**（默认） |
+| 位置 | 磁盘第一个扇区 | 头部 + 尾部各一份（**有备份**） |
+| 容错 | 单点损坏即全盘分区表丢失 | **有备份副本**，更健壮 |
+| 启动方式 | BIOS/Legacy | **UEFI 要求 GPT** |
+| 嵌入式常用 | ✅ 常见（sdcard.img 多见） | 逐渐增多 |
+
+:::tip[嵌入式板子的实际分区布局]
+SD 卡启动的板子常见布局（**注意第一个分区通常是 FAT，因为 BootROM 要读它**）：
+
+```
+/dev/mmcblk0p1  FAT32   128MB   ← boot 分区：内核 zImage/uImage、.dtb、boot.scr
+/dev/mmcblk0p2  ext4    剩余    ← rootfs：根文件系统
+```
+
+第一分区必须是 **BootROM 能识别的文件系统（通常是 FAT32）**，因为芯片内部的固化代码不会解析 ext4。这是硬件限制，不是选择。
+
+有些板子（如使用 SPL+U-Boot 的 Allwinner/Rockchip）则把 U-Boot 写在**扇区级别的固定偏移**（比如 SD 卡第 8KB 处），不在任何分区里。
+:::
+
+### 6.2 分区工具：fdisk vs parted
+
+| 工具 | 支持 | 特点 |
+| --- | --- | --- |
+| `fdisk` | MBR + GPT（新版） | 交互式，**简单直观** |
+| `parted` | MBR + GPT | 支持**脚本化**、支持大于 2TB |
+| `sgdisk` | GPT | 纯命令行，适合自动化脚本 |
+| `sfdisk` | MBR + GPT | 可导入导出分区表，**适合量产** |
+
+常用只读查看命令（**安全，随便跑**）：
+
+```bash
+lsblk                 # 树形列出块设备
+lsblk -f              # 带文件系统类型和 UUID
+blkid                 # 列出所有设备的 UUID 和类型
+fdisk -l /dev/sda     # 列出分区表
+parted -l             # 列出所有磁盘及分区表类型
+findmnt               # 列出挂载关系（树形）
+df -h                 # 磁盘空间
+df -i                 # inode 使用
+du -sh /path          # 某目录占用
+```
+
+实测：
+
+```bash
+$ lsblk -f
+NAME   FSTYPE FSVER LABEL UUID                                 FSAVAIL FSUSE% MOUNTPOINTS
+sda
+|-sda1 ext4   1.0         d45532a8-f577-4a6a-80a2-7bf9cbc61058   32.7G    36% /
+`-sda5 swap   1           80af691e-739b-4df2-a2a1-e23a28fc3b44                [SWAP]
+```
+
+注意分区号从 `sda1` 直接跳到 `sda5`：编号 5 起是**逻辑分区**，它挂在扩展分区（`sda2`）里。扩展分区本身只是一个 1K 大小的容器、不承载文件系统，所以上面的输出里没有它——这是 MBR 时代的典型痕迹。
+
+:::danger[分区操作会销毁数据]
+`fdisk`、`parted`、`mkfs`、`dd` 都是**破坏性**操作。写错设备名（比如把 `/dev/sda` 写成你的硬盘而实际想写 SD 卡）会导致**数据无法恢复**。
+
+**操作前必做**：
+1. `lsblk` 确认设备名和容量
+2. 确认设备**未挂载**（`umount`）
+3. 重要数据先备份
+
+本文档中只读命令可以随便跑，**写入类命令请在实验环境执行**。
+:::
+
+### 6.3 df 与 du 的区别
+
+| 命令 | 统计的是什么 | 特点 |
+| --- | --- | --- |
+| `df` | **文件系统层面**的剩余空间（问内核） | 快，反映真实可用空间 |
+| `du` | **逐目录累加文件大小** | 慢，但能定位"哪个目录大" |
+
+两者不一致的常见原因：
+
+1. **被删除但仍被进程打开的文件**（`du` 看不到，`df` 算作占用）
+2. 挂载点遮挡（`du` 会穿过挂载点，`df` 按文件系统算）
+3. 稀疏文件
+4. 文件系统保留块（ext4 默认保留 5% 给 root）
+
+```bash
+du -sh /var/*  | sort -h | tail -10     # 找最大的目录
+du -x -sh /                              # -x 不跨文件系统，只看根分区
+```
+
+## 7. 设备文件与"一切皆文件"
+
+```bash
+$ ls -l /dev/null /dev/zero /dev/random /dev/urandom /dev/tty
+crw-rw-rw- 1 root root 1, 3 Oct 13 22:48 /dev/null
+crw-rw-rw- 1 root root 1, 8 Oct 13 22:48 /dev/random
+crw-rw-rw- 1 root tty  5, 0 Oct 13 22:48 /dev/tty
+crw-rw-rw- 1 root root 1, 9 Oct 13 22:48 /dev/urandom
+crw-rw-rw- 1 root root 1, 5 Oct 13 22:48 /dev/zero
+```
+
+注意：
+
+- 第一列首字符是 **`c`** = 字符设备（**`b`** 是块设备）
+- 文件大小位置显示的是 **`主设备号, 次设备号`**（不是字节数！）
+
+| 设备 | 主,次 | 作用 |
+| --- | --- | --- |
+| `/dev/null` | 1, 3 | 黑洞，写入丢弃，读返回 EOF |
+| `/dev/zero` | 1, 5 | 读出无限个 0 字节 |
+| `/dev/random` | 1, 8 | 真随机（熵池，可能阻塞） |
+| `/dev/urandom` | 1, 9 | 伪随机（不阻塞，**一般用这个**） |
+| `/dev/tty` | 5, 0 | 当前控制终端 |
+
+**主设备号**标识"哪个驱动"，**次设备号**标识"该驱动管理的第几个设备"。内核用这两个号把文件操作路由到对应驱动——这就是"一切皆文件"的落地机制。
+
+嵌入式上的对应物：
+
+```bash
+/dev/ttyS0        # 串口 0（调试串口）
+/dev/mmcblk0      # SD 卡/eMMC（块设备）
+/dev/mtd0         # Raw NAND（MTD 字符设备）
+/dev/i2c-0        # I2C 总线 0
+/dev/spidev0.0    # SPI 设备
+/dev/gpiochip0    # GPIO 控制器（新接口）
+```
+
+## 8. 验证
+
+```bash
+# 1. inode 与硬链接
+mkdir -p /tmp/fs_test && cd /tmp/fs_test
+echo "hello" > a.txt && ln a.txt hard.txt && ln -s a.txt soft.txt
+ls -li                                # 观察 inode 号与链接数
+rm a.txt && ls -li                    # 硬链接仍在，软链接悬空
+
+# 2. 目录链接数
+mkdir d1 && stat -c '%h' d1           # 2
+mkdir d1/sub && stat -c '%h' d1       # 3
+
+# 3. 挂载信息
+findmnt --real                        # 只看真实块设备
+df -hT && df -i
+
+# 4. 存储拓扑
+lsblk -f
+
+# 5. inode 耗尽模拟（看现象即可，别在生产环境）
+df -i /
+```
+
+## 常见坑
+
+| 症状 | 病根 |
+| --- | --- |
+| "No space left on device" 但 `df -h` 显示有空间 | **inode 耗尽**，用 `df -i` 确认 |
+| `rm` 了大文件但空间没释放 | 文件仍被进程打开。`lsof | grep deleted`，或改用 `> file` 截断 |
+| 软链接变成红色/失效 | 源文件被删或移动。用 `readlink` 看它指向哪 |
+| 硬链接跨分区失败 `Invalid cross-device link` | 硬链接**不能跨文件系统**，用软链接 |
+| `ln` 指向目录失败 | 硬链接不能指向目录（防环路），用 `ln -s` |
+| 相对软链接移动后失效 | 相对链接按**链接文件所在目录**解析。要稳定就用绝对路径 |
+| 挂载后原目录内容不见了 | 正常，被**遮挡**了。`umount` 后恢复 |
+| `mount: /mnt: device is busy` | 有进程在该挂载点下（或有 cwd 在那里）。`lsof +f -- /mnt` 或 `fuser -m /mnt` 查 |
+| fstab 改错导致**开不了机** | 启动失败会进 emergency mode。用 `UUID` 而非 `/dev/sdX`；改前备份 |
+| Raw NAND 上用 ext4，用几个月变砖 | ext4 **不支持**坏块管理与磨损均衡，Raw NAND 必须用 UBIFS |
+| 板子用了半年变慢/只读 | Flash 磨损或文件系统损坏。检查 `dmesg` 里的 I/O error |
+| 日志把 Flash 写坏了 | 日志应放 tmpfs 或限速。加 `noatime` 挂载选项减少写入 |
+| 分区表写错设备导致数据丢失 | 操作前用 `lsblk` 核对设备名与容量，确认未挂载 |
+| `du` 和 `df` 数字对不上 | 被删除但打开的文件、挂载点遮挡、ext4 保留块 |
+| 误以为 `ctime` 是创建时间 | ctime = change time（inode 变更）。真正的创建时间是 `Birth`（ext4 支持） |
+
+## 自检清单
+
+- [ ] 说出 inode 里存什么、**不存什么**（文件名！）
+- [ ] 解释为什么"文件名"属于目录而不属于文件
+- [ ] 已知硬链接和源文件，说出它们的 inode 关系和链接数
+- [ ] 解释删除源文件后硬链接和软链接各自的命运
+- [ ] 说出硬链接不能做的两件事（跨分区、指向目录）
+- [ ] 解释为什么空目录的链接数是 2，子目录会让它变成 3
+- [ ] 说出文件真正被删除的条件（链接数归零 + 无进程打开）
+- [ ] 解释挂载的"遮挡"现象
+- [ ] 说出至少 3 个嵌入式常用的挂载选项及其意义（`ro`、`noatime`、`errors=remount-ro`）
+- [ ] 说出 fstab 六个字段的含义
+- [ ] 说出为什么 Raw NAND 不能用 ext4，应该用什么
+- [ ] 说出 MTD 与块设备的区别，怎么判断板子是哪种
+- [ ] 说出 squashfs / ubifs / f2fs / tmpfs 各自的适用场景
+- [ ] 说出 MBR 与 GPT 的三个区别
+- [ ] 解释 `/dev/null` 上显示的 `1, 3` 是什么
+- [ ] 说出 `df` 和 `du` 的区别，以及数字对不上的两个常见原因
+
+## 下一步
+
+- [系统编程入门](./sysprog)——真正用代码操作文件：`open`/`read`/`write`/`lseek`
+- [根文件系统](./rootfs)——把本页的知识用于实战：手工搭一个 rootfs 并做成镜像
+
+---
+
+**翻页**：[← 上一页](./filesystem-02) · [返回目录](./)

@@ -1,0 +1,362 @@
+---
+id: 08-copy
+title: 08 拷贝构造与赋值
+sidebar_position: 8
+description: 浅拷贝的灾难、Rule of Three、拷贝构造与拷贝赋值的区别，以及为什么现代 C++ 更推荐 Rule of Zero。
+---
+
+# 08 拷贝构造与赋值
+
+**本课目标**：理解对象复制时发生了什么，知道什么时候必须自己写。
+
+## 对象复制有两种语法
+
+```cpp
+MyClass a;
+MyClass b = a;          /* ① 拷贝构造：创建新对象 */
+MyClass c;
+c = a;                  /* ② 拷贝赋值：已存在的对象被赋值 */
+```
+
+| | 拷贝构造 | 拷贝赋值 |
+| --- | --- | --- |
+| 语法 | `T b = a;` / `T b(a);` | `b = a;` |
+| 对象 | **新建** | **已存在** |
+| 函数 | `T(const T&)` | `T& operator=(const T&)` |
+| 返回 | 无 | `*this` 的引用 |
+
+## 默认行为：逐成员拷贝
+
+如果你不写，编译器会生成**默认的拷贝构造和拷贝赋值**，行为是**逐个成员复制**。
+
+对于简单类型没问题：
+
+```cpp
+class Point {
+    int x = 0, y = 0;
+};
+
+Point a{1, 2};
+Point b = a;            /* b.x=1, b.y=2，完全独立 ✅ */
+```
+
+:::danger[但如果成员里有指针，就是灾难]
+```cpp
+class BadString {
+public:
+    BadString(const char *s) {
+        len_ = std::strlen(s);
+        data_ = new char[len_ + 1];        /* 堆内存 */
+        std::strcpy(data_, s);
+    }
+    ~BadString() { delete[] data_; }
+
+private:
+    char *data_ = nullptr;
+    size_t len_ = 0;
+};
+
+BadString a("hello");
+BadString b = a;        /* 默认拷贝：只复制了 data_ 指针的值 */
+```
+
+**`a.data_` 和 `b.data_` 指向同一块内存！**
+:::
+
+### 后果：双重释放
+
+本机实测：
+
+```cpp
+BadString a("hello");
+BadString b = a;
+/* 程序结束时两个析构函数都 delete[] 同一块内存 */
+```
+
+**结果**：程序直接崩溃
+
+```text
+退出码: -1073740940
+```
+
+（`0xC0000374` = Windows 的堆损坏错误。连输出都没打印出来。）
+
+:::danger[这就是「浅拷贝」的灾难]
+```text
+a: data_ ──┐
+           ├──→ [ "hello" ]   ← 同一块内存
+b: data_ ──┘
+```
+
+- 一个对象修改内容，另一个也变了（**意外共享**）
+- 两个析构函数各 `delete[]` 一次 → **重复释放 → 崩溃**
+
+**这就是为什么 C++ 有「Rule of Three」。**
+:::
+
+## Rule of Three（三法则）
+
+:::tip[核心规则]
+**如果你需要自己写其中任何一个，就需要写全部三个**：
+
+1. **析构函数**（`~T()`）
+2. **拷贝构造函数**（`T(const T&)`）
+3. **拷贝赋值运算符**（`T& operator=(const T&)`）
+
+原因：它们通常一起处理「手动管理的资源」（内存、文件句柄、锁）。
+:::
+
+### 正确实现
+
+```cpp
+class GoodString {
+public:
+    GoodString(const char *s) {
+        len_ = std::strlen(s);
+        data_ = new char[len_ + 1];
+        std::strcpy(data_, s);
+    }
+
+    /* ① 拷贝构造：深拷贝 */
+    GoodString(const GoodString &other) : len_(other.len_) {
+        data_ = new char[len_ + 1];
+        std::strcpy(data_, other.data_);
+    }
+
+    /* ② 拷贝赋值 */
+    GoodString &operator=(const GoodString &other) {
+        if (this != &other) {              /* ← 必须判自赋值 */
+            delete[] data_;                /* ← 释放原有资源 */
+            len_ = other.len_;
+            data_ = new char[len_ + 1];
+            std::strcpy(data_, other.data_);
+        }
+        return *this;
+    }
+
+    /* ③ 析构 */
+    ~GoodString() { delete[] data_; }
+
+private:
+    char *data_ = nullptr;
+    size_t len_ = 0;
+};
+```
+
+本机实测输出：
+
+```text
+  [拷贝构造]
+  [拷贝赋值]
+a=hello b=hello c=hello
+a.data 与 b.data 不同: OK（各自独立）
+```
+
+## 拷贝赋值的两个关键点
+
+### ① 必须判断自赋值
+
+```cpp
+a = a;              /* 自己赋给自己 */
+```
+
+如果不判断：
+
+```cpp
+delete[] data_;              /* 先把自己释放了 */
+data_ = new char[len_+1];    /* 再按 other(=自己).len_ 读取——但已经释放了！ */
+std::strcpy(data_, other.data_);   /* other.data_ 是野指针 → 崩溃 */
+```
+
+**`if (this != &other)` 这一行不能省。**
+
+### ② 必须先释放原有资源
+
+```cpp
+GoodString c("x");
+c = a;               /* c 原来有 "x" 的内存，要先释放 */
+```
+
+不释放就**内存泄漏**。
+
+:::tip[更安全的实现：拷贝并交换（copy-and-swap）]
+```cpp
+GoodString &operator=(GoodString other) {     /* 注意：按值传参，自动拷贝 */
+    swap(*this, other);
+    return *this;
+}   /* other 析构时释放旧资源 */
+```
+
+好处：
+
+- 自动处理自赋值（因为 `other` 是副本）
+- **异常安全**（要么全成功，要么不变）
+- 代码更短
+
+**代价**：多一次拷贝。但对大多数场景值得。
+:::
+
+## Rule of Five（C++11 之后）
+
+加入了**移动构造**和**移动赋值**（第 16 课讲）：
+
+| 函数 | 签名 |
+| --- | --- |
+| 析构 | `~T()` |
+| 拷贝构造 | `T(const T&)` |
+| 拷贝赋值 | `T& operator=(const T&)` |
+| 移动构造 | `T(T&&)` |
+| 移动赋值 | `T& operator=(T&&)` |
+
+**如果你只写了拷贝相关的，编译器不会自动生成移动版本**（反而会禁用）。
+
+## Rule of Zero：最好的选择
+
+:::tip[最推荐的写法]
+> **不要自己管理资源，就不用写任何这五个函数。**
+
+```cpp
+class Student {
+public:
+    Student(std::string name, int score)
+        : name_(std::move(name)), score_(score) {}
+
+private:
+    std::string name_;       /* 自己会管理内存 */
+    int score_;
+};
+
+/* 不需要写析构、拷贝、移动——编译器生成的都对 */
+```
+
+**因为 `std::string` 已经正确实现了 Rule of Five**，包含它的类自动就是安全的。
+:::
+
+| 规则 | 什么时候用 |
+| --- | --- |
+| **Rule of Zero** | **首选**：成员都是 RAII 类型（string/vector/智能指针） |
+| Rule of Three | 必须手动管理资源时 |
+| Rule of Five | 手动管理资源 + 想要移动优化 |
+
+:::danger[现代 C++ 几乎没有理由手动 new/delete]
+```cpp
+/* ❌ 需要自己写一堆拷贝函数 */
+class A {
+    char *data_;
+};
+
+/* ✅ 用 vector / string，什么都不用写 */
+class A {
+    std::vector<char> data_;
+};
+```
+
+**这条线后面会反复强调：优先用标准库的 RAII 类型。**
+:::
+
+## 完整示例：对比三种写法
+
+```cpp
+#include <iostream>
+#include <cstring>
+#include <vector>
+
+/* ---- ① 危险的：浅拷贝 ---- */
+class Bad {
+public:
+    explicit Bad(const char *s) {
+        data_ = new char[std::strlen(s) + 1];
+        std::strcpy(data_, s);
+    }
+    ~Bad() { delete[] data_; }
+    /* 没写拷贝函数 → 默认浅拷贝 → double free */
+private:
+    char *data_;
+};
+
+/* ---- ② 正确的：Rule of Three ---- */
+class Ok {
+public:
+    explicit Ok(const char *s) {
+        len_ = std::strlen(s);
+        data_ = new char[len_ + 1];
+        std::strcpy(data_, s);
+    }
+    Ok(const Ok &o) : len_(o.len_) {
+        data_ = new char[len_ + 1];
+        std::strcpy(data_, o.data_);
+    }
+    Ok &operator=(const Ok &o) {
+        if (this != &o) {
+            delete[] data_;
+            len_ = o.len_;
+            data_ = new char[len_ + 1];
+            std::strcpy(data_, o.data_);
+        }
+        return *this;
+    }
+    ~Ok() { delete[] data_; }
+
+    const char *c_str() const { return data_; }
+
+private:
+    char *data_;
+    size_t len_;
+};
+
+/* ---- ③ 最好的：Rule of Zero ---- */
+class Best {
+public:
+    explicit Best(const char *s) : data_(s) {}
+    const char *c_str() const { return data_.c_str(); }
+private:
+    std::string data_;           /* 标准库类型自己管好了内存 */
+};
+
+int main() {
+    Ok a("hello");
+    Ok b = a;
+    std::cout << "Rule of Three: b = " << b.c_str() << "\n";
+
+    Best c("world");
+    Best d = c;
+    std::cout << "Rule of Zero:  d = " << d.c_str() << "\n";
+
+    /* Bad 不演示——会崩溃 */
+    return 0;
+}
+```
+
+输出：
+
+```text
+Rule of Three: b = hello
+Rule of Zero:  d = world
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 有指针成员却不写拷贝函数 | double free 崩溃 | 浅拷贝 | Rule of Three 或改用 RAII |
+| 拷贝赋值不判断自赋值 | 偶发崩溃 | 释放了自己的资源 | `if (this != &other)` |
+| 拷贝赋值不释放旧资源 | 内存泄漏 | 没 delete | 先释放再分配 |
+| 写了拷贝但漏了赋值 | 部分场景崩溃 | 只覆盖了一半 | 三个都要写 |
+| 拷贝构造参数不用 `const T&` | 编译错/低效 | 应为 const 引用 | `T(const T&)` |
+| 手动 new/delete 管理数组 | 各种麻烦 | 没用 RAII | 改用 `std::vector` |
+
+## 本课自检
+
+- [ ] 分清拷贝构造（新建）和拷贝赋值（已存在）
+- [ ] **知道默认拷贝是「逐成员复制」**
+- [ ] **知道有指针成员时默认拷贝会导致 double free**
+- [ ] 能说出 Rule of Three 的三个函数
+- [ ] 会写正确的拷贝构造（深拷贝）
+- [ ] 会写拷贝赋值，**知道要判自赋值和释放旧资源**
+- [ ] 知道 Rule of Five 多了移动构造/赋值
+- [ ] **知道 Rule of Zero 是最佳实践**
+- [ ] 知道现代 C++ 应优先用 `std::string`/`std::vector`
+
+## 下一步
+
+[09 运算符重载](./09-operator) —— 让自定义类型也能用 `+`、`==`、`<<`。

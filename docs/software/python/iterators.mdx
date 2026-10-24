@@ -1,0 +1,219 @@
+---
+id: iterators
+title: 迭代器协议与 itertools
+sidebar_position: 18
+description: 可迭代对象与迭代器的区别、生成器表达式与列表推导的内存差异、itertools 的七个必会工具、以及迭代器只能消费一次的坑。
+---
+
+# 迭代器协议与 itertools
+
+**本课目标**：理解"惰性序列"的本质，会用 `itertools` 处理流式数据。
+
+## 三个概念别混
+
+![可迭代对象与迭代器的区别：前者每次 iter() 产生新迭代器可反复遍历，后者只能一次；右侧是 next() 的返回序列](/img/diagrams/py-iterator-protocol.svg)
+
+
+| 概念 | 有 `__iter__` | 有 `__next__` | 能重复遍历 |
+| --- | --- | --- | --- |
+| **可迭代对象**（list, dict, str） | ✅ | ❌ | **✅** |
+| **迭代器**（generator, map, zip） | ✅ | ✅ | **❌ 只能一次** |
+| 序列（list, tuple） | ✅ | ❌ | ✅ 且支持下标 |
+
+```python
+>>> it = iter([1,2,3])         # list 是可迭代的，iter() 拿到迭代器
+>>> next(it), next(it)
+(1, 2)
+>>> next(it)                    # 再取第三个
+3
+>>> next(it)                    # 取完了
+StopIteration
+```
+
+:::danger[迭代器只能消费一次]
+```python
+nums = (x for x in range(5))       # 生成器表达式 = 迭代器
+
+sum(nums)      # 10
+sum(nums)      # 0    ← 空的！已经耗尽了
+```
+
+**列表推导是"立刻算出全部"，生成器表达式是"生成一个迭代器"** —— 后者只能走一遍。
+:::
+
+```python
+# 列表推导：立刻分配全部内存
+squares_list = [x*x for x in range(10**6)]      # 约 40 MB
+
+# 生成器表达式：惰性，几乎不占内存
+squares_gen  = (x*x for x in range(10**6))      # 几十字节
+```
+
+:::tip[什么时候必须用生成器]
+```python
+# 读一个 10GB 的文件：绝不能用列表推导
+with open("huge.log") as f:
+    for line in f:              # 文件对象本身就是迭代器，逐行读
+        process(line)
+```
+
+**`open()` 返回的文件对象是迭代器**（逐行惰性读取），这就是它能处理超大文件的原因。
+:::
+
+## 自己实现迭代器
+
+```python
+class Countdown:
+    def __init__(self, start):
+        self.n = start
+
+    def __iter__(self):
+        return self                 # 迭代器返回自己
+
+    def __next__(self):
+        if self.n <= 0:
+            raise StopIteration
+        self.n -= 1
+        return self.n + 1
+```
+
+:::warning[可迭代对象与迭代器分开写更安全]
+```python
+class Countdown:                    # 可迭代对象
+    def __init__(self, start): self.start = start
+    def __iter__(self):
+        n = self.start              # ← 每次遍历都产生新迭代器
+        while n > 0:
+            yield n
+            n -= 1
+```
+
+**上面第一种写法（`__iter__` 返回 self）只能遍历一次** —— 因为状态存在对象自己身上。
+
+**用生成器函数写 `__iter__` 最省事**，且每次 `for` 都是全新的一遍。
+:::
+
+## `itertools` 的七个必会工具
+
+| 工具 | 作用 | 典型用途 |
+| --- | --- | --- |
+| `chain(a, b)` | 串接多个可迭代对象 | 合并多份数据 |
+| **`islice(it, start, stop, step)`** | **对任意可迭代对象切片** | 取前 N 条 |
+| `groupby(it, key)` | 相邻元素分组 | **必须先排序** |
+| `product(a, b)` | 笛卡尔积 | 组合测试用例 |
+| `combinations(it, r)` | 组合 | |
+| `permutations(it, r)` | 排列 | |
+| `count(start, step)` | 无限计数器 | |
+| `cycle(it)` | 无限循环 | 轮询 |
+| **`accumulate(it, op)`** | **累积（默认求和）** | 前缀和 |
+| `takewhile(pred, it)` / `dropwhile` | 按条件截断 | |
+
+```python
+from itertools import islice, chain, groupby, accumulate
+
+# 取前 10 条（不消耗整个序列）
+first10 = list(islice(gen, 10))
+
+# 前缀和
+list(accumulate([1,2,3,4]))          # [1, 3, 6, 10]
+
+# 分组（必须先排序！）
+data = [("a",1), ("a",2), ("b",3)]
+for k, g in groupby(data, key=lambda x: x[0]):
+    print(k, list(g))
+```
+
+:::danger[`groupby` 只能分组"相邻"的相同键]
+```python
+data = [("a",1), ("b",2), ("a",3)]
+for k, g in groupby(data, key=lambda x: x[0]):
+    print(k, list(g))
+# a [(a,1)]
+# b [(b,2)]
+# a [(a,3)]      ← 又出现一次 a！
+```
+
+**它不像 SQL 的 `GROUP BY`** —— 必须先排序：
+
+```python
+data.sort(key=lambda x: x[0])
+```
+
+**这是 `itertools.groupby` 最常被误解的地方。**
+:::
+
+:::warning[`takewhile` 与 `filter` 的区别]
+```python
+list(takewhile(lambda x: x < 3, [1,2,3,4,1,2]))   # [1, 2]
+list(filter(lambda x: x < 3,   [1,2,3,4,1,2]))    # [1, 2, 1, 2]
+```
+
+**`takewhile` 一遇到不满足的就停**，`filter` 会继续找后面的。
+
+**对已排序数据用 `takewhile` 效率更高**（可以提前终止）。
+:::
+
+## 惰性的陷阱：什么时候会被"意外求值"
+
+:::danger[这些操作会立刻消耗整个迭代器]
+```python
+list(gen)          # 全部
+sum(gen)           # 全部
+sorted(gen)        # 全部（排序必须看所有元素）
+max(gen) / min(gen)
+len(list(gen))     # 先转 list 才能 len（迭代器没有长度）
+any(gen) / all(gen)   # 可能提前停，但可能全部消耗
+",".join(gen)      # 全部
+```
+
+**`sorted` 和 `len` 本质上无法对无限序列工作。**
+:::
+
+```python
+# 无限序列
+from itertools import count
+nums = count(1)              # 1,2,3,... 无限
+
+sum(nums)                    # ❌ 永远跑不完
+list(islice(nums, 5))        # ✅ [1,2,3,4,5]
+```
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 第二次遍历是空的 | 迭代器只能消费一次 | 转成 list 或重新创建 |
+| `len(gen)` 报错 | 迭代器没有长度 | `sum(1 for _ in gen)` 或转 list |
+| `groupby` 分组结果重复 | 没排序 | 先 `sort` |
+| 内存没降下来 | 中途用了 list | 全程保持惰性 |
+| 无限序列卡死 | 用了 `sum`/`sorted` | 用 `islice` 截断 |
+| 生成器里报错难定位 | 栈帧只有一层 | 加日志或用 `list()` 复现 |
+| 多处共用同一生成器 | 隐式共享状态 | 每个使用者独立创建 |
+
+:::tip[判断要不要"消费掉"的方法]
+**问自己：这份数据会被用几次？**
+
+- **一次** → 用生成器（省内存）
+- **多次** → 先 `list()` 存下来（但这又占内存）
+
+**最容易出的 bug 是"以为是一次，实际用了两次"** —— 比如先 `sum()` 算总量，再 `for` 输出。
+:::
+
+## 本课自检
+
+- [ ] **能区分可迭代对象与迭代器（后者只能遍历一次）**
+- [ ] **知道生成器表达式是迭代器，列表推导是具体列表**
+- [ ] **理解列表推导占全部内存，生成器几乎不占**
+- [ ] 知道文件对象本身就是迭代器（所以能处理超大文件）
+- [ ] 会自己写迭代器，知道 `__iter__` 返回 self 只能遍历一次
+- [ ] **知道用生成器函数写 `__iter__` 最省事**
+- [ ] 会 `islice` / `chain` / `accumulate` / `product`
+- [ ] **知道 `groupby` 只能分组相邻元素，必须先排序**
+- [ ] **知道 `takewhile` 遇阻即停，`filter` 会继续**
+- [ ] 知道哪些操作会耗尽迭代器（`list`/`sum`/`sorted`/`len`）
+- [ ] 知道无限序列必须用 `islice` 截断
+- [ ] **会问"这份数据用几次"来决定是否物化**
+
+## 下一步
+
+[生成器与惰性求值](./adv-02-generator) 讲了 `yield` 的内部机制。

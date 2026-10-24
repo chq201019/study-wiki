@@ -1,0 +1,309 @@
+---
+id: process-03
+title: "03 信号机制"
+sidebar_position: 4
+description: "进程与信号 第 3 部分：信号机制"
+---
+
+# 03 信号机制
+### 5.1 信号是什么
+
+信号是**软件层面的中断**：内核给进程发一个异步通知，进程可以：
+
+- 执行默认动作（终止、忽略、停止、core dump）
+- 执行自定义的处理函数
+- 显式忽略
+
+### 5.2 常见信号表
+
+实测的 `kill -l` 输出（x86_64 Linux）：
+
+```
+ 1) SIGHUP   2) SIGINT   3) SIGQUIT  4) SIGILL   5) SIGTRAP  6) SIGABRT  7) SIGBUS   8) SIGFPE
+ 9) SIGKILL 10) SIGUSR1 11) SIGSEGV 12) SIGUSR2 13) SIGPIPE 14) SIGALRM 15) SIGTERM 16) SIGSTKFLT
+17) SIGCHLD 18) SIGCONT 19) SIGSTOP 20) SIGTSTP 21) SIGTTIN 22) SIGTTOU 23) SIGURG  24) SIGXCPU
+25) SIGXFSZ 26) SIGVTALRM 27) SIGPROF 28) SIGWINCH 29) SIGIO 30) SIGPWR 31) SIGSYS
+34) SIGRTMIN 35) SIGRTMIN+1 ... 42) SIGRTMIN+8
+```
+
+| 信号 | 编号 | 默认动作 | 说明 |
+| --- | --- | --- | --- |
+| `SIGHUP` | 1 | 终止 | 终端挂断。常用来**让 daemon 重读配置** |
+| `SIGINT` | 2 | 终止 | **`Ctrl+C`**，可捕获 |
+| `SIGQUIT` | 3 | 终止 + core | `Ctrl+\` |
+| `SIGKILL` | 9 | 终止 | **不可捕获、不可忽略**，最后的手段 |
+| `SIGSEGV` | 11 | 终止 + core | 段错误（野指针、栈溢出） |
+| `SIGPIPE` | 13 | 终止 | 往已关闭的管道写。网络编程高频 |
+| `SIGALRM` | 14 | 终止 | `alarm()` 定时器 |
+| `SIGTERM` | 15 | 终止 | **优雅退出**，可捕获（先于 SIGKILL 用） |
+| `SIGCHLD` | 17 | 忽略 | 子进程退出时通知父进程 |
+| `SIGCONT` | 18 | 继续 | 恢复被停止的进程 |
+| `SIGSTOP` | 19 | **停止** | 不可捕获，`Ctrl+Z` 用的是 20 不是它 |
+| `SIGTSTP` | 20 | 停止 | **`Ctrl+Z`**，可捕获 |
+
+:::danger[两个不可捕获的信号]
+`SIGKILL`(9) 和 `SIGSTOP`(19) **无法被捕获、阻塞或忽略**。内核把它们硬编码为必定执行。
+
+这是设计上的必要性：如果进程能屏蔽所有信号，一个死循环程序就永远杀不掉了。
+
+**但要注意**：`kill -9` 是**最后手段**。因为它不给程序清理的机会（不 flush 缓冲区、不关闭文件、不释放锁）。正确顺序是先 `kill -15`（SIGTERM），等几秒，不行再 `kill -9`。
+
+另外 `kill -9` **杀不掉 D 状态（不可中断睡眠）的进程**，因为它不响应任何信号。
+:::
+
+### 5.3 注册信号处理：用 sigaction，不要用 signal
+
+```c
+#include <stdio.h>
+#include <signal.h>
+#include <unistd.h>
+#include <string.h>
+
+static void on_int(int s)  { write(1, "got SIGINT\n", 11); }
+static void on_term(int s) { write(1, "got SIGTERM\n", 12); }
+
+int main(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_int;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    if (sigaction(SIGINT, &sa, NULL) == -1) { perror("sigaction"); return 1; }
+    sa.sa_handler = on_term;
+    if (sigaction(SIGTERM, &sa, NULL) == -1) { perror("sigaction"); return 1; }
+    printf("pid=%d ready\n", getpid());
+    fflush(stdout);
+    for (;;) pause();
+    return 0;
+}
+```
+
+实测：
+
+```
+pid=694783 ready
+got SIGINT
+got SIGTERM
+SIGKILL cannot be caught (process died)
+```
+
+发送 SIGKILL 后进程直接死亡，处理函数**没有**被调用——证明 SIGKILL 不可捕获。
+
+**为什么用 `sigaction` 而不是 `signal`**：
+
+| 方面 | `signal()` | `sigaction()` |
+| --- | --- | --- |
+| 可移植性 | 各 Unix 行为**不一致** | POSIX 标准，行为确定 |
+| 能否控制 `SA_RESTART` | 不能 | **能** |
+| 能否设置信号掩码 | 不能 | **能**（`sa_mask`） |
+
+:::tip[SA_RESTART 很重要]
+默认情况下，当进程阻塞在 `read()`、`accept()` 这类"慢系统调用"时收到信号，系统调用会被打断并返回 `EINTR` 错误。
+
+设了 `SA_RESTART` 后，**内核会自动重启被打断的系统调用**，你就不用写一堆 `if (errno == EINTR) retry;` 了。
+
+不设的话，网络程序里会频繁遇到莫名的 `EINTR`，这是经典坑。
+:::
+
+### 5.4 信号处理函数的限制（异步信号安全）
+
+信号处理函数是**异步执行**的，它可能打断你程序的任何位置（包括 `malloc` 执行到一半的时候）。因此只能用**异步信号安全（async-signal-safe）**的函数：
+
+- ✅ 可以：`write()`、`_exit()`、设置一个 `volatile sig_atomic_t` 标志
+- ❌ 禁止：`printf()`、`malloc()`、`free()`、加锁（可能死锁）
+
+注意上面示例代码用的是 `write()` 而不是 `printf()`，正是这个原因。
+
+## 6. 作业控制
+
+### 6.1 前台与后台
+
+| 操作 | 效果 |
+| --- | --- |
+| `cmd &` | **后台运行** |
+| `Ctrl+Z` | **暂停**当前前台进程（发 SIGTSTP） |
+| `jobs` | 列出当前 shell 的作业 |
+| `fg %1` | 把作业 1 拿到前台 |
+| `bg %1` | 让作业 1 在后台继续跑 |
+| `cmd &` + `disown` | 脱离 shell 管理，shell 退出也不受影响 |
+| `nohup cmd &` | 忽略 SIGHUP，shell 退出后继续跑 |
+
+实测：
+
+```bash
+$ bash -c 'sleep 30 & sleep 30 & jobs -l; echo "---"; kill %1 %2 2>/dev/null; true'
+[1]- 694818 Running                 sleep 30 &
+[2]+ 694819 Running                 sleep 30 &
+---
+```
+
+`[1]-` 和 `[2]+` 中的 `+` 表示"当前作业"（`fg` 不带参数时操作它），`-` 表示"上一个作业"。
+
+### 6.2 进程组与会话
+
+```bash
+$ ps -o pid,ppid,pgid,sid,comm -p $$ | cat
+    PID    PPID    PGID     SID COMMAND
+ 694766  694763  694763  694763 bash
+```
+
+| 概念 | 含义 | 作用 |
+| --- | --- | --- |
+| **PID** | 进程 ID | 唯一标识 |
+| **PPID** | 父进程 ID | 构成进程树 |
+| **PGID** | 进程组 ID | **一条管道线上的所有进程同组**，方便一起发信号 |
+| **SID** | 会话 ID | 一个终端登录对应一个会话 |
+
+**为什么要分组？** 因为 `Ctrl+C` 需要发给"当前管道线上的所有进程"，而不只是一个。终端驱动把 SIGINT 发给**整个前台进程组**。
+
+```bash
+$ cat bigfile | grep foo | wc -l
+# Ctrl+C 时，这三个进程都要收到 SIGINT
+```
+
+### 6.3 nohup 与 & 的区别
+
+| 方式 | shell 退出后还活着吗 |
+| --- | --- |
+| `cmd &` | **不一定**。shell 退出时会发 SIGHUP，进程可能死 |
+| `nohup cmd &` | **活着**。nohup 让进程忽略 SIGHUP |
+| `setsid cmd` | **活着**。直接脱离会话 |
+
+:::tip[嵌入式场景：让程序在板子上常驻]
+在开发板上后台跑程序，最稳妥的写法：
+
+```bash
+nohup ./myapp > /tmp/myapp.log 2>&1 &
+```
+
+或者用 `setsid`。如果要在开机时自动跑，那是 init 系统的活（见 [根文件系统](./rootfs)）。
+:::
+
+## 7. nice 优先级
+
+### 7.1 NI 与 PRI
+
+- **NI（nice 值）**：用户**可以调整**的优先级偏移，范围 **-20（最高优先）~ +19（最低优先）**，默认 0
+- **PRI（priority）**：内核（或工具）呈现的优先级
+
+**只有 root 能把 nice 调成负值**（提高优先级），普通用户只能调低自己的优先级。
+
+实测：
+
+```bash
+$ nice -n 10 sh -c 'echo "nice -n 10 -> $(nice)"'
+nice -n 10 -> 10
+
+$ renice -n 5 -p 694766
+694766 (process ID) old priority 0, new priority 5
+$ ps -o pid,ni,pri,comm -p $$ | cat
+    PID  NI PRI COMMAND
+ 694766   5  14 bash
+```
+
+:::warning[PRI 与 NI 的换算随工具而异]
+注意上面 `NI=5` 时 `PRI=14`。`ps` 和 `top` 对 PRI 的换算**不一样**，不同内核调度器下也不完全一样。
+
+**不要编造固定公式**。你只需要记住：
+- **NI 小 = 优先级高**（NI=-20 最优先）
+- **PRI 小 = 优先级高**（在 `ps` 里）
+- 两者正相关，具体数值换算取决于工具实现
+
+嵌入式上的实用结论：把**不重要的后台任务**（日志压缩、数据上传）`nice -n 19`，避免它抢 CPU 影响实时任务。
+:::
+
+### 7.2 CFS 调度器（概念）
+
+现代 Linux 默认调度器是 **CFS（Completely Fair Scheduler，完全公平调度器）**：
+
+- 目标是让每个进程**公平地**分到 CPU 时间
+- nice 值影响的是**权重**（weight），nice 每减 1，权重约乘以 1.25（**非线性**）
+- 内核用**红黑树**管理可运行进程，挑"虚拟运行时间最小"的来跑
+
+:::info[嵌入式实时性]
+**标准 Linux 内核不是硬实时操作系统**。如果你需要严格的时间保证（比如电机控制、硬实时采样），需要：
+
+- `CONFIG_PREEMPT_RT` 补丁（PREEMPT_RT，现已在 mainline 中逐步合入）
+- 或用 `SCHED_FIFO` / `SCHED_RR` 实时调度策略（需要 `CAP_SYS_NICE`）
+- 或双内核方案（Xenomai）
+
+这属于进阶话题，本页不展开。
+:::
+
+## 8. 验证
+
+复现本页关键结论（**这些都在服务器上跑过**）：
+
+```bash
+# 1. COW：同一虚拟地址、不同值
+gcc -O0 -o fork fork.c && ./fork
+
+# 2. 退出状态解码
+gcc -O0 -o status status.c && ./status
+
+# 3. 制造一个僵尸（父进程不 wait）
+gcc -O0 -o zombie zombie.c && ./zombie &
+sleep 1
+ps -eo pid,ppid,stat,comm | awk '$3 ~ /Z/'
+
+# 4. 孤儿被 reparent 到 PID 1
+gcc -O0 -o orphan orphan.c && ./orphan
+
+# 5. 信号不可捕获验证
+gcc -O0 -o sig sig.c && ./sig &
+kill -INT  $!; sleep 0.4
+kill -TERM $!; sleep 0.4
+kill -KILL $!
+
+# 6. 进程状态一览
+ps -eo pid,ppid,stat,comm --no-headers | head -10
+
+# 7. 看某个进程的内存映射
+cat /proc/self/maps | head -5
+```
+
+## 常见坑
+
+| 症状 | 病根 |
+| --- | --- |
+| fork 后输出**重复打印两遍** | 子进程用了 `exit()` 而不是 `_exit()`，把父进程复制来的 stdio 缓冲区又刷了一遍 |
+| fork 后父子顺序不确定 | **这是正常的**，父子进程调度顺序由内核决定。要顺序就得 `wait` |
+| 僵尸进程 `kill -9` 杀不掉 | 僵尸已经死了，`kill` 无效。**杀它的父进程** |
+| 系统 PID 耗尽，无法创建新进程 | 僵尸太多。查 `ps -eo stat | grep Z` 找父进程 |
+| `kill` 了程序但没死 | 可能是 `D` 状态（不可中断睡眠，等 IO）；或程序忽略了信号 |
+| 用 `signal()` 注册，行为在不同平台上不一致 | 改用 `sigaction()` |
+| 信号处理函数里 `printf` 导致诡异崩溃 | 处理函数只能用**异步信号安全**函数，用 `write()` |
+| 阻塞的 `read()` 被信号打断返回 `EINTR` | 没设 `SA_RESTART`，或没处理 `EINTR` |
+| `exit(300)` 拿到的退出码是 44 | 退出码只有 8 位，`300 & 255 = 44` |
+| 后台程序在串口断开后死了 | 收到 `SIGHUP`。用 `nohup` 或 `setsid` |
+| `nice` 调不上去（负值失败） | 只有 root 能降低 nice 值（提高优先级） |
+| daemon 的父进程是 1 但以为它崩了 | 正常，孤儿被 systemd 收养 |
+| 子进程继承了父进程打开的 fd 导致文件关不掉 | fork 会**复制 fd 表**。不需要的 fd 要 `close()`，或设 `FD_CLOEXEC` |
+| 程序在板子上跑着跑着消失，无任何日志 | 可能被 OOM killer 杀了。查 `dmesg | grep -i oom` |
+
+## 自检清单
+
+- [ ] 说出 `task_struct` 是什么，以及进程与线程在内核里的区别
+- [ ] 看着 `ps` 的 STAT 列，能说出 `R`/`S`/`D`/`T`/`Z` 各自含义
+- [ ] 解释为什么 `kill -9` 杀不掉 `D` 状态进程
+- [ ] 说出 shell 运行一条命令的 fork/exec/wait 三步
+- [ ] 解释"fork 之后、exec 之前"这个窗口能干什么（举出重定向的例子）
+- [ ] 用一句话解释 COW，并说明为什么 fork 很便宜
+- [ ] 看着父子进程输出**同一虚拟地址但不同值**，能解释原因
+- [ ] 说出 fork 后为什么要用 `_exit()` 而不是 `exit()`
+- [ ] 区分僵尸与孤儿：谁先死、谁有害、怎么清理
+- [ ] 说出 `SIGKILL` 和 `SIGSTOP` 为什么特殊
+- [ ] 说出 `SIGTERM` 与 `SIGKILL` 的使用顺序及原因
+- [ ] 解释 `SA_RESTART` 解决什么问题
+- [ ] 说出 `Ctrl+C`、`Ctrl+Z`、`Ctrl+\` 分别发什么信号
+- [ ] 说出 `nohup cmd &` 与 `cmd &` 的区别
+- [ ] 说出 nice 的范围，以及谁能设负值
+
+## 下一步
+
+- [文件系统与存储](./filesystem)——理解 inode、硬/软链接、挂载与嵌入式文件系统选型
+- [系统编程入门](./sysprog)——真正动手写 fork 之外的系统调用：文件 IO 与 epoll
+
+---
+
+**翻页**：[← 上一页](./process-02) · [返回目录](./)

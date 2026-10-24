@@ -1,0 +1,238 @@
+---
+id: 04-overload
+title: 04 函数重载与默认参数
+sidebar_position: 4
+description: 同名不同参的函数重载、重载决议规则与陷阱、默认参数的使用与坑。
+---
+
+# 04 函数重载与默认参数
+
+**本课目标**：会写同名函数、给参数设默认值，并知道它们的陷阱。
+
+## 函数重载：同名不同参
+
+C 里不能有两个叫 `add` 的函数。C++ 可以——只要参数不同：
+
+```cpp
+int    add(int a, int b)                { return a + b; }
+double add(double a, double b)          { return a + b; }
+std::string add(const std::string &a, const std::string &b) { return a + b; }
+```
+
+调用时编译器**根据实参类型自动选**：
+
+```cpp
+std::cout << add(1, 2) << "\n";                        /* 3   → int 版本 */
+std::cout << add(1.5, 2.5) << "\n";                    /* 4   → double 版本 */
+std::cout << add(std::string("a"), std::string("b"));  /* ab  → string 版本 */
+```
+
+本机实测输出：
+
+```text
+3
+4
+ab
+```
+
+:::info[重载的条件]
+**参数列表必须不同**（类型、个数、顺序任一不同）。
+
+**返回类型不同不算重载**：
+
+```cpp
+int    f(int);
+double f(int);        /* ❌ 编译错误：只是返回类型不同 */
+```
+
+因为调用 `f(1)` 时编译器无法判断你要哪个返回类型。
+:::
+
+## 重载决议：编译器怎么选
+
+规则按优先级：
+
+1. **精确匹配**（类型完全一致）
+2. **类型提升**（`char`→`int`、`float`→`double`）
+3. **标准转换**（`int`→`double`）
+4. **用户定义转换**（你自己的转换构造函数）
+5. 都不行 → 编译错误
+
+:::danger[常见陷阱：二义性]
+```cpp
+void f(int x);
+void f(double x);
+
+f(1);          /* int → 精确匹配 int 版本 ✅ */
+f(1.0);        /* double → 精确匹配 ✅ */
+f('a');        /* char → 提升为 int，选 int 版本 ✅ */
+f(1L);         /* long → int 和 double 都要转换 → ⚠️ 可能二义 */
+```
+
+如果两个候选**都需要转换且没有更优的**，编译器会报：
+
+```text
+error: call of overloaded 'f(long int)' is ambiguous
+```
+:::
+
+:::warning[重载 + 默认参数会互相干扰]
+```cpp
+void f(int a);
+void f(int a, int b = 0);
+
+f(1);        /* ⚠️ 二义：两个都能匹配 */
+```
+
+**要么用重载，要么用默认参数，别把两者混着用。**
+:::
+
+## 默认参数
+
+```cpp
+void greet(const std::string &name,
+           const std::string &prefix = "你好") {
+    std::cout << prefix << "，" << name << "\n";
+}
+
+greet("小明");                 /* 你好，小明 */
+greet("小红", "早上好");       /* 早上好，小红 */
+```
+
+本机实测输出：
+
+```text
+你好，小明
+早上好，小红
+```
+
+:::danger[默认参数必须放最右边]
+```cpp
+void f(int a, int b = 0, int c);      /* ❌ 编译错 */
+void f(int a, int b, int c = 0);      /* ✅ */
+```
+
+**一旦某个参数有默认值，它右边的所有参数都必须有默认值。**
+:::
+
+### 默认参数只在声明处写一次
+
+```cpp
+/* header.h */
+void f(int x = 10);           /* 默认值写在这里 */
+
+/* source.cpp */
+void f(int x) { ... }         /* 定义处不要再写 */
+```
+
+:::warning[两处都写会编译错]
+```cpp
+void f(int x = 10);
+void f(int x = 10) { }        /* ❌ 重复指定默认参数 */
+```
+:::
+
+### 默认参数的坑：求值时机
+
+```cpp
+int counter = 0;
+int next() { return ++counter; }
+
+void f(int x = next());       /* ⚠️ 每次调用都会执行 next() */
+```
+
+**和 C 不同**：C++ 默认参数是**每次调用时求值**（C 的宏则是文本替换、可能多次求值）。
+
+实际上这是好事——但要知道 `next()` 每次调用都会跑。
+
+## 重载 vs 默认参数怎么选
+
+| 场景 | 选择 |
+| --- | --- |
+| 参数类型不同 | **重载** |
+| 参数个数可选、类型相同 | **默认参数** |
+| 逻辑完全不同 | 换不同名字（更清晰） |
+
+:::tip[别为了炫技而重载]
+```cpp
+/* ❌ 太抽象，看调用不知道在干嘛 */
+process(1);
+process("a");
+process(1, 2);
+
+/* ✅ 名字说明意图 */
+process_id(1);
+process_name("a");
+process_range(1, 2);
+```
+
+**重载适合"同样语义、不同类型"**（比如 `add` 两个数）。语义不同就该用不同名字。
+:::
+
+## 完整示例
+
+```cpp
+#include <iostream>
+#include <string>
+#include <vector>
+
+/* 重载：不同类型打印 */
+void show(int x)                  { std::cout << "整数: " << x << "\n"; }
+void show(double x)               { std::cout << "浮点: " << x << "\n"; }
+void show(const std::string &x)   { std::cout << "字符串: " << x << "\n"; }
+
+/* 默认参数：解析选项 */
+void print_line(int width = 20, char ch = '-') {
+    for (int i = 0; i < width; i++) std::cout << ch;
+    std::cout << "\n";
+}
+
+int main() {
+    show(42);
+    show(3.14);
+    show("hello");
+
+    print_line();                 /* 20 个 - */
+    print_line(10);               /* 10 个 - */
+    print_line(10, '=');          /* 10 个 = */
+
+    return 0;
+}
+```
+
+输出：
+
+```text
+整数: 42
+浮点: 3.14
+字符串: hello
+--------------------
+----------
+==========
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 只有返回类型不同 | 编译错 | 不算重载 | 改参数或名字 |
+| 默认参数在中间 | 编译错 | 必须靠右 | 移到末尾 |
+| 声明和定义都写默认值 | 编译错 | 重复 | 只在声明处写 |
+| 重载与默认参数混用 | 二义性 | 都能匹配 | 二选一 |
+| `f(1L)` 二义 | 编译错 | int/double 都要转换 | 明确类型转换 |
+| 重载语义不同 | 难读 | 不是同一件事 | 用不同函数名 |
+
+## 本课自检
+
+- [ ] 会写函数重载（参数类型/个数不同）
+- [ ] **知道只有返回类型不同不算重载**
+- [ ] 知道重载决议的优先级（精确匹配优先）
+- [ ] 能识别二义性错误
+- [ ] 会用默认参数，**知道要放最右边**
+- [ ] 知道默认参数只在声明处写
+- [ ] 知道重载和默认参数混用会二义
+- [ ] 能判断什么时候用重载、什么时候用不同名字
+
+## 下一步
+
+[05 auto 与范围 for](./05-auto-range) —— 让编译器推导类型，代码能短一截。

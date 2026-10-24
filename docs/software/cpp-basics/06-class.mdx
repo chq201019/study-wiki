@@ -1,0 +1,318 @@
+---
+id: 06-class
+title: 06 类与对象入门
+sidebar_position: 6
+description: 类的定义、成员变量与成员函数、public/private 访问控制、this 指针，以及为什么封装有价值。
+---
+
+# 06 类与对象入门
+
+**本课目标**：会定义类、创建对象、理解封装的意义。
+
+## 从结构体开始
+
+C 的结构体只能装数据（[C 第 21 课](../c-basics/21-struct)）：
+
+```c
+struct Account {
+    char owner[32];
+    double balance;
+};
+```
+
+**问题是：数据和操作分离。**
+
+```c
+void deposit(struct Account *a, double amt) {
+    a->balance += amt;          /* 谁都能直接改 balance */
+}
+```
+
+`a->balance = -999999` 这种非法操作没人能阻止。
+
+## 类：数据 + 操作打包
+
+```cpp
+class Account {
+public:
+    void deposit(double amount) {
+        if (amount > 0) {
+            balance_ += amount;
+        }
+    }
+
+    double balance() const {
+        return balance_;
+    }
+
+private:
+    std::string owner_;
+    double balance_ = 0.0;
+};
+```
+
+创建和使用：
+
+```cpp
+Account a;
+a.deposit(100);
+std::cout << a.balance();       /* 100 */
+
+/* a.balance_ = -999;   ❌ 编译错误：private */
+```
+
+:::tip[类的核心价值：让非法状态无法产生]
+```cpp
+a.deposit(-100);        /* 被 if 挡住，余额不变 */
+a.balance_ = -999;      /* 编译错误，碰不到 */
+```
+
+**所有修改都必须经过你写的函数**，你可以在函数里做校验。
+
+这是「封装」的真正意义——**不是"藏起来"，而是"只能按规矩改"**。
+:::
+
+## `public` 与 `private`
+
+```cpp
+class Account {
+public:                      /* 外部可以访问 */
+    void deposit(double);
+    double balance() const;
+
+private:                     /* 只有类内部能访问 */
+    std::string owner_;
+    double balance_;
+};
+```
+
+| 访问级别 | 谁能用 |
+| --- | --- |
+| `public` | 任何人 |
+| `private` | 只有本类的成员函数 |
+| `protected` | 本类 + 派生类（第 10 课） |
+
+:::warning[`class` 默认是 private，`struct` 默认是 public]
+```cpp
+class A { int x; };          /* x 是 private */
+struct B { int x; };         /* x 是 public */
+```
+
+**这是 `class` 和 `struct` 在 C++ 里唯一的区别。**
+
+**惯例**：
+
+- 用 `class` 表示有封装、有不变量的类型
+- 用 `struct` 表示纯数据聚合（相当于 C 的结构体）
+:::
+
+## 成员函数
+
+```cpp
+class Counter {
+public:
+    void inc() { count_++; }            /* 修改状态 */
+    int value() const { return count_; } /* 只读，加 const */
+
+private:
+    int count_ = 0;
+};
+```
+
+:::danger[只读成员函数一定要加 `const`]
+```cpp
+int value() { return count_; }          /* ⚠️ 没有 const */
+int value() const { return count_; }    /* ✅ */
+```
+
+不加 `const` 的话，**`const Counter` 对象调不了这个方法**：
+
+```cpp
+const Counter c;
+c.value();          /* ❌ 如果 value() 没 const，这里编译错 */
+```
+
+**规矩：不修改成员变量的成员函数，都加 `const`。**
+:::
+
+### 类内定义 vs 类外定义
+
+```cpp
+/* 类内定义（编译器可能内联，适合短函数） */
+class A {
+public:
+    int get() const { return x_; }
+private:
+    int x_ = 0;
+};
+
+/* 类外定义（适合长函数） */
+class B {
+public:
+    void big_function();
+};
+void B::big_function() { /* ... */ }      /* 注意 B:: 前缀 */
+```
+
+## `this` 指针
+
+每个成员函数里都有一个隐藏的 `this`，指向**当前对象**：
+
+```cpp
+class Counter {
+public:
+    void inc() {
+        count_++;           /* 等价于 this->count_++ */
+    }
+
+    Counter &add(int n) {
+        count_ += n;
+        return *this;       /* 返回自己，支持链式调用 */
+    }
+
+private:
+    int count_ = 0;
+};
+```
+
+`this` 的典型用途：
+
+| 用途 | 场景 |
+| --- | --- |
+| 链式调用 | `return *this;` |
+| 区分同名参数 | `this->x = x;` |
+| 判断自赋值 | `if (this != &other)` |
+
+:::tip[命名规范：成员变量加后缀]
+```cpp
+class Foo {
+    int count_;              /* 加下划线后缀 */
+    std::string name_;       /* 一眼看出是成员 */
+};
+```
+
+这样就不会和参数名冲突，也不用到处写 `this->`。
+
+常见风格：`count_`（Google 风格）、`m_count`（微软风格）、`_count`（部分老代码）。**选一种坚持用**。
+:::
+
+## 构造函数（提前预览）
+
+对象的初始化放在构造函数里：
+
+```cpp
+class Account {
+public:
+    Account(std::string owner, double balance = 0.0)
+        : owner_(std::move(owner)), balance_(balance) {    /* 初始化列表 */
+    }
+
+private:
+    std::string owner_;
+    double balance_;
+};
+
+Account a("Alice", 100);        /* 创建时自动调用构造函数 */
+```
+
+本机实测：
+
+```text
+构造 Alice
+Alice: 150
+析构 Alice
+```
+
+**下一课详细讲构造与析构。**
+
+## 完整示例
+
+```cpp
+#include <iostream>
+#include <string>
+
+class Account {
+public:
+    Account(std::string owner, double balance = 0.0)
+        : owner_(std::move(owner)), balance_(balance) {}
+
+    void deposit(double amount) {
+        if (amount <= 0) {
+            std::cerr << "存款金额必须为正\n";
+            return;
+        }
+        balance_ += amount;
+    }
+
+    bool withdraw(double amount) {
+        if (amount <= 0 || amount > balance_) {
+            return false;             /* 失败返回 false */
+        }
+        balance_ -= amount;
+        return true;
+    }
+
+    /* 只读成员函数都加 const */
+    const std::string &owner() const { return owner_; }
+    double balance() const { return balance_; }
+
+private:
+    std::string owner_;
+    double balance_;
+};
+
+int main() {
+    Account a("Alice", 100);
+    a.deposit(50);
+    std::cout << a.owner() << " 余额 " << a.balance() << "\n";
+
+    if (a.withdraw(200)) {
+        std::cout << "取款成功\n";
+    } else {
+        std::cout << "余额不足\n";
+    }
+
+    std::cout << "最终余额 " << a.balance() << "\n";
+    return 0;
+}
+```
+
+输出：
+
+```text
+Alice 余额 150
+余额不足
+最终余额 150
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 类定义末尾漏 `;` | 编译错 | 语法要求 | 加 `;` |
+| 只读函数不加 `const` | const 对象调不了 | 方法非只读 | 加 `const` |
+| 直接访问 private 成员 | 编译错 | 封装 | 通过 public 函数 |
+| 成员函数忘写 `A::` | 链接错 | 类外定义要限定 | `void A::f()` |
+| `class` 忘写 `public:` | 全私有 | 默认 private | 加 `public:` |
+
+:::danger[类定义末尾的分号不能少]
+```cpp
+class A {
+    int x;
+};                   /* ← 这个分号必须写 */
+```
+:::
+
+## 本课自检
+
+- [ ] 会定义 `class`，能分清 `public` / `private`
+- [ ] **知道 `class` 默认 private，`struct` 默认 public**
+- [ ] 会写成员函数，会在类外定义（加 `A::`）
+- [ ] **知道只读成员函数要加 `const`**
+- [ ] 知道 `this` 是什么，会用它返回 `*this`
+- [ ] 理解封装的真正意义（让非法状态无法产生）
+- [ ] 会用成员变量后缀命名（`count_`）
+
+## 下一步
+
+[07 构造函数与析构函数](./07-ctor-dtor) —— 对象怎么创建、怎么销毁，以及初始化列表为什么更快。

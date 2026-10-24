@@ -1,0 +1,273 @@
+---
+id: containers
+title: 容器与隔离
+sidebar_position: 12
+description: 容器不是轻量虚拟机、七种 namespace 各隔离什么、cgroups v2 怎么限资源、overlayfs 分层镜像的原理、以及容器里常见的坑。
+---
+
+# 容器与隔离
+
+**本课目标**：搞清容器到底是什么，出问题时知道往哪查。
+
+## 容器不是轻量虚拟机
+
+:::danger[最根本的区别]
+```text
+虚拟机：硬件虚拟化 → 独立内核 → 运行完整操作系统
+容器：  共享宿主内核 → 只是一个"被隔离的进程"
+```
+
+**容器里没有自己的内核**：
+
+```bash
+# 容器里看内核版本 = 宿主的内核版本
+uname -r
+```
+
+**所以**：
+
+- 容器里**不能加载内核模块**（`modprobe` 失败）
+- 容器里**不能改内核参数**（`sysctl` 只读，除非特权模式）
+- Linux 容器**不能在 Windows/macOS 上原生运行**（Docker Desktop 是靠一层 Linux 虚拟机）
+:::
+
+:::info[容器的三大支柱]
+| 技术 | 解决什么 |
+| --- | --- |
+| **namespaces** | **看得见什么**（隔离视图） |
+| **cgroups** | **能用多少**（限制资源） |
+| **Union/overlay 文件系统** | **文件系统怎么分层**（镜像复用的基础） |
+
+**加上 capability、seccomp、LSM 等安全机制，才是完整的容器。**
+:::
+
+## 七种 namespace
+
+![容器隔离三层：namespace 决定看得见什么、cgroup 决定能用多少、overlayfs 决定文件从哪来；容器共享宿主内核而非独立内核](/img/diagrams/linux-container-isolation.svg)
+
+
+| namespace | 隔离什么 | 看不见的后果 |
+| --- | --- | --- |
+| **mnt** | 挂载点 | 容器有自己的根文件系统 |
+| **pid** | 进程号 | 容器内 PID 1 就是它自己的 1 号 |
+| **net** | 网络栈 | 自己的网卡、IP、端口 |
+| **ipc** | 进程间通信 | 自己的共享内存/消息队列 |
+| **uts** | 主机名与域名 | 自己的 `hostname` |
+| **user** | 用户与权限 | 容器内 root ≠ 宿主 root（映射） |
+| **cgroup** | cgroup 视图 | 看不到宿主的其他 cgroup |
+
+:::tip[自己动手验证 namespace]
+```bash
+# 起一个新的 pid + uts + mnt namespace，跑个 shell
+sudo unshare --pid --uts --mnt --fork --mount-proc /bin/sh
+
+# 进去后：
+hostname container-test     # 改了不影响宿主
+ps aux                      # 只看到这个 namespace 里的进程
+echo $$                     # 通常是 1
+```
+
+**`--fork` 是关键**：不 fork 的话当前进程就是 PID 1，退出会带走一切。
+
+**查看某个进程属于哪些 namespace**：
+
+```bash
+ls -l /proc/$$/ns/
+# lrwxrwxrwx ... mnt -> 'mnt:[4026531841]'
+# lrwxrwxrwx ... pid -> 'pid:[4026531836]'
+```
+
+**方括号里的数字相同 = 同一个 namespace。**
+:::
+
+:::warning[user namespace 是"免 root 跑容器"的关键]
+```bash
+unshare --user --map-root-user /bin/sh
+```
+
+**它把你在容器内的 root（uid 0）映射到宿主的一个普通用户**——所以你能在容器里"当 root 装东西"，但**在宿主上没有任何特权**。
+
+**代价**：某些操作（如挂载真实块设备）仍然做不到，因为内核知道你的真实身份。
+:::
+
+## cgroups：限制资源
+
+:::info[cgroups v1 与 v2 的区别]
+| | v1 | **v2** |
+| --- | --- | --- |
+| 层级 | **多个独立层级树**（cpu、memory 各一棵） | **单一统一层级树** |
+| 控制器混用 | 可以挂在同一进程的不同层级 | 统一管理 |
+| 状态 | 老系统还在用 | **现代发行版默认** |
+
+**Debian 13 / Ubuntu 22.04+ 默认都用 v2**（`/sys/fs/cgroup/cgroup.controllers` 存在即为 v2）。
+:::
+
+```bash
+# 看当前系统支持哪些控制器
+cat /sys/fs/cgroup/cgroup.controllers
+# cpu cpuset io memory pids rdma misc
+
+# 给一个 cgroup 限制内存 100M、CPU 0.5 核
+mkdir /sys/fs/cgroup/demo
+echo "+memory +cpu" > /sys/fs/cgroup/cgroup.subtree_control
+echo $((100*1024*1024)) > /sys/fs/cgroup/demo/memory.max
+echo "50000 100000" > /sys/fs/cgroup/demo/cpu.max      # 50ms/100ms = 0.5 核
+
+# 把进程放进去
+echo $$ > /sys/fs/cgroup/demo/cgroup.procs
+```
+
+:::tip[直接看一个容器的资源限制]
+```bash
+# 找到容器进程的 PID
+docker inspect -f '{{.State.Pid}}' mycontainer
+# 假设是 12345
+
+# 看它的 cgroup
+cat /proc/12345/cgroup
+# 0::/system.slice/docker-<id>.scope
+
+# 看限制
+cat /sys/fs/cgroup/system.slice/docker-<id>.scope/memory.max
+cat /sys/fs/cgroup/system.slice/docker-<id>.scope/cpu.max
+```
+:::
+
+:::danger[内存超限是被"杀"，不是"变慢"]
+```bash
+cat /sys/fs/cgroup/demo/memory.max        # 104857600
+cat /sys/fs/cgroup/demo/memory.events
+# low 0
+# high 0
+# max 3              ← 超限次数
+# oom 1              ← 被 OOM kill 的次数
+```
+
+**进程申请超过 `memory.max` 时，会被内核 OOM killer 直接杀掉**（exit code 通常是 137 = 128+9）。
+
+**Java/Node 应用经常遇到这个**：它们看得到宿主的总内存，于是把堆开到超出容器限制，然后被杀。
+
+**解决**：让运行时感知 cgroup 限制（`-XX:MaxRAMPercentage`、`--max-old-space-size`）。
+:::
+
+## overlayfs：镜像分层的基础
+
+:::info[一个容器看到的根文件系统是"叠"出来的]
+```text
+┌──────────────────────────────┐
+│ 可写层（container layer）      │  ← 容器运行时的一切修改都在这
+├──────────────────────────────┤
+│ 镜像层 3（最上层，如 COPY 的代码）│
+├──────────────────────────────┤
+│ 镜像层 2（如 RUN apt install）  │  ← 只读
+├──────────────────────────────┤
+│ 镜像层 1（如 FROM debian）      │  ← 只读
+└──────────────────────────────┘
+```
+
+**写时复制（CoW）**：容器改一个文件时，overlayfs 把该文件**从只读层复制到可写层**，再修改。
+:::
+
+:::tip[这解释了几件常见的事]
+**① 为什么镜像能共享**
+10 个容器都基于同一个基础镜像 → **基础层在磁盘上只有一份**。
+
+**② 为什么容器删了数据就没了**
+可写层随容器一起删除。
+
+**③ 为什么"改一个文件"会让容器变大**
+overlayfs 是**整文件复制**，不是块级。改一个 1GB 文件里的一个字节 → 可写层多出 1GB。
+
+**④ 为什么 `Dockerfile` 里 `RUN apt install` 后面删缓存没用**
+如果写成两条 `RUN`：
+
+```dockerfile
+RUN apt-get install -y bigpackage
+RUN rm -rf /var/lib/apt/lists/*      # ❌ 只是"在新层里隐藏"，磁盘占用还在
+```
+
+**必须合成一条**：
+
+```dockerfile
+RUN apt-get update && apt-get install -y bigpackage \
+ && rm -rf /var/lib/apt/lists/*      # ✅ 同一层里清掉，不留痕迹
+```
+:::
+
+```bash
+# 亲手挂一个 overlayfs
+mkdir -p /tmp/ovl/{lower,upper,work,merged}
+echo "from lower" > /tmp/ovl/lower/a.txt
+
+mount -t overlay overlay \
+  -o lowerdir=/tmp/ovl/lower,upperdir=/tmp/ovl/upper,workdir=/tmp/ovl/work \
+  /tmp/ovl/merged
+
+cat /tmp/ovl/merged/a.txt          # from lower
+echo "changed" > /tmp/ovl/merged/a.txt
+cat /tmp/ovl/upper/a.txt           # changed（文件被复制到 upper）
+```
+
+**`workdir` 是 overlayfs 必须的**（内部用），不能和 upper 是同一个目录。
+
+## 容器里的常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| **容器 exit 137** | 内存超限被 OOM kill | 调 `memory.max` 或限制应用堆 |
+| `exit 143` | 收到 SIGTERM（正常停止） | 检查应用是否正确响应 |
+| 时区是 UTC | 容器里没有 `/etc/localtime` | 挂载或设 `TZ` 环境变量 |
+| `ps` 看不到别的进程 | pid namespace 隔离（正常） | 要用宿主视角看用 `docker top` |
+| 容器退出后数据丢失 | 没挂 volume | 用 `-v` 挂载 |
+| 端口冲突 | 宿主端口被占用 | 换映射端口 |
+| 拿不到真实 CPU 数 | 看的是宿主的值 | 用 `--cpus` 限制并让应用感知 |
+| `sysctl` 改不了 | 内核参数是宿主的 | 用 `--sysctl` 白名单 |
+| 时间跳变导致定时器异常 | 宿主时间被 NTP 调整 | 用单调时钟（`CLOCK_MONOTONIC`） |
+
+:::danger[PID 1 的特殊性：信号会被忽略]
+**Linux 内核对 PID 1 有特殊待遇：它不响应没有安装处理函数的信号。**
+
+**所以在容器里如果你的程序是 PID 1**：
+
+```text
+docker stop → 发 SIGTERM → 但你的程序没注册 handler → 被内核忽略
+→ 等 10 秒超时 → SIGKILL 强制杀
+```
+
+**表现**：每次 `docker stop` 都要等 10 秒，而且数据可能没来得及保存。
+
+**解决**：
+
+1. **应用里显式注册 SIGTERM 处理**（最佳）
+2. 用 `ENTRYPOINT ["/usr/bin/tini", "--"]` 或 `--init` 让 tini 当 PID 1 负责转发信号
+:::
+
+:::warning[容器里不能做这些事]
+- **改内核参数**（`sysctl net.*`）—— 除非 `--privileged` 或 `--sysctl`
+- **加载内核模块** —— 内核模块是宿主级的
+- **挂载块设备** —— 除非特权 + `--device`
+- **改系统时间** —— 时间是宿主的（`CLOCK_REALTIME` 共享）
+- **运行 systemd** —— 需要特殊配置（`--privileged` + cgroup 挂载）
+
+**遇到"容器里某命令没权限"时，先想"这是不是内核级操作"** —— 那基本就是做不到（或者要做就要放大权限）。
+:::
+
+## 本课自检
+
+- [ ] **知道容器共享宿主内核，不是轻量虚拟机**
+- [ ] 知道容器里 `uname -r` 看到的是宿主内核
+- [ ] 能说出三大支柱：namespaces / cgroups / overlayfs
+- [ ] **能列出七种 namespace 各隔离什么**
+- [ ] 会用 `unshare` 亲手创建 namespace 验证
+- [ ] 会用 `/proc/<pid>/ns/` 对比两个进程是否同一 namespace
+- [ ] 知道 user namespace 能实现"免 root 跑容器"
+- [ ] **知道 cgroups v2 是单一层级树（v1 是多棵）**
+- [ ] 会在 `/sys/fs/cgroup/` 下配 `memory.max` 与 `cpu.max`
+- [ ] **知道内存超限是被 OOM kill（exit 137）不是变慢**
+- [ ] **理解 overlayfs 的写时复制是"整文件复制"**
+- [ ] **知道 Dockerfile 里 `RUN` 删缓存必须和安装同层**
+- [ ] **知道容器里 PID 1 会忽略未注册的信号，要装 tini 或显式处理**
+
+## 下一步
+
+[systemd：单元与依赖](./systemd) —— 服务到底怎么被拉起来的。

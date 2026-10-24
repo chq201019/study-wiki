@@ -1,0 +1,249 @@
+---
+id: performance
+title: 性能分析：perf 与火焰图
+sidebar_position: 17
+description: 先测量再优化、perf top/record/report 的用法、火焰图怎么读、strace 与 ltrace 的分工、以及 USE 方法排查系统瓶颈。
+---
+
+# 性能分析：perf 与火焰图
+
+**本课目标**：能从"系统变慢了"定位到具体代码行。
+
+## 先分类：慢在哪一层
+
+:::info[四个可能的层面]
+| 层面 | 症状 | 工具 |
+| --- | --- | --- |
+| **CPU** | 某进程占 100% | `perf`、`top` |
+| **内存** | OOM、频繁 swap | `free`、`vmstat`、`smem` |
+| **磁盘 IO** | `%iowait` 高 | `iostat`、`iotop` |
+| **网络** | 延迟高、丢包 | `ss`、`tcpdump`、`nstat` |
+
+**先确定是哪一层，再选工具。上来就 `perf record` 是浪费。**
+:::
+
+```bash
+# 30 秒采样，先看整体
+vmstat 1 5              # r/b 列：运行队列/阻塞进程
+iostat -x 1 5           # %util、await
+sar -u 1 5              # CPU 分解（user/sys/iowait）
+```
+
+:::tip[读 `vmstat` 的关键三列]
+```text
+procs -----------memory---------- ---swap-- -----io----
+ r  b   swpd   free   ...    si    so    bi    bo
+ 2  0      0 8000000   ...     0     0    10    20
+ ↑  ↑
+ │  └─ b > 0 持续：有进程阻塞在 IO 上
+ └──── r > CPU 核数：CPU 是瓶颈
+```
+
+**`r` 列 = 运行队列长度**。如果 `r` 长期大于核数，说明 CPU 不够。
+:::
+
+## perf：CPU 层面的主力工具
+
+```bash
+# 实时看谁在吃 CPU（类似 top，但能看到内核符号）
+sudo perf top
+
+# 采样式记录（默认 CPU 时钟事件，997Hz）
+sudo perf record -g -p <pid> -- sleep 30
+
+# 看报告
+sudo perf report
+
+# 不交互，直接输出
+sudo perf report --stdio --sort symbol | head -30
+```
+
+:::warning[`-g` 不能漏]
+**`-g` 开启调用图（call graph）采样** —— 没有它你只知道"哪个函数热"，不知道"谁调用的"。
+
+**火焰图必须要有 `-g` 的数据。**
+:::
+
+:::danger[看不到函数名？检查符号和权限]
+```bash
+cat /proc/sys/kernel/perf_event_paranoid
+# 2 = 只能看自己的进程（普通用户）
+# -1 = 全部可见
+```
+
+```bash
+# 临时放开
+sudo sysctl -w kernel.perf_event_paranoid=1
+```
+
+**看不到用户态函数名** → 程序没带调试符号：
+
+```bash
+# 编译时加 -g，或者保留符号表
+gcc -O2 -g main.c -o main
+```
+:::
+
+## 火焰图怎么读
+
+![火焰图读法：横向宽度是 CPU 时间占比而非时间轴，纵向是调用栈深度，应看塔顶的宽块](/img/diagrams/linux-flamegraph.svg)
+
+
+```bash
+# 抓数据
+sudo perf record -F 99 -g -p <pid> -- sleep 30
+
+# 转成折叠格式
+sudo perf script | stackcollapse-perf.pl > out.folded
+
+# 生成 SVG
+flamegraph.pl out.folded > flame.svg
+```
+
+:::tip[火焰图的三个读法]
+**① 宽度 = 占用时间比例**
+
+横向越长，说明这个函数（及其子调用）占用 CPU 越多。
+
+**② 纵向 = 调用栈深度**
+
+下面是调用者，上面是被调用者。**看"塔顶的宽块"** —— 那才是真正干活的地方。
+
+**③ 顶部锯齿状 = 正常**
+
+顶部不整齐说明采样分散在很多小函数里。**如果某一层突然一大片平的，那通常就是瓶颈。**
+:::
+
+:::warning[火焰图不显示时间轴]
+**它把整段时间聚合了，所以你看到的是"总的占比"，看不到"什么时候发生了抖动"。**
+
+**要查尖峰**：用 `perf record` 配合时间窗口分段，或者用 `perf script` 按时间戳自己统计。
+:::
+
+## `strace` / `ltrace`：系统调用层
+
+```bash
+# 跟踪系统调用（-f 跟进子进程，-T 显示耗时，-c 汇总）
+strace -f -T -o trace.log ./program
+
+# 汇总统计（哪个系统调用最耗时）
+strace -c ./program
+# % time     seconds  usecs/call     calls    errors syscall
+# ------ ----------- ----------- --------- --------- ----------------
+#  85.32    0.512345      256172         2           wait4
+#  10.11    0.060700        3035        20           read
+```
+
+:::danger[`strace` 会让程序慢几十倍]
+**它通过 ptrace 拦截每一次系统调用** —— 上下文切换开销巨大。
+
+**所以**：
+
+- **只能用来"看行为"，不能用来"测性能"**
+- 对高频 IO 的程序（每毫秒一次 `read`）可能慢到不可用
+- **不要在线上生产环境长时间跑**
+:::
+
+```bash
+# 只看特定系统调用
+strace -e trace=openat,read,write ./program
+
+# 只统计耗时超过 10ms 的
+strace -T -e trace=all ./program 2>&1 | awk -F'<' '{...}'
+```
+
+**`ltrace` 跟踪库函数调用**（`malloc`、`strcpy`），比 `strace` 更侵入，用得少。
+
+## USE 方法：系统化排查
+
+:::tip[Brendan Gregg 的 USE 方法]
+对**每个资源**依次问三个问题：
+
+| 字母 | 问题 | 检查 |
+| --- | --- | --- |
+| **U**tilization | 使用率多高？ | `iostat -x` 的 `%util` |
+| **S**aturation | 有没有排队？ | `vmstat` 的 `b`、`iostat` 的 `aqu-sz` |
+| **E**rrors | 有没有错误？ | `dmesg`、`netstat -s` 的错误计数 |
+
+**资源清单**：CPU、内存、磁盘、网络、文件描述符、连接数、锁。
+
+**这比"随便看看"高效得多** —— 它保证你不会漏掉某一层。
+:::
+
+## 一次完整的排查示例
+
+```bash
+# ① 现象：某服务响应慢
+# ② 先看整体
+top -b -n1 | head -15
+#   发现某进程 CPU 98%
+
+# ③ 看是不是 CPU 密集
+pidstat -p <pid> 1 5
+#   %usr 高 → 用户态在算
+#   %system 高 → 系统调用多
+
+# ④ 采样看热点函数
+sudo perf record -F 99 -g -p <pid> -- sleep 20
+sudo perf report --stdio --sort symbol | head -20
+
+# ⑤ 如果是系统调用多，看是哪个
+sudo strace -c -p <pid> -- sleep 5
+
+# ⑥ 如果是 IO 阻塞
+sudo iotop -o -P
+```
+
+:::warning[别在生产上直接 `perf record` 很长时间]
+**采样本身有开销**（通常 1~5%）。**长时间采样要注意**：
+
+```bash
+# 限制采样频率和时长
+sudo perf record -F 99 -g -p <pid> -- sleep 30
+```
+
+**`-F 99` 而不是默认的更高频率**，避开心跳频率的整数倍（减少采样偏差）。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `perf` 看不到符号 | 没 `-g` 编译 / 权限不足 | 加 `-g`，调 `perf_event_paranoid` |
+| 火焰图全是 `[unknown]` | 缺少符号表 | 保留未 strip 的二进制 |
+| `strace` 让程序慢到不可用 | ptrace 开销 | 改短时间采样或换工具 |
+| 火焰图看不出时间分布 | 聚合视图 | 分段采样 |
+| CPU 不高但响应慢 | 在等 IO 或锁 | 看 `vmstat` 的 `b`、`iostat` |
+| `%iowait` 高但磁盘 `%util` 不高 | 可能是网络存储 | 查 NFS / 云盘 |
+| 内存"泄漏"但 RSS 稳定 | 可能是 Page Cache | 看 `free` 的 `buff/cache` |
+
+:::tip[`free` 的 available 才是可用内存]
+```bash
+free -h
+#               total   used   free   shared  buff/cache   available
+# Mem:           31Gi   12Gi   2.0Gi   0.5Gi        17Gi        18Gi
+```
+
+**`free` 只有 2G 但 `available` 有 18G** —— 因为 `buff/cache` 可以随时回收。
+
+**看内存够不够要看 `available`，不是 `free`。**
+:::
+
+## 本课自检
+
+- [ ] 知道性能四个层面及各自的工具
+- [ ] **会读 `vmstat` 的 `r`（运行队列）和 `b`（阻塞）**
+- [ ] 会用 `perf top` / `perf record -g` / `perf report`
+- [ ] **知道 `-g` 不能漏，否则没有调用图**
+- [ ] 知道 `perf_event_paranoid` 控制权限
+- [ ] 会生成火焰图，知道"宽度=时间占比、看塔顶宽块"
+- [ ] **知道火焰图是聚合视图，看不到时间分布**
+- [ ] **知道 `strace` 会让程序慢几十倍，只能看行为不能测性能**
+- [ ] 会用 `strace -c` 汇总系统调用耗时
+- [ ] **知道 USE 方法（使用率/饱和度/错误）**
+- [ ] **知道看内存要看 `available` 不是 `free`**
+
+## 下一步
+
+[调试工具](./debug) 讲了 gdb 与 core dump；
+或者看 [可观测性](./containers) 相关章节。

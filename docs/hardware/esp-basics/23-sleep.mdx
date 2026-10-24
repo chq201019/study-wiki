@@ -1,0 +1,243 @@
+---
+id: 23-sleep
+title: 23 深度睡眠省电
+sidebar_position: 23
+description: ESP32 的几种睡眠模式、电流对比、深度睡眠怎么用、唤醒源，以及为什么电池设备都靠它。
+---
+
+# 23 深度睡眠省电
+
+**本课目标**：让电池供电的设备撑几个月而不是几小时。
+
+## 为什么需要睡眠
+
+:::danger[全速运行的电流很吓人]
+| 状态 | 电流 |
+| --- | --- |
+| WiFi 收发数据 | **120~240 mA** |
+| 仅 CPU 运行（无 WiFi） | 约 20 mA |
+| **深度睡眠** | **10~20 µA** |
+
+**差了 1 万倍。**
+
+**用 2000 mAh 电池算**：
+
+```text
+全速运行：2000 / 200 = 10 小时
+深度睡眠：2000 / 0.015 ≈ 15 年（理论值）
+```
+
+**所以电池设备的核心策略是：绝大部分时间在睡，偶尔醒来干活。**
+:::
+
+## 几种睡眠模式
+
+| 模式 | 电流 | 唤醒时间 | RAM 保留 | 说明 |
+| --- | --- | --- | --- | --- |
+| **Active** | 20~240 mA | —— | ✅ | 正常运行 |
+| **Modem sleep** | 3~20 mA | 极快 | ✅ | WiFi 自动进入，CPU 还跑 |
+| **Light sleep** | 0.8~2 mA | 快 | ✅ | CPU 暂停，RAM 保留 |
+| **Deep sleep** | **10~150 µA** | 慢（几十 ms） | ❌ **只留 RTC 内存** | 几乎全关 |
+| Hibernation | ~5 µA | 更慢 | ❌ | 最省，但限制多 |
+
+:::danger[深度睡眠会丢失 RAM 内容]
+```c
+int counter = 0;          /* 全局变量 */
+/* 进入深度睡眠 → 醒来后 counter 变回 0！ */
+```
+
+**深度睡眠等效于"软关机再开机"**，除了标注为 RTC 内存的变量，其他全部丢失。
+
+**要跨睡眠保留数据 → 存 NVS（[第 22 课](./22-nvs)）或 RTC 内存。**
+:::
+
+## 用深度睡眠
+
+```c
+#include "esp_sleep.h"
+#include "esp_log.h"
+
+void app_main(void)
+{
+    /* ① 判断唤醒原因（重要！） */
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+
+    switch (cause) {
+    case ESP_SLEEP_WAKEUP_TIMER:
+        ESP_LOGI(TAG, "定时器唤醒，去干活");
+        do_work();
+        break;
+    case ESP_SLEEP_WAKEUP_GPIO:
+        ESP_LOGI(TAG, "按键唤醒");
+        break;
+    default:
+        ESP_LOGI(TAG, "首次上电（或复位）");
+        break;
+    }
+
+    /* ② 睡 10 秒后自动醒 */
+    ESP_LOGI(TAG, "进入深度睡眠 10 秒");
+    esp_deep_sleep_enable_timer_wakeup(10ULL * 1000000ULL);   /* 单位：微秒 */
+    esp_deep_sleep_start();                                    /* 不返回 */
+
+    /* 这行永远执行不到 */
+}
+```
+
+:::danger[`esp_deep_sleep_start()` 不返回]
+它直接让芯片进入睡眠，**醒来时是从头重新启动**（重新跑 `app_main`）。
+
+**所以它后面的代码是死代码。**
+:::
+
+:::warning[时间单位是「微秒」，而且要用 `ULL`]
+```c
+esp_deep_sleep_enable_timer_wakeup(10 * 1000000);          /* ⚠️ int 溢出风险 */
+esp_deep_sleep_enable_timer_wakeup(10ULL * 1000000ULL);    /* ✅ */
+```
+
+**类型是 `uint64_t`**，不加 `ULL` 在长睡眠时间下会算错（比如睡 1 天 = 86400 秒）。
+
+**1 天 = `86400ULL * 1000000ULL`。**
+:::
+
+## 唤醒源
+
+| 唤醒源 | 用法 |
+| --- | --- |
+| **定时器** | `esp_deep_sleep_enable_timer_wakeup()` |
+| **GPIO** | `esp_deep_sleep_enable_gpio_wakeup()` |
+| **触摸** | `esp_sleep_enable_touchpad_wakeup()` |
+| **UART** | `esp_sleep_enable_uart_wakeup()` |
+| **外部信号** | `esp_sleep_enable_ext0/1_wakeup()` |
+
+:::tip[可以同时启用多个唤醒源]
+```c
+esp_deep_sleep_enable_timer_wakeup(60ULL * 1000000ULL);   /* 60 秒后 */
+esp_deep_sleep_enable_gpio_wakeup(mask, ESP_GPIO_WAKEUP_GPIO_LOW);  /* 或按键 */
+esp_deep_sleep_start();
+```
+
+**谁先触发就谁唤醒**——醒来后用 `esp_sleep_get_wakeup_cause()` 区分。
+
+**这是"定时上报 + 按键立即响应"的标准做法。**
+:::
+
+## 典型模式：定时采集 + 上报
+
+```c
+void app_main(void)
+{
+    /* ① 唤醒原因 */
+    bool timer_wake = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER);
+
+    /* ② 干活：采集 + 上报（含连 WiFi） */
+    if (timer_wake) {
+        init_wifi();                     /* 约 3~5 秒 */
+        wait_for_ip(15000);
+        float t = read_sensor();
+        mqtt_publish_temp(t);
+        vTaskDelay(pdMS_TO_TICKS(500));  /* 给发送一点时间 */
+    }
+
+    /* ③ 立刻睡回 5 分钟 */
+    esp_deep_sleep_enable_timer_wakeup(300ULL * 1000000ULL);
+    esp_deep_sleep_start();
+}
+```
+
+:::tip[算一下能撑多久]
+假设：每 5 分钟醒一次，每次活动 5 秒，活动电流 150 mA，睡眠电流 15 µA。
+
+```text
+每天活动时间 = 288 次 × 5 秒 = 1440 秒 = 0.4 小时
+每天活动耗电 = 0.4 h × 150 mA = 60 mAh
+每天睡眠耗电 ≈ 24 h × 0.015 mA = 0.36 mAh
+
+合计约 60 mAh/天 → 2000 mAh 电池约 33 天
+```
+
+**大头是 WiFi 连接和数据收发，不是睡眠本身。**
+
+**优化方向：减少上报频率、缩短联网时间、用固定 IP 加速 DHCP。**
+:::
+
+## 降低 WiFi 耗电
+
+:::danger[每次醒来重连 WiFi 很费电]
+WiFi 从启动到拿到 IP 通常要 **3~6 秒**，这段时间电流 100+ mA。
+
+**每 5 分钟一次 → 每天光连 WiFi 就耗掉几小时的电。**
+:::
+
+| 优化手段 | 效果 |
+| --- | --- |
+| **减少上报频率** | 最有效（5 分钟→15 分钟，省 2/3） |
+| **固定 IP**（跳过 DHCP） | 省 1~2 秒 |
+| **记住 AP 信道** | 跳过全信道扫描，省 1~2 秒 |
+| **用 `esp_wifi_set_ps(WIFI_PS_MIN_MODEM)`** | 睡眠期间 WiFi 也省电 |
+| **改用 BLE 上报** | 连接快得多（但需要网关） |
+| **批量上报** | 攒够几条一起发 |
+
+## RTC 内存：跨睡眠保留数据
+
+```c
+/* 声明为 RTC 内存，深度睡眠期间不丢 */
+RTC_DATA_ATTR int boot_count = 0;
+
+void app_main(void)
+{
+    boot_count++;                        /* 每次醒来加一，不会丢 */
+    ESP_LOGI(TAG, "第 %d 次唤醒", boot_count);
+}
+```
+
+:::warning[`RTC_DATA_ATTR` 只保留值，不保留复杂对象]
+**只能放简单类型**（int、数组、结构体）。
+
+**不能放 `std::string`、指针指向的堆数据**——堆在深睡后会丢失。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 忘记判断唤醒原因 | 误当首次启动 | 醒来会重跑 `app_main` | 用 `get_wakeup_cause` |
+| 全局变量用了就丢 | 数值莫名重置 | 深睡清 RAM | 存 NVS 或 `RTC_DATA_ATTR` |
+| 时间单位搞错 | 睡 1 秒而不是 10 秒 | 单位是微秒 | `10ULL*1000000ULL` |
+| 不加 `ULL` | 长睡眠算错 | int 溢出 | 加 `ULL` |
+| `start()` 后写代码 | 不执行 | 不返回 | 别写 |
+| 唤醒后忘记重新初始化外设 | 行为异常 | 相当于重启 | 每次醒来都初始化 |
+| 用深睡还想保持 WiFi 连接 | 连不上 | WiFi 会断 | 每次重连或用 light sleep |
+
+:::tip[想保持 WiFi 连接就用 Light Sleep]
+**深睡会断开 WiFi**，每次都要重连。
+
+**要"保持连接 + 省电"，用 `light sleep`**：
+
+```c
+esp_sleep_enable_timer_wakeup(...);
+esp_light_sleep_start();      /* 这个会返回！ */
+```
+
+**Light sleep 只暂停 CPU，WiFi 连接保持**，电流约 0.8~2 mA。
+
+**代价**：省电效果比深睡差一个数量级。
+:::
+
+## 本课自检
+
+- [ ] 知道全速运行和深睡的电流差 1 万倍
+- [ ] 能区分 Active / Modem / Light / Deep sleep
+- [ ] **知道深睡会丢 RAM，等价于重启**
+- [ ] 会用 `esp_deep_sleep_enable_timer_wakeup` + `start`
+- [ ] **知道时间单位是微秒，要加 `ULL`**
+- [ ] **知道醒来必须判断 `get_wakeup_cause`**
+- [ ] 会配置多个唤醒源（定时 + GPIO）
+- [ ] 会用 `RTC_DATA_ATTR` 保留跨睡眠数据
+- [ ] **知道深睡会断 WiFi，要保连接用 light sleep**
+- [ ] 知道耗电大头是 WiFi 而不是睡眠本身
+
+## 下一步
+
+[24 文件系统](./24-filesystem) —— 在 Flash 上存文件。

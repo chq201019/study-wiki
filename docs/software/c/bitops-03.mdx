@@ -1,0 +1,99 @@
+---
+id: bitops-03
+title: "03 实战：对着手册写寄存器操作"
+sidebar_position: 4
+description: "位运算与寄存器操作 第 3 部分：实战：对着手册写寄存器操作"
+---
+
+# 03 实战：对着手册写寄存器操作
+假设手册说：
+
+> UART_CONFIG_REG (offset 0x18)
+> - bit 0: UART_EN — 使能
+> - bit [3:2]: PARITY — 校验模式
+> - bit [7:4]: reserved
+> - bit [12:8]: BAUD_DIV — 波特率分频
+
+```c
+#define UART_BASE        0x3FF40000u
+#define UART_CONFIG_REG  (*(volatile uint32_t *)(UART_BASE + 0x18u))
+
+#define UART_EN_Pos      0u
+#define UART_EN_Msk      (1u << UART_EN_Pos)
+
+#define UART_PARITY_Pos  2u
+#define UART_PARITY_Msk  (0x3u << UART_PARITY_Pos)   /* 2 位 */
+
+#define UART_BAUD_Pos    8u
+#define UART_BAUD_Msk    (0x1Fu << UART_BAUD_Pos)    /* 5 位 */
+
+/* 使能 */
+static inline void uart_enable(void) {
+    UART_CONFIG_REG |= UART_EN_Msk;
+}
+
+/* 设置校验模式（0~3） */
+static inline void uart_set_parity(uint32_t mode) {
+    uint32_t v = UART_CONFIG_REG;
+    v = (v & ~UART_PARITY_Msk) | ((mode << UART_PARITY_Pos) & UART_PARITY_Msk);
+    UART_CONFIG_REG = v;
+}
+
+/* 读波特率分频 */
+static inline uint32_t uart_get_baud(void) {
+    return (UART_CONFIG_REG & UART_BAUD_Msk) >> UART_BAUD_Pos;
+}
+```
+
+这套写法（CMSIS 风格）是 ARM 生态的标准，ESP-IDF 也有类似的 `REG_SET_FIELD` 宏族。
+
+:::tip[用 `_Static_assert` 守住掩码]
+```c
+_Static_assert(UART_PARITY_Msk == 0x0000000Cu, "parity mask mismatch");
+```
+把从手册算出的掩码钉死，防止手抄错。
+:::
+
+## 常见坑
+
+| 陷阱 | 现象 | 原因 | 正确做法 |
+| --- | --- | --- | --- |
+| `~0x0F` 污染高位 | 64 位变量高 32 位被清 | `~` 的整数提升 | 加 `u` 后缀：`~0x0Fu` |
+| `1 << 31` | 负数或 UB | 有符号左移 | `1u << 31` |
+| 移位量 >= 位宽 | UB，UBSan 会抓 | 标准规定 | 先判断，或用查表 |
+| 右移负数得负值 | 期望补 0 得到补符号 | 算术右移（实现定义） | 先转无符号 |
+| 用位域映射寄存器 | 访问宽度不可控、换编译器错 | 布局实现定义 | 用位掩码 |
+| 忘写 `volatile` | `-O2` 下访问被优化掉 | 编译器认为值不变 | 寄存器指针必须 `volatile` |
+| 多个地方读改写同一寄存器 | 修改丢失 | 非原子的读-改-写 | 用 W1S/W1C 寄存器或临界区 |
+| 以为 `volatile` 保证原子 | 仍然丢失更新 | volatile 只保证访问发生 | 用锁或硬件原子寄存器 |
+| `reg & MASK == MASK` | 判断恒错 | `==` 优先级高于 `&` | `(reg & MASK) == MASK` |
+| 直接发结构体到网络 | 对端解析错 | 字节序+padding+类型宽度 | 显式序列化 |
+| 循环变量当移位量 | `1 << 40` 溢出 | 超过类型位宽 | 用 `uint64_t` 或先判断 |
+| `BIT(n)` 里 n 是 `int` | 负数移位 UB | 未检查 | 确保 n 在 `[0, 31]` |
+
+## 自检清单
+
+- [ ] 能说出六种位运算符吗？哪个的行为是实现定义的？
+- [ ] 知道 `~a`（`a` 为 `uint8_t`）的结果是多少位吗？为什么？
+- [ ] 能写出置位/清位/翻转/检查四种惯用法吗？
+- [ ] 能写出"提取第 pos 位开始的 width 位"的通用公式吗？
+- [ ] 知道为什么硬件寄存器不能用位域吗？至少两条理由
+- [ ] 能解释读改写的三步，以及它为什么会丢失更新吗？
+- [ ] 知道 `volatile` 能不能解决原子性问题吗？
+- [ ] 知道什么是 W1S/W1C 寄存器吗？为什么它们能避免读改写问题？
+- [ ] 本机是大端还是小端？能写出判定代码吗？
+- [ ] 能把 32 位整数按指定字节序序列化吗？
+- [ ] 知道为什么不能直接 `send()` 一个结构体吗？
+- [ ] 能对着芯片手册的寄存器描述写出对应的掩码宏吗？
+
+## 下一步
+
+- [嵌入式 C](./embedded) —— `volatile` 的完整语义、内存映射 IO、中断约束
+- [指针专章](./pointers) —— 指针类型转换（寄存器地址怎么来的）
+- [未定义行为与陷阱](./pitfalls) —— 位移和溢出的 UB 详解
+- [复合类型](./aggregate) —— 位域的详细规则
+- [回到导读](./)
+
+---
+
+**翻页**：[← 上一页](./bitops-02) · [返回目录](./)

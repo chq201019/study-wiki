@@ -1,0 +1,231 @@
+---
+id: 12-i2c
+title: 12 I2C 接 OLED
+sidebar_position: 12
+description: I2C 两根线为什么能接一堆设备、地址怎么找、ESP-IDF 的 I2C 用法，以及通信失败怎么查。
+---
+
+# 12 I2C 接 OLED
+
+**本课目标**：搞懂 I2C 总线，把一块 OLED 屏幕点亮并显示数据。
+
+## I2C 为什么只要两根线
+
+**I2C（读作 I-squared-C）** 只用两根线：
+
+| 线 | 全名 | 作用 |
+| --- | --- | --- |
+| **SDA** | Serial Data | 数据 |
+| **SCL** | Serial Clock | 时钟 |
+
+**所有设备并联在同一对线上**，靠**地址**区分。
+
+```text
+ESP32              设备A(0x3C)   设备B(0x68)   设备C(0x76)
+ SDA ──────┬──────────┬─────────────┬─────────────┬────
+           │          │             │             │
+ SCL ──────┼──────────┼─────────────┼─────────────┼────
+           │          │             │             │
+3.3V ──[R]─┴─[R]──────┴────[R]──────┴─────[R]─────┴──   ← 上拉电阻
+
+（实际是一条总线，各设备都接到同样两根线上）
+```
+
+:::tip[I2C 的三个关键特点]
+1. **两根线**（省引脚）
+2. **支持多设备**（每个有唯一地址）
+3. **必须有上拉电阻**（通常 4.7 kΩ，模块上一般已自带）
+:::
+
+![SSD1306 OLED 接线：VCC→3.3V、GND→GND、SDA→GPIO8、SCL→GPIO9，SDA/SCL 各经一只 4.7kΩ 上拉到 3.3V；开漏输出只能拉低，松手后靠上拉把线抬回 3.3V，设备地址 0x3C](/img/diagrams/esp32-wire-i2c-oled.svg)
+
+## 地址：怎么知道设备在哪
+
+每颗 I2C 设备有一个 **7 位地址**（0x08 ~ 0x77）。
+
+常见地址：
+
+| 设备 | 常见地址 |
+| --- | --- |
+| SSD1306 OLED | **0x3C** 或 0x3D |
+| MPU6050（陀螺仪） | 0x68 |
+| BME280（温湿气压） | 0x76 或 0x77 |
+| PCF8574（IO 扩展） | 0x20 ~ 0x27 |
+| ADS1115（ADC） | 0x48 |
+
+:::danger[地址冲突怎么办]
+同一总线上**不能有两个相同地址**的设备。
+
+**解决**：
+
+- 很多模块有地址跳线/焊盘，可以改成另一个地址
+- 或用另一组 I2C 引脚（ESP32 可以有多组 I2C 主机）
+:::
+
+## 先用扫描程序确认设备在
+
+**接线后第一件事：扫描总线。** 不要直接写业务代码。
+
+```c
+#include "driver/i2c_master.h"
+#include "esp_log.h"
+
+static const char *TAG = "i2cscan";
+
+#define I2C_SCL_GPIO  22
+#define I2C_SDA_GPIO  21
+
+void app_main(void)
+{
+    i2c_master_bus_config_t bus_cfg = {
+        .i2c_port  = I2C_NUM_0,
+        .sda_io_num = I2C_SDA_GPIO,
+        .scl_io_num = I2C_SCL_GPIO,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    i2c_master_bus_handle_t bus;
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &bus));
+
+    ESP_LOGI(TAG, "开始扫描 0x08 ~ 0x77 ...");
+    int found = 0;
+    for (uint8_t addr = 0x08; addr < 0x78; addr++) {
+        /* probe 返回 ESP_OK 说明这个地址有设备 */
+        if (i2c_master_probe(bus, addr, 100) == ESP_OK) {
+            ESP_LOGI(TAG, "  发现设备: 0x%02X", addr);
+            found++;
+        }
+    }
+    ESP_LOGI(TAG, "扫描完成，共 %d 个设备", found);
+}
+```
+
+:::tip[扫描到 0x3C 就是 OLED，0x3D 也是]
+SSD1306 屏通常是 **0x3C**。
+
+**扫描不到任何设备 → 先查接线，别写业务代码。**
+:::
+
+## 扫描不到设备：排查表
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 一个都扫不到 | **SDA/SCL 接反了** | 对调试试 |
+| 一个都扫不到 | 没接电源 | 量 VCC 对 GND 有没有 3.3V |
+| 一个都扫不到 | 没上拉电阻 | 模块一般自带；没有就外接 4.7k |
+| 一个都扫不到 | 引脚号写错 | 核对 `sda_io_num`/`scl_io_num` |
+| 扫到一堆乱地址 | 上拉太弱/线太长 | 加外部上拉、缩短线 |
+| 偶尔扫到 | 接触不良 | 换杜邦线 |
+
+:::danger[先量电压，再怀疑代码]
+用万用表量模块的 VCC 和 GND：
+
+```text
+应该在 3.2 ~ 3.4V
+```
+
+**没电就什么都别谈。** 很多人折腾半天代码，结果是电源线没插。
+:::
+
+## 点亮 SSD1306 OLED
+
+SSD1306 的驱动比较长（要发初始化序列）。**实际项目直接用现成组件**：
+
+```bash
+idf.py add-dependency "espressif/ssd1306"
+```
+
+或者用乐鑫的组件库示例。
+
+:::tip[推荐的组件（LEGO 风格）]
+ESP-IDF 有组件管理器，可以直接拉别人的驱动：
+
+```bash
+idf.py add-dependency "espressif/ssd1306"        # OLED
+idf.py add-dependency "espressif/bme280"          # 温湿气压
+idf.py add-dependency "espressif/mpu6050"         # 六轴
+```
+
+**不用自己抄寄存器序列**——这是 ESP-IDF 相比 Arduino 的优势之一（官方维护的组件库）。
+:::
+
+### 一个最小的手动写法（理解原理）
+
+```c
+/* SSD1306 的命令/数据靠"控制字节"区分 */
+#define SSD1306_CMD   0x00      /* 后面是命令 */
+#define SSD1306_DATA  0x40      /* 后面是显存数据 */
+
+static esp_err_t oled_send(i2c_master_dev_handle_t dev,
+                           uint8_t control, const uint8_t *buf, size_t len)
+{
+    uint8_t tmp[128];
+    if (len + 1 > sizeof(tmp)) return ESP_ERR_INVALID_SIZE;
+    tmp[0] = control;
+    memcpy(&tmp[1], buf, len);
+    return i2c_master_transmit(dev, tmp, len + 1, 100);
+}
+```
+
+:::info[I2C 的"控制字节"是什么]
+SSD1306 收到数据后要知道"这是命令还是显示内容"，所以**每个传输的第一字节是控制字节**：
+
+- `0x00` → 后面全是命令（初始化、设坐标）
+- `0x40` → 后面全是显存数据（要显示的内容）
+
+**这是 SSD1306 的私有协议**，不是 I2C 标准的一部分。
+:::
+
+## 常用外设的 I2C 接线
+
+| 模块 | VCC | GND | SDA | SCL |
+| --- | --- | --- | --- | --- |
+| SSD1306 OLED | 3.3V | GND | GPIO8 | GPIO9 |
+| BME280 | 3.3V | GND | GPIO8 | GPIO9 |
+| MPU6050 | 3.3V | GND | GPIO8 | GPIO9 |
+
+:::warning[上表按 ESP32-S3 的默认 I2C 引脚（GPIO8/9）]
+**经典 ESP32 的默认才是 GPIO21/22**，抄老教程时要改过来。
+
+**任何 GPIO 都能做 I2C**（靠矩阵交换），所以代码里写你实际接的就行。
+
+**但别用 GPIO35/36/37**（被 Octal Flash/PSRAM 占用，接了就变砖，[第 3 课](./03-hardware)讲过）。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| SDA/SCL 接反 | 扫不到设备 | 接错 | 对调试 |
+| 没上拉电阻 | 通信不稳定 | 总线浮空 | 加 4.7k |
+| 忘 `enable_internal_pullup` | 同上 | 内部上拉没开 | 打开该 flag |
+| 地址写错 | 通信失败 | 用了 0x3D 而设备是 0x3C | 先扫描 |
+| 线太长（>50cm） | 偶发失败 | I2C 抗干扰弱 | 缩短线 |
+| 多个设备同地址 | 冲突 | 地址没改 | 改跳线或用另一组总线 |
+| 用 5V 供电 | 通信失败/烧毁 | 电平不匹配 | 用 3.3V |
+
+:::danger[I2C 线不能太长]
+标准 I2C 设计用于**板内通信**，建议 **< 30 cm**。
+
+线长了会出现：偶发通信失败、扫描到乱码、读数据错位。
+
+**要长距离传输 → 用 RS485 或 CAN，不要硬拉 I2C。**
+:::
+
+## 本课自检
+
+- [ ] 知道 I2C 只用 SDA/SCL 两根线
+- [ ] **知道靠地址区分多设备，地址不能冲突**
+- [ ] **知道必须有上拉电阻（4.7k）**
+- [ ] 记得住 SSD1306 是 0x3C
+- [ ] **会先写扫描程序确认设备在**
+- [ ] 知道 `i2c_master_probe` 能探测地址
+- [ ] 知道扫描不到先量电压、查接线
+- [ ] 知道 SSD1306 的控制字节 `0x00`/`0x40`
+- [ ] 知道可以用 `idf.py add-dependency` 拉现成组件
+- [ ] **知道 I2C 线不能太长（`<30cm`）**
+
+## 下一步
+
+[13 SPI 与总线概念](./13-spi) —— 更快的总线，接屏幕和 SD 卡。

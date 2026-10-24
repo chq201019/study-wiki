@@ -1,0 +1,402 @@
+---
+id: 15-functions
+title: 15 函数
+sidebar_position: 15
+description: 函数的定义与调用、参数与返回值、值传递的真相，以及为什么 swap 交换不了。
+---
+
+# 15 函数
+
+**本课目标**：会把代码打包成函数，理解"值传递"这个 C 最重要的机制。
+
+## 为什么需要函数
+
+```c
+/* 不用函数：重复三遍 */
+int a1 = 5, b1 = 3;
+int area1 = a1 * b1;
+printf("矩形1: %d\n", area1);
+
+int a2 = 8, b2 = 4;
+int area2 = a2 * b2;
+printf("矩形2: %d\n", area2);
+```
+
+用函数：
+
+```c
+int rect_area(int w, int h) {
+    return w * h;
+}
+
+printf("矩形1: %d\n", rect_area(5, 3));
+printf("矩形2: %d\n", rect_area(8, 4));
+```
+
+**改公式只需改一处。**
+
+## 函数的定义
+
+```c
+返回类型 函数名(参数列表) {
+    函数体
+    return 返回值;
+}
+```
+
+```c
+int add(int a, int b) {
+    return a + b;
+}
+```
+
+| 部分 | 含义 |
+| --- | --- |
+| `int` | 返回值的类型 |
+| `add` | 函数名 |
+| `(int a, int b)` | 两个 `int` 参数 |
+| `return a + b;` | 返回值 |
+
+## 调用函数
+
+![函数调用时的栈帧布局：调用者栈帧、参数、返回地址、保存的 rbp、局部变量，以及 rsp/rbp 的位置](/img/diagrams/c-stack-frame.svg)
+
+
+```c
+int result = add(3, 5);
+printf("%d\n", result);      /* 8 */
+```
+
+**定义不等于执行**——只有调用时才真正运行。
+
+## 没有返回值：void
+
+```c
+void print_line(void) {
+    printf("----------\n");
+}
+
+print_line();
+print_line();
+```
+
+输出：
+
+```text
+----------
+----------
+```
+
+:::warning[`void` 和 `(void)` 的区别]
+```c
+void f(void)        /* 明确：不接收参数 */
+void f()            /* 老式写法：参数未指定 */
+```
+
+和 `main` 一样，现代代码应该写 `(void)`。
+
+**返回类型 `void` 表示"不返回值"，参数 `(void)` 表示"不接收参数"** —— 两处都可能用 `void`，别混。
+:::
+
+### void 函数可以提前返回
+
+```c
+void check(int n) {
+    if (n < 0) {
+        printf("负数，直接返回\n");
+        return;                  /* void 函数也 return，只是不带值 */
+    }
+    printf("处理 %d\n", n);
+}
+```
+
+这种「提前返回」叫**卫语句**，能减少嵌套。
+
+## 参数：值传递的真相
+
+:::danger[这是 C 最重要的机制，必须搞懂]
+```c
+void change(int x) {
+    x = 100;              /* 改的是副本 */
+}
+
+int main(void) {
+    int a = 1;
+    change(a);
+    printf("%d\n", a);    /* 还是 1！ */
+    return 0;
+}
+```
+
+**函数改不了外面的变量。**
+:::
+
+### 为什么
+
+:::tip[深入一点：参数是"复制"进去的]
+调用 `change(a)` 时，C 会**把 `a` 的值复制一份**给参数 `x`。
+
+`x` 和 `a` 是**两块不同的内存**：
+
+```text
+main 的 a:  [ 1 ]   ← 地址 0x100
+change 的 x:[ 1 ]   ← 地址 0x200（另一个位置）
+```
+
+改 `x` 只影响 0x200，`main` 里的 `a` 在 0x100，完全没变。
+
+**这叫「值传递」（pass by value）**，是 C 唯一的传参方式。
+:::
+
+### 经典例子：swap 为什么失败
+
+```c
+void swap_wrong(int a, int b) {
+    int t = a;
+    a = b;
+    b = t;
+}
+
+int main(void) {
+    int x = 1, y = 2;
+    swap_wrong(x, y);
+    printf("x=%d y=%d\n", x, y);      /* 1 2，没换成功！ */
+    return 0;
+}
+```
+
+本机实测：
+
+```text
+swap_wrong 后: x=1 y=2
+```
+
+**因为在函数里交换的只是两份副本，外面的 `x`、`y` 毫发无损。**
+
+### 解法：传指针
+
+```c
+void swap_right(int *a, int *b) {
+    int t = *a;
+    *a = *b;
+    *b = t;
+}
+
+int main(void) {
+    int x = 1, y = 2;
+    swap_right(&x, &y);              /* 传地址 */
+    printf("x=%d y=%d\n", x, y);      /* 2 1，成功！ */
+    return 0;
+}
+```
+
+本机实测：
+
+```text
+swap_right 后: x=2 y=1
+```
+
+:::info[`*` 和 `&` 是什么]
+- `&x` —— **取地址**（address-of）
+- `*p` —— **解引用**（dereference），访问指针指向的值
+
+```c
+int n = 42;
+int *p = &n;        /* p 存 n 的地址 */
+printf("%d", *p);   /* 42，通过 p 拿到 n 的值 */
+*p = 99;            /* 通过 p 修改 n */
+printf("%d", n);    /* 99 */
+```
+
+**下一课详细讲指针。** 现在只要知道"传地址能让函数改外面的变量"就够了。
+:::
+
+## 数组参数：自动退化为指针
+
+```c
+void print_array(int arr[], int n) {
+    for (int i = 0; i < n; i++) {
+        printf("%d ", arr[i]);
+    }
+}
+```
+
+:::danger[数组传参必须额外传长度]
+```c
+void print_array(int arr[]) {
+    /* 这里的 arr 是指针，不是数组！ */
+    size_t n = sizeof(arr) / sizeof(arr[0]);    /* ❌ 错误 */
+}
+```
+
+本机实测：
+
+```text
+sizeof(arr)=20   （在 main 里，数组的真实大小）
+sizeof(q)=8      （指针的大小）
+```
+
+**在函数内部 `sizeof(arr)` 得到的是指针大小 8，不是数组大小。**
+
+**规则：传数组一定同时传长度。**
+:::
+
+## 函数声明与定义分离
+
+C 要求**先声明后使用**。如果函数定义在后面，要先声明：
+
+```c
+/* 声明（原型）：告诉编译器有这个函数 */
+int add(int a, int b);
+
+int main(void) {
+    printf("%d\n", add(1, 2));    /* ✅ 已知声明，能用 */
+    return 0;
+}
+
+/* 定义：真正的实现 */
+int add(int a, int b) {
+    return a + b;
+}
+```
+
+:::tip[为什么需要声明]
+编译器**从上往下**扫描。看到 `add(1,2)` 时如果没见过 `add`，就不知道参数和返回类型，只能猜（`implicit declaration` 警告）。
+
+**声明就是提前告诉编译器"有这么个函数，长这样"。**
+
+多文件工程里，声明放在 `.h` 头文件里——第 27 课详细讲。
+:::
+
+## 递归：函数调用自己
+
+```c
+int factorial(int n) {
+    if (n <= 1) return 1;            /* 终止条件必须有 */
+    return n * factorial(n - 1);
+}
+
+printf("%d\n", factorial(5));        /* 120 */
+```
+
+:::danger[递归必须有终止条件]
+```c
+int bad(int n) {
+    return bad(n - 1);        /* ❌ 永不停止 → 栈溢出 */
+}
+```
+
+每层递归都在栈上占一块空间，无限递归会把栈耗尽 → **段错误**（stack overflow）。
+
+**写递归第一件事就是写终止条件。**
+:::
+
+递归适合：树形结构、分治算法。**简单的计数循环别用递归**（效率低且易错）。
+
+## 完整示例
+
+```c
+#include <stdio.h>
+
+/* 函数声明 */
+int rect_area(int w, int h);
+double average(const int arr[], int n);
+void print_result(const char *label, double value);
+
+int main(void) {
+    int w = 5, h = 3;
+    printf("面积：%d\n", rect_area(w, h));
+
+    int scores[] = {85, 92, 78, 95, 88};
+    int n = sizeof(scores) / sizeof(scores[0]);
+    print_result("平均分", average(scores, n));
+
+    return 0;
+}
+
+/* 函数定义 */
+int rect_area(int w, int h) {
+    return w * h;
+}
+
+double average(const int arr[], int n) {
+    if (n <= 0) return 0.0;
+
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+        sum += arr[i];
+    }
+    return (double)sum / n;
+}
+
+void print_result(const char *label, double value) {
+    printf("%s：%.2f\n", label, value);
+}
+```
+
+输出：
+
+```text
+面积：15
+平均分：87.60
+```
+
+:::tip[`const int arr[]` 是什么意思]
+```c
+double average(const int arr[], int n)
+```
+
+`const` 表示**函数承诺不修改数组内容**。
+
+好处：
+
+1. 调用者放心——传进去的数组不会被改
+2. 编译器能优化
+3. 能接受 `const` 数组（不加 `const` 就传不进去）
+
+**只读的数组参数都该加 `const`。**
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 忘写返回类型 | 默认 `int`（旧标准）| 语法不完整 | 写 `void` 或具体类型 |
+| 函数改名没改调用 | `implicit declaration` | 名字不一致 | 检查拼写 |
+| 参数个数不对 | `too many/few arguments` | 调用与定义不符 | 核对参数 |
+| 想通过参数改外面变量 | 值没变 | 值传递 | 传指针 |
+| 忘 `return` | 返回垃圾值 | 非 void 函数没返回 | 加 `return` |
+| 数组参数用 sizeof | 得到指针大小 | 数组退化 | 额外传长度 |
+| 递归没终止条件 | 段错误 | 无限递归 | 先写终止条件 |
+
+:::danger[非 void 函数不 return 是未定义行为]
+```c
+int f(void) {
+    /* 没有 return */
+}
+```
+
+调用者拿到的是**垃圾值**。编译器会警告：
+
+```text
+warning: non-void function does not return a value
+```
+
+**看到这个警告一定要修。**
+:::
+
+## 本课自检
+
+- [ ] 会定义和调用函数
+- [ ] 知道 `void` 表示不返回值
+- [ ] **理解值传递：参数是副本，改不了外面的变量**
+- [ ] 知道 swap 为什么失败、怎么用指针解决
+- [ ] 知道 `&` 取地址、`*` 解引用
+- [ ] **知道数组传参要额外传长度**
+- [ ] 会写函数声明（原型）
+- [ ] 知道递归必须有终止条件
+- [ ] 会用 `const` 修饰只读参数
+
+## 下一步
+
+[16 作用域与存储期](./16-scope) —— 变量活多久、在哪能用，这决定了程序的行为。

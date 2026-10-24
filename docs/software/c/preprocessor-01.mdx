@@ -1,0 +1,268 @@
+---
+id: preprocessor-01
+title: "01 预处理器"
+sidebar_position: 2
+description: "预处理器 第 1 部分：预处理器"
+---
+
+# 01 预处理器
+**本页学什么**
+
+- 预处理在编译流程中的位置，以及**它是纯文本处理**
+- 函数式宏的三个经典陷阱，用 `gcc -E` **看真实展开**
+- `#` 字符串化与 `##` 记号连接，以及为什么要双层包装
+- 条件编译与预定义宏
+- include guard vs `#pragma once` 的真实差异
+- X-Macro 技巧：一份定义生成枚举和表（**实测输出**）
+
+预处理器是 C 里唯一**在编译之前**运行的阶段，它完全不理解 C 语法——只做文本替换。这既是它强大的原因，也是它危险的原因。
+
+## 一、预处理器做的事
+
+![C 预处理流程：10 行源文件经 include 递归展开与宏替换后变成约 1750 行的 .i 文件](/img/diagrams/c-preprocess-flow.svg)
+
+
+回顾 [工具链页](./toolchain) 的四阶段：
+
+```mermaid
+flowchart LR
+    A["main.c"] -->|"预处理器<br/>gcc -E"| B["main.i<br/>纯 C，无 # 指令"]
+    B -->|"编译器"| C["main.s"]
+    C --> D["main.o"]
+    D --> E["可执行文件"]
+```
+
+预处理器做四件事：
+
+1. **文件包含**：`#include` 把文件内容原样插入
+2. **宏展开**：`#define` 的文本替换
+3. **条件编译**：`#if` 系列决定哪些代码保留
+4. **删除注释**、处理行标记
+
+:::danger[预处理器不理解 C 语法]
+它只认 `#` 开头的指令和标识符。所以：
+
+- 宏没有类型、没有作用域、没有求值
+- `#define` 可以定义出语法错误的代码，直到编译时才报错
+- 宏替换**不尊重**括号、字符串、注释之外的任何结构
+
+这是所有宏陷阱的根源。
+:::
+
+## 二、对象式宏 vs 函数式宏
+
+```c
+#define PI 3.14159              /* 对象式宏 */
+#define MAX(a, b) ((a)>(b)?(a):(b))   /* 函数式宏 —— 名字后紧跟 ( */
+```
+
+**注意语法**：`MAX(a, b)` 的左括号必须**紧贴**宏名，中间不能有空格。写成 `MAX (a, b)` 就变成对象式宏，展开成 `(a, b)`。
+
+## 三、函数式宏的三个陷阱
+
+### 陷阱 1：参数不加括号 → 优先级错乱
+
+```c
+#define BAD_SQUARE(x) x * x
+#define SQUARE(x) ((x) * (x))
+```
+
+实测：
+
+```c
+printf("BAD_SQUARE(1+2)  = %d  (expected 9)\n", BAD_SQUARE(1 + 2));
+printf("SQUARE(1+2)      = %d\n", SQUARE(1 + 2));
+```
+
+```text
+=== macro side effects ===
+BAD_SQUARE(1+2)  = 5  (expected 9)
+SQUARE(1+2)      = 9
+```
+
+**原因**：`BAD_SQUARE(1+2)` 展开成 `1+2 * 1+2` = `1 + 2 + 2` = **5**（`*` 优先级高于 `+`）。
+
+用 `gcc -E` 看真实展开：
+
+```bash
+gcc -E -P pp.c | grep 'int r ='
+```
+
+```text
+    int r = ((3) > (5) ? (3) : (5)) + ((2) + (2));
+```
+
+:::tip[两条硬性规则]
+1. **每个参数都加括号**：`#define MUL(a,b) ((a)*(b))`
+2. **整个宏体加括号**：`#define MUL(a,b) ((a)*(b))` 而不是 `a*b`
+
+少了外层括号，`MUL(1,2)+3` 展开成 `1*2+3` 可能还行，但 `sizeof MUL(1,2)` 之类场景就会错。
+:::
+
+### 陷阱 2：参数多次求值 → 副作用被放大
+
+```c
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define SQUARE(x) ((x) * (x))
+```
+
+实测：
+
+```c
+int i = 3;
+printf("SQUARE(i++)      = %d   i now = %d\n", SQUARE(i++), i);
+
+int a = 1, b = 2;
+printf("MAX(a++, b++) = %d ; a=%d b=%d\n", MAX(a++, b++), a, b);
+```
+
+```text
+SQUARE(i++)      = 12   i now = 5
+BAD_SQUARE(1+2)  = 5  (expected 9)
+SQUARE(1+2)      = 9
+
+=== MAX double evaluation ===
+MAX(a++, b++) = 3 ; a=2 b=4
+```
+
+分析：
+
+- **`SQUARE(i++)`** 展开成 `((i++) * (i++))`——`i++` 执行了**两次**。`i` 从 3 变成 **5**（不是 4）。而且结果是 `3 * 4 = 12`（依赖求值顺序，实际是 **UB**）
+- **`MAX(a++, b++)`** 展开成 `((a++) > (b++) ? (a++) : (b++))`——`a` 被 `++` 一次（比较时），`b` 被 `++` **两次**（比较一次 + 选中分支又一次）。结果是 `a=2, b=4`
+
+编译器直接警告：
+
+```text
+C:\cprobe\macro.c:21:60: warning: multiple unsequenced modifications to 'i' [-Wunsequenced]
+C:\cprobe\macro.c:28:53: warning: unsequenced modification and access to 'a' [-Wunsequenced]
+C:\cprobe\macro.c:28:58: warning: unsequenced modification and access to 'b' [-Wunsequenced]
+```
+
+:::danger[为什么这是 UB 而不是"结果奇怪"]
+`((i++) * (i++))` 里 `i` 被修改两次，且没有其他用途——**违反序列点规则**，是 UB（参见 [陷阱页](./pitfalls)）。
+
+本实现给出了 12，但另一个编译器可能给 9、16 或别的。**没有任何保证。**
+:::
+
+**正确做法**：
+
+1. **不要在宏参数里用带副作用的表达式**（`++`、`--`、赋值、函数调用有副作用等）
+2. 或者**改用 `static inline` 函数**——参数只求值一次：[函数页](./functions) 有对比
+3. 或者用编译器的**语句表达式**扩展（GCC）：
+
+```c
+#define MAX(a, b) ({ typeof(a) _a = (a); typeof(b) _b = (b); _a > _b ? _a : _b; })
+```
+这个 GCC 扩展能避免重复求值，但**不可移植**（MSVC 不支持）。
+
+### 陷阱 3：多行宏忘记续行符
+
+```c
+#define LOG(msg)  \
+    do {         \
+        printf("[%s] %s\n", __func__, msg);  \
+    } while (0)
+```
+
+反斜杠 `\` 必须是**行尾最后一个字符**——后面**连空格都不能有**（有些编译器容忍空格，但不要冒险）。
+
+### `do { } while(0)` 惯用法
+
+为什么多语句宏要包在 `do { } while(0)` 里？
+
+```c
+/* 坏写法 */
+#define BAD_INIT(a, b) a = 0; b = 0
+
+if (cond)
+    BAD_INIT(x, y);   /* 展开成 a=0; b=0;  →  if 只管到 a=0，b=0 无条件执行！ */
+else
+    foo();
+/* 甚至会因为多出的分号导致 else 无匹配的 if，编译错误 */
+
+/* 好写法 */
+#define GOOD_INIT(a, b) do { a = 0; b = 0; } while (0)
+```
+
+`do { } while(0)` 让宏**像一个语句**：可以用在任何需要语句的地方，且结尾的分号正好匹配。
+
+## 四、`#` 字符串化与 `##` 记号连接
+
+### `#`：把参数变成字符串
+
+```c
+#define STR(x) #x
+```
+
+实测：
+
+```c
+printf("STR(1+2)      = %s\n", STR(1 + 2));
+printf("STR(VERSION)  = %s\n", STR(VERSION));
+printf("XSTR(VERSION) = %s\n", XSTR(VERSION));
+```
+
+```text
+=== stringize ===
+STR(1+2)      = 1 + 2
+STR(VERSION)  = VERSION
+XSTR(VERSION) = 3
+```
+
+**关键观察**：`STR(VERSION)` 得到 `"VERSION"`（宏名本身），而 `XSTR(VERSION)` 得到 `"3"`（宏展开后的值）。
+
+为什么？因为 **`#` 运算符阻止参数的宏展开**——它直接把传入的记号变成字符串。要让 `VERSION` 先展开成 `3`，需要**再包一层**：
+
+```c
+#define STR(x) #x
+#define XSTR(x) STR(x)      /* 双层包装 */
+#define VERSION 3
+
+XSTR(VERSION)   /* → XSTR(3) → STR(3) → "3" */
+```
+
+展开顺序：外层 `XSTR` 的参数 `VERSION` 先展开成 `3`（因为 `XSTR` 的替换列表里没有 `#` 或 `##`），再交给 `STR` 字符串化。
+
+:::tip[记忆法]
+**要展开 → 包两层；不要展开 → 一层。**
+
+这是宏元编程里最常用的技巧之一。
+:::
+
+### `##`：记号连接
+
+```c
+#define CAT(a, b) a##b
+```
+
+实测：
+
+```c
+#define CONCAT_XY CAT(X, Y)
+int CONCAT_XY = 100;   /* → int XY = 100; */
+```
+
+```text
+=== token paste ===
+CONCAT_XY = 100
+```
+
+`CAT(X, Y)` 得到 `XY`，所以变量名叫 `XY`。
+
+**用途**：批量生成名字——寄存器定义、字段名、函数名前缀。
+
+注意：`##` 也**阻止参数展开**（同 `#`），所以多层连接也要包两层。
+
+### 两者结合的经典用法
+
+```c
+#define REG32(base, off) (*(volatile uint32_t *)((base) + (off)))
+#define DEFINE_REG(name, addr) \
+    static volatile uint32_t *const name##_REG = (volatile uint32_t *)(addr)
+
+DEFINE_REG(UART, 0x40000000);   /* 生成 UART_REG */
+```
+
+---
+
+**翻页**：[下一页 →](./preprocessor-02) · [返回目录](./)

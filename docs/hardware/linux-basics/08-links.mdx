@@ -1,0 +1,264 @@
+---
+id: 08-links
+title: 08 链接与 inode
+sidebar_position: 8
+description: inode 是什么、硬链接和软链接的本质区别，以及为什么删了源文件一个还能用另一个失效。
+---
+
+# 08 链接与 inode
+
+**本课目标**：理解 inode，搞清硬链接和软链接的差别。
+
+## 先理解 inode
+
+:::tip[文件名不是文件本身]
+**文件的数据和元信息存在 inode 里，文件名只是一个"入口"。**
+
+```text
+目录项（文件名 → inode 号）      inode（存元信息 + 数据块位置）
+  hello.txt  →  12345         →  权限、大小、时间、数据块...
+```
+:::
+
+inode 里存什么：
+
+| 内容 | 说明 |
+| --- | --- |
+| 权限 | `rwx` |
+| 所有者/组 | uid / gid |
+| 大小 | 字节数 |
+| 时间戳 | 创建/修改/访问 |
+| **硬链接计数** | 有几个名字指向它 |
+| **数据块位置** | 真正数据在哪 |
+
+**inode 里不存文件名**——文件名在目录项里。
+
+## 看 inode 号
+
+```bash
+ls -i file.txt
+stat file.txt
+```
+
+本机实测：
+
+```bash
+stat -c "%n inode=%i links=%h" orig.txt hard.txt soft.txt
+```
+
+输出：
+
+```text
+orig.txt inode=37042 links=2
+hard.txt inode=37042 links=2
+soft.txt inode=37043 links=1
+```
+
+:::danger[这是理解软硬链接的关键数据]
+- `orig.txt` 和 `hard.txt`：**inode 相同（37042）、links=2** → 同一个文件的两个名字
+- `soft.txt`：**inode 不同（37043）、links=1** → 独立的小文件，内容指向别处
+:::
+
+## 硬链接：同一 inode 的多个名字
+
+```bash
+echo hi > orig.txt
+ln orig.txt hard.txt          # 创建硬链接
+```
+
+**效果**：`orig.txt` 和 `hard.txt` 是**同一个文件的两个名字**。
+
+| 特性 | 说明 |
+| --- | --- |
+| inode | **相同** |
+| 链接计数 | +1 |
+| 占用空间 | **不额外占用**（只有目录项多一点） |
+| 能跨分区 | ❌ 不行（inode 号是分区内唯一的） |
+| 能链接目录 | ❌ 一般不行（防止循环） |
+
+:::tip[删除一个名字不会删数据]
+```text
+links=2  →  rm orig.txt  →  links=1  →  数据还在
+```
+
+**只有链接计数归零，数据才真正删除。**
+
+本机实测：删掉 `orig.txt` 后，`cat hard.txt` 仍然输出 `hi`。
+:::
+
+## 软链接（符号链接）：指向路径的"快捷方式"
+
+```bash
+ln -s orig.txt soft.txt       # 创建软链接（-s = symbolic）
+```
+
+**效果**：`soft.txt` 是个**独立的小文件**，内容是"orig.txt 这个路径"。
+
+| 特性 | 说明 |
+| --- | --- |
+| inode | **不同**（自己一个） |
+| 链接计数 | 自己的 links=1 |
+| 占用空间 | 少量（存路径字符串） |
+| 能跨分区 | ✅ 能 |
+| 能链接目录 | ✅ 能 |
+| 源删除后 | ❌ **失效**（悬空链接） |
+
+本机实测：删掉 `orig.txt` 后：
+
+```text
+cat hard.txt   →  hi          （还能用）
+cat soft.txt   →  cat: soft.txt: 没有那个文件或目录
+```
+
+:::warning[软链接失效的错误信息容易误导]
+```text
+cat: soft.txt: 没有那个文件或目录
+```
+
+明明 `soft.txt` 还在！**报的是"目标"不存在**，不是链接本身不存在。
+
+看 `ls -l` 能发现：
+
+```bash
+ls -l soft.txt
+# lrwxrwxrwx 1 root root 8 ... soft.txt -> orig.txt
+```
+
+`l` 开头表示符号链接，`->` 后面是目标。
+:::
+
+## 两者对比表
+
+| 维度 | 硬链接 | 软链接 |
+| --- | --- | --- |
+| 创建命令 | `ln 源 目标` | `ln -s 源 目标` |
+| inode | **与源相同** | 自己一个 |
+| 删除源后 | **仍可用** | **失效** |
+| 跨分区 | ❌ | ✅ |
+| 链接目录 | ❌ | ✅ |
+| 占用空间 | 几乎不占 | 存路径，少量 |
+| `ls -l` 首字符 | `-`（普通文件） | **`l`** |
+| 修改内容 | 改一个另一个也变（同一个文件） | 改的是目标文件 |
+
+## 实际用途
+
+### 软链接最常用：版本切换
+
+```bash
+# 系统里常见
+ls -l /usr/bin/python3
+# lrwxrwxrwx ... python3 -> python3.11
+```
+
+**升级时只需改链接指向**，不用改所有调用方。
+
+### 软链接：跨分区引用
+
+```bash
+# 数据在 /data，想在 /home 下方便访问
+ln -s /data/project ~/project
+```
+
+### 硬链接：节省空间的"副本"
+
+```bash
+# 同一份数据，两个位置都能访问，不占双倍空间
+ln bigfile.iso /backup/bigfile.iso
+```
+
+（但注意：改一个另一个也变，因为就是同一个文件。）
+
+## 查看链接
+
+```bash
+ls -l file              # l 开头 = 软链接，-> 显示目标
+readlink file           # 只输出软链接的目标路径
+readlink -f file        # 解析成最终绝对路径
+stat file               # 看到 inode 和 links
+```
+
+## 实验：自己验证一遍
+
+```bash
+mkdir -p ~/linktest && cd ~/linktest
+
+# 建源文件
+echo "original content" > src.txt
+
+# 建两种链接
+ln src.txt hard.txt
+ln -s src.txt soft.txt
+
+# 看 inode
+stat -c "%n: inode=%i links=%h" src.txt hard.txt soft.txt
+
+# 看 ls -l（注意软链接的 l 和 ->）
+ls -l
+
+# 改内容，三个都变吗？
+echo "new content" >> src.txt
+cat src.txt hard.txt soft.txt
+
+# 删除源文件
+rm src.txt
+
+# 现在谁还能用？
+cat hard.txt            # ✅ 能用
+cat soft.txt            # ❌ 失效
+```
+
+预期输出（inode 号会不同）：
+
+```text
+src.txt: inode=37042 links=2
+hard.txt: inode=37042 links=2
+soft.txt: inode=37043 links=1
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 忘写 `-s` 建软链接 | 建成了硬链接 | `ln` 默认硬链接 | `ln -s` |
+| 硬链接跨分区失败 | `Invalid cross-device link` | inode 是分区内的 | 改用软链接 |
+| 硬链接目录失败 | `Operation not permitted` | 防循环 | 改用软链接 |
+| 软链接用相对路径 | 移动后失效 | 相对路径按链接位置解析 | 用绝对路径 |
+| 删除软链接删到源文件 | 数据丢了 | 加了尾部 `/` 或 `/*` | 小心操作 |
+| 软链接失效但看不出 | 报"没有那个文件" | 报的是目标 | `ls -l` 看 `->` |
+
+:::danger[删软链接时别加斜杠]
+```bash
+rm softlink/            # ⚠️ 如果 softlink 指向目录，可能删目录内容
+rm softlink             # ✅ 只删链接本身
+```
+
+**尾部加 `/` 会让 shell 顺着链接进入目标目录。**
+:::
+
+:::warning[软链接用绝对路径更稳]
+```bash
+ln -s /data/project ~/project      # ✅ 绝对路径
+ln -s ../data/project ~/project    # ⚠️ 相对路径，取决于链接所在位置
+```
+
+**相对路径按"链接所在目录"解析**，移动链接后就会断。
+
+**不确定时用绝对路径。**
+:::
+
+## 本课自检
+
+- [ ] 知道 inode 存什么（不存文件名）
+- [ ] **会用 `stat` 看 inode 号和链接数**
+- [ ] **知道硬链接 inode 相同、links 增加**
+- [ ] **知道软链接是独立文件（inode 不同）**
+- [ ] **知道删源文件后硬链接可用、软链接失效**
+- [ ] 知道硬链接不能跨分区、不能链接目录
+- [ ] 知道软链接能跨分区、能链接目录
+- [ ] 会用 `ls -l` 识别软链接（`l` + `->`）
+- [ ] 会用 `readlink -f` 解析链接
+- [ ] 知道软链接用绝对路径更稳
+
+## 下一步
+
+[09 查找文件](./09-find) —— `find` 的强大用法，以及 `which` `locate`。

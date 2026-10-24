@@ -1,0 +1,216 @@
+---
+id: functions-03
+title: "03 类型注解"
+sidebar_position: 4
+description: "函数与作用域 第 3 部分：类型注解"
+---
+
+# 03 类型注解
+注解是**可选的元数据**，Python 运行时**不会**检查它：
+
+```python
+def ann(a: int, b: str = "x") -> bool:
+    return True
+
+print(ann.__annotations__)
+print(ann("这不是 int"))      # 运行时照跑，不报错
+```
+
+```text
+{'a': <class 'int'>, 'b': <class 'str'>, 'return': <class 'bool'>}
+True
+```
+
+注解存在 `__annotations__` 里，供 **mypy / IDE / 文档生成器**使用。它不校验、不转换——**只有第三方类型检查器会看它**。
+
+:::info[注解的三个实际价值]
+1. **IDE 自动补全和跳转**准确得多
+2. **mypy 能在你运行前发现 bug**（第 10 页）
+3. **它就是最好的文档**——`def load(path: Path) -> dict[str, Record]:` 一眼看懂
+
+从今天起给新函数写注解，收益远超成本。
+:::
+
+## 10. lambda：只用于简单的单行
+
+```python
+print(sorted([(1, "b"), (1, "a")], key=lambda t: t[1]))
+```
+
+```text
+[(1, 'a'), (1, 'b')]
+```
+
+lambda 的限制：**只能写一个表达式**，不能有多条语句、不能有 `return`（它自动返回表达式的值）。
+
+需要多行逻辑就写普通 `def`，或者用第 9 页的 `operator.itemgetter` 替代：
+
+```python
+from operator import itemgetter
+print(sorted([(1, "b"), (1, "a")], key=itemgetter(1)))
+```
+
+```text
+[(1, 'a'), (1, 'b')]
+```
+
+`itemgetter` 比 lambda 更快也更清晰，排序场景优先用它。
+
+## 11. 递归与限制
+
+```python
+import sys
+print("默认递归深度限制:", sys.getrecursionlimit())
+```
+
+```text
+默认递归深度限制: 1000
+```
+
+Python **没有尾递归优化**，递归深度超过限制会 `RecursionError`。处理深结构（比如解析嵌套 JSON）时，要么改成迭代，要么谨慎调整限制——但调得太高会真的耗尽 C 栈并崩溃。
+
+## 12. 命名空间：三个字典
+
+LEGB 里的 G 和 L 具体实现为字典：
+
+```python
+print("globals 里有 __name__:", "__name__" in globals())
+print("内建名字数量:", len(dir(__builtins__)))
+```
+
+```text
+globals 里有 __name__: True
+内建名字数量: 158
+```
+
+- `globals()`：模块级命名空间（一个字典）
+- `locals()`：当前局部命名空间（函数内是**快照**，修改它往往无效）
+- `builtins`：内建名字（`len`、`print` 等）
+
+:::danger[不要依赖修改 `locals()` 的返回值]
+在函数里 `locals()` 返回的是一个**快照字典**，改它**不会**影响真正的局部变量。官方文档明确说明这个行为不可依赖。想动态读写变量请用字典。
+:::
+
+## 13. 一个完整例子：用闭包实现计数器与缓存
+
+把这一页的机制串起来：
+
+```python
+from typing import Callable
+
+
+def make_counter(start: int = 0, step: int = 1) -> Callable[[], int]:
+    """返回一个每次调用加 step 的计数器。"""
+    count = start - step          # 闭包变量
+
+    def inc() -> int:
+        nonlocal count
+        count += step
+        return count
+
+    return inc
+
+
+def make_key_func(*fields: str) -> Callable[[dict], tuple]:
+    """生成一个从字典里取指定字段的排序键函数。"""
+    def key(row: dict) -> tuple:
+        return tuple(row[f] for f in fields)   # 捕获 fields，不会晚绑定问题
+    return key
+
+
+if __name__ == "__main__":
+    c1 = make_counter()
+    c2 = make_counter(100, 10)
+    print("c1:", c1(), c1(), c1())
+    print("c2:", c2(), c2())
+
+    rows = [
+        {"name": "bob", "score": 70},
+        {"name": "amy", "score": 90},
+        {"name": "cy", "score": 70},
+    ]
+    by_score_then_name = make_key_func("score", "name")
+    for r in sorted(rows, key=lambda row: (-row["score"], row["name"])):
+        print(f"  {r['name']:4} {r['score']}")
+```
+
+预期输出：
+
+```text
+c1: 0 1 2
+c2: 100 110
+  amy 90
+  bob 70
+  cy  70
+```
+
+注意 `c1` 和 `c2` 各自持有**独立的** `count`——每次调用 `make_counter` 都创建了新的闭包。这就是闭包能替代简单类的原因。
+
+## 14. 验证：预测这些输出
+
+```python
+def f(x, acc=[]):
+    acc.append(x)
+    return acc
+
+print(f(1), f(2))
+
+x = 5
+def g():
+    return x
+x = 10
+print(g())
+
+funcs = [lambda: i * 2 for i in range(3)]
+print([fn() for fn in funcs])
+```
+
+:::info[答案]
+```text
+[1] [1, 2]
+10
+[4, 4, 4]
+```
+
+1. 默认列表被复用，第二次调用时里面已经有 `1`
+2. `g()` 在**调用时**才查全局 `x`，那时已经是 `10`
+3. 晚绑定：三个 lambda 都读到循环结束后的 `i == 2`，`2 * 2 == 4`
+:::
+
+## 常见坑
+
+| 现象 | 真实原因 | 解决 |
+| --- | --- | --- |
+| 默认列表「记住」了上次的内容 | 默认值在定义时求值一次 | 用 `None` 作哨兵，函数内新建 |
+| `UnboundLocalError` | 函数内有赋值 → 该名字是局部的，读取时还没值 | 加 `global` / `nonlocal`，或改局部名 |
+| 循环里创建的 lambda 全返回最后的值 | 闭包捕获变量而非值，晚绑定 | `lambda i=i:` 或用工厂函数 |
+| 函数里改了全局变量但外面没变 | 没写 `global`，只是建了局部变量 | 加 `global x`（但优先重新设计） |
+| 觉得函数返回了东西，实际是 `None` | 忘了写 `return` | 用 mypy 检查 |
+| `f(a, b=1)` 报「positional-only」 | 参数在 `/` 之前 | 只能按位置传 |
+| 想让参数必须写名字 | 没用 `*` | 把参数放到 `*` 后面 |
+| 递归深了报 `RecursionError` | Python 无尾递归优化，默认限 1000 | 改迭代，或谨慎调 `setrecursionlimit` |
+| 类型注解写了但传错类型不报错 | 注解运行时不检查 | 用 mypy（第 10 页） |
+| 改 `locals()` 返回的字典无效 | 它是快照 | 不要依赖它 |
+
+## 自检清单
+
+- [ ] 能说出 LEGB 四个字母分别代表什么，以及查找顺序
+- [ ] 能解释为什么可变默认参数会「记住」上次的值，并写出正确写法
+- [ ] 知道 `global` 和 `nonlocal` 的区别与各自适用场景
+- [ ] 能解释 `UnboundLocalError` 的真正成因（编译期决定作用域）
+- [ ] 能解释闭包晚绑定，并给出至少一种修法
+- [ ] 能区分「仅位置参数」和「仅关键字参数」，知道 `/` 和 `*` 的作用
+- [ ] 知道 `*args` / `**kwargs` 分别在定义侧和调用侧的行为
+- [ ] 知道注解运行时不生效，以及它的真正价值
+- [ ] 知道没有 `return` 时函数返回 `None`
+- [ ] 能写一个返回闭包的函数（如计数器）
+
+## 下一步
+
+逻辑装进函数了，接下来把状态装进类：[面向对象](./oop)。
+
+**参考链接**：[函数定义文档](https://docs.python.org/zh-cn/3/tutorial/controlflow.html#defining-functions) · [作用域与命名空间](https://docs.python.org/zh-cn/3/tutorial/classes.html#python-scopes-and-namespaces) · [函数式编程指引](https://docs.python.org/zh-cn/3/howto/functional.html)
+
+---
+
+**翻页**：[← 上一页](./functions-02) · [返回目录](./)

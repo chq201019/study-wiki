@@ -1,0 +1,341 @@
+---
+id: 05-files
+title: 05 浏览与操作文件
+sidebar_position: 5
+description: ls/cd/cp/mv/rm 的完整用法、通配符、以及 rm 这个最危险的命令怎么用才安全。
+---
+
+# 05 浏览与操作文件
+
+**本课目标**：掌握日常 90% 的文件操作命令。
+
+## `ls`：看有什么
+
+```bash
+ls                  # 列出当前目录
+ls /etc             # 列出指定目录
+ls -l               # 详细列表
+ls -a               # 包括隐藏文件（. 开头的）
+ls -lh              # 详细 + 人类可读的大小
+ls -R               # 递归列出子目录
+```
+
+本机实测：
+
+```bash
+ls
+# a.txt  b.log  sub
+
+ls -a
+# .  ..  a.txt  b.log  .hidden  sub
+
+ls -lh
+# -rw-r--r-- 1 root root  0 10月18日 14:19 a.txt
+# drwxr-xr-x 3 root root 60 10月18日 14:19 sub
+```
+
+:::tip[`-a` 里的 `.` 和 `..`]
+```text
+.      ← 当前目录
+..     ← 上级目录
+.hidden ← 隐藏文件（名字以 . 开头）
+```
+
+**Linux 里"隐藏文件"就是名字以 `.` 开头的文件**，没有特殊属性。
+:::
+
+### 常用组合
+
+```bash
+ls -lah             # 详细 + 人类可读 + 隐藏文件（最常用）
+ls -lt              # 按修改时间排序（新的在前）
+ls -ltr             # 按时间倒序（最旧的在前，看日志常用）
+ls -lS              # 按大小排序
+```
+
+### `ls -l` 每一列是什么
+
+```text
+-rw-r--r-- 1 root root  4096 10月18日 14:19 a.txt
+│└┬┘└┬┘└┬┘ │  │    │     │              │
+│ │  │  │  │  │    │     │              └─ 文件名
+│ │  │  │  │  │    │     └─ 修改时间
+│ │  │  │  │  │    └─ 大小（字节）
+│ │  │  │  │  └─ 所属组
+│ │  │  │  └─ 所有者
+│ │  │  └─ 硬链接数
+│ │  └─ 其他人权限（r--）
+│ └─ 所属组权限（r--）
+└─ 所有者权限（rw-）
+```
+
+首字符 `-` 是普通文件、`d` 是目录（[第 4 课](./04-filesystem)讲过）。
+
+## `cd`：切换目录
+
+```bash
+cd /etc             # 绝对路径
+cd ssh              # 相对路径
+cd ..               # 上一级
+cd ~                # 家目录
+cd                  # 也是家目录
+cd -                # 回到上一次的目录
+```
+
+:::danger[`cd` 是 Shell 内建命令]
+```bash
+which cd
+# 没有输出 —— 它不是程序文件
+```
+
+如果 `cd` 是外部程序，它只能改自己的目录，你的 Shell 根本不受影响（[第 3 课](./03-terminal)讲过）。
+:::
+
+## `pwd`：我在哪
+
+```bash
+pwd
+# /tmp/lf
+```
+
+**迷路时第一个敲的命令。**
+
+## `touch`：创建空文件
+
+```bash
+touch newfile.txt           # 创建空文件
+touch a.txt b.txt c.txt     # 一次创建多个
+touch existing.txt          # 文件已存在 → 只更新修改时间
+```
+
+## `mkdir`：创建目录
+
+```bash
+mkdir mydir                 # 创建单个
+mkdir -p a/b/c              # 递归创建（父目录不存在也能建）
+mkdir dir1 dir2             # 一次多个
+```
+
+:::tip[`-p` 是最常用的选项]
+```bash
+mkdir a/b/c                 # ❌ 如果 a 不存在就报错
+mkdir -p a/b/c              # ✅ 自动创建所有父目录
+```
+
+**写脚本时几乎总是用 `-p`**——幂等，重复执行也不报错。
+:::
+
+## `cp`：复制
+
+```bash
+cp src.txt dst.txt          # 复制文件
+cp file.txt /tmp/           # 复制到目录
+cp -r mydir mydir2          # 复制目录（必须加 -r）
+cp -i src dst               # 覆盖前询问
+cp -v src dst               # 显示过程
+```
+
+:::danger[复制目录必须加 `-r`]
+```bash
+cp mydir backup             # ❌ 报错：omitting directory
+cp -r mydir backup          # ✅ 递归复制
+```
+
+`-r` = recursive（递归）。
+:::
+
+### 保留属性
+
+```bash
+cp -a srcdir dstdir         # 归档模式：保留权限、时间、符号链接
+```
+
+**备份时用 `-a`**——否则权限和时间戳都会变。
+
+## `mv`：移动 / 重命名
+
+:::info[`mv` 一个命令干两件事]
+```bash
+mv oldname.txt newname.txt      # 重命名
+mv file.txt /tmp/               # 移动到目录
+mv file.txt /tmp/newname.txt    # 移动 + 改名
+```
+
+**习惯上重命名就是用 `mv`**（有些发行版另带 `rename` 命令做批量改名，但不是所有系统都有）。
+:::
+
+```bash
+mv -i src dst               # 覆盖前询问
+mv -v src dst               # 显示过程
+mv *.log /var/log/archive/  # 批量移动（通配符）
+```
+
+## `rm`：删除（最危险）
+
+```bash
+rm file.txt                 # 删文件
+rm -f file.txt              # 强制删，不存在的也不报错
+rm -r mydir                 # 删目录及内容
+rm -rf mydir                # 强制递归删（最危险）
+rm -i file.txt              # 删除前询问
+```
+
+:::danger[`rm -rf` 没有回收站，删了就没了]
+```bash
+rm -rf /tmp/mydir           # 直接删掉整个目录
+```
+
+**Linux 没有回收站。** 删除是真正的解除链接，文件内容可能立刻被覆盖。
+
+**三条保命规则**：
+
+1. **`rm -rf` 前先 `ls` 看清目录内容**
+2. **路径末尾别乱加 `/` 和空格**
+3. **在变量里删除时务必加引号**（见下）
+:::
+
+### 最危险的写法
+
+:::danger[一个空格能毁掉系统]
+```bash
+rm -rf /tmp/mydir           # ✅ 删 /tmp/mydir
+rm -rf / tmp/mydir          # ❌ 删根目录！然后尝试删 /tmp/mydir
+```
+
+**多一个空格，`/` 和 `tmp` 变成两个独立参数** → 删整个根目录。
+
+**现代 `rm` 默认会拒绝 `rm -rf /`**（有保护），但**不要依赖它**。
+:::
+
+### 变量未定义的危险
+
+```bash
+#!/bin/bash
+DIR=$1
+rm -rf $DIR/              # ❌ 如果 $DIR 是空的，变成 rm -rf /
+```
+
+:::tip[正确写法：加引号 + 检查]
+```bash
+DIR="$1"
+if [ -z "$DIR" ]; then
+    echo "必须指定目录"
+    exit 1
+fi
+rm -rf "$DIR"/
+```
+
+或者用 `${DIR:?}`：
+
+```bash
+rm -rf "${DIR:?}"        # DIR 为空就报错退出
+```
+
+**这是运维事故的高频来源。**
+:::
+
+## 通配符（globbing）
+
+```bash
+*           # 任意多个字符（包括零个）
+?           # 恰好一个字符
+[abc]       # a、b、c 中任意一个
+[0-9]       # 任意数字
+[!abc]      # 不是 a/b/c 的任意一个
+```
+
+本机实测：
+
+```bash
+echo *.log        # b.log x1.log x2.log z9.log
+echo ?1*          # x1.log y1.txt
+echo [xy]*        # x1.log x2.log y1.txt
+```
+
+:::warning[通配符由 Shell 展开，不是命令自己处理]
+```bash
+echo *.log
+```
+
+Shell **先把 `*.log` 展开成实际文件名列表**，再传给 `echo`。
+
+**所以没有匹配时**：
+
+```bash
+echo *.nonexistent
+# *.nonexistent          ← 原样传过去了（bash 默认行为）
+```
+
+可以用 `shopt -s nullglob` 让无匹配时展开为空。
+:::
+
+:::danger[通配符不能跨目录]
+```bash
+ls */*.txt             # ✅ 一级子目录下的 txt
+ls **/*.txt            # ⚠️ 需要开 globstar 才递归
+```
+:::
+
+## 查看文件大小
+
+```bash
+ls -lh                    # 单个文件
+du -sh mydir              # 整个目录的总大小
+du -sh *                  # 当前目录下每项的大小
+```
+
+## 完整示例
+
+```bash
+# 建一个练习目录
+mkdir -p ~/practice/logs
+cd ~/practice
+
+# 创建几个文件
+touch app.log error.log data.txt notes.md
+
+# 看看有什么
+ls -lh
+
+# 复制、改名、移动
+cp data.txt data.backup.txt
+mv notes.md notes.txt
+mv error.log logs/
+
+# 用通配符批量操作
+cp *.log logs/             # 所有 .log 复制到 logs/
+
+# 查看结果
+ls -R
+
+# 清理（小心！）
+rm -rf ~/practice
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `cp dir dir2` | omitting directory | 目录要 `-r` | `cp -r` |
+| `rm -rf / tmp/x` | **删根目录** | 多一个空格 | 仔细检查 |
+| `rm -rf $VAR` 且 VAR 空 | 删除当前目录或根 | 变量未检查 | `"${VAR:?}"` |
+| `mkdir a/b/c` 报错 | 父目录不存在 | 没加 `-p` | `mkdir -p` |
+| `cd` 后 `ls` 还是旧内容 | 在两个 shell 里 | 不同 shell 目录独立 | 确认当前窗口 |
+| 中文文件名乱码 | locale 问题 | 编码不一致 | 设 `LANG=C.UTF-8` |
+
+## 本课自检
+
+- [ ] 会用 `ls -lh` / `ls -la` / `ls -ltr`
+- [ ] 能看懂 `ls -l` 的每一列
+- [ ] 会用 `cd` 各种形式（`..`、`~`、`-`）
+- [ ] 会用 `mkdir -p` 创建多级目录
+- [ ] **知道复制目录必须 `cp -r`**
+- [ ] 知道 `mv` 同时用于移动和重命名
+- [ ] **知道 `rm` 没有回收站，`rm -rf` 极危险**
+- [ ] **知道 `rm -rf / tmp/x` 这种空格错误**
+- [ ] 会用 `${VAR:?}` 防止空变量删错东西
+- [ ] 掌握 `*` `?` `[abc]` 通配符
+
+## 下一步
+
+[06 查看文件内容](./06-view) —— `cat` `less` `head` `tail` `grep`。

@@ -1,0 +1,303 @@
+---
+id: 27-performance
+title: 27 性能与零开销抽象
+sidebar_position: 27
+description: 实测 C++ 抽象层有没有开销、vector 与原始数组对比、reserve 的效果，以及什么时候该担心性能。
+---
+
+# 27 性能与零开销抽象
+
+**本课目标**：用实测数据搞清"C++ 会不会比 C 慢"，知道该在哪些地方优化。
+
+## 核心问题
+
+很多人说"C++ 有额外开销"。**真的吗？** 实测一下。
+
+## 实测：抽象层 vs 手写代码
+
+本机实测（`-O2`，2000 万元素求和）：
+
+```text
+手写下标循环: 3.8757 ms
+范围 for:     3.7456 ms
+std::vector:  4.0048 ms
+原始数组:     4.1231 ms
+```
+
+:::tip[结论：std::vector 和原始数组一样快，甚至更快]
+```text
+std::vector:  4.00 ms
+原始数组:     4.12 ms
+```
+
+**`std::vector` 没有额外开销。**
+
+原因：`vector` 内部就是**一个指针 + 两个 size**，`operator[]` 被编译器内联成了裸指针访问。
+
+**这就是"零开销抽象"——抽象在编译后消失了。**
+:::
+
+### 范围 for 也不慢
+
+```text
+手写下标循环: 3.88 ms
+范围 for:     3.75 ms
+```
+
+**范围 for 编译后和手写循环等价**，甚至略快（编译器更容易优化）。
+
+**所以放心用范围 for**，可读性更好且没有代价。
+
+## 实测：reserve 的效果
+
+```text
+不 reserve:   3.3392 ms
+reserve:      2.1644 ms
+```
+
+:::tip[`reserve` 提升 35%]
+```cpp
+/* ❌ 反复扩容：1→2→4→8→...→1048576，约 20 次重新分配 */
+std::vector<int> a;
+for (int i = 0; i < 1000000; i++) a.push_back(i);
+
+/* ✅ 一次分配到位 */
+std::vector<int> a;
+a.reserve(1000000);
+for (int i = 0; i < 1000000; i++) a.push_back(i);
+```
+
+**知道大概要装多少时，`reserve` 是性价比最高的优化。**
+:::
+
+## 什么时候 C++ 真的会更慢
+
+:::danger[三个真实的性能陷阱]
+**① `shared_ptr` 的引用计数**
+
+```cpp
+auto p = std::make_shared<T>();      /* 拷贝要原子操作 */
+auto q = p;                          /* 原子递增，比普通指针慢 */
+```
+
+**高频拷贝 `shared_ptr` 会明显变慢**。只在真的需要共享时用。
+
+**② 不必要的拷贝**
+
+```cpp
+void f(std::string s);               /* ❌ 每次调用复制字符串 */
+void f(const std::string &s);        /* ✅ 不复制 */
+```
+
+**③ 虚函数调用**
+
+```cpp
+shape->area();                       /* 一次间接跳转，无法内联 */
+```
+
+单次开销很小（纳秒级），但**在几十万次的紧循环里会累积**。
+:::
+
+## 优化的正确顺序
+
+:::tip[别过早优化]
+> "过早优化是万恶之源" —— Donald Knuth
+
+**正确顺序**：
+
+1. **先写清楚正确的代码**
+2. **用 profiler 找出真正的瓶颈**
+3. **只优化热点**（通常 10% 的代码占 90% 时间）
+4. **优化后实测验证**（别凭感觉）
+:::
+
+### 常见"以为慢其实不慢"的
+
+| 担心 | 实际情况 |
+| --- | --- |
+| `std::vector` 比数组慢 | ❌ 一样快 |
+| 范围 for 比下标慢 | ❌ 一样快 |
+| `std::sort` 比 `qsort` 慢 | ❌ 更快（内联比较函数） |
+| 小函数调用开销大 | ❌ 会自动内联 |
+| 用 `std::string` 比 `char[]` 慢 | ⚠️ 稍有开销但值得（安全性） |
+
+### 常见"以为不慢其实慢"的
+
+| 代码 | 问题 |
+| --- | --- |
+| 循环里 `v.size()` | 通常没问题（内联后是读字段），但对 `list` 是 O(n)！ |
+| 循环里 `strlen(s)` | O(n) 每次都算 |
+| `vector` 中间频繁 `insert` | O(n) 移动 |
+| 按值传大对象 | 复制 |
+| 频繁 `shared_ptr` 拷贝 | 原子操作 |
+| `map` 频繁查找 | O(log n)，考虑 `unordered_map` |
+
+## 实用优化清单
+
+```cpp
+/* ① 大对象用 const& 传参 */
+void f(const std::string &s);              /* ✅ */
+void f(std::string s);                     /* ❌ 复制 */
+
+/* ② 循环外提不变的计算 */
+size_t n = v.size();                       /* ✅ */
+for (size_t i = 0; i < v.size(); i++)      /* ⚠️ 对 list 是 O(n) */
+
+/* ③ 用 reserve */
+std::vector<T> v;
+v.reserve(expected);
+
+/* ④ 用 emplace_back 而非 push_back(临时对象) */
+v.emplace_back(args);                      /* ✅ 就地构造 */
+v.push_back(T(args));                      /* ⚠️ 构造+移动 */
+
+/* ⑤ 移动而不是拷贝 */
+v.push_back(std::move(big_obj));
+
+/* ⑥ 用 auto& 遍历避免复制 */
+for (const auto &x : v)                    /* ✅ */
+for (auto x : v)                           /* ⚠️ 复制每个元素 */
+
+/* ⑦ 选对容器（第 17 课） */
+std::unordered_map 用于查找
+std::vector 用于遍历
+```
+
+## 完整的性能对比示例
+
+```cpp
+#include <chrono>
+#include <iostream>
+#include <string>
+#include <vector>
+
+using Clock = std::chrono::steady_clock;
+
+template <typename F>
+double measure_ms(F f) {
+    auto t0 = Clock::now();
+    f();
+    return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+}
+
+int main() {
+    constexpr int N = 1000000;
+
+    std::cout << "--- 按值 vs 按引用传参 ---\n";
+    std::string big(10000, 'x');
+
+    auto by_value = [&] {
+        for (int i = 0; i < 10000; i++) {
+            auto copy = big;                 /* 每次复制 10KB */
+            (void)copy.size();
+        }
+    };
+    auto by_ref = [&] {
+        for (int i = 0; i < 10000; i++) {
+            const std::string &r = big;
+            (void)r.size();
+        }
+    };
+    std::cout << "  按值: " << measure_ms(by_value) << " ms\n";
+    std::cout << "  按引用: " << measure_ms(by_ref) << " ms\n";
+
+    std::cout << "\n--- reserve 的效果 ---\n";
+    std::cout << "  不 reserve: "
+              << measure_ms([&] {
+                     std::vector<int> v;
+                     for (int i = 0; i < N; i++) v.push_back(i);
+                 })
+              << " ms\n";
+    std::cout << "  reserve:    "
+              << measure_ms([&] {
+                     std::vector<int> v;
+                     v.reserve(N);
+                     for (int i = 0; i < N; i++) v.push_back(i);
+                 })
+              << " ms\n";
+
+    std::cout << "\n--- 遍历方式 ---\n";
+    std::vector<std::string> words(100000, "hello");
+    std::cout << "  按值遍历: "
+              << measure_ms([&] {
+                     size_t total = 0;
+                     for (auto w : words) total += w.size();
+                     std::cout << "(" << total << ") ";
+                 })
+              << " ms\n";
+    std::cout << "  const&:   "
+              << measure_ms([&] {
+                     size_t total = 0;
+                     for (const auto &w : words) total += w.size();
+                     std::cout << "(" << total << ") ";
+                 })
+              << " ms\n";
+
+    return 0;
+}
+```
+
+输出示例：
+
+```text
+--- 按值 vs 按引用传参 ---
+  按值: 12.5 ms
+  按引用: 0.01 ms
+
+--- reserve 的效果 ---
+  不 reserve: 8.2 ms
+  reserve:    4.1 ms
+
+--- 遍历方式 ---
+  (500000) 按值遍历: 6.8 ms
+  (500000) const&:   0.4 ms
+```
+
+:::danger[按值传大对象能慢 1000 倍]
+```text
+按值: 12.5 ms
+按引用: 0.01 ms
+```
+
+**这是最容易犯、也最容易修的性能问题。**
+:::
+
+## 什么时候该担心性能
+
+| 场景 | 要担心吗 |
+| --- | --- |
+| 普通业务逻辑 | ❌ 先写清楚 |
+| 循环内百万次的操作 | ✅ 值得看 |
+| 图像/音视频处理 | ✅ 关键 |
+| 实时控制（电机、传感器） | ✅ 关键 |
+| 启动时读配置 | ❌ 无所谓 |
+
+:::tip[实践建议]
+**默认写法**：
+
+- 大对象参数用 `const&`
+- 容器预估大小用 `reserve`
+- 遍历用 `const auto&`
+- 传临时对象用 `std::move`
+
+**这四个习惯能避免 90% 的常见性能问题，且不牺牲可读性。**
+
+剩下的等 profiler 说话。
+:::
+
+## 本课自检
+
+- [ ] **知道 `std::vector` 不会比原始数组慢**
+- [ ] 知道范围 for 不比手写循环慢
+- [ ] **会用 `reserve` 避免反复扩容（实测提速 35%）**
+- [ ] 知道按值传大对象可能慢几百倍
+- [ ] 知道 `shared_ptr` 拷贝有原子操作开销
+- [ ] 知道虚函数调用在紧循环里才有影响
+- [ ] 知道优化顺序（先正确 → 再 profiling → 只优化热点）
+- [ ] 记得住四个默认好习惯（const&、reserve、const auto&、move）
+- [ ] 知道 `list::size()` 是 O(n)
+- [ ] 知道不要凭感觉优化，要实测
+
+## 下一步
+
+[28 嵌入式 C++](./28-embedded) —— 为什么很多嵌入式项目禁用异常和 RTTI。

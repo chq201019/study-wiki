@@ -1,0 +1,245 @@
+---
+id: weakref
+title: 弱引用与对象生命周期
+sidebar_position: 28
+description: 引用计数怎么工作、循环引用为什么需要 gc、weakref 的三种用法（缓存/父子引用/观察者）、以及 __del__ 的不可靠性。
+---
+
+# 弱引用与对象生命周期
+
+**本课目标**：知道对象什么时候被回收，会用 `weakref` 打破循环。
+
+## 引用计数：Python 的主要回收机制
+
+```python
+import sys
+
+a = [1, 2, 3]
+sys.getrefcount(a)      # 2（a 本身 + getrefcount 的参数）
+b = a
+sys.getrefcount(a)      # 3
+del b
+sys.getrefcount(a)      # 2
+```
+
+:::warning[`getrefcount` 的结果总比你以为的多 1]
+**因为传参本身也创建了一个临时引用。**
+
+所以"引用数为 2"通常意味着"只有 1 个真实引用"。
+:::
+
+:::info[引用数归零 → 立即回收]
+```python
+class A:
+    def __del__(self):
+        print("被回收")
+
+a = A()
+del a                  # 立即打印"被回收"（CPython 上）
+```
+
+**这是 CPython 的实现细节**（引用计数），不是 Python 语言规范。
+
+**PyPy 用 GC，`del` 后不会立即回收。**
+:::
+
+## 循环引用：引用计数的盲区
+
+```python
+class Node:
+    def __init__(self):
+        self.peer = None
+
+a = Node()
+b = Node()
+a.peer = b
+b.peer = a          # ← 循环
+del a, b            # 引用数都变成 1（互相指着），不会归零！
+```
+
+:::danger[循环引用要靠"分代 GC"清理]
+**引用计数对循环无能为力** —— 它们的引用数永远不会到 0。
+
+**CPython 有一个额外的循环 GC**（`gc` 模块），定期扫描并回收这类对象。
+
+```python
+import gc
+gc.collect()                  # 手动触发
+gc.get_count()                # 当前各代计数
+```
+:::
+
+:::tip[什么时候需要关心]
+**大量创建互相引用的对象时**（树、图、观察者模式）。
+
+**GC 扫描有开销** —— 对象越多，暂停越久。
+
+**用 `gc.freeze()` 可以把"长期存活的对象"移出扫描范围**（Python 3.7+），显著减少大内存程序的 GC 时间。
+:::
+
+## `weakref`：不增加引用计数的引用
+
+```python
+import weakref
+
+class Obj: pass
+
+o = Obj()
+r = weakref.ref(o)      # 弱引用，不增加引用计数
+r()                     # 返回 o（还活着）
+del o
+r()                     # None（已被回收）
+```
+
+:::info[三种弱引用容器]
+| 类型 | 说明 |
+| --- | --- |
+| `weakref.ref(o)` | 单个弱引用 |
+| **`weakref.WeakValueDictionary`** | **值被回收时自动删除条目** |
+| **`weakref.WeakKeyDictionary`** | **键被回收时自动删除条目** |
+| `weakref.WeakSet` | 元素被回收时自动移除 |
+:::
+
+### 用法一：缓存（不阻止对象被回收）
+
+```python
+import weakref
+
+_cache = weakref.WeakValueDictionary()
+
+def get_obj(key):
+    obj = _cache.get(key)
+    if obj is None:
+        obj = build_obj(key)
+        _cache[key] = obj        # 弱引用：没人用了就自动消失
+    return obj
+```
+
+:::tip[这解决了"缓存导致内存永不释放"的问题]
+**普通 dict 缓存会让对象永远活着**（缓存持有强引用）。
+
+**`WeakValueDictionary` 让缓存"尽力而为"** —— 对象被外部引用时命中缓存，没人引用时自动清掉。
+:::
+
+### 用法二：父子引用（避免循环）
+
+```python
+class Parent:
+    def __init__(self):
+        self.children = []
+
+class Child:
+    def __init__(self, parent):
+        self.parent = weakref.ref(parent)    # ✅ 弱引用打破循环
+```
+
+**如果子对象写 `self.parent = parent`（强引用），父子就形成了循环。**
+
+### 用法三：观察者列表
+
+```python
+class Event:
+    def __init__(self):
+        self._handlers = weakref.WeakSet()
+
+    def subscribe(self, fn):
+        self._handlers.add(fn)
+
+    def fire(self, *args):
+        for fn in list(self._handlers):
+            fn(*args)
+```
+
+:::danger[`WeakSet` 里存的是"函数对象"，注意 lambda 会立刻被回收]
+```python
+event.subscribe(lambda: print("x"))    # ❌ lambda 没有其他引用，立刻被回收
+```
+
+**要保证订阅者本身有强引用存活**（比如它是某个对象的绑定方法）。
+:::
+
+## `__del__` 为什么不可靠
+
+:::danger[三个原因]
+**① CPython 外的实现不保证及时调用**
+
+**② 循环引用中的对象可能永远不调用 `__del__`**（或延迟很久）
+
+**③ 解释器退出时调用顺序不确定** —— 依赖的全局对象可能已经被清掉
+
+```python
+class Bad:
+    def __del__(self):
+        print(self.name)      # ❌ 退出时 self.name 可能已不存在
+```
+:::
+
+:::tip[正确做法：用 `contextmanager` 或显式 `close()`]
+```python
+class Res:
+    def close(self):
+        if self._closed: return
+        self._closed = True
+        # 真正清理
+
+    def __enter__(self): return self
+    def __exit__(self, *a): self.close()
+```
+
+**`with` 保证及时、可预测的清理** —— 这是唯一可靠的方式。
+:::
+
+## 一个诊断例子
+
+```python
+import weakref, gc
+
+class Tracked:
+    def __init__(self, name):
+        self.name = name
+        self._ref = weakref.ref(self, lambda r: print(f"{name} 被回收"))
+
+t = Tracked("x")
+del t                # 打印 "x 被回收"
+```
+
+**`weakref.ref(obj, callback)` 的第二个参数是"被回收时执行的回调"** —— 用来观察对象生命周期很方便。
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 缓存越大内存越高 | 强引用缓存 | `WeakValueDictionary` |
+| 对象不释放 | 循环引用 | 弱引用打破 / `gc.collect()` |
+| `WeakSet` 里的 lambda 立刻消失 | 没有其他强引用 | 保存订阅者引用 |
+| `__del__` 没被调用 | 循环引用 / 解释器退出 | 用 `with` 或显式 `close()` |
+| `del` 后内存没降 | 循环引用或 PyPy 的 GC | 检查循环，手动 `gc.collect()` |
+| `weakref` 报 `TypeError` | 该类型不支持弱引用 | 加 `__slots__` 里含 `__weakref__` |
+
+:::warning[有 `__slots__` 的类默认不支持弱引用]
+```python
+class A:
+    __slots__ = ("x",)          # ❌ 不能 weakref
+
+class B:
+    __slots__ = ("x", "__weakref__")     # ✅
+```
+:::
+
+## 本课自检
+
+- [ ] 知道 CPython 主要靠引用计数回收
+- [ ] **知道 `getrefcount` 的结果总比实际多 1**
+- [ ] **知道引用计数处理不了循环引用，要靠分代 GC**
+- [ ] 会用 `gc.collect()` / `gc.freeze()`
+- [ ] 会用 `weakref.ref` / `WeakValueDictionary` / `WeakSet`
+- [ ] **知道弱引用缓存能避免"缓存导致内存不释放"**
+- [ ] 会用弱引用打破父子循环
+- [ ] **知道 `WeakSet` 里的 lambda 会立刻被回收**
+- [ ] **知道 `__del__` 三个不可靠的原因**
+- [ ] **知道正确做法是 `with` 或显式 `close()`**
+- [ ] 知道 `__slots__` 要加 `__weakref__` 才支持弱引用
+
+## 下一步
+
+[上下文管理器进阶](./contextlib) 或 [内存管理深入](../../hardware/linux/memory-deep)。

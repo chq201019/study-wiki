@@ -1,0 +1,451 @@
+---
+id: 23-enum-union
+title: 23 枚举、联合体、typedef
+sidebar_position: 23
+description: enum 让代码可读、union 共享内存的原理与用途、typedef 的正确姿势，以及小端序的直观验证。
+---
+
+# 23 枚举、联合体、typedef
+
+**本课目标**：掌握剩下三种自定义类型，补齐你的工具箱。
+
+## enum：给整数起名字
+
+:::danger[不用 enum 的代码]
+```c
+int color = 0;      /* 0 是什么？红？绿？ */
+int status = 404;   /* 为什么是 404？ */
+```
+
+**魔数无法自解释**，过一周你自己都不记得。
+:::
+
+用 `enum`：
+
+```c
+enum Color { RED, GREEN, BLUE };
+
+enum Color c = RED;
+printf("%d\n", c);      /* 0 */
+```
+
+本机实测：
+
+```text
+RED=0 GREEN=1 BLUE=2
+```
+
+:::info[enum 的本质就是整数]
+enum 成员默认从 **0** 开始，依次 +1。`sizeof(enum Color)` 是 **4**（就是 int 的大小）。
+
+**所以 enum 没有运行时开销**，纯粹是给数字起了个名字。
+:::
+
+### 指定值
+
+```c
+enum Status {
+    OK        = 200,
+    NOT_FOUND = 404,
+    ERROR     = 500,
+};
+```
+
+本机实测：`OK=200 NOT_FOUND=404 ERROR=500`
+
+**用 HTTP 状态码做例子最直观**——名字和值一一对应。
+
+### 自动递增
+
+```c
+enum Level {
+    LOW,            /* 0 */
+    MEDIUM,         /* 1 */
+    HIGH,           /* 2 */
+    CRITICAL = 10,
+    PANIC,          /* 11，接着上一个 +1 */
+};
+```
+
+后面的成员不写值就**接着前一个 +1**。
+
+### 用作位标志
+
+```c
+enum Flags {
+    FLAG_A = 1,         /* 0001 */
+    FLAG_B = 2,         /* 0010 */
+    FLAG_C = 4,         /* 0100 */
+    FLAG_AB = FLAG_A | FLAG_B,      /* 0011 = 3 */
+};
+```
+
+本机实测：`AB=3`（即 1|2）。
+
+**这个用法在嵌入式里极常见**（寄存器位、配置选项），第 28 课位运算会细讲。
+
+```c
+/* 组合使用 */
+int opts = FLAG_A | FLAG_C;
+
+/* 检查是否包含某标志 */
+if (opts & FLAG_A) {
+    printf("A 已启用\n");
+}
+```
+
+## enum 的实际好处
+
+```c
+/* ❌ 不用 enum */
+void set_color(int color);
+set_color(0);           /* 0 是什么意思？ */
+
+/* ✅ 用 enum */
+void set_color(enum Color color);
+set_color(RED);         /* 一眼就懂 */
+```
+
+| 好处 | 说明 |
+| --- | --- |
+| **可读** | `RED` 比 `0` 清楚 |
+| **可维护** | 加一个颜色不影响已有值 |
+| **有类型检查** | 部分编译器会警告类型不符 |
+| **便于搜索** | 搜 `RED` 能找到所有用处 |
+
+:::tip[用 enum 代替 `#define` 定义常量组]
+```c
+/* 旧写法 */
+#define RED   0
+#define GREEN 1
+#define BLUE  2
+
+/* 更好：enum */
+enum Color { RED, GREEN, BLUE };
+```
+
+`enum` 有作用域、能被调试器识别、能作为类型用。**成组的整数常量优先用 enum。**
+:::
+
+## union：所有成员共享同一块内存
+
+![enum / union / struct 三种聚合的内存布局对比：struct 有对齐填充、union 成员重叠共用、enum 本质是整数](/img/diagrams/c-enum-union.svg)
+
+
+:::danger[union 和 struct 的核心区别]
+```c
+struct S { int a; char b; };      /* 大小 ≥ 4+1，成员各占各的 */
+union  U { int a; char b; };      /* 大小 = 4，成员共用同一块 */
+```
+:::
+
+```c
+union Value {
+    int   i;
+    float f;
+    char  bytes[4];
+};
+```
+
+本机实测：`sizeof(union Value)` = **4**（不是 4+4+4=12）。
+
+### 共享内存的直观验证
+
+```c
+union Value v;
+v.i = 0x41424344;
+printf("i = 0x%X\n", v.i);
+printf("bytes: %c %c %c %c\n", v.bytes[0], v.bytes[1], v.bytes[2], v.bytes[3]);
+```
+
+本机实测输出：
+
+```text
+i = 0x41424344
+bytes: D C B A
+```
+
+:::danger[这证明了小端序（little-endian）]
+值 `0x41424344` 在内存里：
+
+```text
+低地址 → 高地址
+  44   43   42   41
+  'D'  'C'  'B'  'A'
+```
+
+**低位字节存在低地址**，这叫**小端序**。x86、ARM（默认）都是小端。
+
+`'A'` 的 ASCII 是 0x41，`'D'` 是 0x44。所以 `bytes[0]` 是 `'D'`。
+
+**这就是为什么网络传输要用 `htonl` 转字节序**——不同架构字节序可能相反。
+:::
+
+### 改一个成员会影响其他成员
+
+```c
+v.f = 3.14f;                    /* 写入 float */
+printf("i = 0x%X\n", v.i);      /* 读 int：0x4048F5C3 */
+```
+
+本机实测：`i = 0x4048F5C3`。
+
+**原来的 `0x41424344` 被完全覆盖了**——因为它们是同一块内存。
+
+```text
+union Value
+┌─────────────┐
+│ 4 字节内存   │ ← i、f、bytes 都从这里读写
+└─────────────┘
+```
+
+:::warning[读"没写过的成员"是未定义行为]
+```c
+union Value v;
+v.i = 42;
+float x = v.f;          /* ⚠️ 读的是同一块内存，但按 float 解释 */
+```
+
+技术上这叫"类型双关"（type punning）。**C99 起允许**，但**可能是陷阱值**（比如触发 NaN）。
+
+**不要依赖这种用法**，除非你完全清楚自己在做什么（比如解析二进制协议）。
+:::
+
+### union 的实际用途：带标签的联合体
+
+```c
+struct Variant {
+    enum { T_INT, T_FLOAT } type;      /* 标签：说明当前存的是什么 */
+    union {
+        int   i;
+        float f;
+    } data;
+};
+```
+
+本机实测：
+
+```c
+struct Variant t1 = { T_INT, {.i = 42} };
+printf("type=%d val=%d\n", t1.type, t1.data.i);      /* type=0 val=42 */
+
+t2.type = T_FLOAT; t2.data.f = 2.5f;
+printf("type=%d val=%.1f\n", t2.type, t2.data.f);    /* type=1 val=2.5 */
+```
+
+:::tip[为什么需要"标签"]
+union 自己不知道当前存的是什么。**必须另外用一个字段记录类型**。
+
+读的时候先看 `type`，再决定访问哪个成员：
+
+```c
+if (t.type == T_INT) {
+    printf("%d\n", t.data.i);
+} else {
+    printf("%f\n", t.data.f);
+}
+```
+
+**这是 C 里实现"可变类型"的标准做法**（类似其他语言的 sum type）。
+:::
+
+### union 的其他用途：省内存
+
+嵌入式里内存紧张时，几个**互斥**使用的字段可以塞进 union：
+
+```c
+struct Packet {
+    uint8_t type;
+    union {
+        uint8_t  raw[16];
+        struct { uint16_t id; uint16_t len; } head;
+        struct { uint32_t ts; } tail;
+    } payload;
+};
+```
+
+**同一时刻只可能是其中一种格式**，所以共享内存不冲突。
+
+## typedef：给类型起别名
+
+```c
+typedef unsigned int u32;
+typedef struct { int x, y; } Point;
+typedef int (*BinOp)(int, int);
+```
+
+### 三种常见用法
+
+```c
+/* ① 简化长类型名 */
+typedef unsigned long long u64;
+u64 big = 1234567890123ULL;
+
+/* ② 匿名结构 + 别名（最常用） */
+typedef struct {
+    char name[32];
+    int  age;
+} Person;
+
+Person p = {"Alice", 20};       /* 不用写 struct */
+
+/* ③ 函数指针别名（强烈建议） */
+typedef int (*Compare)(const void *, const void *);
+void sort(int *arr, int n, Compare cmp);
+```
+
+:::danger[typedef 的指针陷阱]
+```c
+typedef int *IntPtr;
+IntPtr a, b;          /* ⚠️ a 和 b 都是 int* */
+
+const IntPtr p;       /* 等价于 int *const p（指针本身是 const） */
+const int *q;         /* 指向的内容是 const */
+```
+
+`typedef` 把 `int *` 整个打包成一个类型名，**`const` 修饰的是这个整体**，容易和直觉不符。
+
+**建议：不要 typedef 指针类型**，除非配合函数指针这种复杂场景。
+:::
+
+### 命名习惯
+
+```c
+typedef struct { ... } Person;          /* 大写开头（类型） */
+typedef unsigned int   u32;             /* 全小写 + 数字 */
+typedef size_t         Size;            /* 大写开头 */
+```
+
+| 风格 | 例子 | 说明 |
+| --- | --- | --- |
+| 大写开头 | `Person`、`Node` | 最直观，看出是类型 |
+| `_t` 后缀 | `size_t`、`uint32_t` | 标准库风格 |
+| 全小写 | `u32`、`u8` | 嵌入式常见 |
+
+**选一种坚持用**，别混。
+
+## 三者对比
+
+| 类型 | 作用 | 内存 |
+| --- | --- | --- |
+| `enum` | 给整数命名 | 4 字节（就是 int） |
+| `union` | 成员共享内存 | 最大成员的大小 |
+| `typedef` | 给类型起别名 | 不产生新类型 |
+
+## 完整示例
+
+```c
+#include <stdio.h>
+
+/* 枚举：状态 */
+typedef enum {
+    STATE_IDLE,
+    STATE_RUNNING,
+    STATE_ERROR,
+} State;
+
+/* 联合体：一个字段存不同类型 */
+typedef struct {
+    enum { VAL_INT, VAL_FLOAT } type;
+    union {
+        int   i;
+        float f;
+    } data;
+} Number;
+
+/* 打印任意类型的 Number */
+void print_number(const Number *n) {
+    if (n->type == VAL_INT) {
+        printf("整数：%d\n", n->data.i);
+    } else {
+        printf("浮点：%.2f\n", n->data.f);
+    }
+}
+
+/* 状态名 */
+const char *state_name(State s) {
+    switch (s) {
+        case STATE_IDLE:    return "空闲";
+        case STATE_RUNNING: return "运行中";
+        case STATE_ERROR:   return "错误";
+        default:            return "未知";
+    }
+}
+
+int main(void) {
+    State st = STATE_RUNNING;
+    printf("状态：%s（值 %d）\n", state_name(st), st);
+
+    Number a = { VAL_INT,   {.i = 42} };
+    Number b = { VAL_FLOAT, {.f = 3.14f} };
+    print_number(&a);
+    print_number(&b);
+
+    printf("sizeof(Number) = %zu\n", sizeof(Number));
+
+    return 0;
+}
+```
+
+输出：
+
+```text
+状态：运行中（值 1）
+整数：42
+浮点：3.14
+sizeof(Number) = 8
+```
+
+:::tip[`sizeof(Number)` 为什么是 8]
+```text
+type:  4 字节（int）
+data:  4 字节（union 取最大成员）
+─────────────
+合计   8 字节
+```
+
+如果不用 union，要同时存 int 和 float 就得 4+4+4=12 字节。
+
+**union 省下了 4 字节。**
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| enum 定义末尾漏分号 | 编译错 | 语法 | 加 `;` |
+| 读 union 没写过的成员 | 陷阱值 | 类型双关 | 先用标签判断 |
+| 以为 union 成员各占空间 | sizeof 不符 | 共享内存 | 记住是共用 |
+| `typedef struct X X;` 后又写 `struct X` | 混用 | 其实都行 | 选一种 |
+| enum 值用于 switch 漏 default | 警告 | 未覆盖所有值 | 加 default |
+| 大端小端假设错误 | 通信数据错 | 字节序不同 | 用 `htonl` 转换 |
+
+:::warning[`switch` 处理 enum 建议加 `default`]
+```c
+switch (state) {
+    case STATE_IDLE: ...; break;
+    case STATE_RUNNING: ...; break;
+    /* 漏了 STATE_ERROR */
+}
+```
+
+**加 `default` 能捕获"没考虑到的新值"**，避免静默错误。
+:::
+
+## 本课自检
+
+- [ ] 会定义 enum，知道默认从 0 开始、自动递增
+- [ ] 会给 enum 指定值（如 HTTP 状态码）
+- [ ] 会用 enum 做位标志
+- [ ] 知道 enum 本质是 int，无运行时开销
+- [ ] **知道 union 所有成员共享同一块内存**
+- [ ] 知道 union 大小 = 最大成员大小
+- [ ] 理解"改一个成员会影响其他成员"
+- [ ] **知道"标签 + union"是实现可变类型的标准做法**
+- [ ] 能用 union 验证字节序（小端）
+- [ ] 会用 typedef 简化类型名
+- [ ] 知道 typedef 指针的 `const` 陷阱
+
+## 下一步
+
+[24 阶段实战：通讯录](./24-project-contacts) —— 用结构体 + 动态内存 + 链表做一个完整应用。

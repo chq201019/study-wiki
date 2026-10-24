@@ -1,0 +1,390 @@
+---
+id: 25-files
+title: 25 文件读写
+sidebar_position: 25
+description: fopen 的模式、fprintf/fscanf、fgets 读整行、二进制读写，以及为什么必须检查 fopen 的返回值。
+---
+
+# 25 文件读写
+
+**本课目标**：会让程序读写文件，**不漏掉任何错误检查**。
+
+## 三步走：打开 → 读写 → 关闭
+
+```c
+#include <stdio.h>
+
+FILE *fp = fopen("data.txt", "w");      /* ① 打开 */
+if (fp == NULL) {                        /* ← 必须检查！ */
+    perror("打开失败");
+    return 1;
+}
+
+fprintf(fp, "hello %d\n", 42);           /* ② 写 */
+
+fclose(fp);                              /* ③ 关闭 */
+```
+
+:::danger[`fopen` 可能返回 NULL，必须检查]
+```c
+FILE *fp = fopen("data.txt", "r");
+fprintf(fp, "x");        /* ❌ 文件不存在时 fp 是 NULL，崩溃 */
+```
+
+**本机实测**：打开不存在的文件时
+
+```c
+FILE *fp = fopen("no_such.txt", "r");
+printf("fp = %p\n", (void*)fp);      /* fp = 0000000000000000 */
+perror("错误信息");                   /* 错误信息: No such file or directory */
+```
+
+**规矩：每次 `fopen` 后立刻检查。**
+:::
+
+## 打开模式
+
+| 模式 | 含义 | 文件不存在 | 已有内容 |
+| --- | --- | --- | --- |
+| `"r"` | 只读 | **返回 NULL** | 保留 |
+| `"w"` | 只写 | 创建 | **全部清空！** |
+| `"a"` | 追加 | 创建 | 保留，末尾追加 |
+| `"r+"` | 读写 | **返回 NULL** | 保留 |
+| `"w+"` | 读写 | 创建 | **全部清空** |
+| `"a+"` | 读写追加 | 创建 | 保留 |
+
+再加 `b` 表示二进制：`"rb"`、`"wb"`。
+
+:::danger[`"w"` 会清空文件，这是最危险的]
+```c
+FILE *fp = fopen("important.txt", "w");    /* 原来的内容全没了 */
+```
+
+**不是覆盖某一行，是整个文件清空。**
+
+**只想追加用 `"a"`。**
+:::
+
+:::warning[Windows 上文本模式和二进制模式有区别]
+- **文本模式**（`"r"`/`"w"`）：`\n` 会被转换为 `\r\n`
+- **二进制模式**（`"rb"`/`"wb"`）：原样读写，不转换
+
+**什么时候必须用二进制模式**：
+
+- 读写图片、音频等非文本
+- 网络协议、文件格式要求精确字节
+- 跨平台交换数据
+
+**文本文件用文本模式，其他一律二进制模式。**
+:::
+
+## 写入
+
+### fprintf：格式化写
+
+```c
+fprintf(fp, "%d %s %.2f\n", 42, "hello", 3.14);
+```
+
+用法和 `printf` 完全一样，只是多一个 `FILE *` 参数。
+
+### fputs：写字符串
+
+```c
+fputs("second line\n", fp);        /* 不会自动加换行 */
+```
+
+### fputc：写单个字符
+
+```c
+fputc('A', fp);
+```
+
+### 完整例子
+
+```c
+FILE *fp = fopen("out.txt", "w");
+if (fp == NULL) { perror("fopen"); return 1; }
+
+fprintf(fp, "名字：%s\n", "小明");
+fprintf(fp, "年龄：%d\n", 18);
+fprintf(fp, "分数：%.1f\n", 88.5);
+
+fclose(fp);
+```
+
+文件内容：
+
+```text
+名字：小明
+年龄：18
+分数：88.5
+```
+
+## 读取
+
+### 方法一：fgets 逐行读（推荐）
+
+```c
+char line[128];
+while (fgets(line, sizeof(line), fp) != NULL) {
+    printf("%s", line);          /* line 里已经包含 \n */
+}
+```
+
+:::tip[`fgets` 的三个细节]
+**① 会保留换行符**
+
+```c
+fgets(line, sizeof(line), fp);      /* line 可能是 "hello\n" */
+```
+
+要去掉换行：
+
+```c
+line[strcspn(line, "\n")] = '\0';    /* 找到 \n 并替换成 \0 */
+```
+
+（`strcspn` 返回"第一个出现在第二参数中的字符"的下标。）
+
+**② 最多读 `size-1` 个字符**，留一个给 `\0`。所以不会溢出。
+
+**③ 读到 EOF 或出错返回 `NULL`**，所以循环条件用 `!= NULL`。
+:::
+
+### 方法二：fscanf 格式化读
+
+```c
+int i;
+char s[32];
+double d;
+
+if (fscanf(fp, "%d %31s %lf", &i, s, &d) == 3) {
+    printf("%d %s %.2f\n", i, s, d);
+}
+```
+
+本机实测输出：`读到 i=42 s=hello d=3.14`
+
+:::warning[`fscanf` 要限制字符串长度]
+```c
+fscanf(fp, "%s", s);        /* ❌ 可能溢出 */
+fscanf(fp, "%31s", s);      /* ✅ 最多读 31 个字符 */
+```
+
+**数字要比数组大小小 1**（留给 `\0`）。
+
+另外 `fscanf` 返回值是**成功读到的项数**，应该检查：
+
+```c
+if (fscanf(fp, "%d", &n) != 1) {
+    /* 读取失败 */
+}
+```
+:::
+
+### 方法三：fread 二进制读
+
+```c
+int buf[10];
+size_t n = fread(buf, sizeof(int), 10, fp);
+printf("读了 %zu 个元素\n", n);
+```
+
+`fread(ptr, 元素大小, 元素个数, fp)` 返回**实际读到的元素个数**。
+
+### 方法四：一次读全部
+
+```c
+fseek(fp, 0, SEEK_END);        /* 移到末尾 */
+long size = ftell(fp);         /* 得到大小 */
+fseek(fp, 0, SEEK_SET);        /* 回到开头 */
+
+char *buf = malloc((size_t)size + 1);
+if (buf) {
+    size_t n = fread(buf, 1, (size_t)size, fp);
+    buf[n] = '\0';
+    printf("%s", buf);
+    free(buf);
+}
+```
+
+**适合小文件。大文件别这么做。**
+
+## 关闭：fclose
+
+```c
+fclose(fp);
+```
+
+:::danger[不 `fclose` 会丢数据]
+`fprintf` 写入的内容先存在**缓冲区**里，`fclose` 才真正落到磁盘。
+
+**程序异常退出（没 `fclose`）时，缓冲区里的数据可能丢失。**
+
+```c
+/* 想立刻落盘可以用 fflush */
+fflush(fp);
+```
+:::
+
+### 检查 fclose 的返回值
+
+```c
+if (fclose(fp) != 0) {
+    perror("关闭失败");      /* 磁盘满时可能出错 */
+}
+```
+
+**写文件的场景要检查**——`fclose` 时才可能发现写入失败。
+
+## 完整示例：读写学生成绩
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define NAME_LEN 32
+
+typedef struct {
+    char name[NAME_LEN];
+    int  score;
+} Student;
+
+int main(void) {
+    const char *path = "scores.txt";
+
+    /* ---- 写 ---- */
+    Student list[] = {
+        {"Alice", 88},
+        {"Bob",   92},
+        {"Carol", 75},
+    };
+    int n = (int)(sizeof(list) / sizeof(list[0]));
+
+    FILE *fp = fopen(path, "w");
+    if (fp == NULL) { perror("写入打开失败"); return 1; }
+
+    for (int i = 0; i < n; i++) {
+        fprintf(fp, "%s %d\n", list[i].name, list[i].score);
+    }
+    if (fclose(fp) != 0) { perror("关闭失败"); return 1; }
+
+    printf("已写入 %d 条\n", n);
+
+    /* ---- 读 ---- */
+    fp = fopen(path, "r");
+    if (fp == NULL) { perror("读取打开失败"); return 1; }
+
+    char line[128];
+    int total = 0, count = 0;
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        line[strcspn(line, "\n")] = '\0';
+        if (line[0] == '\0') continue;       /* 跳过空行 */
+
+        Student s;
+        if (sscanf(line, "%31s %d", s.name, &s.score) == 2) {
+            printf("%-10s %d\n", s.name, s.score);
+            total += s.score;
+            count++;
+        } else {
+            printf("格式不符，跳过：%s\n", line);
+        }
+    }
+    fclose(fp);
+
+    if (count > 0) {
+        printf("平均分：%.2f\n", (double)total / count);
+    }
+    return 0;
+}
+```
+
+输出：
+
+```text
+已写入 3 条
+Alice      88
+Bob        92
+Carol      75
+平均分：85.00
+```
+
+:::tip[`sscanf` 是"从字符串读"]
+```c
+sscanf(line, "%31s %d", s.name, &s.score);
+```
+
+用法和 `fscanf` 一样，但**从字符串而不是文件**读。
+
+**这比 `fscanf` 更好用**——先用 `fgets` 读一整行，再用 `sscanf` 解析。这样能：
+
+- 精确控制每行长度
+- 优雅处理格式错误的行（跳过而不是卡住）
+- 便于调试（能看到完整的行）
+:::
+
+## 文件定位
+
+```c
+fseek(fp, 0, SEEK_SET);       /* 移到开头 */
+fseek(fp, 0, SEEK_END);       /* 移到末尾 */
+fseek(fp, offset, SEEK_CUR);  /* 从当前位置移动 */
+
+long pos = ftell(fp);         /* 当前偏移量 */
+
+rewind(fp);                   /* 等价于 fseek(fp, 0, SEEK_SET) */
+```
+
+读取文件大小时常用：
+
+```c
+fseek(fp, 0, SEEK_END);
+long size = ftell(fp);
+rewind(fp);
+printf("文件大小：%ld 字节\n", size);
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 不检查 `fopen` 返回值 | 崩溃 | 文件打不开 | 判 NULL |
+| 用 `"w"` 想追加 | 内容被清空 | 模式选错 | 用 `"a"` |
+| 不 `fclose` | 数据丢失 | 缓冲区没落盘 | 必须关 |
+| `fgets` 后残留 `\n` | 输出多空行 | 未去掉换行 | `strcspn` |
+| `fscanf("%s")` 溢出 | 崩溃 | 没限长度 | `%31s` |
+| 二进制文件用文本模式 | 数据损坏 | `\n` 被转换 | 加 `b` |
+| 循环里重复 `fopen` | 句柄泄漏 | 没关 | 一个文件一个 `fp` |
+
+:::danger[文件句柄会耗尽]
+```c
+for (int i = 0; i < 10000; i++) {
+    FILE *fp = fopen(path, "r");      /* ❌ 每次都不关 */
+    /* ... */
+}
+```
+
+操作系统对同时打开的文件数有上限（通常几千）。**不关就会到上限，之后所有 `fopen` 都失败。**
+
+**规矩：每个 `fopen` 配一个 `fclose`。**
+:::
+
+## 本课自检
+
+- [ ] 会用 `fopen` / `fclose`，**知道必须检查返回值**
+- [ ] 分清 `"r"` / `"w"` / `"a"` 三种模式
+- [ ] **知道 `"w"` 会清空文件**
+- [ ] 知道文本模式和二进制模式的区别
+- [ ] 会用 `fprintf` / `fputs` 写
+- [ ] 会用 `fgets` 读行，知道要去掉换行符
+- [ ] 会用 `fscanf` / `sscanf` 解析，知道要限制长度
+- [ ] 知道 `fgets` + `sscanf` 的组合最好用
+- [ ] 知道不 `fclose` 可能丢数据
+- [ ] 知道文件句柄会耗尽
+
+## 下一步
+
+[26 预处理器与宏](./26-preprocessor) —— 看懂那些 `#define`，以及宏的陷阱。

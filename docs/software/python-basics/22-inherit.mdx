@@ -1,0 +1,440 @@
+---
+id: 22-inherit
+title: 22 面向对象进阶：继承
+sidebar_position: 22
+description: 继承的语法、super() 的用法、方法重写、isinstance 判断，以及为什么组合往往优于继承。
+---
+
+# 22 面向对象进阶：继承
+
+**本课目标**：会用继承复用代码，也知道什么时候**不该**用继承。
+
+## 继承解决什么问题
+
+假设有三种动物，都会「叫」和「睡」：
+
+```python
+class Dog:
+    def eat(self):
+        print("在吃")
+    def sleep(self):
+        print("在睡")
+    def bark(self):
+        print("汪汪")
+
+class Cat:
+    def eat(self):          # 一模一样
+        print("在吃")
+    def sleep(self):        # 一模一样
+        print("在睡")
+    def meow(self):
+        print("喵喵")
+```
+
+`eat` 和 `sleep` 重复了两遍。用继承：
+
+```python
+class Animal:
+    def eat(self):
+        print("在吃")
+    def sleep(self):
+        print("在睡")
+
+
+class Dog(Animal):          # 括号里写父类
+    def bark(self):
+        print("汪汪")
+
+
+class Cat(Animal):
+    def meow(self):
+        print("喵喵")
+
+
+d = Dog()
+d.eat()        # 继承自 Animal
+d.bark()       # 自己的
+```
+
+输出：
+
+```text
+在吃
+汪汪
+```
+
+**`Dog` 自动拥有了 `Animal` 的所有方法**，不用重写。
+
+## 术语
+
+```python
+class Animal:      # 父类 / 基类 / 超类（parent / base / super class）
+    ...
+
+class Dog(Animal): # 子类 / 派生类（child / derived class）
+    ...
+```
+
+`Dog` **继承**（inherit）自 `Animal`，`Dog` **是一种**（is-a）`Animal`。
+
+## `__init__` 的继承：用 super()
+
+子类如果没定义 `__init__`，会自动用父类的：
+
+```python
+class Animal:
+    def __init__(self, name):
+        self.name = name
+
+
+class Dog(Animal):
+    pass
+
+
+d = Dog("旺财")
+print(d.name)      # 旺财
+```
+
+但如果子类要**在父类基础上加东西**，必须自己写 `__init__` 并调用 `super()`：
+
+:::danger[不调用 super() 的经典 bug]
+```python
+class Animal:
+    def __init__(self, name):
+        self.name = name
+
+
+class Dog(Animal):
+    def __init__(self, name, breed):
+        self.breed = breed       # ❌ 忘了 super()
+
+
+d = Dog("旺财", "柴犬")
+print(d.breed)     # 柴犬
+print(d.name)      # AttributeError: 'Dog' object has no attribute 'name'
+```
+
+**子类的 `__init__` 覆盖了父类的，父类那段代码根本没执行**，所以 `name` 没被设置。
+:::
+
+正确写法：
+
+```python
+class Animal:
+    def __init__(self, name):
+        self.name = name
+
+
+class Dog(Animal):
+    def __init__(self, name, breed):
+        super().__init__(name)      # ✅ 先让父类初始化
+        self.breed = breed          # 再加自己的
+
+
+d = Dog("旺财", "柴犬")
+print(d.name, d.breed)
+```
+
+输出：
+
+```text
+旺财 柴犬
+```
+
+:::tip[super() 是什么]
+`super()` 返回「父类的代理」，让你能调用父类的方法。
+
+`super().__init__(name)` 就是「调用父类的 `__init__`，并传 name 进去」。
+
+**为什么用 `super()` 而不是 `Animal.__init__(self, name)`**：
+
+- 多继承时 `super()` 会按 MRO 顺序正确查找
+- 父类改名时不用改子类代码
+
+**规矩：永远用 `super()`。**
+:::
+
+## 方法重写（Override）
+
+子类可以重新定义父类的方法：
+
+```python
+class Animal:
+    def speak(self):
+        return "..."
+
+
+class Dog(Animal):
+    def speak(self):                # 重写
+        return "汪汪"
+
+
+class Cat(Animal):
+    def speak(self):                # 重写
+        return "喵喵"
+
+
+for a in [Animal(), Dog(), Cat()]:
+    print(a.speak())
+```
+
+输出：
+
+```text
+...
+汪汪
+喵喵
+```
+
+### 在重写里保留父类行为
+
+```python
+class Cat(Animal):
+    def speak(self):
+        base = super().speak()      # 先拿父类的
+        return f"{base}（但其实是想吃鱼）"
+
+
+print(Cat().speak())
+```
+
+输出：
+
+```text
+...（但其实是想吃鱼）
+```
+
+## 多态：同一个调用，不同行为
+
+![Python MRO：菱形继承下 C3 线性化得到的查找顺序 C -> A -> B -> object，super() 就是沿 MRO 往后找](/img/diagrams/py-mro.svg)
+
+
+上面的 `for` 循环体现了**多态**：
+
+```python
+animals = [Dog(), Cat(), Dog()]
+
+for a in animals:
+    print(a.speak())      # 不用判断类型，各自执行自己的版本
+```
+
+输出：
+
+```text
+汪汪
+喵喵
+汪汪
+```
+
+:::tip[多态的价值]
+如果需要「根据类型做不同的事」，新手会写：
+
+```python
+for a in animals:
+    if isinstance(a, Dog):
+        print("汪汪")
+    elif isinstance(a, Cat):
+        print("喵喵")
+    # 加一种动物就要改这里
+```
+
+用多态就变成：
+
+```python
+for a in animals:
+    print(a.speak())      # 加新动物不用改这段
+```
+
+**新增类型时不用改已有代码**，这就是继承 + 多态的核心好处。
+:::
+
+## isinstance：判断类型
+
+```python
+d = Dog("旺财")
+
+print(isinstance(d, Dog))        # True
+print(isinstance(d, Animal))     # True   ← 子类也算父类的实例
+print(isinstance(d, Cat))        # False
+```
+
+:::warning[isinstance 会检查继承链]
+`isinstance(d, Animal)` 为 `True`，因为 Dog **是**一种 Animal。
+
+如果只想判断「精确是这个类」，用 `type()`：
+
+```python
+print(type(d) is Dog)        # True
+print(type(d) is Animal)     # False
+```
+
+**日常判断类型用 `isinstance`**（更符合多态思想），`type()` 少用。
+:::
+
+## 组合：比继承更常用的方式
+
+:::danger[不要滥用继承]
+继承表示「**是一种**」（is-a）关系。用错会造成灾难。
+
+**典型误用**：
+
+```python
+class Car:
+    def drive(self): ...
+
+class Boat:
+    def sail(self): ...
+
+class AmphibiousVehicle(Car, Boat):    # 水陆两用车「是」车也「是」船？
+    pass
+```
+
+看起来能跑，但继承了**所有**方法，包括不该有的。改 Car 的 `drive` 逻辑，水陆车也跟着变，可能就出 bug。
+:::
+
+### 组合：用「有」代替「是」
+
+```python
+class Engine:
+    def start(self):
+        return "引擎启动"
+
+    def stop(self):
+        return "引擎关闭"
+
+
+class Car:
+    def __init__(self):
+        self.engine = Engine()      # Car「有一个」Engine，而不是「是一个」
+
+    def drive(self):
+        return f"开车：{self.engine.start()}"
+
+
+c = Car()
+print(c.drive())
+```
+
+输出：
+
+```text
+开车：引擎启动
+```
+
+:::tip[「是一个」还是「有一个」]
+判断标准：
+
+```text
+「A 是一种 B」吗？
+  是 → 可以用继承        （Dog is an Animal ✅）
+  否 → 用组合            （Car has an Engine ✅）
+```
+
+**实用建议**：**优先用组合**。组合更灵活（运行时能换部件）、耦合更松、不会继承到不需要的东西。
+
+继承适合「真的有明确的类型层级」的场景，比如 GUI 控件（`Button` 是 `Widget`）。
+:::
+
+### 组合的额外好处：可替换
+
+```python
+class ElectricEngine:
+    def start(self):
+        return "电机启动"
+
+
+class Car:
+    def __init__(self, engine):
+        self.engine = engine        # 引擎从外面传进来
+
+    def drive(self):
+        return f"开车：{self.engine.start()}"
+
+
+print(Car(Engine()).drive())
+print(Car(ElectricEngine()).drive())
+```
+
+输出：
+
+```text
+开车：引擎启动
+开车：电机启动
+```
+
+**换个引擎不用改 Car 的代码**，这叫「依赖注入」，是组合的最大优势。
+
+## 实战：一个完整的继承例子
+
+```python
+class Shape:
+    """所有图形的基类"""
+    def area(self):
+        raise NotImplementedError("子类必须实现 area()")
+
+    def __str__(self):
+        return f"{self.__class__.__name__}(面积={self.area():.2f})"
+
+
+class Circle(Shape):
+    def __init__(self, r):
+        self.r = r
+
+    def area(self):
+        return 3.14159 * self.r ** 2
+
+
+class Rect(Shape):
+    def __init__(self, w, h):
+        self.w = w
+        self.h = h
+
+    def area(self):
+        return self.w * self.h
+
+
+shapes = [Circle(5), Rect(3, 4)]
+for s in shapes:
+    print(s)
+```
+
+输出：
+
+```text
+Circle(面积=78.54)
+Rect(面积=12.00)
+```
+
+:::tip[这个例子的三个设计要点]
+1. **基类定义接口**：`Shape.area()` 抛 `NotImplementedError`，明确告诉子类「你必须实现」
+2. **`__str__` 写在基类**：所有子类自动获得，不用重复写
+3. **`self.__class__.__name__`** 能拿到子类自己的类名，基类代码不用知道具体是什么
+
+**这就是继承的正确用法：基类提供共性，子类提供差异。**
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 子类 `__init__` 没调 super | AttributeError 缺属性 | 父类初始化没执行 | 加 `super().__init__(...)` |
+| super 参数传错 | TypeError | 参数和父类不匹配 | 对齐父类签名 |
+| 用继承表达「有一个」 | 继承到不该有的方法 | is-a / has-a 混淆 | 改用组合 |
+| 继承层级过深 | 难维护 | 超过 2~3 层就该反思 | 用组合扁平化 |
+| `isinstance` 判断太多 | 加类型就要改代码 | 没用多态 | 让子类重写方法 |
+
+## 本课自检
+
+- [ ] 会写 `class 子类(父类):`
+- [ ] 知道子类自动继承父类所有方法
+- [ ] **知道子类写 `__init__` 时必须调 `super().__init__()`**
+- [ ] 会重写方法，会在重写里用 `super()` 保留父类行为
+- [ ] 理解多态：同一个调用不同行为
+- [ ] 知道 `isinstance` 会检查继承链，`type()` 不会
+- [ ] **能分清「是一个」和「有一个」**
+- [ ] 知道组合通常优于继承
+- [ ] 知道组合能实现「换部件不改代码」
+
+## 下一步
+
+[23 推导式与常用写法](./23-comprehension) —— 学会 Python 特有的简洁写法，代码能短一半。

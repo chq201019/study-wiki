@@ -1,0 +1,202 @@
+---
+id: oop-02
+title: "02 魔术方法：让自定义类型像内建类型"
+sidebar_position: 3
+description: "面向对象 第 2 部分：魔术方法：让自定义类型像内建类型"
+---
+
+# 02 魔术方法：让自定义类型像内建类型
+魔术方法（dunder = double underscore）是 Python 的**运算符重载**与**协议**机制。下面是一个较完整的例子：
+
+```python
+class Vec:
+    def __init__(self, x, y):
+        self.x, self.y = x, y
+
+    def __repr__(self):
+        return f"Vec({self.x}, {self.y})"
+
+    def __eq__(self, other):
+        if not isinstance(other, Vec):
+            return NotImplemented        # 交给对方处理
+        return (self.x, self.y) == (other.x, other.y)
+
+    def __hash__(self):
+        return hash((self.x, self.y))    # 定义了 __eq__ 就得定义 __hash__
+
+    def __add__(self, other):
+        return Vec(self.x + other.x, self.y + other.y)
+
+    def __len__(self):
+        return 2
+
+    def __bool__(self):
+        return bool(self.x or self.y)
+
+    def __getitem__(self, i):
+        return (self.x, self.y)[i]
+
+    def __iter__(self):
+        return iter((self.x, self.y))
+
+    def __lt__(self, other):
+        return (self.x ** 2 + self.y ** 2) < (other.x ** 2 + other.y ** 2)
+```
+
+```python
+v = Vec(1, 2)
+print("repr   :", repr(v))
+print("==     :", v == Vec(1, 2))
+print("hash   :", hash(v) == hash(Vec(1, 2)))
+print("+      :", v + Vec(1, 1))
+print("len    :", len(v))
+print("bool   :", bool(v), "| bool(Vec(0,0)):", bool(Vec(0, 0)))
+print("索引   :", v[0])
+print("迭代   :", list(v))
+print("<      :", Vec(1, 1) < Vec(2, 2))
+print("去重   :", {Vec(1, 2), Vec(1, 2)})     # 靠 __hash__ + __eq__
+print("跨类型 :", v == "x")
+```
+
+```text
+repr   : Vec(1, 2)
+==     : True
+hash   : True
++      : Vec(2, 3)
+len    : 2
+bool   : True | bool(Vec(0,0)): False
+索引   : 1
+迭代   : [1, 2]
+<      : True
+去重   : {Vec(1, 2)}
+跨类型 : False
+```
+
+### 常用魔术方法速查
+
+| 类别 | 方法 | 触发 |
+| --- | --- | --- |
+| 构造 | `__init__` / `__new__` | 初始化 / 创建实例 |
+| 表示 | `__repr__` / `__str__` | `repr()` / `str()`、`print()` |
+| 比较 | `__eq__` `__lt__` `__le__` `__gt__` `__ge__` | `==` `<` `<=` `>` `>=` |
+| 哈希 | `__hash__` | `hash()`、作 dict 键、进 set |
+| 真假 | `__bool__` / `__len__` | `bool()`、条件判断 |
+| 算术 | `__add__` `__sub__` `__mul__` `__truediv__` | `+` `-` `*` `/` |
+| 反向算术 | `__radd__` 等 | 左操作数不支持时 |
+| 容器 | `__len__` `__getitem__` `__setitem__` `__contains__` `__iter__` | `len()` `x[i]` `x[i]=v` `in` `for` |
+| 调用 | `__call__` | `obj()` |
+| 上下文 | `__enter__` / `__exit__` | `with` |
+| 属性 | `__getattr__` `__getattribute__` `__setattr__` | 属性访问（第 7 页） |
+
+### `__repr__` vs `__str__`
+
+```python
+import datetime
+
+d = datetime.date(2024, 1, 1)
+print("repr:", repr(d))
+print("str :", str(d))
+print("列表里的元素用 repr:", [d])
+```
+
+```text
+repr: datetime.date(2024, 1, 1)
+str : 2024-01-01
+列表里的元素用 repr: [datetime.date(2024, 1, 1)]
+```
+
+- **`__repr__`**：给开发者看，目标是**无歧义**，理想情况下能 `eval` 回来
+- **`__str__`**：给用户看，目标是**可读**
+
+没定义 `__str__` 时，`str()` 会退回用 `__repr__`。**写类时至少定义 `__repr__`**，调试时收益巨大。
+
+### `NotImplemented`：比较的正确写法
+
+```python
+class N:
+    def __eq__(self, other):
+        return NotImplemented
+
+print(N() == 5)
+```
+
+```text
+False
+```
+
+二元运算符找不到实现时，Python 会：先试左边的 `__eq__`，返回 `NotImplemented` 就试右边的 `__eq__`（反射），两边都不行则返回 `False`（比较）或抛 `TypeError`（算术）。
+
+**所以比较方法遇到不认识的类型，要返回 `NotImplemented`，不要抛异常或硬返回 `False`。**
+
+:::danger[定义了 `__eq__` 就必须定义 `__hash__`]
+Python 的规则：**一旦你在类里定义了 `__eq__` 而没定义 `__hash__`，`__hash__` 会被自动设为 `None`**，实例立刻变成不可哈希。
+
+```python
+class P:
+    def __eq__(self, other):
+        return True
+
+print("__hash__:", P.__hash__)       # None
+```
+
+进 set 或作 dict 键时会报 `TypeError: unhashable type`。想要可哈希就同时实现：
+
+```python
+def __hash__(self):
+    return hash((self.x, self.y))    # 用决定相等性的那批字段
+```
+
+**并且哈希必须基于相等的那些字段**——否则会违反「相等的对象哈希必相同」这条铁律（第 4 页）。
+:::
+
+## 7. `property`：把方法伪装成属性
+
+```python
+class Circle:
+    def __init__(self, radius):
+        self._radius = radius
+
+    @property
+    def radius(self):
+        return self._radius
+
+    @radius.setter
+    def radius(self, value):
+        if value < 0:
+            raise ValueError("半径必须 >= 0")
+        self._radius = value
+
+    @property
+    def area(self):
+        return 3.14159 * self._radius ** 2
+
+c = Circle(2)
+print("radius:", c.radius, "| area:", round(c.area, 3))
+c.radius = 5
+print("改后:", c.radius)
+
+try:
+    c.radius = -1
+except ValueError as e:
+    print("->", e)
+
+try:
+    c.area = 1          # 没有 setter 的属性是只读的
+except AttributeError as e:
+    print("只读 ->", type(e).__name__)
+```
+
+```text
+radius: 2 | area: 12.566
+改后: 5
+-> 半径必须 >= 0
+只读 -> AttributeError
+```
+
+**`property` 的最大价值是向后兼容**：一开始直接用普通属性 `self.radius`，后来需要加校验或计算时，改成 `property` 而**调用方代码一行都不用改**。在 Java 里这就必须预先写 `getRadius()`/`setRadius()`，Python 不需要。
+
+`property` 本身就是一个**描述符**（第 7 页讲原理），`@property` 是它的语法糖。
+
+---
+
+**翻页**：[← 上一页](./oop-01) · [下一页 →](./oop-03) · [返回目录](./)

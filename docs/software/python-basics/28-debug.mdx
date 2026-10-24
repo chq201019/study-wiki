@@ -1,0 +1,420 @@
+---
+id: 28-debug
+title: 28 调试技巧与读懂报错
+sidebar_position: 28
+description: 怎么读 traceback、常见异常对照表、print 调试法、断点调试，以及用二分法快速定位 bug。
+---
+
+# 28 调试技巧与读懂报错
+
+**本课目标**：看到报错不再慌，能按步骤定位问题。**这是最实用的一课。**
+
+## 报错不是失败，是提示
+
+新手看到红色报错就慌，其实**报错是 Python 在帮你**——它精确告诉你哪里错了、为什么错。
+
+**会读报错的人，调试速度是别人的 10 倍。**
+
+## 读懂 traceback
+
+这是一个真实的报错（本机实测）：
+
+```python
+def inner():
+    return 1 / 0
+
+def outer():
+    return inner()
+
+outer()
+```
+
+输出：
+
+```text
+Traceback (most recent call last):
+  File "tb.py", line 7, in <module>
+    outer()
+  File "tb.py", line 5, in outer
+    return inner()
+           ^^^^^^^
+  File "tb.py", line 3, in inner
+    return 1/0
+           ~^~
+ZeroDivisionError: division by zero
+```
+
+:::tip[读 traceback 的顺序：从下往上]
+**大部分人从上看，这是错的。**
+
+正确顺序：
+
+1. **先看最后一行**：`ZeroDivisionError: division by zero`——这是**错误类型和原因**
+2. **往上看最近的 `File` 行**：`line 3, in inner`——错误**具体发生的位置**
+3. **再往上**：调用链，告诉你是「谁调用了它」
+
+**核心信息就两个**：什么错（最后一行）、错在哪（最后一个 File）。
+:::
+
+### 三个部分的作用
+
+| 部分 | 含义 |
+| --- | --- |
+| `File "tb.py", line 3, in inner` | 文件、行号、所在函数 |
+| `return 1/0` | 出错的那行代码 |
+| `^^^^^` / `~^~` | **精确指出哪个表达式出错**（Python 3.11+ 新特性） |
+| `ZeroDivisionError: ...` | 错误类型 + 说明 |
+
+:::info[`^^^^^` 是 Python 3.11 才有的]
+这个指示符会精确标出出错的具体子表达式。上面 `~^~` 指着 `1/0` 这个除法，说明是它出的问题。
+
+如果你用的是 3.10 或更早，不会有这个提示——升级到 3.11+ 调试体验会好很多。
+:::
+
+## 从「最后一行」能知道什么
+
+错误类型直接提示了排查方向：
+
+| 错误类型 | 大概率原因 |
+| --- | --- |
+| `NameError` | 变量名拼错、大小写错、没定义就用了 |
+| `TypeError` | 类型不对（字符串加数字、参数个数错） |
+| `ValueError` | 类型对但值不对（`int("abc")`） |
+| `KeyError` | 字典键不存在 |
+| `IndexError` | 列表下标越界 |
+| `AttributeError` | 对象没有这个属性/方法 |
+| `FileNotFoundError` | 文件路径错 |
+| `IndentationError` | 缩进不对 |
+| `SyntaxError` | 语法错（少冒号、少括号） |
+
+### 真实错误消息对照（本机实测）
+
+```text
+int('abc')           -> ValueError: invalid literal for int() with base 10: 'abc'
+[1,2][5]             -> IndexError: list index out of range
+{'a':1}['b']         -> KeyError: 'b'
+'a'+1                -> TypeError: can only concatenate str (not "int") to str
+open('nope.txt')     -> FileNotFoundError: [Errno 2] No such file or directory: 'nope.txt'
+None.attr            -> AttributeError: 'NoneType' object has no attribute 'attr'
+```
+
+:::tip[记住几个高频错误的典型长相]
+- 看到 `'NoneType' object has no attribute` → **某个函数返回了 None，你没检查就用了它的属性**
+- 看到 `can only concatenate str (not "int") to str` → 忘了 `int()` 或 `str()` 转换
+- 看到 `list index out of range` → 下标超了，检查 `len()`
+:::
+
+## 方法一：print 调试法（最朴素但最有效）
+
+**核心思路**：在怀疑的地方打印中间值，看它和你以为的是否一致。
+
+```python
+def calc_average(scores):
+    print(f"[调试] 收到 scores = {scores}")        # ← 加这行
+    total = sum(scores)
+    print(f"[调试] total = {total}")               # ← 加这行
+    return total / len(scores)
+```
+
+```python
+scores = [90, 80, 70]
+avg = calc_average(scores)
+print(avg)
+```
+
+输出：
+
+```text
+[调试] 收到 scores = [90, 80, 70]
+[调试] total = 240
+80.0
+```
+
+:::tip[print 调试的三个要点]
+1. **打印「你以为的值」**：怀疑 `x` 是 5，就打印出来看是不是 5
+2. **加前缀 `[调试]`**：方便调试完一次性搜出来删掉
+3. **打印类型**：`print(type(x), x)`，很多 bug 是类型不对（以为是数字其实是字符串）
+
+**bug 的本质永远是「实际值和你想的不一样」。** print 就是用来发现这个差异的。
+:::
+
+### 更聪明的打印
+
+```python
+x = "123"
+print(f"{x=}")          # x='123'     ← f-string 的调试语法
+print(f"{type(x)=}")    # type(x)=<class 'str'>
+```
+
+`f"{变量=}"` 会同时打印变量名和值，比手写 `"x = " + str(x)` 方便。
+
+## 方法二：断点调试
+
+print 适合简单情况。**逻辑复杂时用断点**——可以暂停程序、查看所有变量、单步执行。
+
+### VS Code 里用断点
+
+1. 在行号左边**点一下**，出现红点（断点）
+2. 按 `F5` 启动调试
+3. 程序运行到红点会**暂停**
+4. 此时：
+   - 左侧「变量」面板能看到所有变量的当前值
+   - `F10` 单步跳过（执行下一行）
+   - `F11` 单步进入（进入函数内部）
+   - `F5` 继续运行到下一个断点
+
+:::tip[断点比 print 强在哪]
+- **不用改代码**（不用加 print 再删掉）
+- **能看到所有变量**，不用猜该打印哪个
+- **能单步跟踪**，看清每一步怎么变的
+- 能**看到调用栈**（谁调用了谁）
+
+**学会用断点，调试效率会有质变。** 花 10 分钟学一下 VS Code 调试器的用法，绝对值得。
+:::
+
+### 代码里临时打断点
+
+不方便开调试器时，可以在代码里写：
+
+```python
+def buggy(a, b):
+    result = a + b
+    breakpoint()          # 执行到这里会暂停，进入交互式调试
+    return result * 2
+```
+
+运行后进入 `(Pdb)` 提示符，可以：
+
+| 命令 | 作用 |
+| --- | --- |
+| `p 变量名` | 打印变量 |
+| `n` | 下一行（不进函数） |
+| `s` | 进入函数 |
+| `c` | 继续运行 |
+| `q` | 退出 |
+
+## 方法三：二分法定位
+
+**bug 在一大段代码里，不知道哪一行出的问题。**
+
+用二分法：注释掉后半段，看还有没有错。
+
+```python
+def process(data):
+    step1 = load(data)
+    step2 = clean(step1)
+    step3 = transform(step2)      # ← 怀疑这里
+    step4 = save(step3)
+    return step4
+```
+
+**做法**：
+
+1. 在 `transform` 前后各打一个 print
+2. 看是「进去之前就错了」还是「出来之后才错」
+3. 缩小到具体函数后，再在函数内部二分
+
+:::tip[打印「标记」快速定位卡死]
+程序**卡住不动**（不是报错）时，在各阶段打标记：
+
+```python
+print(">>> 开始 load")
+data = load()
+print(">>> load 完成")
+
+print(">>> 开始 clean")
+data = clean(data)
+print(">>> clean 完成")
+```
+
+**看最后打印的是哪个标记，问题就在下一步。** 这招在调试网络请求、死循环时特别有效。
+:::
+
+## 常见 bug 类型与对策
+
+### ① 类型不对
+
+```python
+age = input("年龄：")
+print(age + 1)          # TypeError
+```
+
+**原因**：`input()` 返回字符串。
+**对策**：打印 `type()` 确认，加 `int()`。
+
+### ② 空值（None）
+
+```python
+result = some_function()
+print(result.upper())      # AttributeError: 'NoneType'
+```
+
+**原因**：`some_function()` 没返回值（或返回了 None）。
+**对策**：先 `print(result)` 看看，加 `if result is not None`。
+
+**这是最常见的 bug 之一**，尤其容易发生在「忘了 `return`」时。
+
+### ③ 下标越界
+
+```python
+items = [1, 2, 3]
+for i in range(5):
+    print(items[i])        # IndexError
+```
+
+**对策**：用 `for x in items` 而不是下标遍历；或用 `len(items)`。
+
+### ④ 差一错误（off-by-one）
+
+```python
+# 想取前 3 个，写了 items[0:3] 是对的
+# 但循环写成 for i in range(1, 3) 只跑了 1、2 两次
+```
+
+**对策**：牢记 `range` 和切片都是**含头不含尾**，边界处打印确认。
+
+### ⑤ 作用域错误
+
+```python
+count = 0
+def inc():
+    count += 1        # UnboundLocalError
+```
+
+**对策**：加 `global count`（[第 17 课](./17-scope)）。但更好的做法是重构，别用全局变量。
+
+### ⑥ 可变对象被意外修改
+
+```python
+def add(a, lst=[]):        # 经典陷阱
+    lst.append(a)
+    return lst
+```
+
+**对策**：默认值用 `None`（[第 16 课](./16-functions-advanced)）。
+
+### ⑦ 修改正在遍历的列表
+
+```python
+for x in nums:
+    if x % 2 == 0:
+        nums.remove(x)      # 漏删
+```
+
+**对策**：遍历副本 `for x in nums[:]`，或用列表推导式生成新列表。
+
+## 调试的系统方法
+
+:::tip[遇到 bug 的四步法]
+**第一步：复现**
+
+能稳定复现，才能验证修好没有。记下「什么输入 → 什么现象」。
+
+**第二步：定位**
+
+用 print/断点/二分法，缩小到**具体哪一行**。
+
+**第三步：解释**
+
+**必须能说出「为什么会这样」**。如果只是「改了一下就好了」，说明没搞懂——同样的 bug 还会再来。
+
+**第四步：修复 + 验证**
+
+改完后：
+- 用原来的复现步骤测试
+- 再测几个边界情况（空输入、负数、超大值）
+:::
+
+:::danger[最常见的错误做法：瞎改]
+看到报错就这里改一下、那里改一下，直到不报错了。
+
+**问题**：很可能只是把错误藏起来了，或者引入了新 bug。
+
+**正确做法**：先读懂报错说的是什么，再动手。
+:::
+
+## 求助的正确方式
+
+卡住了要求助（问人、问 AI、搜索），**信息给全才有用**：
+
+:::warning[低效提问]
+> 我的代码报错了，怎么改？
+
+没人能回答。
+:::
+
+:::tip[高效提问的模板]
+```text
+【我想做什么】
+读取 CSV 并计算平均分
+
+【报错信息】
+ValueError: could not convert string to float: 'N/A'
+
+【相关代码】
+with open("scores.csv") as f:
+    for row in csv.reader(f):
+        scores.append(float(row[1]))
+
+【我试过什么】
+- 确认文件存在，路径没问题
+- 打印过 row[1]，发现有一行是 'N/A'
+
+【我的猜测】
+可能是数据里有非数字的行，但我不知道该怎么跳过
+```
+
+这个模板里，**「报错信息 + 相关代码 + 试过什么」缺一不可**。
+
+**注意**：问题里已经包含了答案的一半（`'N/A'`），很多时候在整理信息的过程中就自己想到解法了——这叫「小黄鸭调试法」。
+:::
+
+## 用 print 之外的调试工具
+
+| 工具 | 用途 |
+| --- | --- |
+| `logging` 模块 | 比 print 更专业，能分级、输出到文件 |
+| `assert` 语句 | 断言「这里必须满足某条件」 |
+| `traceback` 模块 | 程序化获取错误堆栈 |
+| `pdb` / 断点 | 交互式调试 |
+
+### assert：快速检查假设
+
+```python
+def withdraw(balance, amount):
+    assert amount > 0, "取款金额必须为正"
+    assert amount <= balance, "余额不足"
+    return balance - amount
+```
+
+条件不满足时抛 `AssertionError`，并显示你写的消息。
+
+:::warning[assert 只用于调试，不用于用户输入校验]
+```python
+# ❌ 不要这样
+def register(age):
+    assert age >= 0, "年龄不能为负"
+```
+
+因为 `python -O` 启动时会**禁用所有 assert**，校验就失效了。
+
+**用户输入校验用 `if + raise`，assert 只用于「检查我自己的假设」。**
+:::
+
+## 本课自检
+
+- [ ] **会从下往上读 traceback**（先看最后一行）
+- [ ] 能说出常见异常类型对应的排查方向
+- [ ] 知道 `'NoneType' object has no attribute` 通常意味什么
+- [ ] 会用 print 调试，知道要打印「类型 + 值」
+- [ ] 会在 VS Code 里打断点、单步执行
+- [ ] 会用标记打印法定位「程序卡住」
+- [ ] 会用二分法缩小范围
+- [ ] 知道调试四步法（复现→定位→解释→验证）
+- [ ] 能说清「为什么会这样」才动手改
+- [ ] 会写一份信息完整的问题描述
+- [ ] 知道 assert 不能用于用户输入校验
+
+## 下一步
+
+[29 代码风格与命名](./29-style) —— 让代码不只是能跑，还要别人看得懂、自己一个月后还看得懂。

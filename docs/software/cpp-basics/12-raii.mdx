@@ -1,0 +1,364 @@
+---
+id: 12-raii
+title: 12 RAII：C++ 的核心思想
+sidebar_position: 12
+description: 资源获取即初始化——为什么 C++ 能自动释放资源、异常安全、以及如何用 RAII 包装任何资源。
+---
+
+# 12 RAII：C++ 的核心思想
+
+**本课目标**：理解 RAII，知道它为什么是 C++ 最重要的设计。
+
+## RAII 是什么
+
+**RAII = Resource Acquisition Is Initialization（资源获取即初始化）**
+
+听起来很绕，实际意思很简单：
+
+> **把资源的生命周期绑定到一个对象的生命周期上。**
+
+```cpp
+{
+    FileHandle f("data.txt");     /* 构造时打开文件 */
+    /* 用 f 读文件... */
+}                                  /* 出作用域，f 析构 → 自动关闭文件 */
+```
+
+**不用写 `close()`，析构函数帮你关。**
+
+## 它解决了什么问题
+
+回顾 C 的写法（[C 第 25 课](../c-basics/25-files)）：
+
+```c
+FILE *fp = fopen("data.txt", "r");
+if (!fp) return -1;
+
+/* ... 一堆处理逻辑 ... */
+if (出错了) {
+    fclose(fp);          /* ❌ 每个返回点都要记得关 */
+    return -1;
+}
+if (又出错) {
+    fclose(fp);          /* ❌ 漏一个就泄漏 */
+    return -1;
+}
+
+fclose(fp);              /* ❌ 容易漏 */
+return 0;
+```
+
+:::danger[C 风格的问题]
+1. **每个提前返回点都要记得释放**
+2. **中间抛异常时就漏了**
+3. **代码越复杂，越容易漏**
+
+**这不是程序员不小心，是这种写法本身就有缺陷。**
+:::
+
+RAII 写法：
+
+```cpp
+{
+    FileHandle f("data.txt");       /* 构造：打开 */
+    if (!f.valid()) return -1;      /* 直接返回，f 析构自动关闭 */
+
+    if (出错了) return -1;           /* 同上，自动关闭 */
+
+    /* 正常结束，还是自动关闭 */
+}
+```
+
+**一个 `close` 都不用写。**
+
+## 关键：异常也不怕
+
+:::tip[这是 RAII 最强大的地方]
+本机实测：
+
+```cpp
+void may_throw(int i) {
+    Res r("throw-test-" + std::to_string(i));
+    if (i == 2) throw std::runtime_error("boom");
+}
+```
+
+输出：
+
+```text
+  获取 throw-test-1
+  正常结束
+  释放 throw-test-1        ← 正常路径，释放了
+  获取 throw-test-2
+  释放 throw-test-2        ← 抛异常，也释放了！
+  捕获: boom
+```
+
+**即使抛异常，析构函数仍然执行**——这是 C++ 的栈展开（stack unwinding）机制保证的。
+:::
+
+:::danger[前面那段 C 代码在异常时必漏]
+```c
+FILE *fp = fopen(...);
+do_something_that_throws();     /* 如果抛异常... */
+fclose(fp);                      /* 这行永远不执行 → 泄漏 */
+```
+
+**C 没有栈展开机制，所以只能靠人肉检查每个分支。**
+:::
+
+## 用 RAII 包装任何资源
+
+### 例一：文件
+
+```cpp
+#include <cstdio>
+#include <stdexcept>
+
+class FileHandle {
+public:
+    explicit FileHandle(const char *path) {
+        fp_ = std::fopen(path, "r");
+        if (!fp_) throw std::runtime_error("打开文件失败");
+    }
+
+    ~FileHandle() {
+        if (fp_) std::fclose(fp_);      /* 构造没成功也要安全 */
+    }
+
+    /* 禁止拷贝：文件句柄不该被复制 */
+    FileHandle(const FileHandle &) = delete;
+    FileHandle &operator=(const FileHandle &) = delete;
+
+    std::FILE *get() const { return fp_; }
+
+private:
+    std::FILE *fp_ = nullptr;
+};
+```
+
+### 例二：互斥锁
+
+```cpp
+#include <mutex>
+
+class LockGuard {
+public:
+    explicit LockGuard(std::mutex &m) : m_(m) { m_.lock(); }
+    ~LockGuard() { m_.unlock(); }
+
+    LockGuard(const LockGuard &) = delete;
+    LockGuard &operator=(const LockGuard &) = delete;
+
+private:
+    std::mutex &m_;
+};
+
+/* 使用 */
+std::mutex mtx;
+{
+    LockGuard lock(mtx);        /* 自动加锁 */
+    /* ... 临界区 ... */
+}                               /* 自动解锁，绝不忘记 */
+```
+
+**标准库已经有 `std::lock_guard`、`std::unique_lock`**，不用自己写。
+
+### 例三：内存
+
+```cpp
+{
+    auto p = std::make_unique<int>(42);      /* 等价于 new */
+    /* 用 p ... */
+}   /* 自动 delete */
+```
+
+## 标准库的 RAII 类型
+
+| 类型 | 管理什么 |
+| --- | --- |
+| `std::string` | 字符数组 |
+| `std::vector` / `std::map` | 堆内存 |
+| `std::unique_ptr` / `shared_ptr` | 单个对象 |
+| `std::fstream` / `ifstream` / `ofstream` | 文件 |
+| `std::lock_guard` / `unique_lock` | 互斥锁 |
+| `std::thread`（join 时） | 线程 |
+
+:::tip[你能用到的大部分资源，标准库都有 RAII 包装]
+**所以现代 C++ 的规矩是：不手动 `new`/`delete`，不手动 `fopen`/`fclose`。**
+
+用现成的 RAII 类型，你几乎不会遇到资源泄漏。
+:::
+
+## RAII 的设计要点
+
+:::tip[写 RAII 类时的四条规则]
+**① 构造函数获取资源，失败就抛异常**
+
+```cpp
+explicit FileHandle(const char *p) {
+    fp_ = std::fopen(p, "r");
+    if (!fp_) throw std::runtime_error("失败");
+}
+```
+
+**② 析构函数释放资源，绝不抛异常**
+
+```cpp
+~FileHandle() noexcept {
+    if (fp_) std::fclose(fp_);
+}
+```
+
+**③ 禁止或正确实现拷贝**
+
+```cpp
+FileHandle(const FileHandle &) = delete;             /* 独占资源 */
+/* 或者实现深拷贝 / 移动语义 */
+```
+
+**④ 提供移动构造，让资源能转移**
+
+```cpp
+FileHandle(FileHandle &&other) noexcept : fp_(other.fp_) {
+    other.fp_ = nullptr;        /* 源对象不再拥有 */
+}
+```
+:::
+
+:::danger[为什么析构不能抛异常]
+析构函数常常在**栈展开**时被调用（处理另一个异常的过程中）。
+
+如果此时再抛异常，C++ 会直接调用 `std::terminate()` **终止程序**。
+
+**规矩：析构函数标记 `noexcept`（默认就是），内部捕获所有异常。**
+:::
+
+## 为什么禁止拷贝
+
+```cpp
+FileHandle a("x.txt");
+FileHandle b = a;              /* 如果允许，两个对象管同一个 FILE* */
+/* 析构时都 fclose 同一个句柄 → 崩溃 */
+```
+
+**和 C 的 double free 是同一类问题**（[第 8 课](./08-copy)）。
+
+**解决方式**：
+
+- **禁止拷贝**：`= delete`（独占资源，如 `unique_ptr`）
+- **引用计数**：`shared_ptr` 的做法
+- **深拷贝**：复制一份资源
+
+## 完整示例：自己写一个 RAII 计时器
+
+```cpp
+#include <chrono>
+#include <iostream>
+#include <string>
+
+class Timer {
+public:
+    explicit Timer(std::string name)
+        : name_(std::move(name)), start_(std::chrono::steady_clock::now()) {}
+
+    ~Timer() {
+        auto end = std::chrono::steady_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      end - start_).count();
+        std::cout << "[" << name_ << "] 耗时 " << ms << " ms\n";
+    }
+
+    /* 禁止拷贝，允许移动 */
+    Timer(const Timer &) = delete;
+    Timer &operator=(const Timer &) = delete;
+
+private:
+    std::string name_;
+    std::chrono::steady_clock::time_point start_;
+};
+
+void work() {
+    Timer t("work");                 /* 构造开始计时 */
+    /* ... 干活 ... */
+}                                    /* 析构自动打印耗时 */
+
+int main() {
+    work();
+    work();
+    return 0;
+}
+```
+
+输出示例：
+
+```text
+[work] 耗时 0 ms
+[work] 耗时 0 ms
+```
+
+:::tip[这个例子展示了 RAII 的通用性]
+**RAII 不只管"释放"，也管"收尾动作"**：
+
+- 释放内存/文件
+- 解锁
+- 打印耗时
+- 回滚事务
+- 恢复某个状态
+
+**只要「进入时做一件事、离开时必须做另一件事」，就适合 RAII。**
+:::
+
+## RAII vs 手动管理
+
+| | 手动管理 | RAII |
+| --- | --- | --- |
+| 正常路径 | 要记得释放 | 自动 |
+| 提前返回 | 每个分支都要释放 | 自动 |
+| 抛异常 | **必漏** | 自动 |
+| 代码量 | 多 | 少 |
+| 出错概率 | 高 | 低 |
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 在构造函数里抛异常但已部分分配 | 泄漏 | 析构不会执行 | 用成员 RAII 对象管理 |
+| 析构里抛异常 | 程序 terminate | 栈展开时二次异常 | 捕获所有异常 |
+| 允许拷贝独占资源 | double free | 两个对象管一个资源 | `= delete` |
+| 析构不释放 | 泄漏 | 忘写 | 检查每个析构 |
+| 手动 new/delete | 容易漏 | 没用 RAII | 用 `unique_ptr` |
+| 成员是裸指针 | 拷贝时出问题 | 需要手动 Rule of Three | 改用智能指针 |
+
+:::danger[构造函数抛异常时，已构造的成员会被析构]
+```cpp
+class A {
+    std::string s_;          /* 已构造 */
+public:
+    A() {
+        /* 这里抛异常 → s_ 的析构会执行（成员已经构造完了） */
+        throw std::runtime_error("x");
+    }
+};
+```
+
+**这是 C++ 自动保证的**——所以用 RAII 成员，即使构造失败也不会泄漏。
+
+**但如果你在构造函数体里手动 `new` 了东西再抛异常，那部分就漏了。**
+:::
+
+## 本课自检
+
+- [ ] 能说出 RAII 的含义（资源生命周期绑定对象生命周期）
+- [ ] **知道 RAII 在抛异常时也能保证释放**
+- [ ] 知道 C 手动管理的三个缺陷
+- [ ] 会写一个 RAII 包装类
+- [ ] 知道析构函数不能抛异常
+- [ ] 知道独占资源要禁止拷贝（`= delete`）
+- [ ] 能列举 5 个标准库的 RAII 类型
+- [ ] 知道 RAII 不只用于释放，也用于任何"收尾动作"
+- [ ] 知道构造函数抛异常时已构造的成员会被析构
+
+## 下一步
+
+[13 std::string 与 std::vector](./13-string-vector) —— 告别 `char[]` 和 `malloc`。

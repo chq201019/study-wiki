@@ -1,0 +1,253 @@
+---
+id: argparse
+title: 命令行工具 argparse
+sidebar_position: 34
+description: 位置参数与选项、子命令、互斥组、类型校验与错误处理、以及让 --help 真正有用的写法。
+---
+
+# 命令行工具 argparse
+
+**本课目标**：写出 `--help` 清晰、参数校验严格、报错友好的 CLI。
+
+## 最小可用
+
+```python
+import argparse
+
+p = argparse.ArgumentParser(description="处理文件")
+p.add_argument("input", help="输入文件路径")
+p.add_argument("-o", "--output", default="out.txt", help="输出路径")
+p.add_argument("-v", "--verbose", action="store_true", help="详细输出")
+
+args = p.parse_args()
+print(args.input, args.output, args.verbose)
+```
+
+```bash
+python tool.py data.csv -o result.txt -v
+python tool.py --help
+```
+
+:::tip[`description` 和每个参数的 `help` 都要写]
+**`--help` 是用户第一次接触你的工具时唯一会看的东西。**
+
+```text
+usage: tool.py [-h] [-o OUTPUT] [-v] input
+
+处理文件
+
+positional arguments:
+  input                 输入文件路径
+
+options:
+  -h, --help            show this help message and exit
+  -o OUTPUT, --output OUTPUT
+                        输出路径
+  -v, --verbose         详细输出
+```
+:::
+
+## 位置参数 vs 选项
+
+| 类型 | 写法 | 用法 |
+| --- | --- | --- |
+| **位置参数** | `add_argument("file")` | `tool.py data.csv` |
+| **选项** | `add_argument("-o", "--output")` | `tool.py -o out.txt` |
+
+:::warning[位置参数不要超过 2 个]
+**超过两个位置参数，用户就得靠 `--help` 才知道顺序。**
+
+**改成选项更清晰**：`tool.py --src a --dst b` 比 `tool.py a b` 明确。
+:::
+
+## 常用参数类型
+
+```python
+# 整数 + 范围校验
+p.add_argument("-n", type=int, default=10)
+
+# 限定取值
+p.add_argument("--mode", choices=["fast", "safe"], default="safe")
+
+# 多个值
+p.add_argument("--tags", nargs="+")          # --tags a b c
+p.add_argument("--pair", nargs=2)            # --pair x y
+p.add_argument("--opt", nargs="?")           # 可省略
+
+# 可重复
+p.add_argument("-v", "--verbose", action="count", default=0)   # -vvv
+
+# 布尔开关
+p.add_argument("--dry-run", action="store_true")
+p.add_argument("--no-color", action="store_false", dest="color")
+```
+
+:::danger[`action="store_true"` 的默认值是 `False`]
+```python
+p.add_argument("--dry-run", action="store_true")
+args.dry_run       # 没传时是 False
+```
+
+**要默认 True 就用 `action="store_false"`**（配 `dest` 改名）。
+:::
+
+## 类型校验：用自定义函数
+
+```python
+def positive_int(s):
+    try:
+        v = int(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"不是整数: {s}")
+    if v <= 0:
+        raise argparse.ArgumentTypeError(f"必须大于 0: {v}")
+    return v
+
+p.add_argument("-n", type=positive_int, default=10)
+```
+
+:::tip[抛 `ArgumentTypeError` 而不是 `ValueError`]
+**`ArgumentTypeError` 会被 argparse 转成友好的用法提示**：
+
+```text
+error: argument -n: 必须大于 0: -3
+```
+
+**而 `ValueError` 会变成一长串 traceback。**
+:::
+
+## 子命令
+
+```python
+p = argparse.ArgumentParser(prog="mytool")
+sub = p.add_subparsers(dest="cmd", required=True)
+
+add = sub.add_parser("add", help="添加条目")
+add.add_argument("name")
+
+del_p = sub.add_parser("del", help="删除条目")
+del_p.add_argument("name")
+
+args = p.parse_args()
+if args.cmd == "add":
+    do_add(args.name)
+elif args.cmd == "del":
+    do_del(args.name)
+```
+
+```bash
+mytool add foo
+mytool del foo
+mytool --help                    # 列出所有子命令
+mytool add --help                # 看子命令的参数
+```
+
+:::warning[`required=True` 在 Python 3.7+ 才支持]
+**不加它时，用户直接敲 `mytool` 不会报错**（`args.cmd` 是 `None`）。
+
+**老版本要手动检查**：
+
+```python
+if not args.cmd:
+    p.print_help()
+    sys.exit(1)
+```
+:::
+
+## 互斥组
+
+```python
+g = p.add_mutually_exclusive_group()
+g.add_argument("--json", action="store_true")
+g.add_argument("--yaml", action="store_true")
+```
+
+```bash
+tool.py --json --yaml     # error: argument --yaml: not allowed with argument --json
+```
+
+**互斥组能自动产生清晰的错误提示**，比手写检查好。
+
+## 从文件读参数
+
+```python
+# Python 3.8+：支持从文件读（每行一个参数）
+p = argparse.ArgumentParser(fromfile_prefix_chars="@")
+p.add_argument("files", nargs="+")
+```
+
+```bash
+tool.py @args.txt         # args.txt 里每行一个文件路径
+```
+
+## 完整例子
+
+```python
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="logtool",
+        description="日志分析工具",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""示例:
+  logtool stats access.log
+  logtool grep --pattern ERROR access.log
+""")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("stats", help="统计")
+    s.add_argument("file")
+    s.add_argument("--top", type=int, default=10)
+
+    g = sub.add_parser("grep", help="过滤")
+    g.add_argument("file")
+    g.add_argument("--pattern", required=True)
+    return p
+
+def main():
+    args = build_parser().parse_args()
+    return 0 if dispatch(args) else 1
+```
+
+:::tip[`epilog` 写示例]
+**用户最想看的是"怎么用"，不是"每个参数是什么"。**
+
+**把 2~3 个典型用法放在 `epilog` 里，比一堆参数说明更有用。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `store_true` 默认是 True | 记反了 | 用 `store_false` + `dest` |
+| 类型错误抛 traceback | 抛了 `ValueError` | 改抛 `ArgumentTypeError` |
+| 子命令不传时不报错 | 没设 `required=True` | 加上或手动检查 |
+| `-v` 和 `--version` 冲突 | 都用 `-v` | 换一个短选项 |
+| 负数被当选项 | `-5` 被解析成选项 | 用 `--` 分隔：`tool.py -- -5` |
+| `--help` 太长 | 没分组 | 用 `add_argument_group` 分组 |
+
+:::danger[负数参数会被误认为选项]
+```bash
+tool.py -5            # error: unrecognized arguments: -5
+tool.py -- -5         # ✅ -- 之后的都当位置参数
+```
+
+**或者用 `-n=-5` 这种写法（带等号）。**
+:::
+
+## 本课自检
+
+- [ ] 会写 `ArgumentParser` 与 `add_argument`
+- [ ] **知道 `description` 和 `help` 必须写**
+- [ ] **知道位置参数不要超过 2 个**
+- [ ] 会用 `type` / `choices` / `nargs` / `action`
+- [ ] **知道 `action="count"` 能实现 `-vvv`**
+- [ ] **知道 `store_true` 默认 False，要 True 用 `store_false` + `dest`**
+- [ ] **知道自定义类型要抛 `ArgumentTypeError`**
+- [ ] 会用 `add_subparsers` 做子命令
+- [ ] 知道子命令 `required=True` 只在 3.7+ 可用
+- [ ] 知道 `add_mutually_exclusive_group` 自动产生清晰错误
+- [ ] **知道负数参数要用 `--` 分隔**
+
+## 下一步
+
+[配置与密钥管理](../../hardware/linux/secrets) 或 [logging 模块](./logging)。

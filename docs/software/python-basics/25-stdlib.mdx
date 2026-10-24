@@ -1,0 +1,476 @@
+---
+id: 25-stdlib
+title: 25 常用标准库速成
+sidebar_position: 25
+description: datetime 处理时间、pathlib 处理路径、json 存数据、os/sys 基本操作——这四个模块能解决八成日常需求。
+---
+
+# 25 常用标准库速成
+
+**本课目标**：掌握 4 个最常用的标准库，能立刻用在真实项目里。
+
+## 为什么要学标准库
+
+**Python 自带 200 多个模块**，覆盖时间、路径、网络、压缩、加密……
+
+学会用它们，就不用自己造轮子。本课只讲**日常最常用的 4 个**，够用很久。
+
+## datetime：处理时间和日期
+
+```python
+from datetime import datetime, date, timedelta
+```
+
+### 获取当前时间
+
+```python
+now = datetime.now()
+print(now)
+print(now.year, now.month, now.day)
+print(now.hour, now.minute, now.second)
+```
+
+输出示例：
+
+```text
+2026-10-18 14:32:15.123456
+2026 10 18
+14 32 15
+```
+
+### 格式化输出：strftime
+
+```python
+now = datetime(2026, 10, 18, 14, 30, 0)
+
+print(now.strftime("%Y-%m-%d"))
+print(now.strftime("%Y年%m月%d日 %H:%M"))
+print(now.strftime("%Y-%m-%d %H:%M:%S"))
+```
+
+输出：
+
+```text
+2026-10-18
+2026年10月18日 14:30
+2026-10-18 14:30:00
+```
+
+高频格式符：
+
+| 符 | 含义 | 例子 |
+| --- | --- | --- |
+| `%Y` | 四位年 | 2026 |
+| `%m` | 两位月 | 10 |
+| `%d` | 两位日 | 18 |
+| `%H` | 24 小时制 | 14 |
+| `%M` | 分 | 30 |
+| `%S` | 秒 | 00 |
+| `%A` | 星期全名 | Saturday |
+
+:::warning[`%m` 和 `%M` 别搞混]
+- `%m` = **月**（month）
+- `%M` = **分**（minute）
+
+大小写不同，含义完全不同。写错不会报错，只会得到错误结果。
+:::
+
+### 解析字符串：strptime
+
+```python
+d = datetime.strptime("2026-10-18", "%Y-%m-%d")
+print(d)
+print(type(d))
+```
+
+输出：
+
+```text
+2026-10-18 00:00:00
+<class 'datetime.datetime'>
+```
+
+:::tip[strftime 和 strptime 的区别]
+| 方法 | 方向 | 记忆 |
+| --- | --- | --- |
+| `strftime` | **datetime → 字符串** | f = format（格式化） |
+| `strptime` | **字符串 → datetime** | p = parse（解析） |
+
+**两者格式符完全相同**，只是方向相反。
+:::
+
+### 时间计算：timedelta
+
+```python
+today = date(2026, 10, 18)
+
+print(today + timedelta(days=7))
+print(today - timedelta(days=30))
+print(today + timedelta(weeks=2))
+```
+
+输出：
+
+```text
+2026-10-25
+2026-09-18
+2026-11-01
+```
+
+计算两个日期差：
+
+```python
+d1 = date(2026, 10, 18)
+d2 = date(2026, 12, 25)
+diff = d2 - d1
+print(diff.days)
+```
+
+输出：
+
+```text
+68
+```
+
+:::tip[倒计时、到期提醒都靠这个]
+```python
+from datetime import date
+
+deadline = date(2026, 11, 1)
+today = date.today()
+left = (deadline - today).days
+
+if left > 0:
+    print(f"还有 {left} 天")
+elif left == 0:
+    print("就是今天！")
+else:
+    print(f"已过期 {-left} 天")
+```
+:::
+
+## pathlib：处理文件路径
+
+比老式的 `os.path` 好用得多。
+
+```python
+from pathlib import Path
+```
+
+### 基本操作
+
+```python
+p = Path("data") / "logs" / "app.log"
+print(p)
+
+print(p.name)        # app.log
+print(p.stem)        # app
+print(p.suffix)      # .log
+print(p.parent)      # data/logs
+```
+
+输出（Windows 上）：
+
+```text
+data\logs\app.log
+app.log
+app
+.log
+data\logs
+```
+
+:::tip[路径拼接用 `/`，不用字符串加]
+```python
+# ❌ 字符串拼接：跨平台会出错
+path = "data" + "/" + "logs"
+
+# ✅ pathlib
+path = Path("data") / "logs"
+```
+
+`Path` 会自动用当前系统的分隔符（Windows `\`、Linux `/`）。
+:::
+
+### 判断与创建
+
+```python
+p = Path("test.txt")
+
+print(p.exists())       # 是否存在
+print(p.is_file())      # 是文件吗
+print(p.is_dir())       # 是目录吗
+
+# 创建目录（parents 建所有中间层，exist_ok 已存在不报错）
+Path("output/reports").mkdir(parents=True, exist_ok=True)
+```
+
+### 读写文件（小文件很方便）
+
+```python
+Path("a.txt").write_text("你好", encoding="utf-8")
+print(Path("a.txt").read_text(encoding="utf-8"))
+```
+
+:::warning[这两个方法也要写 encoding]
+`write_text` / `read_text` 默认用系统编码，**中文会有乱码风险**。
+
+永远显式写 `encoding="utf-8"`。
+:::
+
+### 遍历目录
+
+```python
+# 当前目录下所有 .py 文件
+for f in Path(".").glob("*.py"):
+    print(f.name, f.stat().st_size, "字节")
+
+# 递归所有层级
+for f in Path(".").rglob("*.py"):
+    print(f)
+```
+
+| 方法 | 范围 |
+| --- | --- |
+| `glob("*.py")` | 当前目录，不递归 |
+| `rglob("*.py")` | **递归**所有子目录 |
+| `iterdir()` | 所有子项（不筛选） |
+
+## json：存结构化数据
+
+JSON 是通用的数据交换格式，几乎所有语言都支持。
+
+```python
+import json
+```
+
+### 字典 ↔ 字符串
+
+```python
+data = {"name": "小明", "age": 18, "tags": ["学生", "篮球"]}
+
+# 转字符串
+text = json.dumps(data, ensure_ascii=False, indent=2)
+print(text)
+
+# 转回字典
+parsed = json.loads(text)
+print(parsed["name"])
+```
+
+输出：
+
+```text
+{
+  "name": "小明",
+  "age": 18,
+  "tags": [
+    "学生",
+    "篮球"
+  ]
+}
+小明
+```
+
+:::danger[`ensure_ascii=False` 必须加]
+```python
+json.dumps({"name": "小明"})                      # '{"name": "\\u5c0f\\u660e"}'
+json.dumps({"name": "小明"}, ensure_ascii=False)  # '{"name": "小明"}'
+```
+
+不加的话中文变成 `\u5c0f\u660e` 这种转义序列。**数据本身没问题（能正确还原），但文件没法看、没法手改。**
+:::
+
+### 直接读写文件
+
+```python
+# 写
+with open("data.json", "w", encoding="utf-8") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+
+# 读
+with open("data.json", encoding="utf-8") as f:
+    loaded = json.load(f)
+```
+
+:::warning[`dump` 和 `dumps` 差一个 s]
+| 函数 | 作用 |
+| --- | --- |
+| `dumps` | 对象 → **字符串**（s = string） |
+| `dump` | 对象 → **文件** |
+| `loads` | 字符串 → 对象 |
+| `load` | 文件 → 对象 |
+
+**带 s 的处理字符串，不带 s 的处理文件。**
+:::
+
+### 支持的类型的
+
+JSON 只能表示这几种：
+
+| Python | JSON |
+| --- | --- |
+| `dict` | 对象 `{}` |
+| `list` / `tuple` | 数组 `[]` |
+| `str` | 字符串 |
+| `int` / `float` | 数字 |
+| `True` / `False` | `true` / `false` |
+| `None` | `null` |
+
+:::danger[不能直接存自定义对象]
+```python
+class User:
+    def __init__(self, name):
+        self.name = name
+
+json.dumps(User("小明"))      # TypeError: Object of type User is not JSON serializable
+```
+
+要先转成字典（[24 课](./24-project-contacts)用过这招）：
+
+```python
+json.dumps({"name": user.name})
+```
+:::
+
+## os 与 sys：基础环境操作
+
+```python
+import os
+import sys
+```
+
+### 常用 os 操作
+
+```python
+print(os.getcwd())              # 当前目录
+print(os.listdir("."))          # 列出文件
+print(os.environ.get("PATH"))   # 读环境变量（不存在返回 None）
+
+# 文件操作
+os.rename("old.txt", "new.txt")
+os.remove("a.txt")              # 删除文件
+os.makedirs("a/b/c", exist_ok=True)   # 建目录
+```
+
+:::warning[`os.remove` 直接删，没有回收站]
+删了就没了。**重要数据先备份。**
+
+要判断存在再删：
+
+```python
+if os.path.exists("a.txt"):
+    os.remove("a.txt")
+```
+
+（或者直接用 `Path("a.txt").unlink(missing_ok=True)`，更安全。）
+:::
+
+### 常用 sys 操作
+
+```python
+print(sys.version)          # Python 版本
+print(sys.platform)         # 'win32' / 'linux' / 'darwin'
+print(sys.argv)             # 命令行参数
+
+# 退出程序
+sys.exit(0)                 # 0 表示正常退出
+```
+
+:::tip[`sys.argv`：接收命令行参数]
+运行 `python script.py hello world`：
+
+```python
+import sys
+print(sys.argv)
+```
+
+输出：
+
+```text
+['script.py', 'hello', 'world']
+```
+
+第一个元素是脚本名，后面才是参数。
+
+**这就是把脚本变成命令行工具的第一步**（更专业的用 `argparse`，属于进阶内容）。
+:::
+
+## 综合实战
+
+```python
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+
+def backup_json(src, backup_dir="backups"):
+    """备份 JSON 文件，文件名带上时间戳"""
+    src_path = Path(src)
+    if not src_path.exists():
+        print(f"文件不存在：{src}")
+        return None
+
+    out_dir = Path(backup_dir)
+    out_dir.mkdir(exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = out_dir / f"{src_path.stem}_{stamp}{src_path.suffix}"
+
+    data = json.loads(src_path.read_text(encoding="utf-8"))
+    dest.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
+    print(f"已备份到 {dest}")
+    return dest
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("用法：python backup.py <json文件>")
+        sys.exit(1)
+    backup_json(sys.argv[1])
+```
+
+运行：
+
+```bash
+python backup.py data.json
+```
+
+输出：
+
+```text
+已备份到 backups\data_20261018_143215.json
+```
+
+## 常见错误
+
+| 错误 | 报错 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `%m` 和 `%M` 写反 | 结果错但不报错 | 月 vs 分 | 记住大小写 |
+| `strptime` 格式不匹配 | ValueError | 格式串和字符串不符 | 逐字符对照 |
+| json 中文变 `\u` | —— | 没加 `ensure_ascii=False` | 加上 |
+| `json.dump` 存对象 | TypeError | 不能序列化 | 先转 dict |
+| 路径用字符串拼接 | 跨平台错 | 分隔符不同 | 用 `Path /` |
+| `read_text` 中文乱码 | 乱码 | 没指定 encoding | 加 `encoding="utf-8"` |
+| `os.remove` 删错文件 | 数据丢失 | 没有回收站 | 先判断/备份 |
+
+## 本课自检
+
+- [ ] 会用 `datetime.now()` 和 `strftime` 格式化
+- [ ] 会用 `strptime` 解析字符串，知道和 `strftime` 方向相反
+- [ ] 记住 `%m` 是月、`%M` 是分
+- [ ] 会用 `timedelta` 做日期加减和算天数差
+- [ ] 会用 `Path /` 拼路径，知道它跨平台
+- [ ] 会用 `glob` / `rglob` 遍历文件
+- [ ] 会 `json.dumps/loads`，记得 `ensure_ascii=False`
+- [ ] 分清 `dump` / `dumps`、`load` / `loads`
+- [ ] 知道 JSON 不能直接存自定义对象
+- [ ] 会用 `sys.argv` 接收参数
+
+## 下一步
+
+[26 正则表达式入门](./26-regex) —— 从杂乱文本里精确提取需要的信息。

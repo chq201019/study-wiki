@@ -1,0 +1,306 @@
+---
+id: 29-modern
+title: 29 现代 C++ 特性速览
+sidebar_position: 29
+description: C++11/14/17/20 里值得用的特性清单——哪些立刻能用上、哪些先了解，附版本速查。
+---
+
+# 29 现代 C++ 特性速览
+
+**本课目标**：知道有哪些现代特性、哪些值得立刻用、哪些先了解。
+
+## 什么是"现代 C++"
+
+**C++11 是分水岭**——之后的标准（14/17/20/23）持续加入实用特性。
+
+| 标准 | 发布 | 关键特性 |
+| --- | --- | --- |
+| C++98/03 | 1998/2003 | 原始 C++（类、模板、STL） |
+| **C++11** | 2011 | **auto、范围 for、智能指针、移动语义、lambda、nullptr** |
+| C++14 | 2014 | 泛型 lambda、返回类型推导 |
+| **C++17** | 2017 | **结构化绑定、if constexpr、optional、string_view、filesystem** |
+| **C++20** | 2020 | **concepts、ranges、`<=>`、span、协程** |
+| C++23 | 2023 | `expected`、`mdspan` 等 |
+
+:::tip[怎么选版本]
+- **新项目**：用 C++17 或 C++20（编译器支持已很成熟）
+- **嵌入式**：C++17 是比较稳妥的选择
+- **维护老代码**：至少保证 C++11
+:::
+
+## 必用清单（这几条你已经学过了）
+
+| 特性 | 版本 | 本教程哪一课 |
+| --- | --- | --- |
+| `auto` | C++11 | [05](./05-auto-range) |
+| 范围 for | C++11 | [05](./05-auto-range) |
+| `nullptr` | C++11 | [03](./03-reference) |
+| `override` | C++11 | [10](./10-inherit) |
+| `unique_ptr` / `shared_ptr` | C++11 | [14](./14-unique-ptr) / [15](./15-shared-ptr) |
+| 移动语义 | C++11 | [16](./16-move) |
+| lambda | C++11 | [18](./18-algorithms) |
+| `= delete` / `= default` | C++11 | [08](./08-copy) |
+| `constexpr` | C++11 | [23](./23-const) |
+
+**这些已经是日常必备**，不用犹豫直接用。
+
+## 值得立刻学的几个
+
+### `nullptr`（C++11）
+
+```cpp
+int *p = NULL;           /* ⚠️ NULL 实际是 0，有重载歧义 */
+int *p2 = nullptr;       /* ✅ 类型安全，就是"空指针" */
+```
+
+:::danger[`NULL` 的重载陷阱]
+```cpp
+void f(int);
+void f(char *);
+
+f(NULL);                 /* ⚠️ 可能调到 f(int)！ */
+f(nullptr);              /* ✅ 明确调到 f(char*) */
+```
+
+因为 `NULL` 常被定义为 `0`，编译器会选 `int` 版本。
+
+**新代码一律用 `nullptr`。**
+:::
+
+### `std::optional`（C++17）
+
+**表示"可能有值，也可能没有"**——比返回指针或特殊值清晰。
+
+```cpp
+#include <optional>
+
+std::optional<int> find_index(const std::vector<int> &v, int target) {
+    for (size_t i = 0; i < v.size(); i++) {
+        if (v[i] == target) return static_cast<int>(i);
+    }
+    return std::nullopt;                 /* 明确表示"没有" */
+}
+
+/* 使用 */
+if (auto idx = find_index(v, 42)) {
+    std::cout << "找到，下标 " << *idx << "\n";
+} else {
+    std::cout << "没找到\n";
+}
+```
+
+:::tip[比这些方案都好]
+```cpp
+int find_index(...);          /* ❌ 返回 -1 表示没有？靠约定 */
+int *find_index(...);         /* ⚠️ 要管理指针、可能忘记判空 */
+std::optional<int> find();    /* ✅ 类型系统帮你区分 */
+```
+
+**`optional` 让"可能没有"成为类型的一部分**，忘检查就编译不过（部分场景）。
+:::
+
+### `std::string_view`（C++17）
+
+**只读的字符串"视图"**——不复制、不拥有。
+
+```cpp
+#include <string_view>
+
+void print(std::string_view sv) {        /* 不复制 */
+    std::cout << sv << "\n";
+}
+
+print("字符串字面量");                     /* ✅ 不构造 string */
+print(std::string("临时 string"));        /* ✅ 不复制 */
+```
+
+:::danger[`string_view` 不拥有数据]
+```cpp
+std::string_view bad() {
+    std::string s = "temporary";
+    return s;                            /* ❌ s 销毁后 sv 悬垂 */
+}
+```
+
+**`string_view` 只是"看"，不负责生命周期。**
+
+**用于函数参数（函数执行期间有效），不要保存或返回。**
+:::
+
+### 结构化绑定（C++17）
+
+```cpp
+std::map<std::string, int> m = {{"a", 1}};
+
+for (const auto &[key, value] : m) {     /* ✅ 直接拆开 */
+    std::cout << key << "=" << value << "\n";
+}
+
+auto [q, r] = divmod(17, 5);             /* 拆函数返回值 */
+```
+
+（[第 5 课](./05-auto-range)讲过。）
+
+### `if constexpr`（C++17）
+
+**编译期的 if**——不同分支只编译其中一个。
+
+```cpp
+template<typename T>
+void process(T v) {
+    if constexpr (std::is_integral_v<T>) {
+        std::cout << "整数：" << v << "\n";
+    } else {
+        std::cout << "其他类型\n";
+    }
+}
+```
+
+:::tip[和普通 `if` 的区别]
+普通 `if` 两个分支**都要能编译**；`if constexpr` 只编译选中的那个。
+
+**所以可以写只在某类型下合法的代码**——这是模板编程的关键工具。
+:::
+
+### `<filesystem>`（C++17）
+
+```cpp
+#include <filesystem>
+namespace fs = std::filesystem;
+
+for (const auto &entry : fs::directory_iterator(".")) {
+    std::cout << entry.path() << "\n";
+}
+
+fs::create_directories("a/b/c");
+fs::exists("x.txt");
+```
+
+**跨平台的文件系统操作**，不用写 `#ifdef _WIN32`。
+
+（老编译器可能要 `-lstdc++fs`。）
+
+## 先了解就行的
+
+### Concepts（C++20）
+
+**给模板参数加约束**，报错更清晰。
+
+```cpp
+#include <concepts>
+
+template<std::integral T>                /* 要求 T 是整数类型 */
+T twice(T v) { return v * 2; }
+
+twice(5);                                /* ✅ */
+twice(3.14);                             /* ❌ 清晰报错：不满足 integral */
+```
+
+**好处**：错误信息从几百行变成一句。
+
+### Ranges（C++20）
+
+**更简洁的算法调用**，能链式组合。
+
+```cpp
+#include <ranges>
+
+/* C++20 之前 */
+std::vector<int> out;
+std::transform(v.begin(), v.end(), std::back_inserter(out),
+               [](int x) { return x * 2; });
+
+/* C++20 ranges */
+auto out = v | std::views::filter([](int x) { return x % 2 == 0; })
+             | std::views::transform([](int x) { return x * 2; });
+```
+
+**可读性大幅提升**，但编译器支持还不完全统一。
+
+### `<=>` 三路比较（C++20）
+
+```cpp
+#include <compare>
+
+class Point {
+public:
+    auto operator<=>(const Point &) const = default;    /* 自动生成全部比较 */
+private:
+    int x_, y_;
+};
+```
+
+**一行生成 `==` `!=` `<` `>` `<=` `>=`**，按成员逐个比较。
+
+## 语言特性之外：工具链
+
+现代 C++ 的"现代"也包括工具：
+
+| 工具 | 用途 |
+| --- | --- |
+| **CMake** | 构建（[25](./25-cmake)） |
+| **clang-format** | 自动格式化 |
+| **clang-tidy** | 静态检查 |
+| **AddressSanitizer** | 内存错误（[26](./26-debug)） |
+| **vcpkg / Conan** | 包管理 |
+| **Catch2 / GoogleTest** | 单元测试 |
+
+:::tip[优先级建议]
+**先掌握**：CMake、格式化工具、ASan
+
+**后面再说**：包管理器、测试框架、静态分析
+
+**工具能省的时间远超学习成本。**
+:::
+
+## 一份"该用什么"清单
+
+:::tip[日常写 C++ 的默认选择]
+| 场景 | 用什么 |
+| --- | --- |
+| 字符串 | `std::string`，参数用 `std::string_view` |
+| 动态数组 | `std::vector` |
+| 固定大小数组 | `std::array` |
+| 字典 | `std::unordered_map`（无序）或 `std::map`（有序） |
+| 堆对象 | `std::unique_ptr`（默认）/ `shared_ptr`（共享） |
+| 可能没有值 | `std::optional` |
+| 空指针 | `nullptr` |
+| 遍历 | 范围 for + `const auto&` |
+| 匿名函数 | lambda |
+| 常量 | `constexpr` |
+| 类型推断 | `auto`（迭代器等复杂类型） |
+| 算法 | STL 算法而非手写循环 |
+| 构建 | CMake |
+:::
+
+## 该避免的"老写法"
+
+| 老写法 | 现代替代 |
+| --- | --- |
+| `NULL` | `nullptr` |
+| `char buf[256]` | `std::string` / `std::array` |
+| `malloc`/`free` | `new`/`delete`（更推荐 `make_unique`） |
+| `new T` / `delete p` | `std::make_unique<T>()` |
+| `typedef` | `using` |
+| `#define MAX 100` | `constexpr int MAX = 100;` |
+| 手写循环求和 | `std::accumulate` |
+| `printf`/`scanf` | `std::cout`/`std::cin`（除性能敏感处） |
+| `using namespace std;` | 写 `std::` 前缀 |
+| 裸指针传多态对象 | 智能指针 |
+
+## 本课自检
+
+- [ ] 知道 C++11 是分水岭
+- [ ] 记得住 C++11/14/17/20 各自的关键特性
+- [ ] **知道 `nullptr` 比 `NULL` 好（重载歧义）**
+- [ ] 会用 `std::optional` 表示"可能没有值"
+- [ ] 会用 `std::string_view` 作只读参数
+- [ ] 知道 `string_view` 不拥有数据
+- [ ] 会结构化绑定
+- [ ] 知道 `if constexpr` 只编译选中的分支
+- [ ] 知道 concepts 和 ranges 是 C++20 的重要特性
+- [ ] 知道该用什么替代一堆老写法
+
+## 下一步
+
+[30 下一步](./30-next) —— C++ 学完之后往哪走。

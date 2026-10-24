@@ -1,0 +1,159 @@
+---
+title: STM32 常用外设实战
+sidebar_position: 4
+description: GPIO/EXTI、UART、ADC、TIM PWM、I2C/SPI 的 HAL 实战，每项与 ESP32 对照，重点讲"STM32 特有的约束"。
+---
+
+# STM32 常用外设实战
+
+原理你在[完整教程 L4](../../course/l4-peripherals/)已经学透了——GPIO 电平与上拉、UART 字节帧、ADC 逐次逼近、PWM 平均效应、I2C 应答机制，全部通用。这一页只干两件事：给出每个外设的 **HAL 实战骨架**，以及**每个外设上 STM32 特有的约束/方言**（ESP32 没有或不一样的部分）。
+
+约定：以下均基于 F1 系列（蓝板），CubeMX 已配好对应外设。换 F4/G4 思路不变，只有函数名细节差异（如 `HAL_ADCEx_Calibration_Start`）。
+
+## 1. GPIO 与外部中断（EXTI）
+
+HAL 输出和 ESP32 几乎同构：
+
+```c
+HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);     // 拉高
+HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);                  // 翻转
+GPIO_PinState s = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0);  // 读输入
+```
+
+**STM32 特有约束一：模式枚举比 ESP32 细**。CubeMX 里 GPIO 有 `Input / Output PP（推挽）/ Output OD（开漏）/ Analog / EXTI 模式`。推挽和开漏的区别在[本站 GPIO 上拉下拉本质一节](../../course/l4-peripherals/gpio)讲过：**I2C 必须开漏、线与场景必须开漏**——ESP32 里 I2C 驱动自动帮你配好，STM32 里软件模拟 I2C 或检查波形时要自己知道选 OD。
+
+**特有约束二：中断引脚走 EXTI 线，且"同号线不共存"**。每个引脚都能触发 EXTI（外部中断控制器），但规则是 **PA0、PB0、PC0 共用 EXTI0 线**——同一时刻只能一个。ESP32 的 GPIO 中断是每脚独立的，这是最典型的"方言差异"：
+
+```c
+// CubeMX 里给 PB0 配 GPIO_EXTI0 模式后自动生成：
+HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)   // 中断回调（HAL 统一入口）
+{
+  if (GPIO_Pin == KEY_Pin) {
+    // 注意：这里在中断上下文！快进快出，别 HAL_Delay
+  }
+}
+```
+
+按键消抖思路和[快速上手 QS-4](../../quickstart/adc-dac)一致：中断里只记时间戳，延迟判断放主循环。
+
+## 2. UART：轮询 → 中断 → DMA 三段进化
+
+F1 蓝板的 USART1 接 PA9(TX)/PA10(RX)，CubeMX 配好 115200-8-N-1 后：
+
+```c
+// 阻塞式（最简单，量小时够用）
+HAL_UART_Transmit(&huart1, (uint8_t *)"hello\r\n", 7, 100);  // 100ms 超时
+HAL_UART_Receive(&huart1, buf, len, 1000);
+
+// 非阻塞：中断式收一个字节（配合回调攒包）
+HAL_UART_Receive_IT(&huart1, &rxByte, 1);
+// 收完后回调触发，在回调里重新挂接收：
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+  ringbuf_push(rxByte);
+  HAL_UART_Receive_IT(huart, &rxByte, 1);
+}
+```
+
+**printf 重定向**（STM32 的"串口打印"要先做这一步，ESP32 里 `printf` 开箱即用）：
+
+```c
+#include <stdio.h>
+int fputc(int ch, FILE *f) {                       // Keil/ArmCC 写法
+  HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 10);
+  return ch;
+}
+// GCC（CubeIDE）改写 int __io_putchar(int ch) 同理
+```
+
+**方言差异对照**：ESP32 的 `uart_write_bytes` 天生异步带环形缓冲；HAL 的阻塞式发长包会卡 CPU——所以 STM32 实战里 UART 进阶方向是 **DMA 收发**（见[进阶页](./rtos-dma-power)）。
+
+## 3. ADC：先校准，再谈精度
+
+F1 的 ADC 是 12 位逐次逼近型（原理见[L4 ADC 一节](../../course/l4-peripherals/adc-dac)，完全一致）。STM32 特有的两件事：
+
+```c
+HAL_ADC_Start(&hadc1);
+HAL_ADC_PollForConversion(&hadc1, 10);
+uint16_t raw = HAL_ADC_GetValue(&hadc1);           // 0~4095
+float volt = raw * 3.3f / 4095.0f;
+```
+
+1. **参考电压不是决定好的**：ESP32 模组出厂校准存在 eFuse 里，`esp_adc_cal` 直接给修正值；STM32 的换算基于 **VDDA 引脚实际电压**——供电是 3.27V 还是 3.34V，满量程就漂。精密场合要么测供电，要么用内部基准通道（F1 有 Vrefint 通道反推 VDDA）
+2. **F1 的 ADC 时钟上限 14MHz**：72MHz 主频下 ADC 预分频必须选 /6（12MHz），超了精度崩坏。**每个外设有自己的时钟树分支约束**，这是 STM32 时钟树的"分支纪律"，CubeMX 会标红违规，但要知道红在哪
+
+另外注意 F1 的 ADC 和 ESP32 的 ADC2 一样**有共享冲突**（注入/规则组、双 ADC 交替）——常规单通道轮询够用时不用管。
+
+## 4. TIM：定时器的"四大家族"与 PWM
+
+STM32 的 TIM（Timer）相当于 ESP32 里"定时器 + LEDC + MCPWM"三样合一，家族庞大：
+
+| 类型 | 代表 | 干什么 |
+| --- | --- | --- |
+| 高级定时器 | TIM1/TIM8 | 三相互补 PWM + 死区（电机驱动核心） |
+| 通用定时器 | TIM2~TIM5 | 定时中断、PWM、输入捕获、编码器接口 |
+| 基本定时器 | TIM6/TIM7 | 只能定时触发（常给 ADC 打拍子） |
+| SysTick | 内核级 | HAL_Delay 的心跳，别拿去做别的 |
+
+PWM 实战（CubeMX 里把 TIM3 CH1 配成 PWM Generation，输出到 PA6）：
+
+```c
+// 预分频 PSC=71 → 计数频率 72MHz/72=1MHz
+// 自动重装 ARR=999 → PWM 频率 1kHz，占空比分辨率 0.1%
+HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 500);  // 50% 占空比（0~999）
+```
+
+**和 ESP32 的 PWM 对照**：LEDC 是"通道↔引脚自由映射"，TIM 是"通道固定落在定时器附带的引脚上"（复用表决定）；LEDC 频率分辨率 14 位可调，STM32 的分辨率由 **ARR（自动重装值）** 决定——你配 PSC 和 ARR 两个数联合决定"频率多高、每级多细"。这两个数的取舍关系就是[本站 PWM 平均效应一节](../../course/l4-peripherals/pwm)的原理翻成方言。
+
+## 5. I2C / SPI：HAL 骨架 + "方言雷区"
+
+### I2C（硬件外设，PB6 SCL / PB7 SDA 默认映射）
+
+```c
+uint8_t data[2] = {0x00, 0x42};
+HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x6B, I2C_MEMADD_SIZE_8BIT, &data[1], 1, 100);
+```
+
+三个 STM32 特有雷区：
+
+1. **地址要左移一位**：HAL 的设备参数是"8 位地址含读写位"，习惯写 7 位地址的（如 MPU6050 的 `0x68`）必须 `<< 1`——**ESP32 的 `i2c_master_write_to_device` 用 7 位，这是两生态间最高频的移植 bug**
+2. **`Mem_Write/Read` 是"带寄存器地址"的变体**：传感器几乎都是"先写寄存器号再读写数据"，用 `Mem_` 系列一步到位；裸的 `Master_Transmit/Receive` 相当于手动两段
+3. **F1 硬件 I2C 有历史遗留怪癖**（总线易卡死），大量老教程直接软件模拟 I2C。学习期用硬件 I2C + 遇到卡死就复位外设即可，见常见坑
+
+### SPI（默认 PA4~PA7：NSS/SCK/MISO/MOSI）
+
+```c
+HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_RESET);   // 片选拉低
+HAL_SPI_TransmitReceive(&hspi1, txBuf, rxBuf, 2, 100);     // 全双工同时收发
+HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_SET);
+```
+
+SPI 是全双工的：**想收 1 字节必须同时发 1 字节**（发哑字节 0xFF）。HAL 的 `TransmitReceive` 直接体现这个本质，比 ESP32 的 `spi_device_transmit` 把细节包得更露骨。OLED/Flash/SD 卡驱动思路与 [QS-8](../../quickstart/bus) 完全一致，只是换 API。
+
+## 6. 外设速查对照表
+
+| 功能 | ESP32 (IDF) | STM32 (HAL) | 易踩方言 |
+| --- | --- | --- | --- |
+| 写引脚 | `gpio_set_level(4,1)` | `HAL_GPIO_WritePin(GPIOC,GPIO_PIN_13,...)` | 引脚 = 端口+序号二元组 |
+| 串口发 | `uart_write_bytes` | `HAL_UART_Transmit` | printf 要重定向 |
+| 读 ADC | `adc1_get_raw`（带校准） | `HAL_ADC_GetValue` | 参考电压=VDDA 实测 |
+| PWM | `ledc_set_duty` | `__HAL_TIM_SET_COMPARE` | 占空比上限=ARR，不是 2^14 |
+| I2C 写寄存器 | `i2c_master_write_to_device` | `HAL_I2C_Mem_Write` | 地址要 `<<1` |
+| SPI 全双工 | `spi_device_transmit` | `HAL_SPI_TransmitReceive` | 收必须配发 |
+| 延时让出 CPU | `vTaskDelay` | （裸机）`HAL_Delay`=死等 | 跑 RTOS 后换 `osDelay` |
+
+## 常见坑
+
+| 症状 | 病根 |
+| --- | --- |
+| I2C 扫不到设备 | 地址没 `<<1`；或 SDA/SCL 没接上拉（硬件 I2C 内部弱上拉不可靠，外接 4.7k） |
+| I2C 总线卡死，之后所有传输 BUSY | 从机拉死 SDA。救援：SCL 手动打 9 个时钟释放总线，或复位 I2C 外设 |
+| PWM 频率/占空比改不动 | 忘了 `HAL_TIM_PWM_Start`；或改了 CCR 但定时器没开 ARR 预装载 |
+| ADC 数值抖得厉害 | ADC 时钟超 14MHz；输入阻抗太高（加一级 RC 或运放跟随） |
+| 中断回调里 HAL_Delay 死等 | SysTick 中断优先级低于 EXTI，嵌套卡死——**中断里禁止阻塞调用** |
+| HAL_UART_Receive_IT 只收一次 | 回调里忘了重新挂接收 |
+
+## 下一步
+
+- [进阶：DMA / FreeRTOS / 低功耗](./rtos-dma-power)——项目变复杂后的三板斧
+- [ESP32↔STM32 迁移对照](./from-esp32)——概念层总对账

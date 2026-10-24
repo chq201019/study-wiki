@@ -1,0 +1,359 @@
+---
+id: 18-modules
+title: 18 模块与 import
+sidebar_position: 18
+description: import 的四种写法、标准库与第三方库、自己写模块、以及 if __name__ == "__main__" 到底在干什么。
+---
+
+# 18 模块与 import
+
+**本课目标**：会用别人写的模块，会把自己的代码拆成多个文件，彻底搞懂那个 `if __name__` 语句。
+
+## 模块是什么
+
+**模块 = 一个 .py 文件。** 里面定义的函数、变量、类，可以被别的文件用。
+
+Python 自带一大堆模块（叫**标准库**），装上就能用，不用额外下载：
+
+```python
+import math
+
+print(math.sqrt(16))
+print(math.pi)
+print(math.floor(3.7))
+```
+
+输出：
+
+```text
+4.0
+3.141592653589793
+3
+```
+
+## import 的四种写法
+
+### ① 最常用：import 模块名
+
+```python
+import math
+print(math.sqrt(25))
+```
+
+使用时必须加 `math.` 前缀。**这样最清晰**，一眼能看出函数来自哪。
+
+### ② 导入特定成员：from ... import ...
+
+```python
+from math import sqrt, pi
+
+print(sqrt(25))
+print(pi)
+```
+
+不用加前缀，但**可能和你的变量重名**。
+
+### ③ 起别名：as
+
+```python
+import math as m
+print(m.sqrt(25))
+```
+
+常见于名字长的模块：
+
+```python
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+```
+
+**这是社区约定俗成的别名**，看到 `np` 就知道是 numpy。
+
+### ④ 导入全部（不推荐）
+
+```python
+from math import *
+print(sqrt(25))
+```
+
+:::danger[不要用 `from x import *`]
+问题：
+
+1. **不知道某个函数从哪来**，代码难读
+2. **会悄悄覆盖你的变量**，如果模块里有同名函数
+3. 静态检查工具无法分析
+
+**只在交互式试验时用，正式代码永远不要用。**
+:::
+
+## 常用标准库速览
+
+```python
+import math        # 数学函数
+import random      # 随机数
+import datetime    # 日期时间
+import json        # JSON 解析
+import os          # 操作系统接口
+import sys         # 解释器相关
+import re          # 正则表达式
+import pathlib     # 路径操作（推荐替代 os.path）
+```
+
+几个立即能用的例子：
+
+```python
+import random
+import datetime
+
+# 随机
+print(random.randint(1, 10))
+print(random.choice(["石头", "剪刀", "布"]))
+
+# 日期
+now = datetime.datetime.now()
+print(now.strftime("%Y-%m-%d %H:%M"))
+```
+
+输出示例：
+
+```text
+7
+剪刀
+2026-10-18 14:32
+```
+
+第 25 课会详细讲这些。
+
+## 自己写模块
+
+### 建两个文件
+
+`mytools.py`：
+
+```python
+"""我的工具模块"""
+
+PI = 3.14159
+
+
+def circle_area(r):
+    """计算圆面积"""
+    return PI * r * r
+
+
+def greet(name):
+    return f"你好，{name}"
+
+
+print("mytools 被加载了")
+```
+
+`main.py`：
+
+```python
+import mytools
+
+print(mytools.circle_area(5))
+print(mytools.greet("小明"))
+print(mytools.PI)
+```
+
+运行 `python main.py`：
+
+```text
+mytools 被加载了
+78.53975
+你好，小明
+3.14159
+```
+
+:::warning[两个文件必须放在同一个目录]
+`import mytools` 时，Python 会到**当前目录**（和 sys.path 里配置的路径）去找 `mytools.py`。
+
+如果报 `ModuleNotFoundError: No module named 'mytools'`，最常见原因是：
+
+- 两个文件不在同一目录
+- 运行时的「当前目录」不对（在别的目录执行的 `python` 命令）
+
+**排查**：在 `main.py` 里加 `import sys; print(sys.path[0])` 看它找的是哪个目录。
+:::
+
+## `if __name__ == "__main__"` 到底是什么
+
+这是 Python 里出现频率最高的「看不懂的固定写法」。先说结论：
+
+**它的作用是：让这个文件既可以直接运行，又可以被别人 import 而不执行测试代码。**
+
+### 观察现象
+
+还记得上面 `mytools.py` 里那句 `print("mytools 被加载了")` 吗？**只要被 import，它就会执行**——这通常不是你想要的（导入模块时不该有输出）。
+
+### `__name__` 是什么
+
+每个 .py 文件都有一个内置变量 `__name__`，它的值取决于是怎么运行的：
+
+| 运行方式 | `__name__` 的值 |
+| --- | --- |
+| **直接运行** `python mytools.py` | `"__main__"` |
+| **被 import** `import mytools` | `"mytools"` |
+
+验证一下，在 `mytools.py` 末尾加：
+
+```python
+if __name__ == "__main__":
+    print(f"我是被直接运行的，__name__ = {__name__}")
+else:
+    print(f"我是被导入的，__name__ = {__name__}")
+```
+
+**直接运行** `python mytools.py`：
+
+```text
+mytools 被加载了
+我是被直接运行的，__name__ = __main__
+```
+
+**通过 main.py 导入**：
+
+```text
+mytools 被加载了
+我是被导入的，__name__ = mytools
+78.53975
+...
+```
+
+### 正确用法
+
+```python
+"""mytools.py"""
+
+def circle_area(r):
+    return PI * r * r
+
+PI = 3.14159
+
+
+def main():
+    """只在直接运行时才做的事：测试、演示"""
+    print("这是自测")
+    print(circle_area(5))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+现在：
+
+- `python mytools.py` → 会执行 `main()`，方便自己测试
+- `import mytools` → **不会**执行 `main()`，安静地被导入
+
+:::tip[这就是为什么每个项目文件都该这么写]
+**好处**：
+
+1. 模块被导入时没有副作用（不打印、不乱跑）
+2. 同一个文件既能当脚本用，又能当模块用
+3. 把「测试代码」和「库代码」自然分开
+
+**养成习惯：每个 .py 文件都写 `if __name__ == "__main__":`**，然后把测试/演示代码放进去。
+:::
+
+## 包：多个模块的集合
+
+**包 = 一个文件夹，里面有多个模块，还带一个 `__init__.py`。**
+
+```text
+myproject/
+├── main.py
+└── utils/
+    ├── __init__.py       ← 有这个文件，才被认作包
+    ├── math_utils.py
+    └── text_utils.py
+```
+
+使用：
+
+```python
+from utils import math_utils
+print(math_utils.circle_area(5))
+
+# 或者
+from utils.text_utils import clean
+```
+
+:::info[`__init__.py` 可以空着]
+Python 3.3+ 起，技术上空文件夹也能当包用（叫命名空间包）。
+
+但**建议还是建一个空的 `__init__.py`**，兼容性更好，也明确表达「这是个包」。
+:::
+
+## 模块搜索顺序
+
+`import xxx` 时 Python 按这个顺序找：
+
+1. **当前目录**
+2. `PYTHONPATH` 环境变量里的目录
+3. **标准库目录**
+4. **site-packages**（pip 装的第三方库）
+
+:::warning[不要把自己的文件命名为标准库的名字]
+如果建一个 `random.py`，那么 `import random` 会导入**你的**文件，而不是标准库的！
+
+**症状**：`AttributeError: module 'random' has no attribute 'randint'`
+
+**常见踩雷名字**：`random.py`、`json.py`、`string.py`、`email.py`、`code.py`、`test.py`、`types.py`
+
+**规则：自己的模块名不要和标准库重名。**
+:::
+
+## 第三方库
+
+pip 安装的库用法完全一样：
+
+```bash
+python -m pip install requests
+```
+
+```python
+import requests
+
+resp = requests.get("https://example.com", timeout=10)
+print(resp.status_code)
+```
+
+第 27 课详细讲 pip 和虚拟环境。
+
+## 常见错误
+
+| 报错 | 原因 | 解决 |
+| --- | --- | --- |
+| `ModuleNotFoundError: No module named 'x'` | 没装 / 路径不对 / 名字拼错 | 检查目录、`pip install` |
+| `ImportError: cannot import name 'y'` | 模块里没有 `y` | 检查拼写和该模块的 API |
+| `AttributeError: module has no attribute` | 自己的文件与标准库重名 | 改文件名 |
+| 循环导入 | A import B，B 又 import A | 重构，把共用部分抽出去 |
+| import 后代码自动执行了 | 没写 `if __name__` | 加 `if __name__ == "__main__":` |
+
+:::danger[循环导入]
+`a.py` 里 `import b`，`b.py` 里 `import a` —— 会报错或得到不完整的结果。
+
+**解法**：把两者都需要的代码抽到第三个模块 `common.py`，让 a 和 b 都 import 它。
+
+设计上应该形成「单向依赖」，不要互相依赖。
+:::
+
+## 本课自检
+
+- [ ] 能用 `import` / `from ... import` / `as`
+- [ ] 知道不该用 `from x import *`
+- [ ] 会自己写模块并在别的文件里 import
+- [ ] **能解释 `if __name__ == "__main__"` 的作用**
+- [ ] 知道 `__name__` 在直接运行和导入时的不同值
+- [ ] 知道包需要 `__init__.py`
+- [ ] 知道模块搜索顺序，当前目录优先
+- [ ] 知道不能把文件命名为标准库的名字
+- [ ] 知道循环导入该怎么解决
+
+## 下一步
+
+[19 文件读写](./19-files) —— 让程序能保存数据，关机也不会丢。

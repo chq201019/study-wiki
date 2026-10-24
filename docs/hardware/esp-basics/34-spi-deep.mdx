@@ -1,0 +1,188 @@
+---
+id: 34-spi-deep
+title: 21 SPI 深入
+sidebar_position: 34
+description: SPI 四种模式的 CPOL/CPHA 组合、为什么模式配置错就通信失败、片选与多从机、时钟上限与走线、以及 DMA 全双工。
+---
+
+# 21 SPI 深入
+
+**本课目标**：搞清四种模式，理解"SPI 比 I2C 快但接线多"的代价。
+
+## 四根线的职责
+
+| 线 | 全称 | 方向 |
+| --- | --- | --- |
+| **SCLK** | 时钟 | 主机输出 |
+| **MOSI** | Master Out Slave In | 主机输出 |
+| **MISO** | Master In Slave Out | 从机输出 |
+| **CS** | 片选（低有效） | 主机输出 |
+
+:::info[SPI 是全双工]
+**每次时钟脉冲：MOSI 发一位出去，MISO 同时收一位进来。**
+
+**所以"发数据"必然伴随"收数据"** —— 即使从机不需要返回内容，你也会收到 0xFF 之类的填充。
+:::
+
+## 四种模式（CPOL / CPHA）
+
+:::danger[这一节没搞懂，SPI 就永远调不通]
+| CPOL | CPHA | 模式 | 空闲电平 | 采样边沿 |
+| --- | --- | --- | --- | --- |
+| **0** | **0** | **0** | 低 | **上升沿** |
+| 0 | 1 | 1 | 低 | 下降沿 |
+| 1 | 0 | 2 | 高 | 下降沿 |
+| **1** | **1** | **3** | 高 | **上升沿** |
+
+- **CPOL**（时钟极性）：空闲时 SCLK 是高还是低
+- **CPHA**（时钟相位）：在**第几个边沿**采样
+:::
+
+:::warning[怎么确定从机要哪种模式]
+**必须查器件手册** —— 它写在"SPI 接口"章节，通常叫 `SPI Mode 0/3` 或直接写 CPOL/CPHA。
+
+**经验分布**：
+
+- **Mode 0 最常见**（Flash、多数传感器）
+- Mode 3 次之
+- Mode 1/2 较少
+
+**猜错的症状**：能收到数据但全是 0xFF/0x00/乱码。
+:::
+
+```c
+/* STM32 CubeMX 里的对应设置 */
+hspi.Init.CLKPolarity = SPI_POLARITY_LOW;    /* CPOL = 0 */
+hspi.Init.CLKPhase    = SPI_PHASE_1EDGE;     /* CPHA = 0 → Mode 0 */
+hspi.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+hspi.Init.DataSize   = SPI_DATASIZE_8BIT;
+hspi.Init.FirstBit   = SPI_FIRSTBIT_MSB;     /* 通常 MSB 优先 */
+```
+
+:::danger[`FirstBit` 也要对]
+**大多数器件是 MSB 优先，但有些（如某些 ADC）是 LSB 优先。**
+
+**填错的症状**：收到的字节"位序颠倒"（0x01 变成 0x80）。
+:::
+
+## 片选：多从机怎么接
+
+```text
+主机 SCLK/MOSI/MISO  →  并联到所有从机
+主机 CS1 → 从机1 CS
+主机 CS2 → 从机2 CS
+```
+
+:::warning[同一时刻只能有一个 CS 有效]
+**两个 CS 同时拉低，两个从机会同时往 MISO 上驱动** → 电平冲突（可能损坏器件）。
+
+**软件上必须保证互斥** —— 一句话：`CS` 的拉低/拉高要包在同一个函数里。
+:::
+
+```c
+void spi_select(int idx)  { HAL_GPIO_WritePin(cs_port[idx], cs_pin[idx], GPIO_PIN_RESET); }
+void spi_deselect(int idx){ HAL_GPIO_WritePin(cs_port[idx], cs_pin[idx], GPIO_PIN_SET);   }
+
+/* 用法：成对出现 */
+spi_select(0);
+HAL_SPI_Transmit(&hspi, buf, len, 100);
+spi_deselect(0);
+```
+
+:::danger[CS 拉低和第一个时钟之间要留时间]
+**有些器件要求 CS 建立时间（tCSS）** —— 通常几十纳秒。
+
+**在 72MHz 的 MCU 上，`GPIO_WritePin` 到第一次 SPI 传输之间的几条指令就够了**，一般不用刻意加延时。
+
+**但如果你在中间插了 `printf`，就可能出问题。**
+:::
+
+## 速度与走线
+
+:::info[SPI 能到几十 MHz，但对走线敏感]
+| 速率 | 走线要求 |
+| --- | --- |
+| 小于 1 MHz | 杜邦线随便 |
+| 1~10 MHz | 短线（小于 10cm）、地线靠近 |
+| 10~50 MHz | **PCB + 阻抗控制 + 等长** |
+
+**"SPI 调不通"在高速时几乎总是信号完整性问题**，不是配置问题。
+:::
+
+:::danger[SPI 没有应答机制]
+**I2C 有 ACK，SPI 没有。**
+
+**所以 SPI 通信失败时"看起来完全正常"** —— `HAL_SPI_Transmit` 永远返回 `HAL_OK`，因为它只是把数据推出去，不知道从机有没有收到。
+
+**验证手段**：
+
+1. **读器件 ID**（Flash 的 `0x9F`、传感器的 WHO_AM_I）
+2. 回环测试（MISO 短接到 MOSI）
+3. 示波器看波形
+:::
+
+## DMA 全双工
+
+```c
+/* 同时收发（全双工）*/
+uint8_t tx[16], rx[16];
+HAL_SPI_TransmitReceive_DMA(&hspi1, tx, rx, sizeof(tx));
+```
+
+:::tip[只发不收时要"丢弃接收"]
+```c
+/* 发数据但不需要读回 */
+HAL_SPI_Transmit(&hspi1, buf, len, 100);
+```
+
+**HAL 内部会读 DR 寄存器来清除标志**，你不用管。
+
+**但如果用 DMA 只发不收，可能因为 OVR（溢出）标志导致卡住** —— 这时候要用 `TransmitReceive` 并传一个哑缓冲区。
+:::
+
+:::warning[片选必须在 DMA 传输完成后才拉高]
+```c
+spi_select(0);
+HAL_SPI_Transmit_DMA(&hspi, buf, len);
+spi_deselect(0);        /* ❌ 传输还没完成就拉高了 */
+```
+
+**必须在 `HAL_SPI_TxCpltCallback` 里拉高 CS。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 全 0xFF 或全 0x00 | 模式（CPOL/CPHA）错 | 查手册改 Mode |
+| 位序颠倒 | `FirstBit` 设置错 | 改 MSB/LSB |
+| 读到 ID 但数据错 | 速度太快 | 降分频 |
+| 多从机互扰 | 两个 CS 同时有效 | 检查互斥 |
+| 高速时随机错 | 信号完整性 | 缩短走线、加地线 |
+| DMA 传输后 CS 提前拉高 | 没等完成就操作 | 在回调里拉高 |
+| 收发数据不匹配 | 忘了全双工 | 用 `TransmitReceive` |
+| 偶发失败 | 没等 CS 建立时间 | 加短延时 |
+
+:::tip[最快的排查顺序]
+1. **先用最低速**（分频到 256）试
+2. **读器件 ID** —— 能不能读到正确的 ID
+3. 检查 Mode（CPOL/CPHA）——**这是最常见的错**
+4. 示波器看 CS 和第一个时钟的时序
+:::
+
+## 本课自检
+
+- [ ] 知道四根线的职责
+- [ ] **知道 SPI 是全双工（发的同时必收）**
+- [ ] **能背出四种模式的 CPOL/CPHA 组合**
+- [ ] **知道 Mode 0 最常见，但要查手册确认**
+- [ ] 知道 `FirstBit` 也要对（MSB/LSB）
+- [ ] **知道多从机时两个 CS 不能同时有效**
+- [ ] 知道高速时信号完整性是主要问题
+- [ ] **知道 SPI 没有应答，`HAL_OK` 不代表从机收到了**
+- [ ] 会用"读器件 ID"验证链路
+- [ ] 知道 DMA 传输时 CS 要在回调里拉高
+
+## 下一步
+
+回到 [ESP32 零基础导读](../esp-basics/)。

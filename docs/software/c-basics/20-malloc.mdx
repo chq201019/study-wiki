@@ -1,0 +1,390 @@
+---
+id: 20-malloc
+title: 20 动态内存 malloc/free
+sidebar_position: 20
+description: 运行时申请内存、malloc 与 calloc 的区别、realloc 扩缩容，以及内存泄漏、野指针、重复释放三大错误。
+---
+
+# 20 动态内存 malloc/free
+
+**本课目标**：会在运行时申请内存，并且**不制造内存泄漏**。
+
+## 为什么需要动态内存
+
+前面学的数组大小必须**编译期确定**：
+
+```c
+int arr[100];        /* 永远 100 个，改不了 */
+```
+
+但很多时候**运行时才知道要多少**：
+
+- 读文件，不知道有多少行
+- 用户输入，不知道有多长
+- 链表、树，节点数量动态变化
+
+**动态内存让你在运行时申请。**
+
+## malloc：申请内存
+
+```c
+#include <stdlib.h>
+
+int *arr = malloc(10 * sizeof(int));     /* 申请 10 个 int */
+if (arr == NULL) {
+    /* 申请失败处理 */
+}
+/* ... 使用 arr ... */
+free(arr);                               /* 用完必须释放 */
+```
+
+### 三个要点
+
+```c
+int *arr = malloc(10 * sizeof(int));
+              ↑        ↑
+          返回 void*   字节数（不是元素个数！）
+```
+
+| 要点 | 说明 |
+| --- | --- |
+| 参数是**字节数** | 要写 `n * sizeof(int)`，不是 `n` |
+| 返回 `void *` | 能隐式转成任何指针类型 |
+| 可能返回 `NULL` | **必须检查** |
+
+:::danger[必须检查 NULL]
+```c
+int *p = malloc(huge_size);
+*p = 1;              /* ❌ p 可能是 NULL，直接崩溃 */
+```
+
+**正确做法**：
+
+```c
+int *p = malloc(huge_size);
+if (p == NULL) {
+    fprintf(stderr, "内存不足\n");
+    return -1;
+}
+*p = 1;
+```
+
+内存不足、申请过大时会返回 `NULL`。**不检查就是定时炸弹。**
+:::
+
+:::warning[`sizeof(int)` 别写成 `sizeof(int*)`]
+```c
+int *arr = malloc(10 * sizeof(int));      /* ✅ 40 字节 */
+int *arr = malloc(10 * sizeof(int *));    /* ❌ 80 字节，浪费一倍 */
+```
+
+**`sizeof(int)` 是元素大小（4），`sizeof(int*)` 是指针大小（8）。**
+
+推荐写法（更不容易错）：
+
+```c
+int *arr = malloc(10 * sizeof *arr);      /* 用变量本身推导类型 */
+```
+
+`sizeof *arr` 就是 `sizeof(int)`，改类型时不用改这行。
+:::
+
+## calloc：申请并清零
+
+```c
+int *arr = calloc(10, sizeof(int));       /* 两个参数：个数、每个大小 */
+```
+
+:::tip[malloc 和 calloc 的关键区别]
+**本机实测对比**：
+
+```c
+int *m = malloc(5 * sizeof(int));
+int *c = calloc(5, sizeof(int));
+
+printf("malloc: %d %d %d\n", m[0], m[1], m[2]);
+printf("calloc: %d %d %d\n", c[0], c[1], c[2]);
+```
+
+输出：
+
+```text
+malloc 未清零: 4390912 7143535 7274605 (垃圾)
+calloc 清零:   0 0 0
+```
+
+| | `malloc` | `calloc` |
+| --- | --- | --- |
+| 内容 | **垃圾值** | **全 0** |
+| 参数 | 总字节数 | 个数 + 单个大小 |
+| 速度 | 快一点 | 慢一点（要清零） |
+| 适用 | 马上会覆盖 | 需要初始为 0 |
+
+**需要初始为 0 就用 `calloc`**，别自己写 `memset`。
+:::
+
+## free：释放内存
+
+```c
+free(arr);           /* 释放 malloc/calloc/realloc 得到的内存 */
+arr = NULL;          /* 好习惯：释放后置空 */
+```
+
+:::tip[为什么释放后要置 `NULL`]
+```c
+free(arr);
+/* ... 后面某处不小心又用了 arr ... */
+arr[0] = 1;          /* ❌ 使用已释放的内存 → 未定义行为 */
+
+/* 置空后至少能检查出来 */
+free(arr);
+arr = NULL;
+if (arr) { ... }     /* 不会被误用 */
+```
+
+**这是防御性编程的低成本习惯。**
+:::
+
+### `free(NULL)` 是安全的
+
+```c
+free(NULL);          /* ✅ 什么都不做，不崩溃 */
+```
+
+所以「先判断非空再 free」其实不必要：
+
+```c
+if (p) free(p);      /* 冗余，但无害 */
+free(p);             /* 更简洁 */
+```
+
+但 **`free` 两次同一块内存是严重错误**（见下文）。
+
+## realloc：调整大小
+
+```c
+int *p = malloc(3 * sizeof(int));
+/* ... 用了 3 个 ... */
+
+p = realloc(p, 6 * sizeof(int));       /* 扩到 6 个 */
+if (p == NULL) {
+    /* 原内存还在，但 p 被覆盖了 —— 见下面警告 */
+}
+```
+
+**本机实测：`realloc` 会保留原有数据**
+
+```c
+int *r = malloc(3 * sizeof(int));
+for (int i = 0; i < 3; i++) r[i] = i + 1;     /* 1 2 3 */
+r = realloc(r, 6 * sizeof(int));
+for (int i = 3; i < 6; i++) r[i] = i + 1;     /* 4 5 6 */
+/* 输出：1 2 3 4 5 6 */
+```
+
+:::danger[`realloc` 的正确写法：用临时变量]
+```c
+p = realloc(p, new_size);        /* ❌ 危险 */
+```
+
+如果 `realloc` 失败返回 `NULL`，**原来的 `p` 就丢了**——原内存还在但没人指向它，**内存泄漏**。
+
+**正确写法**：
+
+```c
+int *tmp = realloc(p, new_size);
+if (tmp == NULL) {
+    /* 失败：原 p 仍然有效，可以继续用或释放 */
+    free(p);
+    return -1;
+}
+p = tmp;                         /* 成功才覆盖 */
+```
+:::
+
+## 三大内存错误
+
+:::danger[错误一：内存泄漏（memory leak）]
+```c
+void leak(void) {
+    int *p = malloc(100 * sizeof(int));
+    /* 忘了 free(p) */
+}                                     /* 函数返回，p 消失，内存永远拿不回来 */
+```
+
+**症状**：程序跑得越久占内存越多，最后被系统杀掉。
+
+**排查**：用 `valgrind`（Linux）或 AddressSanitizer（第 29 课）。
+:::
+
+:::danger[错误二：重复释放（double free）]
+```c
+int *p = malloc(10 * sizeof(int));
+free(p);
+free(p);              /* ❌ 未定义行为，通常崩溃 */
+```
+
+**每次 `malloc` 只能 `free` 一次。**
+
+**预防**：`free` 后立刻置 `NULL`：
+
+```c
+free(p);
+p = NULL;
+free(p);              /* free(NULL) 安全 */
+```
+:::
+
+:::danger[错误三：使用已释放的内存（use-after-free）]
+```c
+int *p = malloc(10 * sizeof(int));
+free(p);
+p[0] = 1;             /* ❌ p 指向的内存已经不属于你了 */
+```
+
+**这块内存可能已经被分配给别人**，你写入就破坏了别人的数据。
+
+**这比崩溃更可怕**——数据悄悄被改坏。
+:::
+
+### 三种错误对比
+
+| 错误 | 后果 | 检测 |
+| --- | --- | --- |
+| 内存泄漏 | 内存越用越多 | valgrind / ASan |
+| 重复释放 | 崩溃或堆破坏 | ASan |
+| 已释放后使用 | 数据损坏或崩溃 | ASan |
+
+## 完整示例：动态数组
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+/* 读入 n 个数字，返回动态分配的数组 */
+int *read_numbers(int n) {
+    int *arr = malloc((size_t)n * sizeof(int));
+    if (arr == NULL) {
+        return NULL;                    /* 让调用者处理 */
+    }
+
+    for (int i = 0; i < n; i++) {
+        arr[i] = (i + 1) * 10;
+    }
+    return arr;                         /* 返回给调用者，由它负责 free */
+}
+
+int main(void) {
+    int n = 5;
+
+    int *nums = read_numbers(n);
+    if (nums == NULL) {
+        fprintf(stderr, "内存分配失败\n");
+        return 1;
+    }
+
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+        printf("%d ", nums[i]);
+        sum += nums[i];
+    }
+    printf("\n总和：%d\n", sum);
+
+    free(nums);                         /* 谁 malloc 谁 free */
+    nums = NULL;
+
+    return 0;
+}
+```
+
+输出：
+
+```text
+10 20 30 40 50
+总和：150
+```
+
+:::tip[所有权规则：谁申请谁释放]
+**约定**：`malloc` 的那个函数负责 `free`。
+
+如果函数**返回**了分配的内存（像上面的 `read_numbers`），就变成**调用者负责 free**。
+
+**必须用注释写清楚**：
+
+```c
+/* 返回值：调用者负责 free()，失败返回 NULL */
+int *read_numbers(int n);
+```
+
+**这是 C 项目里最容易出内存问题的地方**——所有权不清晰。
+:::
+
+## 二维数组的动态分配
+
+```c
+/* 方法一：指针的指针（每行单独分配） */
+int rows = 3, cols = 4;
+int **m = malloc((size_t)rows * sizeof(int *));
+for (int i = 0; i < rows; i++) {
+    m[i] = malloc((size_t)cols * sizeof(int));
+}
+
+/* 使用 m[i][j] ... */
+
+/* 释放：反着来 */
+for (int i = 0; i < rows; i++) {
+    free(m[i]);
+}
+free(m);
+```
+
+:::tip[更简单的方法：一维模拟二维]
+```c
+int *m = malloc((size_t)rows * cols * sizeof(int));
+/* 访问：m[i * cols + j] */
+
+free(m);        /* 只需一次 free */
+```
+
+**连续内存，cache 友好，而且只有一次 malloc/free，不容易漏。**
+
+嵌入式里推荐这种做法。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 不检查 NULL | 崩溃 | 分配可能失败 | `if (p == NULL)` |
+| 忘 `free` | 内存泄漏 | 没配对 | 每个 malloc 配一个 free |
+| `free` 两次 | 崩溃 | 重复释放 | free 后置 NULL |
+| free 后继续用 | 数据损坏 | 野指针 | free 后置 NULL |
+| `realloc` 直接赋回 | 失败时泄漏 | 原指针丢失 | 用临时变量 |
+| `malloc(n)` 而非 `n*sizeof` | 内存不够 | 参数是字节数 | `n * sizeof(T)` |
+| `free` 栈上变量 | 崩溃 | 不是 malloc 来的 | 只 free 动态内存 |
+
+:::danger[不要 free 非 malloc 的内存]
+```c
+int arr[10];
+free(arr);           /* ❌ 崩溃：arr 在栈上 */
+```
+
+`free` 只能释放 `malloc`/`calloc`/`realloc` 返回的指针。
+:::
+
+## 本课自检
+
+- [ ] 会用 `malloc(n * sizeof(T))` 申请内存
+- [ ] **知道必须检查返回值是否为 NULL**
+- [ ] 知道参数是字节数不是元素个数
+- [ ] 知道 `calloc` 会自动清零，`malloc` 不会
+- [ ] 会用 `free`，知道释放后要置 NULL
+- [ ] 知道 `free(NULL)` 是安全的
+- [ ] 会用 `realloc`，**知道要用临时变量接**
+- [ ] **能说出三大内存错误：泄漏、重复释放、已释放后使用**
+- [ ] 理解"谁申请谁释放"的所有权规则
+- [ ] 知道二维数组的两种动态分配方式
+
+## 下一步
+
+[21 结构体](./21-struct) —— 把不同类型的数据打包在一起，这是描述现实世界的基础。

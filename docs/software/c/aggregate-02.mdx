@@ -1,0 +1,300 @@
+---
+id: aggregate-02
+title: "02 位域（bit-field）"
+sidebar_position: 3
+description: "复合类型 第 2 部分：位域（bit-field）"
+---
+
+# 02 位域（bit-field）
+位域允许你指定一个成员**占多少位**，用于紧凑地打包标志位。
+
+### 实测
+
+```c
+struct Bits {
+    uint8_t flag : 1;
+    uint8_t mode : 3;
+    uint8_t rsv  : 4;
+};
+
+struct BitsWide {
+    uint32_t low  : 4;
+    uint32_t mid  : 16;
+    uint32_t high : 12;
+};
+
+struct Bits bs = {0};
+bs.flag = 1;
+bs.mode = 5;
+printf("Bits      : size=%zu  value=0x%02X\n", sizeof(struct Bits), *(uint8_t *)&bs);
+
+struct BitsWide bw = {0};
+bw.low = 0xA; bw.mid = 0xBEEF; bw.high = 0xCDE;
+uint32_t raw;
+memcpy(&raw, &bw, sizeof(raw));
+printf("BitsWide packed raw = 0x%08X\n", raw);
+```
+
+```text
+=== bitfields ===
+Bits      : size=1  value=0x0B
+BitsWide  : size=4
+BitsWide packed raw = 0xCDEBEEFA
+```
+
+解读：
+
+**`struct Bits` = 1 字节，`value = 0x0B`**
+
+`0x0B` = 二进制 `0000 1011`。`flag:1` = 1，`mode:3` = 5（`101`），`rsv:4` = 0。所以位模式是 `rsv(0000) mode(101) flag(1)` = `00001011` = `0x0B`。
+
+**注意排列方向：第一个声明的位域 `flag` 在最低位**（bit 0）。这是 **gcc/clang 在小端机器上的行为**。
+
+**`struct BitsWide` = 4 字节，`raw = 0xCDEBEEFA`**
+
+`low=0xA`(4位) + `mid=0xBEEF`(16位) + `high=0xCDE`(12位) = 32 位，正好塞进一个 `uint32_t`：
+`high(0xCDE) << 20 | mid(0xBEEF) << 4 | low(0xA)` = `0xCDEBEEFA`。
+
+实测值 `0xCDEBEEFA` 完全吻合——**位域从低位向高位依次排列，紧邻无间隙**。
+
+:::danger[位域的布局是**实现定义的**，不能跨平台依赖]
+标准明确说：位域的分配顺序、是否跨存储单元边界、对齐方式，全部**实现定义**。具体：
+
+- **位的排列方向**（从低到高还是从高到低）：实现定义。本实测（x86-64 gcc/clang）是**从低到高**
+- **是否跨越存储单元**：实现定义。如果 `uint8_t a:6; uint8_t b:4;` 总共 10 位，编译器可能让 `b` 跨到下一个字节，也可能拆开
+- **基础类型的作用**：用 `uint32_t` 还是 `int` 会影响分配单元大小
+- **signed 位域**：`int x:1` 只能表示 0 和 -1（有符号），不是 0 和 1
+
+**这意味着：位域绝对不能用于需要跨编译器/跨平台一致的二进制格式。**
+:::
+
+### 位域 vs 位掩码
+
+| 维度 | 位域 | 位掩码 |
+| --- | --- | --- |
+| 可读性 | 高（`reg.enable = 1`） | 中（`reg OR_EQ (1u << 3)`） |
+| 布局确定性 | **实现定义**，不可移植 | **完全可控** |
+| 原子性 | 读改写由编译器生成，非原子 | 同样非原子，但你可控 |
+| 硬件寄存器 | **有风险**（生成的代码不一定是你想要的） | **推荐** |
+| 内存紧凑 | 好 | 一样好 |
+| 跨编译器 ABI | 不能依赖 | 可以（用定宽类型） |
+
+:::warning[硬件寄存器不要用位域]
+这是嵌入式的一条重要准则。原因：
+
+1. 位域的读改写由编译器生成，你无法保证它生成的是"正确的单次 32 位访问"——有些编译器会生成 8 位访问再合并，**而很多硬件寄存器不支持字节访问**
+2. 布局是实现定义的，换编译器就错
+3. 无法精确控制"写 1 清零"这类特殊寄存器语义
+
+**寄存器一律用位掩码**，见 [位运算页](./bitops)。
+
+位域适合**纯内存的紧凑标志结构**（不映射硬件），且不需要跨编译器兼容的场景。
+:::
+
+### 位域的其他限制
+
+- **不能取地址**：`&bs.flag` 是语法错误（位没有独立地址）
+- **不能用 `sizeof`/`offsetof`** 作用于单个位域
+- **不能是数组**
+- `:0` 是特殊语法：强制下一个位域从新的存储单元开始
+
+## 五、枚举（enum）
+
+```c
+enum Color { RED = 1, GREEN = 2, BLUE = 4 };
+```
+
+实测：
+
+```text
+=== enum ===
+sizeof(enum Color)=4 RED=1 GREEN=2 BLUE=4
+cc=4
+```
+
+:::caution[枚举的底层类型是实现定义的]
+标准说枚举类型要与 **`char`、一个有符号整型、或一个无符号整型**兼容，具体选哪个由实现决定（且要能装下所有枚举值）。
+
+本机实测 `sizeof(enum Color) == 4`（选了 `int`）。换了编译器或加了 `-fshort-enums`（ARM 工具链常用）可能变成 1 字节。
+
+**这意味着：枚举的大小不能写进跨编译器的二进制格式。** 需要确定大小时用 `uint32_t` 显式承载。
+
+C23 新增了显式指定底层类型的语法：`enum E : uint8_t { ... }`。C17 没有。
+:::
+
+### 枚举的实用要点
+
+1. **枚举常量是 `int` 类型**，不是枚举类型——`sizeof(RED) == 4`
+2. **可以省略赋值**，从 0 开始递增；后续未赋值的从上一个 +1
+3. **枚举变量可以赋任意整型**（C 不做类型检查），这是它不如 C++ `enum class` 的地方
+4. **用于位标志时显式写 2 的幂**：`RED=1, GREEN=2, BLUE=4`，配合 `|` 使用
+
+```c
+enum Color { RED = 1, GREEN = 2, BLUE = 4 };
+enum Color c = RED | BLUE;   /* 合法，值为 5 */
+```
+
+:::tip[嵌入式里枚举的常见用法]
+ESP-IDF 里大量用枚举做错误码和模式选择：
+
+```c
+typedef enum {
+    ESP_OK = 0,
+    ESP_FAIL = -1,
+    ESP_ERR_NO_MEM = 0x101,
+    ESP_ERR_INVALID_ARG = 0x102,
+} esp_err_t;
+```
+
+**注意 `ESP_OK = 0`**——这样 `if (err)` 就能判断失败，是 C 的惯例（0 表示成功，非 0 表示失败）。
+:::
+
+## 六、`typedef`
+
+`typedef` 给类型起别名。它**不创建新类型**，只是同义词——这一点很重要（`typedef int MyInt;` 后 `MyInt` 和 `int` 完全等价，可以互相赋值、混用）。
+
+### 三类主要用途
+
+#### 1. 简写复杂类型
+
+```c
+typedef unsigned long ulong;              /* 简写 */
+typedef struct Packed3 Packed3_t;         /* 省掉 struct 关键字 */
+typedef enum Color Color_t;
+```
+
+实测：
+
+```text
+sizeof(Packed3_t)=12
+```
+
+#### 2. 函数指针类型（最有价值）
+
+```c
+typedef int (*handler_t)(int, void *);
+```
+
+实测：
+
+```text
+sizeof(handler_t)=8 h=0000000000000000
+```
+
+没有 `typedef` 的话，每次声明一个回调函数都要写：
+
+```c
+void register_cb(int (*cb)(int, void *));          /* 不用 typedef */
+void register_cb(handler_t cb);                     /* 用 typedef */
+void (*table[10])(int, void *);                     /* 不用 typedef：函数指针数组 */
+handler_t table[10];                                /* 用 typedef：清晰得多 */
+```
+
+**函数指针 typedef 是嵌入式代码的标配**——驱动抽象层、中断向量表、回调注册到处都是。
+
+#### 3. 提高可移植性
+
+```c
+typedef uint32_t tick_t;    /* 换平台时改一处即可 */
+```
+
+:::warning[不要 typedef 指针（通常）]
+```c
+typedef char *str_t;
+const str_t s;     /* 这是 char * const（常量指针），不是 const char *！ */
+```
+因为 `typedef` 是文本别名，`const str_t` 展开成 `const (char *)`，作用于指针本身而非指向的内容。这个坑非常隐蔽。
+
+**例外**：**不透明指针**（opaque pointer）是正当用法——隐藏实现细节：
+
+```c
+/* 头文件：只暴露不完整的类型 */
+typedef struct uart_dev uart_dev_t;
+uart_dev_t *uart_open(int port);
+void uart_close(uart_dev_t *dev);
+
+/* 源文件里才定义 struct uart_dev 的真实内容 */
+```
+这是 ESP-IDF 的 `spi_device_handle_t`、`i2c_master_bus_handle_t` 等句柄的标准实现方式。
+:::
+
+## 七、C99 高级初始化
+
+### 指定初始化器（designated initializer）
+
+实测：
+
+```c
+struct Packed3 di = {.c = 3, .a = 1};
+printf("di.a=%u di.b=%u di.c=%u\n", di.a, di.b, di.c);
+```
+
+```text
+di.a=1 di.b=0 di.c=3
+```
+
+用 `.成员名 = 值` 指定，**顺序可以任意**，未指定的成员**零初始化**。
+
+```c
+int arr[10] = {[3] = 7, [8] = 9};   /* 数组也能用索引指定 */
+```
+
+这在大型配置结构体里非常好用——不用记住成员顺序，改结构体定义时也不会错位。
+
+### 复合字面量（compound literal）
+
+实测：
+
+```c
+struct Packed3 cl = (struct Packed3){.b = 7};
+```
+
+```text
+cl.a=0 cl.b=7 cl.c=0
+```
+
+语法是 `(类型){初始化列表}`，产生一个该类型的**匿名对象**。可以取地址：
+
+```c
+foo(&(struct Point){.x = 1, .y = 2});   /* 传一个临时的结构体 */
+```
+
+作用域：块内产生自动存储期对象，文件作用域产生静态存储期对象。
+
+### 柔性数组成员（flexible array member, C99）
+
+```c
+struct Flex {
+    size_t len;
+    int data[];      /* 不指定大小，必须是最后一个成员 */
+};
+```
+
+实测：
+
+```c
+struct Flex *fx = malloc(sizeof(struct Flex) + 4 * sizeof(int));
+fx->len = 4;
+for (int i = 0; i < 4; i++) fx->data[i] = i * i;
+```
+
+```text
+=== flexible array member (C99) ===
+Flex sizeof=8 data=0 1 4 9 
+```
+
+**注意 `sizeof(struct Flex) == 8`**——只有 `len`（`size_t`，8 字节）的大小，**不包含数组部分**。
+
+这是 C99 引入的特性，取代了经典的"大小为 1 的数组"hack（`int data[1]`）。用途是**变长结构体**：一次 `malloc` 同时分配头部和数据，减少一次分配、提高 locality。
+
+:::caution[柔性数组成员的规则]
+1. 必须是**最后一个**成员
+2. 结构体**至少要有另一个**命名成员
+3. `sizeof` **不包含**数组部分
+4. 不能作为数组元素或其他结构体的成员（不能嵌套）
+5. C99 引入；之前是 gcc 扩展（`int data[0]`）。**C89 代码里看到的 `data[1]` 是老 hack**，现代代码用 `data[]`
+:::
+
+---
+
+**翻页**：[← 上一页](./aggregate-01) · [下一页 →](./aggregate-03) · [返回目录](./)

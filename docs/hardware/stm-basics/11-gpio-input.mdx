@@ -1,0 +1,290 @@
+---
+id: 11-gpio-input
+title: 11 GPIO 输入与按键
+sidebar_position: 11
+description: 输入模式与上下拉、CubeMX 配法、按键消抖的三种实现、HAL_GPIO_ReadPin 的坑。
+---
+
+# 11 GPIO 输入与按键
+
+**本课目标**：正确读按键，理解上下拉和消抖。
+
+## 输入模式
+
+在 CubeMX 里把引脚设为 **GPIO_Input** 后，还要选**上下拉**：
+
+| Pull 选项 | 含义 | 什么时候用 |
+| --- | --- | --- |
+| **No pull-up and no pull-down** | 悬空 | ❌ 按钮千万别用 |
+| **Pull-up** | 内部上拉 | ✅ **按键接 GND 时用** |
+| Pull-down | 内部下拉 | 按键接 3.3V 时用 |
+
+:::danger[输入引脚悬空会读到随机值]
+如果按键只是"一头接 GPIO、一头接 GND"，**没按下时引脚什么都没接**。
+
+电平会随机跳变（受静电、邻近走线影响）。
+
+**所以必须开内部上拉（或外接 10k 电阻）。**
+:::
+
+### 最常见接法
+
+```text
+STM32 内部上拉
+       ↓
+   [引脚 PA0]─────[按键]─────GND
+
+未按下：内部上拉到 3.3V → 读到 1（SET）
+按下：  直接接 GND      → 读到 0（RESET）
+```
+
+**所以"按下 = 低电平"。**
+
+## 读引脚
+
+```c
+GPIO_PinState state = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0);
+
+if (state == GPIO_PIN_RESET) {
+    /* 按下了（低电平） */
+}
+```
+
+:::danger[常见的逻辑写反]
+```c
+if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_SET) {
+    /* ❌ 这是"没按下" */
+}
+```
+
+**上拉接法下，按下是 RESET（0）。**
+
+**建议用宏定义，避免记混**：
+
+```c
+#define BTN_PRESSED  GPIO_PIN_RESET
+if (HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin) == BTN_PRESSED) { ... }
+```
+:::
+
+## 按键抖动
+
+:::danger[按一次，程序却检测到几十次]
+机械触点在闭合瞬间会弹跳 **5~20 ms**：
+
+```text
+理想：  ────┐
+            └────────
+
+实际：  ────┐┌┐┌─┐┌──┐┌──────
+            └┘└┘ └┘  └┘
+            ↑ 抖动
+```
+
+**不消抖的后果**：按一下灯切换了好几次（看起来"没反应"或"随机"）。
+:::
+
+## 三种消抖实现
+
+### ① 延时消抖（最简单）
+
+```c
+if (HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin) == BTN_PRESSED) {
+    HAL_Delay(20);                  /* 等抖动过去 */
+    if (HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin) == BTN_PRESSED) {
+        /* 确认按下了 */
+        HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+    }
+    /* 等松手，防止一次按住触发多次 */
+    while (HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin) == BTN_PRESSED) {
+        HAL_Delay(10);
+    }
+}
+```
+
+:::warning[`HAL_Delay` 会阻塞整个主循环]
+在简单程序里没问题。
+
+**但如果主循环里还要做别的事（刷新显示、采样），就会卡顿。**
+
+**用中断或状态机更好**（[第 14 课](./14-interrupt)）。
+:::
+
+### ② 状态机消抖（不阻塞）
+
+```c
+/* 每 10ms 调用一次 */
+static bool debounce(void)
+{
+    static uint8_t cnt = 0;
+    static bool stable = false;
+    const uint8_t THRESHOLD = 3;
+
+    bool raw = (HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin) == BTN_PRESSED);
+
+    if (raw != stable) {
+        if (++cnt >= THRESHOLD) {
+            stable = raw;
+            cnt = 0;
+            return true;              /* 状态真的变了 */
+        }
+    } else {
+        cnt = 0;
+    }
+    return false;
+}
+
+/* 主循环 */
+while (1) {
+    if (debounce()) {
+        HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+    }
+    HAL_Delay(10);                   /* 固定 10ms 采样 */
+}
+```
+
+**优点**：不阻塞，只在实际变化时返回一次。
+
+### ③ 边沿检测（配合 ①②）
+
+```c
+static GPIO_PinState last = GPIO_PIN_SET;
+
+GPIO_PinState now = HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin);
+
+if (last == GPIO_PIN_SET && now == GPIO_PIN_RESET) {   /* 下降沿 */
+    /* 按下瞬间，只触发一次 */
+}
+last = now;
+```
+
+:::tip[实践中用哪个]
+**简单实验** → ①延时消抖（几行搞定）
+
+**要响应快/主循环有别的活** → ②状态机
+
+**最专业** → 外部中断 + 时间戳过滤（[第 14 课](./14-interrupt)）
+:::
+
+## 完整示例：按键控制 LED
+
+```c
+#include "main.h"
+#include "gpio.h"
+#include "usart.h"
+#include <stdio.h>
+
+/* 定义按键为低电平有效 */
+#define BTN_PRESSED  GPIO_PIN_RESET
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_USART1_UART_Init();
+
+    bool led_on = false;
+    GPIO_PinState last = GPIO_PIN_SET;
+
+    printf("\r\n按键测试开始\r\n");
+
+    while (1)
+    {
+        GPIO_PinState now = HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin);
+
+        /* 下降沿：1 → 0 */
+        if (last == GPIO_PIN_SET && now == GPIO_PIN_RESET) {
+            HAL_Delay(20);              /* 消抖 */
+            if (HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin) == BTN_PRESSED) {
+                led_on = !led_on;
+
+                /* 蓝板 PC13 低电平点亮 */
+                HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin,
+                                  led_on ? GPIO_PIN_RESET : GPIO_PIN_SET);
+
+                printf("LED %s\r\n", led_on ? "ON" : "OFF");
+            }
+        }
+        last = HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin);
+
+        HAL_Delay(10);
+    }
+}
+```
+
+:::tip[为什么取 `last` 要重新读一次]
+```c
+/* 消抖等了 20ms，期间状态可能已经变了 */
+last = HAL_GPIO_ReadPin(BTN_GPIO_Port, BTN_Pin);   /* ✅ 重新读 */
+```
+
+**如果直接用消抖前的 `now`**，可能在按住不放时反复触发。
+
+**这是很隐蔽的 bug。**
+:::
+
+## 长按与双击
+
+:::tip[记录按下时长]
+```c
+static uint32_t press_tick = 0;
+
+if (按下) {
+    if (press_tick == 0) press_tick = HAL_GetTick();   /* 记录按下时刻 */
+} else {
+    if (press_tick != 0) {
+        uint32_t held = HAL_GetTick() - press_tick;
+        if (held > 1000) {
+            printf("长按\r\n");
+        } else {
+            printf("短按\r\n");
+        }
+        press_tick = 0;
+    }
+}
+```
+
+**关键工具是 `HAL_GetTick()`**——返回开机毫秒数，相当于 Arduino 的 `millis()`。
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 没开上下拉 | 读数乱跳 | 引脚悬空 | CubeMX 设 Pull-up |
+| 判断电平反了 | 逻辑相反 | 按下是 0 | 用宏定义 |
+| 没消抖 | 按一次触发多次 | 机械抖动 | 延时或状态机 |
+| `last` 用旧值 | 按住时反复触发 | 没重新读 | 重新读引脚 |
+| 输入引脚接 5V | 烧引脚 | 超电压 | 只用 3.3V |
+| 消抖延时太长 | 响应迟钝 | 50ms 已够 | 用 20ms |
+
+:::danger[别把 5V 接到 GPIO]
+**虽然 STM32F103 的很多引脚是"5V 容忍"（FT）**，但不是全部！
+
+| 引脚类型 | 5V 容忍 |
+| --- | --- |
+| 标 FT 的 | ✅ 可以 |
+| 模拟引脚（ADC 用的） | ❌ **绝对不行** |
+| 电源引脚 | ❌ |
+
+**查数据手册的引脚定义表确认。**
+
+**不确定就别接 5V。**
+:::
+
+## 本课自检
+
+- [ ] 知道输入引脚悬空会读到随机值
+- [ ] **知道按键接 GND 时要开 Pull-up**
+- [ ] **知道上拉接法下"按下 = 低电平"**
+- [ ] 会用 `HAL_GPIO_ReadPin`
+- [ ] **理解按键抖动，知道必须消抖**
+- [ ] 会三种消抖实现（延时/状态机/边沿）
+- [ ] **知道取 `last` 要重新读引脚**
+- [ ] 会用 `HAL_GetTick()` 做长按判断
+- [ ] **知道不是所有引脚都 5V 容忍，ADC 引脚绝对不行**
+
+## 下一步
+
+[12 定时器与 PWM](./12-timer-pwm) —— 精确定时、调亮度、调电机。

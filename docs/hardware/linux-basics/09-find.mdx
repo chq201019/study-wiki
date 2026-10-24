@@ -1,0 +1,343 @@
+---
+id: 09-find
+title: 09 查找文件
+sidebar_position: 9
+description: find 的完整用法（按名/类型/大小/时间/权限）、which/whereis/locate 的区别，以及与 xargs 配合。
+---
+
+# 09 查找文件
+
+**本课目标**：会用 `find` 精准定位文件，知道几个查找命令的分工。
+
+## 三个命令的分工
+
+| 命令 | 查什么 | 速度 |
+| --- | --- | --- |
+| `which` | **命令**在哪 | 快 |
+| `whereis` | 命令的程序/源码/手册 | 快 |
+| `locate` | 按名查（用数据库） | **极快** |
+| `find` | **按任意条件**查 | 慢（真遍历） |
+
+## `which`：命令在哪
+
+```bash
+which ls
+# /usr/bin/ls
+
+which grep
+# /usr/bin/grep
+```
+
+**只查 `PATH` 里的可执行文件**（[第 18 课](./18-env)讲 PATH）。
+
+:::tip[`which` 找不到说明什么]
+```bash
+which python3
+# 没有输出 → PATH 里没有 python3
+```
+
+**"命令找不到"时第一个该敲的就是 `which`。**
+
+如果 `which` 也没输出，说明这个命令没装，或不在 PATH 里。
+:::
+
+## `find`：最强大的查找
+
+### 基本语法
+
+```bash
+find 起始目录 条件 动作
+```
+
+### 按名字查
+
+```bash
+find . -name "*.txt"            # 当前目录下所有 .txt
+find /etc -name "*.conf"
+find . -iname "*.TXT"           # 忽略大小写
+```
+
+本机实测：
+
+```bash
+find deep -name '*.txt'
+# deep/b/f2.txt
+# deep/a/f1.txt
+```
+
+:::danger[`-name` 的模式要加引号]
+```bash
+find . -name *.txt              # ❌ 当前目录有 .txt 时，*.txt 会被 shell 先展开
+find . -name "*.txt"            # ✅ 加引号，让 find 自己处理
+```
+
+**不加引号时，如果当前目录恰好有匹配的文件，shell 会先把它展开成文件名列表**，`find` 收到的就不是模式了。
+
+**规矩：`-name` 的模式一律加引号。**
+:::
+
+### 按类型查
+
+```bash
+find . -type f                  # 普通文件
+find . -type d                  # 目录
+find . -type l                  # 符号链接
+find . -type f -name "*.log"    # 组合
+```
+
+本机实测：
+
+```bash
+find deep -type d
+# deep
+# deep/b
+# deep/a
+```
+
+### 按大小查
+
+```bash
+find . -size +10M               # 大于 10MB
+find . -size -1k                # 小于 1KB
+find . -size 100c               # 恰好 100 字节（c = bytes）
+find /var/log -size +100M       # 找大日志
+```
+
+| 单位 | 含义 |
+| --- | --- |
+| `c` | 字节 |
+| `k` | KB |
+| `M` | MB |
+| `G` | GB |
+
+**`+` 大于、`-` 小于、不加是恰好等于**（按单位取整）。
+
+### 按时间查
+
+```bash
+find . -mtime -7                # 7 天内修改过
+find . -mtime +30               # 30 天前修改的
+find . -mmin -60                # 60 分钟内修改过
+find /tmp -atime +7             # 7 天没访问过
+```
+
+| 选项 | 含义 |
+| --- | --- |
+| `-mtime` | 修改时间（天） |
+| `-mmin` | 修改时间（分钟） |
+| `-atime` | 访问时间 |
+| `-ctime` | 状态改变时间 |
+
+**`-7` = 7 天内，`+7` = 超过 7 天**（注意正负号含义相反于直觉）。
+
+### 按权限/属主查
+
+```bash
+find . -perm 644                # 权限恰好 644
+find . -user root               # 属主是 root
+find . -group www-data
+find / -perm -4000 2>/dev/null  # 所有 setuid 文件（安全审计）
+```
+
+### 组合条件
+
+```bash
+find . -name "*.log" -size +10M              # 与（默认）
+find . -name "*.txt" -o -name "*.md"         # 或
+find . -type f ! -name "*.tmp"               # 非
+find . \( -name "*.txt" -o -name "*.md" \) -size +1k   # 分组
+```
+
+:::warning[`-o` 优先级要小心]
+```bash
+find . -name "*.txt" -o -name "*.md" -size +1k
+```
+
+这**不是**"(txt 或 md) 且大于 1k"，而是 "txt 或 (md 且大于 1k)"。
+
+**要分组必须加括号，并且括号要转义或加引号**：
+
+```bash
+find . \( -name "*.txt" -o -name "*.md" \) -size +1k
+```
+:::
+
+## 对找到的文件执行操作
+
+### `-exec`
+
+```bash
+find . -name "*.tmp" -exec rm {} \;             # 每个文件执行一次 rm
+find . -name "*.log" -exec wc -l {} +
+```
+
+:::danger[`\;` 和 `+` 的区别很重要]
+```bash
+find . -name "*.log" -exec wc -l {} \;      # 每个文件调一次 wc（慢）
+find . -name "*.log" -exec wc -l {} +       # 批量传给一次 wc（快）
+```
+
+`{}` 是"找到的文件名"的占位符。
+
+- `\;` 结尾：每个文件单独执行
+- `+` 结尾：**一次传多个文件**（效率高得多）
+:::
+
+### 用 `xargs`（更灵活）
+
+```bash
+find . -name "*.tmp" | xargs rm
+find . -name "*.txt" -print0 | xargs -0 wc -l
+```
+
+:::danger[文件名含空格时管道会出错]
+```bash
+find . -name "*.txt" | xargs rm          # ❌ "my file.txt" 会被拆成两个参数
+find . -name "*.txt" -print0 | xargs -0 rm   # ✅ 用 \0 分隔
+```
+
+**`-print0` + `xargs -0`** 是处理任意文件名的标准组合。
+:::
+
+## `locate`：极快但可能过时
+
+```bash
+locate filename
+```
+
+**它查的是数据库**（`/var/lib/mlocate/mlocate.db`），不是真遍历硬盘，所以**极快**。
+
+:::warning[`locate` 的两个限制]
+**① 数据库需要定期更新**
+
+```bash
+sudo updatedb          # 手动更新
+```
+
+新文件可能查不到。
+
+**② 很多系统默认没装**
+
+```bash
+command -v locate || echo "locate 未安装"
+apt install plocate
+```
+
+**本机实测**：这个 Debian 服务器上 `locate` **默认没装**。
+:::
+
+## 实战场景
+
+### 找大文件（清理磁盘）
+
+```bash
+find / -type f -size +100M 2>/dev/null
+```
+
+:::tip[`2>/dev/null` 是干什么的]
+`find /` 会遍历所有目录，遇到没权限的会打印错误（大量 `Permission denied`）。
+
+**`2>/dev/null` 把标准错误丢弃**，只看结果。
+
+**这是 `find /` 的标准写法。**
+:::
+
+### 找最近改过的文件
+
+```bash
+find . -type f -mmin -60                # 1 小时内
+find /etc -type f -mtime -1             # 1 天内
+```
+
+### 批量删旧日志
+
+```bash
+find /var/log -name "*.log" -mtime +30 -delete
+```
+
+（`-delete` 比 `-exec rm` 更高效。）
+
+### 找空文件/空目录
+
+```bash
+find . -type f -empty
+find . -type d -empty
+```
+
+### 安全审计：找 setuid 文件
+
+```bash
+find / -perm -4000 -type f 2>/dev/null
+```
+
+**定期检查有好处**——异常出现的 setuid 文件可能是后门。
+
+## 完整示例
+
+```bash
+mkdir -p ~/findtest/{logs,src,tmp} && cd ~/findtest
+
+# 造点文件
+echo "log content" > logs/app.log
+echo "log content" > logs/error.log
+echo "code" > src/main.cpp
+touch tmp/empty.tmp
+
+# ① 找所有 log
+find . -name "*.log"
+
+# ② 找目录
+find . -type d
+
+# ③ 找空文件
+find . -type f -empty
+
+# ④ 按大小
+find . -type f -size -1k
+
+# ⑤ 找 log 并统计行数
+find . -name "*.log" -exec wc -l {} +
+
+# ⑥ 清理 tmp
+find . -name "*.tmp" -delete
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `-name *.txt` 不加引号 | 结果不对 | shell 先展开 | 加引号 |
+| `find /` 满屏错误 | 大量 Permission denied | 没权限的目录 | `2>/dev/null` |
+| `-o` 没加括号 | 逻辑不对 | 优先级 | `\( ... \)` |
+| `xargs` 遇空格文件名 | 处理错文件 | 空格分参数 | `-print0` + `-0` |
+| `locate` 查不到新文件 | 数据库过期 | 需要 updatedb | `sudo updatedb` |
+| `-mtime -7` 以为 7 天前 | 实际是 7 天内 | 正负含义 | 记住 `-` 是"以内" |
+
+## 本课自检
+
+- [ ] 分清 `which` / `locate` / `find` 的用途
+- [ ] **知道 `which` 找不到说明命令不在 PATH**
+- [ ] 会用 `find -name`，**知道要加引号**
+- [ ] 会用 `-type f/d/l`
+- [ ] 会用 `-size +10M` / `-mtime -7`
+- [ ] **理解 `+` 和 `-` 在 `-size`/`-mtime` 里的含义**
+- [ ] 会用 `-exec ... {} \;` 和 `{} +`
+- [ ] **知道文件名含空格要用 `-print0` + `xargs -0`**
+- [ ] 知道 `find /` 要加 `2>/dev/null`
+- [ ] 知道 `locate` 需要数据库且可能没装
+
+## 第二阶段小结
+
+你现在掌握了文件和权限：
+
+- 增删改查（`ls` `cp` `mv` `rm`）
+- 查看内容（`cat` `less` `head` `tail` `grep`）
+- **权限系统**（`rwx`、`chmod`、`umask`、特殊位）
+- **inode 与链接**（硬链接 vs 软链接）
+- 查找（`find`）
+
+**这是日常使用 Linux 最频繁的部分。**
+
+## 下一步
+
+[10 进程管理](./10-process) —— 看谁在跑、怎么停掉它。

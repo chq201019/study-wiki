@@ -1,0 +1,443 @@
+---
+id: 10-if
+title: 10 条件判断 if / switch
+sidebar_position: 10
+description: if/else if/else 的写法、花括号的陷阱、switch 的贯穿问题，以及什么算"真"。
+---
+
+# 10 条件判断 if / switch
+
+**本课目标**：会让程序根据条件做不同的事，避开悬空 else 和 switch 漏 break 这两个经典坑。
+
+## 最基本的 if
+
+```c
+int age = 18;
+
+if (age >= 18) {
+    printf("已成年\n");
+}
+```
+
+结构：
+
+```c
+if (条件) {
+    条件为真时执行的代码
+}
+```
+
+:::danger[条件必须用括号包起来]
+```c
+if age >= 18 { }        /* ❌ 编译错误 */
+if (age >= 18) { }      /* ✅ */
+```
+
+这和 Python 不同（Python 不用括号，用冒号）。**C 的括号不能省。**
+:::
+
+## if-else
+
+```c
+int score = 55;
+
+if (score >= 60) {
+    printf("及格\n");
+} else {
+    printf("不及格\n");
+}
+```
+
+## if - else if - else
+
+```c
+int score = 85;
+
+if (score >= 90) {
+    printf("优秀\n");
+} else if (score >= 80) {
+    printf("良好\n");
+} else if (score >= 60) {
+    printf("及格\n");
+} else {
+    printf("不及格\n");
+}
+```
+
+输出：
+
+```text
+良好
+```
+
+:::warning[顺序必须从严到宽]
+```c
+if (score >= 60) {
+    printf("及格\n");
+} else if (score >= 90) {
+    printf("优秀\n");      /* 永远执行不到！ */
+}
+```
+
+`score = 95` 会先命中 `>= 60`，直接跳出去，后面的 `else if` 不再检查。
+
+**这是逻辑错误，编译不报错**，最难发现。**养成从严格条件往宽写的习惯。**
+:::
+
+## 花括号能不能省
+
+```c
+if (x > 0)
+    printf("正数\n");        /* 单条语句可以省花括号 */
+```
+
+**强烈建议永远写花括号**，因为：
+
+:::danger[省花括号 + 缩进错误 = 经典 bug]
+```c
+if (x > 0)
+    printf("正数\n");
+    printf("这行看起来在 if 里\n");    /* ❌ 其实不在！ */
+```
+
+**第二条 `printf` 根本不受 `if` 控制**，无论 `x` 是正是负都会执行。
+
+因为 C 的 `if` 只控制**紧接着的一条语句**，缩进对编译器毫无意义。
+
+### 苹果的著名安全漏洞
+
+2014 年苹果的 "goto fail" 漏洞就是这个原因：
+
+```c
+if ((err = SSLHashSHA1.update(&hashCtx, &signedParams)) != 0)
+    goto fail;
+    goto fail;              /* ← 这一行不受 if 控制，永远执行 */
+
+/* ... 正常的校验代码被跳过了 ... */
+fail:
+    return err;
+```
+
+一个多余的 `goto fail` 导致 **SSL 证书校验被完全绕过**。
+
+**教训：永远写花括号。**
+:::
+
+## 什么算"真"
+
+:::info[C 里 0 是假，非 0 是真]
+```c
+if (0) { }       /* 假 */
+if (1) { }       /* 真 */
+if (-1) { }      /* 真！负数也算真 */
+if (42) { }      /* 真 */
+if (0.0) { }     /* 假 */
+if (0.5) { }     /* 真 */
+```
+
+**只要不等于 0 就是真。**
+
+本机实测：`if (-1)` 会执行，`if (0)` 不执行。
+:::
+
+### 常见写法
+
+```c
+if (x)              /* 等价于 x != 0 */
+if (!x)             /* 等价于 x == 0 */
+if (ptr)            /* 指针非空 */
+if (!ptr)           /* 指针为空 */
+if (count)          /* 计数非零 */
+```
+
+:::warning[别和 Python 的"真值"混了]
+| 值 | C | Python |
+| --- | --- | --- |
+| `0` | 假 | 假 |
+| `""`（空字符串） | 指针非空 → **真** | 假 |
+| `-1` | 真 | 真 |
+
+**C 里 `if ("")` 是真**，因为空字符串的地址不是 0。
+
+**C 只有"0 和非 0"两个概念**，没有 Python 那套"空容器算假"的规则。
+:::
+
+## 比较运算符
+
+```c
+printf("%d\n", 5 > 3);      /* 1 */
+printf("%d\n", 5 < 3);      /* 0 */
+printf("%d\n", 5 >= 5);     /* 1 */
+printf("%d\n", 5 <= 4);     /* 0 */
+printf("%d\n", 5 == 5);     /* 1  注意两个等号 */
+printf("%d\n", 5 != 3);     /* 1  不等于 */
+```
+
+:::danger[`=` 和 `==` 的区别会造成严重 bug]
+```c
+int x = 5;
+if (x = 0) {              /* 赋值！x 变成 0，条件为假 */
+    printf("不会执行\n");
+}
+```
+
+**本意是 `x == 0`，但写成 `x = 0` 就变成"把 0 赋给 x 然后判断 x"**。
+
+危险的是：**这是合法代码，只产生警告不报错**：
+
+```text
+warning: using the result of an assignment as a condition without parentheses
+```
+
+**对策**：
+
+1. **认真看警告**（所以必须开 `-Wall`）
+2. 常量放左边：`if (0 == x)` —— 少写一个 `=` 就变成 `if (0 = x)` 直接报错
+:::
+
+## 逻辑运算符
+
+```c
+int age = 25;
+int has_ticket = 1;
+
+if (age >= 18 && has_ticket) {
+    printf("可以入场\n");
+}
+
+if (age < 18 || age > 60) {
+    printf("有优惠\n");
+}
+
+if (!has_ticket) {
+    printf("请先买票\n");
+}
+```
+
+| 运算符 | 含义 | 注意 |
+| --- | --- | --- |
+| `&&` | 并且 | **两个 &，不是 and** |
+| `\|\|` | 或者 | **两个竖线，不是 or** |
+| `!` | 取反 | 单个感叹号 |
+
+:::warning[C 没有 `and` / `or` 关键字]
+```c
+if (a and b)        /* ❌ C 里没有 and */
+if (a && b)         /* ✅ */
+```
+
+（除非包含 `<iso646.h>`，那会定义 `and` 等宏，但**不要用**——没人这么写。）
+:::
+
+## switch：多分支选择
+
+当条件是"等于某个整数"时，`switch` 比一串 `else if` 清晰：
+
+```c
+int day = 3;
+
+switch (day) {
+    case 1:
+        printf("周一\n");
+        break;
+    case 2:
+        printf("周二\n");
+        break;
+    case 3:
+        printf("周三\n");
+        break;
+    default:
+        printf("其他\n");
+        break;
+}
+```
+
+输出：
+
+```text
+周三
+```
+
+### switch 只能用整数或字符
+
+```c
+switch (day)              /* ✅ int */
+switch (ch)               /* ✅ char */
+switch (str)              /* ❌ 不能是字符串 */
+switch (3.14)             /* ❌ 不能是浮点 */
+```
+
+## 最重要的坑：漏写 break
+
+:::danger[switch 会"贯穿"到下一个 case]
+```c
+int x = 2;
+switch (x) {
+    case 1: printf("one\n");
+    case 2: printf("two\n");
+    case 3: printf("three\n");
+    default: printf("default\n");
+}
+```
+
+本机实测输出：
+
+```text
+two
+three
+default
+```
+
+**没有 `break`，匹配后会把后面的所有 case 都执行一遍！**
+:::
+
+### 完整演示贯穿
+
+```c
+for (int d = 1; d <= 3; d++) {
+    printf("d=%d: ", d);
+    switch (d) {
+        case 1: printf("周一 ");
+        case 2: printf("周二 ");
+        case 3: printf("周三 ");
+                break;
+        default: printf("其他");
+    }
+    printf("\n");
+}
+```
+
+本机实测输出：
+
+```text
+d=1: 周一 周二 周三
+d=2: 周二 周三
+d=3: 周三
+```
+
+**`d=1` 时三个 case 全执行了。**
+
+:::tip[贯穿有时是特性]
+刻意利用贯穿可以简化代码：
+
+```c
+switch (month) {
+    case 12: case 1: case 2:
+        printf("冬季\n");
+        break;
+    case 3: case 4: case 5:
+        printf("春季\n");
+        break;
+    /* ... */
+}
+```
+
+多个 case 共享同一段处理，这是**合法的技巧**。
+
+**但要写注释说明是故意的**，否则别人以为你忘了 break。
+:::
+
+### 其他 switch 注意事项
+
+```c
+switch (x) {
+    case 1:
+        int y = 10;          /* ⚠️ 在 case 里定义变量要小心 */
+        break;
+}
+```
+
+**如果非要在 case 里定义变量，用花括号圈起来**：
+
+```c
+switch (x) {
+    case 1: {
+        int y = 10;
+        printf("%d\n", y);
+        break;
+    }
+}
+```
+
+还有：`default` 不一定要放最后，但**放最后最清晰**。
+
+## 完整示例
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int score;
+
+    printf("请输入分数：");
+    if (scanf("%d", &score) != 1) {
+        printf("输入无效\n");
+        return 1;
+    }
+
+    /* 从严格到宽松 */
+    if (score < 0 || score > 100) {
+        printf("分数超出范围\n");
+    } else if (score >= 90) {
+        printf("等级：A\n");
+    } else if (score >= 80) {
+        printf("等级：B\n");
+    } else if (score >= 60) {
+        printf("等级：C\n");
+    } else {
+        printf("等级：D\n");
+    }
+
+    return 0;
+}
+```
+
+运行：
+
+```text
+请输入分数：85
+等级：B
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `if x > 0` | 编译错 | 缺括号 | `if (x > 0)` |
+| `if (x = 1)` | 恒真 | 赋值不是比较 | 用 `==` |
+| 省花括号 + 多语句 | 逻辑错 | if 只管一条 | 永远写花括号 |
+| `else if` 顺序颠倒 | 分支不生效 | 先命中宽条件 | 从严到宽 |
+| switch 漏 `break` | 执行多个分支 | 贯穿 | 每个 case 加 break |
+| `switch` 用字符串 | 编译错 | 只能整型 | 用 `if` + `strcmp` |
+| `&&` 写成 `&` | 逻辑错 | 一个是逻辑与，一个是按位与 | 检查符号 |
+
+:::danger[`&` 和 `&&` 的区别]
+```c
+if (a & b)         /* 按位与：两个数的二进制逐位相与 */
+if (a && b)        /* 逻辑与：都为真才真 */
+```
+
+对 `a=1, b=2`：
+
+- `a & b` = 0（假）
+- `a && b` = 1（真）
+
+**结果可能完全不同。** 编译不报错，但逻辑错了。
+:::
+
+## 本课自检
+
+- [ ] 会写 if / if-else / else if 链
+- [ ] 知道条件必须用括号
+- [ ] **知道 if 只控制一条语句，永远写花括号**
+- [ ] 知道 0 是假、非 0 是真（`-1` 也是真）
+- [ ] 知道 C 没有 Python 那套"空字符串算假"
+- [ ] 分清 `=` 和 `==`
+- [ ] 知道 `&&` / `||` 不是 `and` / `or`
+- [ ] 会写 switch，**知道漏 break 会贯穿**
+- [ ] 知道 switch 只支持整型和字符
+- [ ] 知道 case 里定义变量要加花括号
+
+## 下一步
+
+[11 循环 for / while](./11-loops) —— 让程序重复做事，这是自动化的基础。

@@ -1,0 +1,276 @@
+---
+id: freertos-deep
+title: "15 FreeRTOS 深入"
+sidebar_position: 15
+description: 调度器怎么选下一个任务、优先级方向与 NVIC 相反、任务栈单位是"字"不是字节、五种内存方案的取舍、切换一次的真实代价。
+---
+
+# 15 FreeRTOS 深入
+
+**本课目标**：搞清调度规则和内存方案，避开三个致命错误。
+
+## 调度器怎么工作
+
+:::info[FreeRTOS 默认是"抢占式 + 同优先级轮转"]
+```text
+每来一个 Tick（默认 1ms）：
+  ① 检查有没有更高优先级的就绪任务
+     → 有 → 立刻切换（抢占）
+  ② 没有更高优先级，但有同优先级的其他就绪任务
+     → 时间片用完就轮转
+  ③ 否则继续跑当前任务
+```
+:::
+
+:::danger[优先级方向与 NVIC 相反 —— 这是最容易记混的]
+| | 数字大 | 数字小 |
+| --- | --- | --- |
+| **NVIC 中断** | 低优先级 | **高优先级** |
+| **FreeRTOS 任务** | **高优先级** | 低优先级 |
+
+**中断是"紧急程度"（0 号最急），任务是"重要性"（数字大的更重要）。**
+
+**写代码时同时在改中断和任务优先级，一定要停下来确认自己在改哪个。**
+:::
+
+### 时间片
+
+```c
+/* FreeRTOSConfig.h */
+#define configUSE_TIME_SLICING   1      /* 同优先级任务轮转 */
+#define configUSE_PREEMPTION     1      /* 抢占 */
+#define configTICK_RATE_HZ       1000   /* 1ms 一个 tick */
+```
+
+:::warning[最高优先级任务不阻塞 → 其他任务全部饿死]
+```c
+void high_prio_task(void *arg)
+{
+    for (;;) {
+        do_something();          /* ❌ 没有 vTaskDelay，永不阻塞 */
+    }
+}
+```
+
+**FreeRTOS 是严格优先级抢占**：只要最高优先级的就绪任务存在，低优先级的**永远得不到 CPU**。
+
+**规矩：每个任务里必须有阻塞点**（`vTaskDelay` / 等队列 / 等信号量）。
+
+**哪怕 `vTaskDelay(1)` 也能让出 CPU。**
+:::
+
+## 任务创建与栈
+
+:::danger[`xTaskCreate` 的栈参数单位是"字"（word），不是字节]
+```c
+xTaskCreate(my_task, "t", 128, NULL, 2, NULL);
+/*                          ↑ 128 个字 = 128 × 4 = 512 字节 */
+```
+
+**而 ESP-IDF 的 `xTaskCreate` 单位是字节！**
+
+```c
+/* ESP-IDF：直接是字节 */
+xTaskCreate(my_task, "t", 4096, NULL, 2, NULL);   /* 4096 字节 */
+```
+
+**两个平台参数含义完全不同——跨平台移植时这里是重灾区。**
+:::
+
+:::tip[栈要开多大]
+**经验值**（F103，无浮点 `printf`）：
+
+| 任务内容 | 建议栈（字） | 约合字节 |
+| --- | --- | --- |
+| 只翻转 GPIO | 64 ~ 128 | 256 ~ 512 |
+| 一般逻辑 + 少量局部变量 | 128 ~ 256 | 512 ~ 1024 |
+| **用了 `printf` / `sprintf`** | **512 ~ 1024** | **2 ~ 4 KB** |
+| 有浮点运算 | 再加 256 | 加 1 KB |
+
+**`printf` 是栈杀手**（内部有较大的临时缓冲）。
+
+**F103 只有 20KB RAM，总共能开的栈很有限——这是用 RTOS 的主要约束。**
+:::
+
+```c
+/* 检查某个任务用了多少栈（剩余最小值） */
+UBaseType_t remain = uxTaskGetStackHighWaterMark(task_handle);
+/* remain 是"历史最小剩余量"，单位是字 */
+/* 如果 remain < 32，说明快溢出了，要加 */
+```
+
+:::danger[栈溢出检测要在开发阶段打开]
+```c
+#define configCHECK_FOR_STACK_OVERFLOW   2      /* 2 = 最严格 */
+```
+
+**实现这个回调**：
+
+```c
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+    /* 这里断点，就能抓到是哪个任务溢出了 */
+    for (;;) { }
+}
+```
+
+**不打开的话，栈溢出会静默破坏相邻内存**，表现为"某个完全不相关的变量莫名其妙变了"——极难查。
+:::
+
+## 五种内存方案
+
+:::info[FreeRTOS 的堆管理与标准 `malloc` 完全独立]
+它在 `heap_1.c` ~ `heap_5.c` 里各有一份实现，**编译时选一个**。
+:::
+
+| 方案 | 能否释放 | 碎片 | 适合 |
+| --- | --- | --- | --- |
+| **heap_1** | ❌ 不能 | ❌ 无 | 任务全在启动时创建，之后不删 |
+| **heap_2** | ✅ 能 | ⚠️ 严重 | **不推荐**（已过时） |
+| **heap_3** | ✅ 能 | 同标准 malloc | 包了一层 `malloc`，需要 `configTOTAL_HEAP_SIZE` 之外的堆 |
+| **heap_4** | ✅ 能 | ✅ 有合并 | **最常用**（默认选它） |
+| **heap_5** | ✅ 能 | ✅ 有合并 | 内存不连续（如内部 RAM + 外部 SRAM） |
+
+```c
+/* FreeRTOSConfig.h */
+#define configTOTAL_HEAP_SIZE  ((size_t)(6 * 1024))    /* 6KB 堆 */
+```
+
+:::warning[`configTOTAL_HEAP_SIZE` 是静态数组，不是"可用内存"]
+**FreeRTOS 在编译时就分配这么大一个静态数组**（`ucHeap[]`）。
+
+**这意味着它占的是 `.bss`**——F103 的 20KB RAM 里被切走 6KB。
+
+**如果只用 heap_1 且任务全在启动时创建，可以把堆设得很小（刚好够用），甚至用 heap_1 让它完全无碎片。**
+:::
+
+```c
+/* 查还剩多少堆 */
+size_t free = xPortGetFreeHeapSize();
+size_t min_ever = xPortGetMinimumEverFreeHeapSize();   /* 历史最低 */
+```
+
+:::tip[`xPortGetMinimumEverFreeHeapSize()` 比当前空闲量更有用]
+它告诉你**历史最低点**。如果这个值很小（比如 < 512 字节），说明你已经贴着上限跑，随时可能创建失败。
+
+**产品里应该监控这个值并预留 20% 余量。**
+:::
+
+## 上下文切换的真实代价
+
+:::info[切换时发生了什么]
+```text
+① SysTick 中断 → 置 PendSV 挂起
+② PendSV 中断（最低优先级）：
+     - 保存当前任务的 R4~R11 到它的栈
+     - 恢复下一个任务的 R4~R11
+     - 更新 PSP
+③ 硬件自动保存/恢复 R0~R3、R12、LR、PC、xPSR
+```
+
+**一次切换大约 100~200 个周期**（F103 @72MHz 约 **1.4~2.8 µs**）。
+:::
+
+:::danger[Tick 频率不能盲目调高]
+```c
+#define configTICK_RATE_HZ  1000     /* 1ms */
+```
+
+**每秒 1000 次 SysTick 中断**，每次中断本身就有开销（即使不切换任务）。
+
+**调成 10000（100µs）时**：中断开销占 CPU 的比例上升，**可能吃掉 10~20% 的算力**。
+
+**除非需要 100µs 级的延时精度，否则 1000Hz 足够了。**
+:::
+
+:::tip[需要更精细的延时怎么办]
+用硬件定时器做高精度延时（`vTaskDelayUntil` 只能到 tick 精度）。
+
+```c
+/* 用 DWT 做微秒级忙等（会占 CPU，但精确） */
+static inline void delay_us(uint32_t us)
+{
+    uint32_t start = DWT->CYCCNT;
+    uint32_t ticks = us * (SystemCoreClock / 1000000);
+    while (DWT->CYCCNT - start < ticks) { }
+}
+```
+:::
+
+## 中断里的规则
+
+:::danger[中断里必须用 `FromISR` 版本]
+```c
+/* ❌ 在中断里调普通版本 —— 可能死锁或破坏内核 */
+xQueueSend(q, &data, portMAX_DELAY);
+
+/* ✅ 用 FromISR 版本 */
+BaseType_t woken = pdFALSE;
+xQueueSendFromISR(q, &data, &woken);
+portYIELD_FROM_ISR(woken);        /* ← 不能漏 */
+```
+
+**`portYIELD_FROM_ISR(woken)` 的作用**：如果这个中断唤醒了更高优先级的任务，**在中断返回时立刻切换**，而不是等到下一个 tick。
+
+**漏了它 → 被唤醒的任务最多延迟 1ms 才运行**，实时性差。
+:::
+
+:::warning[中断优先级与 FreeRTOS 的关系]
+```c
+/* 只有优先级数值 ≥ 这个值的中断，才能调用 FromISR API */
+#define configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY   5
+```
+
+**优先级比 5 更"高"（数字更小，即 0~4）的中断，不能调用任何 FreeRTOS API。**
+
+**为什么**：这些中断不受内核临界区保护，调内核函数会破坏内部状态（表现是随机死机）。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 低优先级任务永不运行 | 高优先级任务没阻塞点 | 加 `vTaskDelay` |
+| 随机死机 | 中断里用了非 FromISR API | 改 `xxxFromISR` |
+| 唤醒延迟 1ms | 漏了 `portYIELD_FROM_ISR` | 补上 |
+| 某个变量莫名被改 | 栈溢出破坏内存 | 开 `configCHECK_FOR_STACK_OVERFLOW` |
+| 创建任务失败 | 堆不够 | 加大 `configTOTAL_HEAP_SIZE` |
+| 栈明明够却溢出 | **单位搞错（字 vs 字节）** | 确认平台 |
+| 运行一段时间后创建失败 | 堆碎片 | 用 heap_4，避免频繁创建删除 |
+| Tick 调高后性能下降 | 中断开销 | 改回 1000Hz |
+
+:::tip[调试时打开这两个工具]
+```c
+/* 打印所有任务状态、剩余栈、优先级 */
+void print_tasks(void)
+{
+    char buf[512];
+    vTaskList(buf);         /* 需要 configUSE_TRACE_FACILITY = 1 */
+    printf("%s\r\n", buf);
+    /* 输出：名字 状态 优先级 剩余栈 序号 */
+}
+```
+
+**`vTaskList` 的输出能一眼看出哪个任务在跑、哪个栈快没了。**
+:::
+
+## 本课自检
+
+- [ ] 知道 FreeRTOS 默认抢占式 + 同优先级轮转
+- [ ] **牢记任务优先级数字大 = 优先级高（与 NVIC 相反）**
+- [ ] **知道最高优先级任务不阻塞会让其他任务饿死**
+- [ ] **知道 `xTaskCreate` 栈单位是"字"（ESP-IDF 是字节）**
+- [ ] 知道 `printf` 要 512~1024 字的栈
+- [ ] 会用 `uxTaskGetStackHighWaterMark` 查栈用量
+- [ ] **知道要开 `configCHECK_FOR_STACK_OVERFLOW`**
+- [ ] 能区分五种 heap 方案，知道 heap_4 最常用
+- [ ] **知道 `configTOTAL_HEAP_SIZE` 是静态数组占 RAM**
+- [ ] 知道用 `xPortGetMinimumEverFreeHeapSize` 监控余量
+- [ ] 知道一次上下文切换约 100~200 周期
+- [ ] **知道 Tick 不是越高越好**
+- [ ] **知道中断里必须用 `FromISR` + `portYIELD_FROM_ISR`**
+- [ ] 知道优先级高于 `MAX_SYSCALL_INTERRUPT_PRIORITY` 的中断不能调 FreeRTOS API
+
+## 下一步
+
+[16 FreeRTOS 同步机制](./freertos-sync) —— 队列、信号量、互斥锁怎么选。

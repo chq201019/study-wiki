@@ -1,0 +1,323 @@
+---
+id: 12-timer-pwm
+title: 12 定时器与 PWM
+sidebar_position: 12
+description: 定时器的三种用途、PSC/ARR 怎么算周期、PWM 的占空比怎么设、HAL_TIM_PWM_Start 为什么容易漏，以及定时器中断。
+---
+
+# 12 定时器与 PWM
+
+**本课目标**：会算定时器参数、能输出任意频率占空比的 PWM。
+
+## 定时器能干什么
+
+| 用途 | 说明 |
+| --- | --- |
+| **精确定时/中断** | 每 X 微秒触发一次 |
+| **PWM 输出** | 调亮度、调电机、舵机 |
+| **输入捕获** | 测频率、测脉宽（读超声波、编码器） |
+| **输出比较** | 产生精确脉冲序列 |
+
+:::tip[STM32 的定时器比 ESP32 强很多]
+| | ESP32 | STM32F103 |
+| --- | --- | --- |
+| 定时器数量 | 多个（esp_timer 是软件） | **4 个通用 + 2 个高级** |
+| 通道 | LEDC 靠专用外设 | 每个定时器 4 个独立通道 |
+| 精度 | 微秒级 | **纳秒级**（72MHz 计数） |
+| 输入捕获 | 一般 | **硬件支持** |
+
+**做电机控制、精密测量是 STM32 的主场。**
+:::
+
+## 核心公式：PSC 和 ARR
+
+定时器的基本原理是**数数**：
+
+```text
+时钟 → [预分频 PSC] → [计数器 CNT 数到 ARR] → 溢出/中断
+```
+
+两个关键参数：
+
+| 参数 | 作用 |
+| --- | --- |
+| **PSC**（Prescaler，预分频） | 把时钟降低多少倍 |
+| **ARR**（Auto Reload Register） | 数到多少就溢出 |
+
+**公式**：
+
+```text
+计数频率 = 定时器时钟 / (PSC + 1)
+溢出周期 = (PSC + 1) × (ARR + 1) / 定时器时钟
+```
+
+:::danger[为什么都要 +1]
+```c
+PSC = 0    → 实际分频 1（不分频）
+PSC = 71   → 实际分频 72
+PSC = 7199 → 实际分频 7200
+```
+
+**寄存器值是从 0 开始数的，所以实际倍数要 +1。**
+
+**忘了 +1 会导致周期差一个数量级**——这是最常见的计算错误。
+:::
+
+### 算一个 1 秒的定时器
+
+STM32F103 的 TIM2 挂在 APB1（36MHz），但因为 APB1 分频≠1，**定时器时钟是 72 MHz**（[第 10 课](./10-clock)讲的隐藏倍频）。
+
+要 1 秒：
+
+```text
+方法一：先分频到 10kHz，再数 10000 次
+  PSC = 7200 - 1 = 7199      → 72MHz / 7200 = 10 kHz
+  ARR = 10000 - 1 = 9999     → 10kHz 数 10000 次 = 1 秒
+
+方法二：先分频到 1MHz，再数 1000000 次
+  PSC = 72 - 1 = 71          → 72MHz / 72 = 1 MHz
+  ARR = 1000000 - 1 = 999999  → 但 ARR 最大只有 65535（16位）！❌
+```
+
+:::warning[ARR 是 16 位的]
+**通用定时器（TIM2~5）的 ARR 最大 65535**，高级定时器（TIM1/8）也是 16 位。
+
+**所以单靠 ARR 数不到 100 万。** 必须先加大 PSC。
+
+**规矩：先算 PSC 把频率降到 1~100 kHz 范围，再用 ARR 数。**
+:::
+
+### 算一个 10 kHz 的 PWM
+
+```text
+PSC = 72 - 1 = 71          → 72MHz / 72 = 1 MHz
+ARR = 100 - 1 = 99         → 1MHz / 100 = 10 kHz ✓
+
+占空比分辨率 = 100 级（0~99）
+```
+
+## 用 CubeMX 配定时器
+
+以 **TIM2 输出 PWM 到 PA0** 为例：
+
+1. 引脚图上点 **PA0** → 选 **TIM2_CH1**
+2. 左侧 **Timers → TIM2**：
+   - **Clock Source**: Internal Clock
+   - **Channel1**: **PWM Generation CH1**
+3. 下方 **Parameter Settings**：
+
+| 参数 | 值 | 说明 |
+| --- | --- | --- |
+| **Prescaler (PSC)** | **71** | 分频到 1MHz |
+| **Counter Mode** | Up | 向上计数 |
+| **Counter Period (ARR)** | **99** | 数 100 次 → 10kHz |
+| **Pulse** | **0** | 初始占空比 |
+
+生成代码后，`main()` 里会多出 `MX_TIM2_Init()`。
+
+## 启动 PWM
+
+:::danger[最容易漏的一步：`HAL_TIM_PWM_Start`]
+```c
+MX_TIM2_Init();                        /* CubeMX 只做了配置 */
+/* ❌ 到这里 PWM 还没输出！ */
+
+HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);   /* ✅ 必须启动 */
+```
+
+**`MX_TIM2_Init()` 只配置了寄存器，没开定时器。**
+
+**这和 ESP32 的 `ledc_update_duty` 是同一类坑**（[ESP32 第 8 课](../esp-basics/08-pwm)）——配置好了不等于生效。
+:::
+
+## 改占空比
+
+```c
+/* 方式一：用宏（推荐） */
+__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 30);
+
+/* 方式二：直接改结构体（不推荐，容易忘同步） */
+htim2.Instance->CCR1 = 30;
+```
+
+:::tip[占空比 = CCR / (ARR+1)]
+```text
+ARR = 99（即 100 级）
+CCR = 30  →  占空比 30%
+CCR = 0   →  0%
+CCR = 99  →  99%（注意不是 100%）
+CCR = 100 →  100%（CCR 可以等于 ARR+1）
+```
+
+**`CCR` 就是"数到第几个就翻转"。**
+:::
+
+## 完整示例：呼吸灯
+
+```c
+#include "main.h"
+#include "tim.h"
+#include "gpio.h"
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_TIM2_Init();
+
+    /* 启动 PWM（不能漏） */
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+
+    uint16_t duty = 0;
+    int8_t   step = 2;
+
+    while (1)
+    {
+        /* 渐变：0 → 99 → 0 */
+        duty += step;
+        if (duty >= 99 || duty == 0) {
+            step = -step;
+        }
+
+        __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, duty);
+
+        HAL_Delay(15);
+    }
+}
+```
+
+:::tip[这就是"硬件呼吸灯"]
+和 [ESP32 第 8 课](../esp-basics/08-pwm)的软件 PWM 不同，**这里是硬件在产生波形**——CPU 只改一个寄存器值，不占时间。
+
+**这才是正确做法。**
+:::
+
+## 定时器中断
+
+想做"每 1ms 精确执行一次"，用定时器中断比 `HAL_Delay` 准得多。
+
+### CubeMX 配置
+
+TIM 配置里把 **NVIC Settings → TIMx global interrupt** 打勾。
+
+### 启动中断
+
+```c
+HAL_TIM_Base_Start_IT(&htim3);      /* 注意是 _IT 后缀 */
+```
+
+### 实现回调
+
+在 `main.c` 的 `USER CODE 4` 区：
+
+```c
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM3) {
+        /* 每 1ms 执行一次 */
+        static uint32_t cnt = 0;
+        if (++cnt >= 1000) {
+            cnt = 0;
+            HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);   /* 每 1 秒翻转 */
+        }
+    }
+}
+```
+
+:::danger[中断回调里不要做耗时操作]
+```c
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    printf("1ms 到了\r\n");        /* ❌ 串口要 2ms，中断超时 */
+}
+```
+
+**中断里 `printf` 会阻塞（[第 9 课](./09-uart)讲过），导致中断超时甚至卡死。**
+
+**规矩：中断里只置标志位/改变量，打印放主循环。**
+
+```c
+/* 中断里 */
+volatile bool flag = false;
+
+void HAL_TIM_PeriodElapsedCallback(...) {
+    flag = true;                   /* ✅ 只做这个 */
+}
+
+/* 主循环里 */
+while (1) {
+    if (flag) {
+        flag = false;
+        printf("触发\r\n");        /* ✅ 在这里打印 */
+    }
+}
+```
+:::
+
+:::warning[`volatile` 不能省]
+```c
+bool flag = false;          /* ❌ 主循环的 while(!flag) 可能被优化成死循环 */
+volatile bool flag = false; /* ✅ 每次都真的读内存 */
+```
+
+**中断和主循环共享的变量必须加 `volatile`。**
+
+（这和 ESP32 的规矩一样，[C 第 28 课](../../software/c-basics/28-bitops)也讲过。）
+:::
+
+## 常用定时器分配建议
+
+| 用途 | 建议定时器 |
+| --- | --- |
+| PWM 输出（LED/电机） | TIM2 / TIM3 / TIM4 |
+| 系统时基（1ms 中断） | TIM3 或 TIM4 |
+| 舵机（50Hz） | 任一通用定时器 |
+| 输入捕获（测频率） | TIM2 / TIM5（32位更好） |
+| 高级 PWM（互补输出） | TIM1 / TIM8 |
+
+:::tip[别把 TIM2 同时用作三种用途]
+一个定时器的**四个通道共享同一个 PSC 和 ARR**——频率必须相同。
+
+**要不同频率的 PWM，就得用不同定时器。**
+
+（通道之间的占空比可以独立设置。）
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 忘 `HAL_TIM_PWM_Start` | 没波形 | 只配置没启动 | 加上 |
+| PSC/ARR 忘了 +1 | 周期差几倍 | 寄存器从 0 开始 | 减 1 再填 |
+| ARR 超 65535 | 溢出/异常 | 16 位限制 | 加大 PSC |
+| 中断里 printf | 卡死/超时 | 阻塞 | 只置标志位 |
+| 共享变量没 `volatile` | 优化后失效 | 编译器优化 | 加 `volatile` |
+| 一个定时器想输出两种频率 | 不行 | 共享 ARR | 用两个定时器 |
+| 引脚没配成复用 | 没波形 | PA0 没设 TIM2_CH1 | CubeMX 里配 |
+
+:::danger[PWM 输出引脚必须配成"复用"模式]
+在 CubeMX 里点引脚选 `TIM2_CH1` 时，它会自动设成 **Alternate Function Push Pull**。
+
+**千万别手动改回 GPIO_Output**——那样定时器的波形出不来。
+
+**如果没波形，先检查这个引脚的模式。**
+:::
+
+## 本课自检
+
+- [ ] 知道定时器的四种用途
+- [ ] **会算 PSC / ARR：`周期 = (PSC+1)×(ARR+1)/时钟`**
+- [ ] **知道两个都要 +1（寄存器从 0 开始）**
+- [ ] **知道 ARR 是 16 位，最大 65535**
+- [ ] **知道 APB1 上定时器的时钟是 72MHz（隐藏倍频）**
+- [ ] 会在 CubeMX 配 PWM 通道
+- [ ] **知道 `MX_TIMx_Init()` 之后必须 `HAL_TIM_PWM_Start`**
+- [ ] 会用 `__HAL_TIM_SET_COMPARE` 改占空比
+- [ ] 知道定时器中断要 `HAL_TIM_Base_Start_IT`
+- [ ] **知道中断里不能 printf，且共享变量要 `volatile`**
+- [ ] 知道一个定时器的四通道共享频率
+
+## 下一步
+
+[13 ADC 采集](./13-adc) —— 读电位器、传感器这些模拟量。

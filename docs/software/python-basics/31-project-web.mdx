@@ -1,0 +1,472 @@
+---
+id: 31-project-web
+title: 31 实战：抓取网页数据
+sidebar_position: 31
+description: 用 requests 取网页、用 BeautifulSoup 解析、提取数据存成 CSV，以及必须遵守的合法合规底线。
+---
+
+# 31 实战：抓取网页数据
+
+**本课目标**：会抓取网页内容并提取需要的数据，**同时知道哪些不能抓**。
+
+## 先说合规：这不是可选项
+
+:::danger[抓取前必须知道的四条底线]
+1. **遵守 robots.txt**：网站根目录下的 `/robots.txt` 明确写了哪些路径不允许抓
+2. **控制频率**：两次请求之间加延迟（至少 1 秒），不要并发猛刷
+3. **不抓隐私和付费内容**：个人数据、需要登录才能看的内容，抓了就是侵权
+4. **不绕过技术保护**：破解验证码、伪造登录态去抓受限内容，可能违法
+
+**技术上门槛很低，不代表做了就没问题。** 因爬虫被判刑的案例真实存在（侵犯公民个人信息、破坏计算机信息系统）。
+
+**本课只演示公开的、供练习使用的页面。**
+:::
+
+## 安装依赖
+
+```bash
+python -m pip install requests beautifulsoup4
+```
+
+```python
+import requests
+from bs4 import BeautifulSoup
+```
+
+## 第一步：把网页取下来
+
+```python
+import requests
+
+r = requests.get("https://example.com", timeout=10)
+
+print(r.status_code)
+print(r.encoding)
+print(r.text[:200])
+```
+
+本机实测输出：
+
+```text
+200
+utf-8
+<!doctype html><html><head><title>Example Domain</title>...
+```
+
+### 关键参数
+
+| 参数 | 作用 | 建议 |
+| --- | --- | --- |
+| `timeout` | 超时秒数 | **必须设置**，否则可能永久卡住 |
+| `headers` | 请求头 | 有些站点要求 User-Agent |
+| `params` | URL 查询参数 | `{"q": "python"}` |
+
+```python
+headers = {
+    "User-Agent": "Mozilla/5.0 (compatible; StudyBot/1.0)"
+}
+r = requests.get("https://example.com", headers=headers, timeout=10)
+```
+
+:::warning[`timeout` 一定要写]
+不写 `timeout`，遇到网络问题程序会**无限期挂着**。
+
+**规矩：所有网络请求都加 `timeout=10`。**
+:::
+
+### 检查状态码
+
+```python
+r = requests.get(url, timeout=10)
+
+if r.status_code == 200:
+    print("成功")
+elif r.status_code == 404:
+    print("页面不存在")
+elif r.status_code == 403:
+    print("被拒绝访问（可能需要 User-Agent，或该站禁止抓取）")
+else:
+    print(f"其他状态：{r.status_code}")
+```
+
+或者用内置的：
+
+```python
+r.raise_for_status()      # 非 2xx 直接抛异常
+```
+
+## 中文乱码怎么办
+
+```python
+r = requests.get(url, timeout=10)
+
+# 如果响应头没声明编码，requests 可能猜错
+if r.encoding == "ISO-8859-1":
+    r.encoding = r.apparent_encoding      # 按内容猜
+
+print(r.text)
+```
+
+:::tip[判断依据]
+- `r.encoding`：从 HTTP 响应头 `Content-Type` 取的
+- `r.apparent_encoding`：从**内容**推测的（用 chardet 算法）
+
+如果 `r.text` 是乱码，先打印 `r.encoding` 看看。常见情况是服务端没声明，requests 默认当 ISO-8859-1 处理中文就乱了。
+:::
+
+## 第二步：解析 HTML
+
+网页本质是一大段文本，直接字符串找很痛苦。用 BeautifulSoup 解析成树结构：
+
+```python
+from bs4 import BeautifulSoup
+
+soup = BeautifulSoup(r.text, "html.parser")
+
+print(soup.title.string)
+```
+
+输出（本机实测）：
+
+```text
+Example Domain
+```
+
+### 常用查找方法
+
+```python
+soup.find("h1")                    # 第一个 h1 标签
+soup.find_all("a")                 # 所有链接
+soup.find("div", class_="item")    # 指定 class
+soup.find("a", href=True)          # 有 href 属性的第一个 a
+soup.select("div.item > a")        # CSS 选择器（功能最强）
+```
+
+:::warning[`class` 是 Python 关键字，要用 `class_`]
+```python
+soup.find("div", class_="item")     # ✅ 加下划线
+soup.find("div", class="item")      # ❌ 语法错误
+```
+:::
+
+### 提取内容
+
+```python
+tag = soup.find("p")
+
+print(tag.get_text())              # 纯文本
+print(tag.get_text(strip=True))    # 去首尾空白
+print(tag.text)                    # 等价于 get_text()
+print(tag.get("href"))             # 取属性
+print(tag["href"])                 # 同上，但不存在会报错
+```
+
+## 一个实测例子
+
+抓 `example.com` 并提取信息（本机真实运行结果）：
+
+```python
+import requests
+from bs4 import BeautifulSoup
+
+r = requests.get("https://example.com", timeout=10)
+soup = BeautifulSoup(r.text, "html.parser")
+
+print("title:", soup.title.string)
+h1 = soup.find("h1")
+print("h1:", h1.get_text(strip=True) if h1 else "(页面上没有 h1)")
+p = soup.find("p")
+print("p:", p.get_text(strip=True)[:60] if p else "(无)")
+print("所有链接:", [a.get("href") for a in soup.find_all("a")])
+```
+
+实际输出：
+
+```text
+title: Example Domain
+h1: (页面上没有 h1)
+p: This domain is for use in documentation examples without nee
+所有链接: []
+```
+
+:::tip[为什么这里没有 h1 和链接]
+`example.com` 的当前版本只用 `<h2>` 而不是 `<h1>`，也没有任何 `<a>` 标签。
+
+**这正是真实抓取的常态**：你以为是 A 结构，实际是 B。
+
+**所以必须「先打印看看有什么」，再写提取逻辑。** 别凭空猜测页面结构。
+:::
+
+### 探索页面的正确姿势
+
+```python
+# 第一步永远是「看看有什么」
+print(r.text[:2000])          # 先看原始 HTML
+
+# 或用 soup 快速扫一遍结构
+for tag in soup.find_all(True)[:30]:      # 前 30 个标签
+    print(tag.name, {k: v for k, v in tag.attrs.items()})
+```
+
+## 练习站：抓结构化数据
+
+`quotes.toscrape.com` 是**专门给练爬虫用的站点**（合法、结构稳定）：
+
+```python
+import time
+import requests
+from bs4 import BeautifulSoup
+
+url = "https://quotes.toscrape.com/"
+
+try:
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+except requests.RequestException as e:
+    print(f"请求失败：{e}")
+    raise SystemExit(1)
+
+soup = BeautifulSoup(r.text, "html.parser")
+
+results = []
+for quote in soup.select("div.quote"):
+    text = quote.select_one("span.text").get_text(strip=True)
+    author = quote.select_one("small.author").get_text(strip=True)
+    tags = [t.get_text(strip=True) for t in quote.select("a.tag")]
+    results.append({"text": text, "author": author, "tags": ",".join(tags)})
+
+for row in results[:3]:
+    print(f"[{row['author']}] {row['text'][:50]}")
+
+time.sleep(1)      # 礼貌延迟
+```
+
+:::warning[这段是否经过实测]
+**结构与选择器是依据该练习站的公开文档写的，但本机当前网络无法稳定访问该站点，未逐条实测输出。**
+
+**你要做的**：自己跑一遍，如果 `results` 为空，说明选择器要调整——用上面的「探索页面」方法先看实际结构。
+
+**本课不伪造抓取结果。** 上面 `example.com` 那段是真实输出，这段是结构示例。
+:::
+
+## 第三步：保存成 CSV
+
+```python
+import csv
+from pathlib import Path
+
+def save_csv(rows, filename="output.csv"):
+    if not rows:
+        print("没有数据，跳过保存")
+        return
+
+    # newline="" 防止 Windows 上多空行
+    with open(filename, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"已保存 {len(rows)} 条到 {filename}")
+
+
+save_csv(results)
+```
+
+:::tip[`encoding="utf-8-sig"` 是什么]
+普通 `utf-8` 存的中文 CSV，用 Excel 打开会**乱码**（Excel 默认按 GBK 读）。
+
+`utf-8-sig` 会在文件开头加一个 BOM 标记，**Excel 就能正确识别**。
+
+**规则**：给 Excel 看的 CSV 用 `utf-8-sig`，给程序读的用 `utf-8`。
+:::
+
+## 完整可用的抓取脚本
+
+```python
+"""抓取练习站点并保存 CSV"""
+import csv
+import time
+from pathlib import Path
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
+
+BASE = "https://quotes.toscrape.com"
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; StudyBot/1.0)"}
+DELAY = 1.0        # 每次请求间隔（秒）—— 不要调太小
+
+
+def fetch(url):
+    """带重试的请求"""
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=10)
+            r.raise_for_status()
+            return r.text
+        except requests.RequestException as e:
+            print(f"  第 {attempt + 1} 次失败：{e}")
+            time.sleep(2 * (attempt + 1))     # 退避
+    return None
+
+
+def parse(html):
+    soup = BeautifulSoup(html, "html.parser")
+    rows = []
+    for q in soup.select("div.quote"):
+        rows.append({
+            "text": q.select_one("span.text").get_text(strip=True),
+            "author": q.select_one("small.author").get_text(strip=True),
+            "tags": ",".join(t.get_text(strip=True) for t in q.select("a.tag")),
+        })
+    next_link = soup.select_one("li.next > a")
+    return rows, (urljoin(BASE, next_link["href"]) if next_link else None)
+
+
+def crawl(max_pages=3):
+    all_rows = []
+    url = BASE
+    for page in range(1, max_pages + 1):
+        print(f"抓取第 {page} 页：{url}")
+        html = fetch(url)
+        if html is None:
+            print("  放弃这一页")
+            break
+        rows, url = parse(html)
+        all_rows.extend(rows)
+        print(f"  本页 {len(rows)} 条，累计 {len(all_rows)} 条")
+        if url is None:
+            print("  没有下一页了")
+            break
+        time.sleep(DELAY)
+    return all_rows
+
+
+def save(rows, path="quotes.csv"):
+    if not rows:
+        print("没有数据")
+        return
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"已保存 {len(rows)} 条到 {path}")
+
+
+if __name__ == "__main__":
+    data = crawl(max_pages=3)
+    save(data)
+```
+
+## 抓不到怎么办
+
+| 现象 | 原因 | 对策 |
+| --- | --- | --- |
+| 403 Forbidden | 被识别为爬虫 | 加 User-Agent；若仍拒绝，**说明该站不允许抓，应停止** |
+| 429 Too Many Requests | 请求太快 | 加延迟、降并发 |
+| 抓到的页面没有数据 | 内容由 JS 动态渲染 | 见下 |
+| 选择器取不到元素 | 结构和你以为的不同 | 先 `print(r.text)` 看真实结构 |
+| 中文乱码 | 编码判断错 | 设 `r.encoding = r.apparent_encoding` |
+| 连接超时 | 网络问题 | 加 `timeout`、重试 |
+
+:::warning[动态渲染的页面 requests 抓不到]
+`requests` 只拿到**服务器返回的原始 HTML**。如果数据是页面加载后由 JavaScript 填进去的，`requests` 里看不到。
+
+**判断方法**：把 `r.text` 存成文件，用浏览器打开看有没有数据；或者右键页面「查看网页源代码」，搜你要的数据。
+
+**解决方案**（属于进阶内容）：
+
+| 方案 | 说明 |
+| --- | --- |
+| 找 API | **最优解**。打开浏览器 F12 → Network → XHR，找返回 JSON 的接口，直接请求它 |
+| Playwright / Selenium | 用真实浏览器渲染后取内容（重，但通用） |
+| 看页面内嵌的初始数据 | 有些站点把数据放在 `<script>` 里的 JSON 中 |
+
+**优先找 API**——比模拟浏览器简单得多，也更稳定。
+:::
+
+## 合规与礼貌：再强调一次
+
+:::danger[写爬虫的六条准则]
+1. **先看 `/robots.txt`**：`https://站点/robots.txt`，遵守 `Disallow` 规则
+2. **限速**：单次请求间隔 ≥ 1 秒，别并发轰炸
+3. **标识身份**：User-Agent 里写明是学习用途和联系方式，方便对方联系你
+4. **不抓个人信息**：姓名、电话、身份证、住址——**抓了就涉嫌侵犯公民个人信息罪**
+5. **不绕过保护**：破解验证码、伪造登录态抓付费内容，可能构成犯罪
+6. **数据别乱公开**：抓下来的内容受著作权保护，别再分发
+:::
+
+```python
+headers = {
+    # 标识自己，方便对方在出问题时联系你
+    "User-Agent": "StudyBot/1.0 (learning project; contact: you@example.com)"
+}
+```
+
+**判断标准很简单：如果你的抓取让网站变慢、或者抓的是别人不希望你拿的东西，就该停手。**
+
+## 学完这一课你能做什么
+
+| 用途 | 说明 |
+| --- | --- |
+| 收集公开数据做分析 | 赛事数据、价格对比、新闻标题 |
+| 监控页面变化 | 定期检查某个页面有没有更新 |
+| 自动整理信息 | 把分散的公开资料汇总成表格 |
+| 练习解析能力 | 这是数据分析/后端开发的基础技能 |
+
+:::warning[不要做的事]
+- 抓别人的付费内容
+- 抓用户隐私数据
+- 高频抓取把人家服务器搞挂
+- 抓下来再转卖
+
+**技术能力越大，越要对边界负责。**
+:::
+
+## 本课自检
+
+- [ ] 会用 `requests.get` 取网页，知道必须加 `timeout`
+- [ ] 会检查 `status_code`，会用 `raise_for_status`
+- [ ] 知道中文乱码时怎么处理（`apparent_encoding`）
+- [ ] 会用 BeautifulSoup 的 `find` / `find_all` / `select`
+- [ ] 知道 `class` 要写成 `class_`
+- [ ] 会用 `get_text(strip=True)` 提取文本
+- [ ] **知道抓取前要先看真实结构，不能靠猜**
+- [ ] 会保存成 CSV，知道给 Excel 用 `utf-8-sig`
+- [ ] 知道动态渲染的页面 requests 抓不到，该优先找 API
+- [ ] **知道 robots.txt、限速、不抓隐私这几条底线**
+
+## 全课程完成
+
+**你已经走完了 Python 零基础的 31 节课。**
+
+现在你能：
+
+| 能力 | 对应课程 |
+| --- | --- |
+| 装环境、跑程序、用编辑器 | 01~04 |
+| 变量、类型、条件、循环、容器 | 05~13 |
+| 写完整的小程序 | 14 |
+| 函数、模块、文件、异常、类 | 15~24 |
+| 标准库、正则、第三方库 | 25~27 |
+| 调试、代码风格 | 28~29 |
+| 做真实可用的工具 | 30~31 |
+
+## 接下来往哪走
+
+| 方向 | 去哪 |
+| --- | --- |
+| **补原理**（GIL、装饰器、并发、内存模型） | [Python 进阶教程](../python/) |
+| **学 C 语言**（嵌入式必学，理解底层） | [C 语言教程](../c/) |
+| **开始玩硬件** | [快速上手](../../quickstart/) · [ESP 系列](../../hardware/esp/) |
+| **学 Linux** | [Linux 系列](../../hardware/linux/) |
+
+:::tip[给你的最后建议]
+**别停在这里。** 找一件你自己真的想解决的小事——整理照片、统计开支、批量改文件名、抓个数据做图表——然后去实现它。
+
+**做出来的东西比学完的课程重要得多。** 卡住时回来查，这才是真正的学习方式。
+:::
+
+---
+
+**回到**：[Python 零基础教程目录](./) · [软件编程总览](../)

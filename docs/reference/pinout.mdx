@@ -1,0 +1,124 @@
+---
+id: pinout
+title: 引脚映射
+sidebar_position: 2
+description: ESP32-S3-WROOM-1 DevKitC-1 完整引脚能力表与使用限制。
+---
+
+# 引脚映射
+
+## 排针对照表
+
+### 左排（J1）
+
+| 序号 | 丝印 | GPIO | 特殊功能 |
+| --- | --- | --- | --- |
+| 1 | 3V3 | — | 3.3V 电源 |
+| 2 | 3V3 | — | 3.3V 电源 |
+| 3 | RST | EN | 复位 |
+| 4 | 4 | GPIO4 | ADC1_CH3, TOUCH4 |
+| 5 | 5 | GPIO5 | ADC1_CH4, TOUCH5 |
+| 6 | 6 | GPIO6 | ADC1_CH5, TOUCH6 |
+| 7 | 7 | GPIO7 | ADC1_CH6, TOUCH7 |
+| 8 | 15 | GPIO15 | ADC2_CH4, U0RTS, XTAL_32K_P |
+| 9 | 16 | GPIO16 | ADC2_CH5, U0CTS, XTAL_32K_N |
+| 10 | 17 | GPIO17 | ADC2_CH6, U1TXD |
+| 11 | 18 | GPIO18 | ADC2_CH7, U1RXD |
+| 12 | 8 | GPIO8 | ADC1_CH7, **I2C SDA** |
+| 13 | 3 | GPIO3 | ADC1_CH2, strapping |
+| 14 | 46 | GPIO46 | strapping |
+| 15 | 9 | GPIO9 | ADC1_CH8, **I2C SCL** |
+| 16 | 10 | GPIO10 | ADC1_CH9, **SPI SS** |
+| 17 | 11 | GPIO11 | ADC2_CH0, **SPI MOSI** |
+| 18 | 12 | GPIO12 | ADC2_CH1, **SPI SCK** |
+| 19 | 13 | GPIO13 | ADC2_CH2, **SPI MISO** |
+| 20 | 14 | GPIO14 | ADC2_CH3, SPI WP |
+| 21 | 5V | — | 5V 电源 |
+| 22 | G | — | 地 |
+
+### 右排（J3）
+
+| 序号 | 丝印 | GPIO | 特殊功能 |
+| --- | --- | --- | --- |
+| 1 | G | — | 地 |
+| 2 | TX | GPIO43 | UART0 TX, CLK_OUT1 |
+| 3 | RX | GPIO44 | UART0 RX, CLK_OUT2 |
+| 4 | 1 | GPIO1 | ADC1_CH0, TOUCH1 |
+| 5 | 2 | GPIO2 | ADC1_CH1, TOUCH2 |
+| 6 | 42 | GPIO42 | MTMS（JTAG） |
+| 7 | 41 | GPIO41 | MTDI（JTAG） |
+| 8 | 40 | GPIO40 | MTDO（JTAG） |
+| 9 | 39 | GPIO39 | MTCK（JTAG） |
+| 10 | 38 | GPIO38 | **RGB LED（v1.1 板）** |
+| 11 | 37 | — | ⚠️ **Flash/PSRAM 占用** |
+| 12 | 36 | — | ⚠️ **Flash/PSRAM 占用** |
+| 13 | 35 | — | ⚠️ **Flash/PSRAM 占用** |
+| 14 | 0 | GPIO0 | **BOOT 键**, strapping |
+| 15 | 45 | GPIO45 | strapping（VDD_SPI 电压） |
+| 16 | 48 | GPIO48 | **RGB LED（v1.0 板）** |
+| 17 | 47 | GPIO47 | SPI 时钟差分对 |
+| 18 | 21 | GPIO21 | — |
+| 19 | 20 | GPIO20 | ADC2_CH9, **USB D+** |
+| 20 | 19 | GPIO19 | ADC2_CH8, **USB D-** |
+| 21 | G | — | 地 |
+| 22 | G | — | 地 |
+
+## ⚠️ 禁止使用
+
+| 引脚 | 原因 |
+| --- | --- |
+| **GPIO35 / 36 / 37** | WROOM-1 的 Octal Flash/PSRAM 占用，**接了会损坏固件甚至变砖** |
+| GPIO19 / 20 | 用原生 USB 时被占用（不用 USB 时可用） |
+| GPIO43 / 44 | UART0 调试口，占用后看不到日志 |
+| GPIO0 | 复位时被采样，接模块可能导致意外进下载模式 |
+| GPIO45 | 决定 Flash 电压，选错会开不了机 |
+| GPIO46 | strapping 脚，复位瞬间被采样，外设慎接 |
+
+![ESP32-S3 引脚能力分区：先认禁区再排外设——GPIO35/36/37 被 Octal Flash 与 PSRAM 占用、接了会写坏固件甚至变砖，GPIO33/34 模组内部建议避开，GPIO19/20 用原生 USB 时被占用，GPIO43/44 是 UART0 调试口，GPIO0/3/45/46 是复位瞬间被采样的 strapping 脚；ADC1 在 GPIO1～10、ADC2 在 GPIO11～20，剩下的（GPIO1～18 等）才是自由引脚；S3 没有任何仅输出脚](/img/diagrams/esp32-pin-capability-map.svg)
+
+## 深睡眠可唤醒引脚
+
+Deep Sleep 时**只有 RTC 域 GPIO0～GPIO21 能作为唤醒源**。想用 GPIO22 以上唤醒，只能用 `esp_sleep_enable_ext1_wakeup()` 配合 RTC IO，或改用 Light Sleep。
+
+## RGB LED 版本差异
+
+| 板子版本 | RGB LED |
+| --- | --- |
+| ESP32-S3-DevKitC-1 **v1.0**（首批） | **GPIO48** |
+| ESP32-S3-DevKitC-1 **v1.1** | **GPIO38** |
+
+不确定时两个都写上，或看板上丝印或日期。
+
+![板载 WS2812 RGB 灯的数据线：v1.0 板接 GPIO48、v1.1 板接 GPIO38，两个批次只差这一根线接哪个脚；它是可寻址灯珠，颜色和亮度靠特定时序的脉冲编码，普通 digitalWrite 点不亮](/img/diagrams/esp32-wire-rgb-led.svg)
+
+## 常用引脚规划建议
+
+| 功能 | 推荐引脚 | 理由 |
+| --- | --- | --- |
+| I2C | 8 / 9 | Arduino 默认值，也是 S3 的 FSPIHD/FSPIHD 外设脚但平时空着 |
+| SPI | 12 / 11 / 13 / 10 | Arduino 默认值（FSPI 完整一组） |
+| 备用 UART | 16(TX) / 17(RX) | 没有额外外设功能冲突（S3 没有 DAC，别按老教程避开 25/26） |
+| ADC（只用 ADC1） | 1～10 | **WiFi 开启时 ADC2 不可用** |
+| 触摸 | 1～14 | |
+| LED | 4 / 5 | |
+
+## 常见模块接线速查
+
+| 模块 | 电源 | 信号 |
+| --- | --- | --- |
+| SSD1306 OLED | 3V3 | SDA→8, SCL→9 |
+| DHT11/22 | 3V3 | DATA→任意 + 4.7kΩ 上拉 |
+| SD 卡（SPI） | 3V3 | SCK→12, MISO→13, MOSI→11, CS→10 |
+| ST7789 LCD | 3V3 | SCK→12, MOSI→11, DC→13, CS→10, RST→14, BL→21 |
+| OV2640 摄像头 | 3V3 | 占用 15 个脚，见 [摄像头章节](../course/l4-peripherals/touch-camera) |
+| WS2812 灯带 | 5V（+共地） | DIN→任意，**必须共地** |
+| 舵机 | **独立 5V** | 信号→任意 |
+
+## 查芯片实际信息
+
+```bash
+# Flash 大小、MAC 地址、芯片型号
+esptool.py --chip esp32s3 --port COM5 flash_id
+```
+
+**模块型号命名规则**：`ESP32-S3-WROOM-1-N16R8` = N16R8 表示 16MB Flash + 8MB PSRAM。

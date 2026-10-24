@@ -1,0 +1,169 @@
+---
+id: profiling
+title: 性能剖析
+sidebar_position: 4
+description: Flash 占用分析、堆内存与碎片化追踪、任务栈与 CPU 占用统计、热点定位与基线管理。
+---
+
+# 性能剖析
+
+"程序慢""内存不够""固件太大"——这些抱怨没有可执行的价值。性能剖析就是**把模糊的抱怨变成具体的数字**：哪个组件吃掉了 Flash、哪个任务在偷 CPU、哪块内存被谁占了。**先测量，再优化**——这一页全是在教"测量"。
+
+## 1. Flash 占用：固件为什么这么大
+
+```bash
+idf.py size                      # 总览
+idf.py size-components           # 按组件分解 ← 最常用
+idf.py size-files                # 按源文件分解
+```
+
+`size-components` 的输出直接告诉你谁是大户：
+
+| 组件 | 典型大小 | 能不能减 |
+| --- | --- | --- |
+| WiFi | ~200KB | 不能整体关，可关某些功能 |
+| mbedTLS | ~90KB | 可按需裁剪算法（menuconfig 里只留你用的） |
+| BLE（Bluedroid） | ~700KB | **换 NimBLE 能省 400KB+**（L5 讲过） |
+| 摄像头 | ~150KB | 需要就留着 |
+| LVGL | ~100KB | 可按需裁剪控件 |
+| debug 日志字符串 | ~30KB | Release 版关闭 D/V |
+
+**固件超分区了的处理顺序**：先 `size-components` 找大户 → 换轻量替代（Bluedroid→NimBLE）→ 裁剪不用功能（menuconfig 里关掉）→ 最后才考虑改分区表。
+
+```bash
+idf.py menuconfig
+# Component config → mbedTLS → 关闭不用的算法/协议
+# Component config → Compiler optimization → -Os（体积优先，默认就是）
+```
+
+## 2. 堆内存：剩余量、水位与碎片
+
+```c
+#include "esp_heap_caps.h"
+
+// 全局快照
+printf("内部剩余 %u\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+printf("PSRAM 剩余 %u\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+printf("历史最低剩余 %u\n", heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT));
+printf("最大连续块 %u\n", heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+```
+
+四个数字各有含义：
+
+- **剩余**：现在还有多少
+- **历史最低**：运行以来最低到过多少——**判断"会不会耗尽"的关键**（离 0 多远）
+- **最大连续块**：虽然剩 100KB，但最大一块只有 20KB → 想申请 50KB 就失败——这就是碎片化
+
+**碎片化是真问题**：剩余总量够，但最大连续块不够，新的大 buffer 就分配失败。症状是"运行几天后某功能开始失败"——泄漏和碎片都会这样，区分方法：**"剩余量持续下降" = 泄漏；"剩余量稳定但最大块变小" = 碎片化**。
+
+**内存泄漏的抓法**：在可疑操作前后各打一次剩余量——
+
+```c
+size_t before = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+do_suspicious_operation();
+size_t after = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+printf("净变化 %d 字节\n", (int)(before - after));   // 正数且不回来 = 泄漏
+```
+
+## 3. 任务级检查：栈与 CPU
+
+**栈水位**（L2 讲过，这里是系统化用法）：
+
+```c
+// 每个任务的栈剩余：用 uxTaskGetSystemState 一次拿全部任务的信息
+void print_task_stats(void) {
+    UBaseType_t count = uxTaskGetNumberOfTasks();
+    TaskStatus_t *stats = pvPortMalloc(count * sizeof(TaskStatus_t));
+    if (stats == NULL) return;
+
+    count = uxTaskGetSystemState(stats, count, NULL);
+    for (UBaseType_t i = 0; i < count; i++) {
+        ESP_LOGI(TAG, "%-12s 栈剩余 %u 字节",
+                 stats[i].pcTaskName, stats[i].usStackHighWaterMark);
+    }
+    vPortFree(stats);
+}
+```
+
+**栈剩余持续下降到 0 = 迟早会崩。** 上线前跑一轮长测（把所有功能都触发），把栈调到"历史最低剩余 1KB 以上"。
+
+**CPU 使用率**（FreeRTOS runtime stats，menuconfig 先开）：
+
+```bash
+idf.py menuconfig
+# Component config → FreeRTOS → Generate run-time stats → ENABLE
+```
+
+```c
+char buf[1024];
+vTaskGetRunTimeStats(buf);            // 输出每个任务的 CPU 占用百分比表
+ESP_LOGI(TAG, "\n%s", buf);
+```
+
+输出类似：
+
+```text
+Task            Abs Time      %Time
+IDLE0           452300        45%
+wifi            210000        21%
+main_task       150000        15%
+IDLE1           120000        12%
+...
+```
+
+**读法**：IDLE 占比越高越好（CPU 在睡觉）；你自己的任务占多少；有没有"不认识的任务"占着 CPU。**WiFi 占 20%+ 是常态**，你的业务任务占 50%+ 就该想想优化了。
+
+## 4. CPU 热点定位：哪段代码慢
+
+**逐段测时**是最朴素也最有效的办法：
+
+```c
+#include "esp_timer.h"
+
+uint64_t t0 = esp_timer_get_time();       // 微秒时间戳
+do_heavy_work();
+uint64_t t1 = esp_timer_get_time();
+printf("耗时 %.2f ms\n", (t1 - t0) / 1000.0);
+```
+
+把"感觉慢"的路径切成几段，每段掐表——**两次测量就能把"慢"锁定到一段代码**。再往细里二分。
+
+更高阶的工具：
+
+| 工具 | 用途 |
+| --- | --- |
+| GDB 采样 | attach 后反复中断，看 PC 落在哪个函数——出现最多的就是热点 |
+| 逻辑分析仪 + GPIO 打点 | 关键路径开头结尾翻转 GPIO，量精确时序 |
+| perf 硬件计数器 | 统计缓存未命中、指令数（进阶） |
+
+**优化的正确顺序**：测量 → 找到占 80% 时间的那 20% 代码 → 只优化它。没有测量就优化 = 猜谜。
+
+## 5. 优化清单（对症下药）
+
+| 症状 | 优化方向 |
+| --- | --- |
+| 启动慢 | 关掉不必要的初始化；WiFi 用固定 BSSID；静态 IP（L5） |
+| 运行卡顿 | 找长时间阻塞（delay、同步 IO）；改异步；降日志频率 |
+| 内存不够 | 大数组进 PSRAM；释放不用的 buffer；静态分配替代 malloc |
+| 碎片化 | 减少动态分配；用 pool 分配固定大小的块 |
+| WiFi 传输慢 | 加大 TCP 窗口；减少请求次数；批量上报 |
+| 刷屏慢 | 提高 SPI 频率、DMA、只刷变化区域（L6） |
+
+## 6. 建立基线：没有基线就没有"变慢"
+
+项目初期记录一组数据，作为后续优化的参照：
+
+```bash
+idf.py size | tee baseline_size.txt
+# 真机跑 10 分钟，记录：
+#   启动到联网成功的耗时
+#   稳态内部 RAM / PSRAM 剩余
+#   各任务栈剩余
+#   平均/峰值 CPU
+```
+
+之后每次觉得"好像变慢了"，跑同样的测量和基线对比——**"变慢了还是我记错了"就不再是玄学**。基线文件提交进 git。
+
+## 下一步
+
+[毕业项目](./capstones)

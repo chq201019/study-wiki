@@ -1,0 +1,239 @@
+---
+id: build-02
+title: "02 CMake 从入门到工程化"
+sidebar_position: 3
+description: "构建与工具链 第 2 部分：CMake 从入门到工程化"
+---
+
+# 02 CMake 从入门到工程化
+### 为什么需要 CMake
+
+`g++ a.cpp b.cpp -o app` 在 3 个文件时就不好用了。CMake 解决：
+
+- 跨平台（生成 Makefile / Ninja / VS 工程）
+- 依赖管理（谁依赖谁）
+- 编译选项、标准版本统一管理
+- 与 IDE 集成
+
+### 最小 CMakeLists.txt
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(MyApp LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)      # 不满足就报错，不静默降级
+set(CMAKE_CXX_EXTENSIONS OFF)            # 不用 GNU 扩展（用 -std=c++17 而非 gnu++17）
+
+add_executable(my_app main.cpp)
+```
+
+构建：
+
+```bash
+cmake -B build -S . -G Ninja
+cmake --build build
+./build/my_app
+```
+
+### 工程化：库 + 目标
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(EmbeddedApp LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# ---------------- 库目标 ----------------
+add_library(sensor_driver
+    src/sensor_driver.cpp
+    src/i2c_bus.cpp
+)
+
+# 关键：区分"给我用的"和"给用我的人用的"
+target_include_directories(sensor_driver
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include   # 使用者也能 include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src       # 只有我自己能 include
+)
+
+target_compile_options(sensor_driver PRIVATE -Wall -Wextra)
+
+# ---------------- 可执行 ----------------
+add_executable(app main.cpp)
+target_link_libraries(app PRIVATE sensor_driver)
+```
+
+**`PUBLIC` / `PRIVATE` / `INTERFACE` 是 CMake 现代用法的核心：**
+
+| 关键字 | 含义 | 传给链接我的人吗 |
+| --- | --- | --- |
+| `PRIVATE` | 只有我自己用 | ❌ |
+| `PUBLIC` | 我自己用，用我的人也要用 | ✅ |
+| `INTERFACE` | 我自己不用，用我的人要用 | ✅ |
+
+:::warning[不要用老式 CMake]
+```cmake
+# 老式（全局，污染所有目标）—— 不要这样
+include_directories(include)
+add_definitions(-DDEBUG)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
+
+# 现代（按目标）—— 这样
+target_include_directories(mylib PUBLIC include)
+target_compile_definitions(mylib PUBLIC DEBUG)
+target_compile_options(mylib PRIVATE -Wall)
+```
+
+老式命令是**全局**的，会影响之后定义的所有目标，且顺序敏感。现代命令绑定到具体目标，依赖关系清晰。
+:::
+
+### 编译选项：Debug / Release
+
+```cmake
+# 设置默认构建类型
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug)
+endif()
+
+# Debug：无优化 + 调试信息 + sanitizer
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
+# Release：优化 + NDEBUG
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+```
+
+**建议为 Debug 加 sanitizer**（见下）：
+
+```cmake
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_options(app PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(app PRIVATE -fsanitize=address,undefined)
+endif()
+```
+
+### 一个完整的多目录工程结构
+
+```text
+my_project/
+├── CMakeLists.txt           # 顶层：project + 选项 + add_subdirectory
+├── cmake/
+│   └── CompilerWarnings.cmake
+├── include/
+│   └── mylib/
+│       └── api.h            # 公开头文件
+├── src/
+│   ├── CMakeLists.txt
+│   └── api.cpp
+├── tests/
+│   ├── CMakeLists.txt
+│   └── test_api.cpp
+└── build/                   # 构建产物（加入 .gitignore）
+```
+
+顶层 `CMakeLists.txt`：
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(MyLib VERSION 1.0.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# 开启编译数据库（clangd / clang-tidy 需要）
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+option(MYLIB_BUILD_TESTS "Build tests" ON)
+
+add_subdirectory(src)
+
+if(MYLIB_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+```
+
+## 4. 包管理：vcpkg / Conan
+
+### 对比
+
+| 维度 | **vcpkg**（微软） | **Conan**（JFrog） |
+| --- | --- | --- |
+| 模型 | 源码构建（也支持二进制缓存） | 二进制包为主 |
+| 集成 | CMake 工具链文件 / manifest | `conanfile.txt` + 生成器 |
+| 包数量 | 2000+ | 1000+（ConanCenter） |
+| 版本控制 | manifest 模式（`vcpkg.json`） | 灵活的版本/选项系统 |
+| 学习曲线 | 较平缓 | 较陡（但更强） |
+| 嵌入式 | 有 triplet 支持交叉编译 | 支持交叉编译 profile |
+| 适合 | 桌面/通用项目，快速上手 | 需要精细控制版本/多配置的企业项目 |
+
+### vcpkg 快速上手
+
+```bash
+# 安装（Windows）
+git clone https://github.com/microsoft/vcpkg.git
+cd vcpkg && ./bootstrap-vcpkg.bat
+
+# manifest 模式（推荐）：项目里放 vcpkg.json
+```
+
+```json
+{
+  "name": "my-app",
+  "version": "1.0.0",
+  "dependencies": [
+    "fmt",
+    "spdlog",
+    { "name": "nlohmann-json", "version>=": "3.11.0" }
+  ]
+}
+```
+
+```cmake
+# CMakeLists.txt 里正常 find_package
+find_package(fmt CONFIG REQUIRED)
+find_package(spdlog CONFIG REQUIRED)
+
+target_link_libraries(app PRIVATE fmt::fmt spdlog::spdlog)
+```
+
+构建时指定工具链：
+
+```bash
+cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+```
+
+**交叉编译到嵌入式**（vcpkg 的 triplet 机制）：
+
+```bash
+vcpkg install fmt --triplet arm64-linux
+```
+
+### Conan 快速上手
+
+```text
+# conanfile.txt
+[requires]
+fmt/10.2.1
+spdlog/1.13.0
+
+[generators]
+CMakeDeps
+CMakeToolchain
+```
+
+```bash
+conan install . --output-folder=build --build=missing
+cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake
+cmake --build build
+```
+
+:::info[怎么选]
+- **个人/小项目、希望简单**：**vcpkg**
+- **需要精确的依赖版本矩阵、私有仓库、多平台二进制**：**Conan**
+- **嵌入式**：两者都能做交叉编译，但**很多时候嵌入式根本不用包管理**——直接把源码放进 `components/` 或用 git submodule，因为交叉编译的二进制包往往不全（见 [嵌入式 C++](./embedded-cpp)）
+:::
+
+---
+
+**翻页**：[← 上一页](./build-01) · [下一页 →](./build-03) · [返回目录](./)

@@ -1,0 +1,344 @@
+---
+id: packaging
+title: 打包与发布
+sidebar_position: 13
+description: pyproject.toml 怎么写、src 布局为何更安全、可编辑安装的原理、wheel 与 sdist 的区别、发布到 PyPI 的完整流程。
+---
+
+# 打包与发布
+
+**本课目标**：能把自己的代码打包成可安装的库。
+
+## 项目结构
+
+:::tip[推荐 src 布局]
+```text
+myproject/
+├── pyproject.toml
+├── README.md
+├── LICENSE
+├── src/
+│   └── myproject/
+│       ├── __init__.py
+│       └── core.py
+└── tests/
+    └── test_core.py
+```
+
+**为什么多套一层 `src/`**：
+
+如果不套 `src/`，`myproject/` 直接在根目录，**你在项目根目录跑 `python` 时 `import myproject` 会导入本地目录**——而不是你安装的那个版本。
+
+**这会导致**：
+
+- 测试通过是因为导入了本地文件，而安装后的包可能是坏的
+- 忘了把新文件加进打包清单，测试照样过
+- 循环导入问题被掩盖
+
+**`src` 布局强制"导入必须经过安装"，能提前暴露这些错误。**
+:::
+
+## pyproject.toml
+
+```toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "myproject"
+version = "0.1.0"
+description = "一个示例库"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "Your Name", email = "you@example.com"}]
+
+dependencies = [
+    "requests>=2.28",
+    "click>=8.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "mypy>=1.0", "ruff>=0.1"]
+docs = ["sphinx>=7"]
+
+[project.scripts]
+myproject-cli = "myproject.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+```
+
+:::danger[`[build-system]` 不能漏]
+**没有这个段，pip 会退回到"老式 setup.py 流程"**，而如果你根本没有 `setup.py`，安装直接失败。
+
+**它是 PEP 518 引入的，是所有现代打包的入口。**
+:::
+
+### 依赖声明
+
+| 写法 | 含义 |
+| --- | --- |
+| `"requests"` | 任意版本 |
+| `"requests>=2.28"` | 2.28 及以上 |
+| `"requests>=2.28,<3"` | 限定范围（**推荐**） |
+| `"requests~=2.28"` | `>=2.28, <3.0`（兼容版本） |
+| `"requests==2.31.0"` | 精确锁定（**只用于应用，不用于库**） |
+
+:::warning[库不要精确锁定依赖版本]
+```toml
+dependencies = ["requests==2.31.0"]      # ❌ 库这么做会害死用户
+```
+
+**用户的项目里可能已经用了 `requests==2.32`，你的精确锁定会让 pip 无解。**
+
+**库应该用宽松范围**（`>=2.28,<3`），**应用**才用 lock 文件精确锁定。
+
+**这是"库"和"应用"在依赖策略上的根本区别。**
+:::
+
+### 可选依赖（extras）
+
+```toml
+[project.optional-dependencies]
+dev = ["pytest", "mypy"]
+fast = ["orjson"]
+```
+
+```bash
+pip install myproject            # 只装核心
+pip install "myproject[dev]"     # 加开发工具
+pip install "myproject[dev,fast]"  # 都要
+```
+
+**用途**：把"只有开发者需要"和"只有部分用户需要"的依赖分离，减小安装体积。
+
+## 可编辑安装
+
+```bash
+pip install -e .
+```
+
+:::info[`-e` 做了什么]
+它在环境里放一个"指针"（`.pth` 文件或 `__editable__` 模块），**指向你的源码目录**。
+
+**所以你改代码后不需要重装**——`import` 立刻就生效。
+:::
+
+:::warning[改了 `pyproject.toml` 的 `[project.scripts]` 要重装]
+**入口点（命令行脚本）是在安装时生成的可执行文件**，改配置后必须重新 `pip install -e .`。
+
+**改了 `dependencies` 也一样**——依赖是安装时解析的。
+
+**只有"改 `.py` 源码"不需要重装。**
+:::
+
+## sdist 与 wheel
+
+| 格式 | 内容 | 安装时 |
+| --- | --- | --- |
+| **sdist**（`.tar.gz`） | 源码 | **需要在用户机器上构建** |
+| **wheel**（`.whl`） | 已构建好的、可直接解压使用 | 直接解压，**快得多** |
+
+:::tip[纯 Python 包要发"通用 wheel"]
+```bash
+python -m build
+# 产出：
+#   dist/myproject-0.1.0.tar.gz                  ← sdist
+#   dist/myproject-0.1.0-py3-none-any.whl        ← 通用 wheel
+```
+
+**`py3-none-any` 的含义**：
+
+- `py3` —— Python 3
+- `none` —— 不依赖具体 ABI
+- `any` —— 不依赖具体平台
+
+**纯 Python 包就应该产出这个**。如果你的包产出了 `cp311-cp311-win_amd64.whl` 这种，说明你误把编译扩展打进去了。
+:::
+
+:::danger[有 C 扩展就不能用 `any` wheel]
+含 C 扩展的包必须为**每个平台 + 每个 Python 版本**各出一个 wheel：
+
+```text
+myext-1.0-cp311-cp311-win_amd64.whl
+myext-1.0-cp311-cp311-manylinux_2_17_x86_64.whl
+myext-1.0-cp311-cp311-macosx_11_0_arm64.whl
+```
+
+**这就是为什么有 C 扩展的项目要用 `cibuildwheel` 在 CI 里批量构建。**
+:::
+
+## 发布到 PyPI
+
+:::tip[完整流程]
+```bash
+# ① 安装工具
+pip install build twine
+
+# ② 构建
+python -m build
+
+# ③ 检查包（很重要，能在上传前发现元数据错误）
+twine check dist/*
+
+# ④ 上传到测试仓库先验证
+twine upload --repository testpypi dist/*
+
+# ⑤ 从测试仓库安装验证
+pip install --index-url https://test.pypi.org/simple/ myproject
+
+# ⑥ 正式上传
+twine upload dist/*
+```
+:::
+
+:::danger[PyPI 的版本号不能重用]
+**同一个版本号一旦上传，即使删掉也不能再传同样名字。**
+
+**所以一定要先在 TestPyPI 验证流程**，别拿正式仓库试错。
+
+**而且 `dist/` 里的旧文件要先删干净**——`python -m build` 不会自动清理，可能把上一次的包也一起传上去。
+:::
+
+:::warning[API Token 比密码安全]
+```bash
+# ~/.pypirc
+[distutils]
+index-servers = pypi
+
+[pypi]
+username = __token__
+password = pypi-AgEIcHlwaS5vcmc...
+```
+
+**或者用环境变量**：
+
+```bash
+export TWINE_USERNAME=__token__
+export TWINE_PASSWORD=pypi-...
+```
+
+**不要把 token 提交进 git。**
+:::
+
+## 命令行入口点
+
+```toml
+[project.scripts]
+myproject-cli = "myproject.cli:main"
+```
+
+```python
+# src/myproject/cli.py
+def main() -> int:
+    print("hello from cli")
+    return 0
+```
+
+安装后就能直接用：
+
+```bash
+myproject-cli
+```
+
+:::tip[入口函数必须返回 int 或 None]
+**返回 int 会作为进程退出码。**
+
+```python
+def main() -> int:
+    try:
+        do_work()
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    return 0
+```
+
+**这样 shell 里 `myproject-cli && echo ok` 才能正确判断成败。**
+:::
+
+## 版本号管理
+
+:::info[语义化版本（SemVer）]
+```text
+MAJOR.MINOR.PATCH
+
+1.4.2
+│ │ └── 修 bug（向后兼容）
+│ └──── 加功能（向后兼容）
+└────── 破坏性改动
+```
+
+**规则**：
+
+- 破坏兼容 → `MAJOR + 1`，`MINOR/PATCH` 归零
+- 加功能但兼容 → `MINOR + 1`，`PATCH` 归零
+- 只修 bug → `PATCH + 1`
+:::
+
+:::warning[0.x.y 版本的语义]
+**`0.x` 被广泛理解为"还在开发中，随时可能不兼容"。**
+
+**pep440 允许 `0.x` 版本号，但用户会当成不稳定。**
+
+**要发稳定版就从 `1.0.0` 开始。**
+:::
+
+```python
+# 单一来源版本号
+# src/myproject/__init__.py
+__version__ = "0.1.0"
+```
+
+```toml
+[project]
+dynamic = ["version"]
+
+[tool.setuptools.dynamic]
+version = {attr = "myproject.__version__"}
+```
+
+**这样代码里和包元数据只有一个版本号来源，不会不一致。**
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `pip install .` 失败 | 缺 `[build-system]` | 补上 |
+| 装完 `import` 失败 | `packages.find` 的 `where` 没指 `src` | 配 `[tool.setuptools.packages.find]` |
+| 测试通过但安装后坏 | 用了平铺布局导入了本地目录 | 改 src 布局 |
+| 装了但命令找不到 | 改 `[project.scripts]` 后没重装 | 重新 `pip install -e .` |
+| 上传报"文件已存在" | 版本号重用 | 换版本号 |
+| wheel 带 `cp311` 而不是 `any` | 误含编译扩展 | 检查是否有 `.c/.cpp` |
+| 用户装不上 | 库锁死了依赖版本 | 用范围而非 `==` |
+| `twine check` 报错 | README 格式或元数据问题 | 按提示修 |
+
+:::danger[`.gitignore` 和 `MANIFEST.in` 都会影响打包结果]
+- `MANIFEST.in` 控制 **sdist 里包含哪些非 Python 文件**（如数据文件、模板）
+- 但 **wheel 里有什么由 `packages` 配置 + `package_data` 决定**
+
+**两处都要照顾到**，否则会出现"sdist 安装正常、wheel 缺文件"这种诡异问题。
+:::
+
+## 本课自检
+
+- [ ] **知道 src 布局能暴露"导入了本地目录"的错误**
+- [ ] 知道 `[build-system]` 是必需段
+- [ ] 会写 `[project]` 的 name/version/dependencies/requires-python
+- [ ] **知道库用宽松范围、应用用精确锁定**
+- [ ] 会用 `optional-dependencies` 分离开发依赖
+- [ ] **知道 `pip install -e .` 只对源码改动免重装**
+- [ ] 能区分 sdist 与 wheel
+- [ ] **知道纯 Python 包应产出 `py3-none-any` wheel**
+- [ ] 会走完整发布流程（build → twine check → testpypi → pypi）
+- [ ] **知道 PyPI 版本号不能重用，必须先上 TestPyPI**
+- [ ] 知道入口点函数应返回 int 作为退出码
+- [ ] 理解语义化版本三段含义
+- [ ] 知道 `MANIFEST.in` 和 `package_data` 分别影响 sdist 和 wheel
+
+## 下一步
+
+[演示与脚本工程化](./engineering) 讲了更大规模的项目组织；
+或者回到 [Python 进阶导读](./advanced)。

@@ -1,0 +1,431 @@
+---
+id: 20-exceptions
+title: 20 异常处理
+sidebar_position: 20
+description: try/except/else/finally 的完整用法、常见异常类型、raise 主动抛错，以及为什么不该写裸 except。
+---
+
+# 20 异常处理
+
+**本课目标**：让程序在出错时优雅处理而不是崩溃，掌握 try/except 的正确用法。
+
+## 异常是什么
+
+程序运行时出错，Python 会「抛出异常」（raise an exception）。如果没人接住，程序就崩溃退出。
+
+```python
+print("开始")
+print(10 / 0)
+print("这行不会执行")
+```
+
+输出：
+
+```text
+开始
+ZeroDivisionError: division by zero
+```
+
+`ZeroDivisionError` 就是异常的类型。
+
+## 不处理异常的后果
+
+```python
+numbers = [1, 2, 3]
+for n in numbers:
+    print(10 / n)
+print("完成")
+```
+
+如果把 `numbers` 改成 `[1, 0, 3]`，结果：
+
+```text
+10.0
+ZeroDivisionError: division by zero
+```
+
+**遇到 0 就崩了，后面的 3 根本没处理，程序直接退出。**
+
+真实场景里这很糟糕：一个用户输入错误就让整个程序挂掉，或者处理 1000 条数据时第 500 条出错，前 499 条的努力全白费。
+
+## try/except：接住异常
+
+```python
+try:
+    result = 10 / 0
+except ZeroDivisionError:
+    print("除数不能为零")
+
+print("程序继续运行")
+```
+
+输出：
+
+```text
+除数不能为零
+程序继续运行
+```
+
+**异常被接住后，程序继续往下走**，不会崩溃。
+
+## 完整结构：四个子句
+
+```python
+try:
+    n = int("abc")
+except ValueError:
+    print("① 出错了：值无效")
+else:
+    print("② 没出错才执行")
+finally:
+    print("③ 不管出不出错都执行")
+```
+
+输出：
+
+```text
+① 出错了：值无效
+③ 不管出不出错都执行
+```
+
+| 子句 | 什么时候执行 |
+| --- | --- |
+| `try` | 总是（放可能出错的代码） |
+| `except` | 出了**匹配类型**的错 |
+| `else` | **没出错**才执行 |
+| `finally` | **无论**出不出错都执行 |
+
+### finally 的典型用途：清理资源
+
+```python
+f = None
+try:
+    f = open("data.txt", encoding="utf-8")
+    content = f.read()
+except FileNotFoundError:
+    print("文件不存在")
+finally:
+    if f:
+        f.close()          # 无论成功失败都关闭
+```
+
+:::tip[实际上你现在很少需要手写 finally]
+因为 `with` 语句已经自动处理了资源释放：
+
+```python
+try:
+    with open("data.txt", encoding="utf-8") as f:
+        content = f.read()
+except FileNotFoundError:
+    print("文件不存在")
+```
+
+**`finally` 更适合「必须执行的收尾动作」**，比如关闭数据库连接、删除临时文件、打印耗时统计。
+:::
+
+## 捕获多种异常
+
+![Python 异常继承树：BaseException 下分 SystemExit / KeyboardInterrupt / Exception 三支，except Exception 抓不到前两支](/img/diagrams/py-exception-tree.svg)
+
+
+### 分别处理
+
+```python
+def safe_divide(a, b):
+    try:
+        return a / b
+    except ZeroDivisionError:
+        print("除数不能为零")
+        return None
+    except TypeError:
+        print("参数类型不对")
+        return None
+```
+
+### 一次捕获多种
+
+```python
+try:
+    value = int("abc")
+except (ValueError, TypeError):
+    print("转换失败")
+```
+
+### 拿到异常信息
+
+```python
+try:
+    int("abc")
+except ValueError as e:
+    print(f"出错了：{e}")
+```
+
+输出：
+
+```text
+出错了：invalid literal for int() with base 10: 'abc'
+```
+
+`as e` 把异常对象绑定到 `e`，可以打印详细信息，也可以记日志。
+
+## 常见异常类型
+
+| 异常 | 什么时候出现 | 例子 |
+| --- | --- | --- |
+| `ValueError` | 值不对 | `int("abc")` |
+| `TypeError` | 类型不对 | `"a" + 1` |
+| `KeyError` | 字典键不存在 | `d["不存在"]` |
+| `IndexError` | 列表下标越界 | `[1,2][5]` |
+| `FileNotFoundError` | 文件不存在 | `open("nope.txt")` |
+| `ZeroDivisionError` | 除零 | `1 / 0` |
+| `AttributeError` | 对象没有这个属性 | `"abc".push()` |
+| `NameError` | 变量没定义 | `print(未定义)` |
+| `ImportError` | 导入失败 | `import 不存在的模块` |
+
+:::tip[读报错的第一步：看最后一行]
+```
+Traceback (most recent call last):
+  File "test.py", line 3, in <module>
+    print(10 / 0)
+ZeroDivisionError: division by zero
+```
+
+**最后一行告诉你是哪种异常、什么原因。** 先看它，再看上面的行号定位代码位置。
+
+详细的读报错方法见[第 28 课](./28-debug)。
+:::
+
+## 为什么不要写裸 except
+
+:::danger[`except:` 和 `except Exception:` 会吞掉一切]
+```python
+try:
+    risky_operation()
+except:                    # ❌ 危险
+    pass                   # 出错了但装作没事
+```
+
+**问题**：
+
+1. **连 `Ctrl+C` 都接住了**，程序没法中断，只能强杀
+2. **把 bug 藏起来了**，比如写错变量名导致的 `NameError` 也被吞掉
+3. 出问题时**什么信息都没有**，无法排查
+
+**正确做法：只捕获你预期的那几种异常。**
+:::
+
+```python
+# ✅ 好
+try:
+    age = int(user_input)
+except ValueError:
+    print("请输入数字")
+
+# ❌ 差
+try:
+    age = int(user_input)
+except:
+    pass
+```
+
+:::warning[确实需要兜底时怎么办]
+程序最外层（比如主循环）有时确实需要「不让任何异常弄崩整个服务」。这时至少：
+
+1. 用 `except Exception`（而不是裸 `except`，这样 `KeyboardInterrupt` 还能生效）
+2. **一定要记录日志**
+
+```python
+import logging
+
+try:
+    main_loop()
+except Exception:
+    logging.exception("主循环异常退出")   # 会打印完整 traceback
+```
+
+**关键区别**：不是「假装没发生」，而是「接住了但记录下来」。
+:::
+
+## raise：主动抛异常
+
+你也可以主动抛：
+
+```python
+def set_age(age):
+    if age < 0:
+        raise ValueError(f"年龄不能为负：{age}")
+    if age > 150:
+        raise ValueError(f"年龄不合理：{age}")
+    return age
+
+
+try:
+    set_age(-5)
+except ValueError as e:
+    print(f"参数错误：{e}")
+```
+
+输出：
+
+```text
+参数错误：年龄不能为负：-5
+```
+
+:::tip[什么时候该 raise]
+**当函数收到不合法参数，且无法给出合理结果时。**
+
+```python
+def withdraw(balance, amount):
+    if amount <= 0:
+        raise ValueError("取款金额必须为正")
+    if amount > balance:
+        raise ValueError(f"余额不足：{balance} < {amount}")
+    return balance - amount
+```
+
+这比「返回 -1 表示出错」好得多，因为：
+
+- 调用者**不能忽略**异常（返回值可以被无视）
+- 错误信息可以很详细
+- 不会和正常返回值混淆
+:::
+
+### 重新抛出
+
+```python
+try:
+    risky()
+except ValueError as e:
+    print(f"记录一下：{e}")
+    raise                  # 处理完再抛出去，让上层决定
+```
+
+`raise` 不带参数表示「把当前异常原样再抛一次」。
+
+## EAFP：Python 的风格
+
+两种编程风格：
+
+### LBYL（Look Before You Leap）：先检查再做
+
+```python
+if "key" in d:
+    value = d["key"]
+else:
+    value = None
+```
+
+### EAFP（Easier to Ask Forgiveness than Permission）：先做，出错再处理
+
+```python
+try:
+    value = d["key"]
+except KeyError:
+    value = None
+```
+
+:::tip[Python 更推崇 EAFP]
+原因：
+
+1. **代码更短**，不用写两遍逻辑
+2. **避免竞态**：检查和使用之间，状态可能被别的线程改掉
+3. **性能更好**：正常路径不需要额外检查
+
+不过对字典这种场景，最简洁的其实是 `d.get("key")`。
+
+**原则**：能用「内置的默认值方法」（`get`、`getattr` 等）解决的，优先用它；否则用 try/except。
+:::
+
+## 实战：让程序更健壮
+
+```python
+def read_numbers(filename):
+    """读文件里的数字，跳过无法解析的行"""
+    numbers = []
+    try:
+        with open(filename, encoding="utf-8") as f:
+            for i, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    numbers.append(float(line))
+                except ValueError:
+                    print(f"  第 {i} 行不是数字，跳过：{line!r}")
+    except FileNotFoundError:
+        print(f"文件不存在：{filename}")
+        return []
+    return numbers
+
+
+data = read_numbers("numbers.txt")
+print(f"成功读取 {len(data)} 个数字，总和 {sum(data):.2f}")
+```
+
+:::tip[分层的异常处理]
+注意这段代码的**两层 try**：
+
+- **外层**处理「文件打不开」——整体失败，返回空列表
+- **内层**处理「某一行不是数字」——局部失败，跳过继续
+
+**原则：在哪一层能做出有意义的决定，就在哪一层处理。**
+
+内层能决定「跳过这一行」，外层能决定「整个操作失败」。
+:::
+
+## 常见错误
+
+| 错误 | 问题 | 解决 |
+| --- | --- | --- |
+| `except: pass` | 吞掉所有错误包括 Ctrl+C | 只捕获具体类型 |
+| 捕获范围过大 | 把 bug 藏起来 | 缩小 try 的范围 |
+| try 包了太多代码 | 不知道哪里出错 | 只包可能出错的那一两行 |
+| 忘了 `as e` | 没有错误信息 | 加 `as e` 并打印/记日志 |
+| 用异常做流程控制 | 性能差、难读 | 能预判就用 if |
+| `finally` 里 return | 会覆盖 try 里的返回值 | 别在 finally 里 return |
+
+:::danger[try 的范围要尽量小]
+```python
+# ❌ 范围太大
+try:
+    a = int(input())
+    b = int(input())
+    c = a + b
+    print(c)
+    save_to_file(c)
+except ValueError:
+    print("输入错误")
+```
+
+`ValueError` 到底来自输入转换，还是 `save_to_file` 内部？看不出来。
+
+```python
+# ✅ 范围精确
+try:
+    a = int(input("a: "))
+    b = int(input("b: "))
+except ValueError:
+    print("输入错误")
+else:
+    c = a + b
+    print(c)
+    save_to_file(c)      # 它的错误让上层处理
+```
+:::
+
+## 本课自检
+
+- [ ] 知道不处理异常程序会崩溃退出
+- [ ] 会写 try/except，知道程序会继续运行
+- [ ] 知道 else 和 finally 分别什么时候执行
+- [ ] 会捕获多种异常，会用 `as e` 拿信息
+- [ ] 能记住常见异常类型（ValueError/TypeError/KeyError/IndexError）
+- [ ] **知道为什么不能写裸 except**
+- [ ] 会用 `raise` 主动抛异常
+- [ ] 理解 EAFP，知道该优先用 `get()` 这类方法
+- [ ] 知道 try 的范围要小
+- [ ] 会做分层异常处理
+
+## 下一步
+
+[21 面向对象：类与对象](./21-class) —— 开始学程序的组织方式，从「一堆函数」升级到「有结构的对象」。

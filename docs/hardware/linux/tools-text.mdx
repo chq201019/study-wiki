@@ -1,0 +1,257 @@
+---
+id: tools-text
+title: 文本处理三剑客
+sidebar_position: 22
+description: grep/sed/awk 各自该干什么、grep 的 -r 与 -o、sed 的原地编辑与替换陷阱、awk 的字段与 BEGIN/END、以及什么时候该换 Python。
+---
+
+# 文本处理三剑客
+
+**本课目标**：会用 `grep` 找、`sed` 改、`awk` 算，知道它们的边界。
+
+## 分工
+
+| 工具 | 定位 | 一句话 |
+| --- | --- | --- |
+| **`grep`** | 按行**筛选** | 找出匹配的行 |
+| **`sed`** | 按行**编辑** | 流式替换/删除/插入 |
+| **`awk`** | 按字段**计算** | 有变量、循环、条件的小语言 |
+
+**它们都是"逐行流式"处理** —— 所以能吃无限长的输入。
+
+## `grep`
+
+```bash
+grep 'error' app.log                  # 含 error 的行
+grep -i 'error' app.log               # 忽略大小写
+grep -v 'error' app.log               # 排除（反向）
+grep -c 'error' app.log               # 只输出计数
+grep -n 'error' app.log               # 带行号
+grep -r 'TODO' src/                   # 递归目录
+grep -l 'main' *.c                    # 只输出文件名
+grep -o '[0-9]\+' app.log             # 只输出匹配到的部分
+grep -E 'error|warn' app.log          # 扩展正则（等价 egrep）
+grep -A3 -B1 'panic' app.log          # 匹配行的后 3 行 / 前 1 行
+grep -w 'main' file                   # 整词匹配
+```
+
+:::danger[`grep -r` 会跟进符号链接吗]
+**默认不跟进**（`-r`），`-R` 才跟进所有符号链接。
+
+```bash
+grep -r pattern dir/        # 不跟进符号链接
+grep -R pattern dir/        # 跟进
+```
+
+**在 `/proc`、`/sys` 或大的仓库里跑 `grep -r` 会卡很久** —— 记得加 `--include` 限定：
+
+```bash
+grep -rn --include='*.py' 'TODO' .
+```
+:::
+
+:::tip[`-o` 配合 `sort | uniq -c` 做统计]
+```bash
+# 统计日志里各 IP 出现的次数
+grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' access.log | sort | uniq -c | sort -rn | head
+```
+
+**`-o` 只输出匹配片段**，这是做频次统计的关键。
+:::
+
+:::warning[`grep` 的正则是 BRE（基本正则）]
+```bash
+grep 'a\{2\}' file          # BRE：量词要转义
+grep -E 'a{2}' file         # ERE：不用转义
+```
+
+**`+` `?` `|` `{}` 在 BRE 里都要加反斜杠** —— 记不住就一律用 `-E`。
+:::
+
+## `sed`
+
+```bash
+sed 's/old/new/' file             # 每行第一处替换（不修改原文件）
+sed 's/old/new/g' file            # 全部替换
+sed -i 's/old/new/g' file         # 原地修改（⚠️ 无备份）
+sed -i.bak 's/old/new/g' file     # 原地修改 + 备份
+sed -n '10,20p' file              # 只打印 10~20 行
+sed '/^#/d' file                  # 删除注释行
+sed '2d' file                     # 删除第 2 行
+sed 's/^/PREFIX /' file            # 每行前加前缀
+sed -n '/START/,/END/p' file      # 打印两个标记之间的内容
+```
+
+:::danger[`sed -i` 在 macOS 与 Linux 上语法不同]
+```bash
+# GNU sed（Linux）
+sed -i 's/a/b/' file
+sed -i.bak 's/a/b/' file          # .bak 是后缀
+
+# BSD sed（macOS）
+sed -i '' 's/a/b/' file           # 必须给空字符串作为备份后缀
+sed -i '.bak' 's/a/b/' file
+```
+
+**写跨平台脚本时要么检测平台，要么用 `sed -i.bak` 形式**（两边都能跑）。
+:::
+
+:::warning[替换内容里的特殊字符要转义]
+```bash
+sed 's/a.b/x/' file         # . 匹配任意字符（正则）
+sed 's/a\.b/x/' file        # 只匹配字面 a.b
+
+# 替换内容里的 / 要转义，或换分隔符
+sed 's|/usr/local|/opt|g' file      # ✅ 用 | 当分隔符更清楚
+```
+
+**用 `|` 或 `#` 当分隔符能避免一堆 `\/`**。
+:::
+
+:::tip[`sed` 的 `&` 表示"整个匹配"]
+```bash
+sed 's/[0-9]\+/(&)/g' file       # 给每个数字加括号
+echo "abc" | sed 's/b/[&]/'      # a[b]c
+```
+:::
+
+## `awk`
+
+```bash
+awk '{print $1}' file                  # 第一列
+awk '{print $NF}' file                 # 最后一列
+awk -F: '{print $1}' /etc/passwd       # 指定分隔符
+awk -F, 'NR>1 {print $2}' data.csv     # 跳过表头
+awk '$3 > 100 {print $1}' file         # 条件过滤
+awk '{sum += $2} END {print sum}' file # 求和
+awk 'END {print NR}' file              # 行数（等价 wc -l）
+awk '{a[$1]++} END {for (k in a) print k, a[k]}' file   # 分组计数
+```
+
+:::info[`awk` 的内置变量]
+| 变量 | 含义 |
+| --- | --- |
+| `$0` | 整行 |
+| `$1..$n` | 第 n 个字段 |
+| **`$NF`** | **最后一个字段** |
+| `NF` | 字段数 |
+| **`NR`** | **当前行号（跨文件累计）** |
+| `FNR` | 当前文件的第几行 |
+| `FS` | 输入分隔符（`-F` 设置） |
+| `OFS` | 输出分隔符（默认空格） |
+:::
+
+```bash
+# 多文件时区分 NR 和 FNR
+awk '{print FILENAME, FNR, $0}' a.txt b.txt
+```
+
+:::tip[`awk` 做分组统计比 `sort | uniq -c` 更灵活]
+```bash
+# 按第一列分组求和第二列
+awk '{sum[$1] += $2} END {for (k in sum) printf "%-10s %d\n", k, sum[k]}' data
+```
+
+**能同时算多个聚合，还能自定义输出格式。**
+:::
+
+:::danger[`awk` 的 `$` 在 shell 里会被展开]
+```bash
+awk '{print $1}' file               # ✅ 单引号保护
+awk "{print $1}" file               # ❌ shell 把 $1 换成了位置参数
+```
+
+**永远用单引号包 awk 脚本** —— 需要传 shell 变量时用 `-v`：
+
+```bash
+awk -v limit="$L" '$3 > limit {print $1}' file
+```
+:::
+
+## 组合使用
+
+```bash
+# 找出耗 CPU 前 5 的进程名
+ps aux | awk 'NR>1 {print $3, $11}' | sort -rn | head -5
+
+# 统计 nginx 日志里 4xx/5xx 的接口
+awk '$9 ~ /^[45]/ {print $7}' access.log | sort | uniq -c | sort -rn | head
+
+# 把配置文件里所有 key=value 的 key 提取出来
+sed -n 's/^\([a-z_]*\)=.*/\1/p' config.ini
+```
+
+:::warning[管道里每一环都要考虑"没有匹配"的情况]
+```bash
+grep -c 'error' app.log       # 没匹配时返回 1（退出码），并输出 0
+```
+
+**`grep` 找不到时退出码非 0** —— 在 `set -e` 的脚本里会中断。**用 `|| true` 或 `grep ... || echo 0`**。
+:::
+
+## 什么时候该换 Python
+
+:::danger[三种该停手的信号]
+**① 需要处理多行结构**（JSON、XML、嵌套括号）
+
+`sed`/`awk` 是行式的，处理跨行结构要写大量状态机。
+
+**② 需要 Unicode 语义**
+
+`grep -o '[0-9]\+'` 对中文/emoji 的"字符"概念是错的（按字节处理）。
+
+**③ 逻辑超过 30 行 awk**
+
+**可读性已经崩了。** 三个月后你自己都看不懂。
+:::
+
+```python
+# 等价但可维护的做法
+import re, json, pathlib
+
+for line in pathlib.Path("access.log").read_text().splitlines():
+    m = re.match(r'\S+ \S+ \S+ \[.*?\] "(\S+) (\S+)', line)
+    if m and m.group(2).startswith(("/api/",)):
+        print(m.group(2))
+```
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `grep -r` 卡死 | 扫到 `/proc` 或超大仓库 | 加 `--include` / 排除目录 |
+| `sed -i` 在 mac 报错 | BSD sed 语法不同 | `sed -i.bak` |
+| `sed` 替换没生效 | 少了 `g` | 加 `g` |
+| `awk` 输出空 | shell 展开了 `$1` | 用单引号 |
+| `awk -F` 分隔符含特殊字符 | 需要正则转义 | 用 `-F'[:\t]'` |
+| `grep` 退出码非 0 中断脚本 | `set -e` | `|| true` |
+| 按字节处理中文出错 | 工具是字节语义 | 换 Python |
+| 大文件 `sed -i` 很慢 | 要写临时文件再改名 | 正常，或用 `sponge` |
+
+:::tip[`sponge` 让管道也能原地写]
+```bash
+sort file | sponge file         # 需要 moreutils 包
+```
+
+**普通管道不能写回同一个文件**（会先被截断成空）。
+:::
+
+## 本课自检
+
+- [ ] 知道三者分工（筛选/编辑/计算）
+- [ ] 会用 `grep -r` / `-o` / `-E` / `-A -B` / `-w`
+- [ ] **知道 `-r` 不跟进符号链接，`-R` 才跟进**
+- [ ] **会用 `grep -o | sort | uniq -c | sort -rn` 做频次统计**
+- [ ] 知道 BRE 与 ERE 的量词转义差异
+- [ ] 会用 `sed` 的 `s///g` / `-n p` / `d` / 范围打印
+- [ ] **知道 `sed -i` 在 macOS 与 Linux 上语法不同**
+- [ ] 会用 `|` 当分隔符避免转义 `/`
+- [ ] **知道 `sed` 的 `&` 代表整个匹配**
+- [ ] 会用 `awk` 的 `$1` / `$NF` / `NR` / `-F`
+- [ ] **知道 `awk` 必须用单引号，变量用 `-v` 传**
+- [ ] **知道三种该换 Python 的信号**
+- [ ] 知道 `grep` 无匹配时退出码非 0
+
+## 下一步
+
+[find 与 xargs](./tools-find) 或 [日志与 journalctl](./tools-journal)。

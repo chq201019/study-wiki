@@ -1,0 +1,262 @@
+---
+id: 19-lowpower
+title: 19 低功耗模式
+sidebar_position: 19
+description: STM32 的三种低功耗模式、电流对比、怎么进入和唤醒、外设时钟要关，以及低功耗设计的实用清单。
+---
+
+# 19 低功耗模式
+
+**本课目标**：让电池供电的设备撑更久。
+
+## STM32 的三种低功耗模式
+
+| 模式 | 电流（F103） | 唤醒时间 | RAM 保留 | 说明 |
+| --- | --- | --- | --- | --- |
+| **Sleep** | 约 7~20 mA | 极快 | ✅ | 只停 CPU，外设还跑 |
+| **Stop** | 约 10~20 µA | 快（微秒） | ✅ | 停所有时钟，RAM 保留 |
+| **Standby** | 约 2~3 µA | 慢（要重启） | ❌ **只有后备域** | 最省，等同关机 |
+
+:::tip[和 ESP32 的对应关系]
+| ESP32 | STM32 |
+| --- | --- |
+| Light sleep | **Stop 模式** |
+| Deep sleep | **Standby 模式** |
+
+（[ESP32 第 23 课](../esp-basics/23-sleep)讲过）
+:::
+
+:::danger[Stop 是最常用的省电模式]
+**Stop 模式**：
+
+- 电流从 20 mA 降到 **20 µA**（省 1000 倍）
+- **RAM 内容保留**（变量不丢）
+- 唤醒快（微秒级）
+- 唤醒后**接着原来的代码继续跑**（不像 Standby 要重启）
+
+**电池设备首选 Stop。**
+:::
+
+## Stop 模式怎么用
+
+```c
+#include "stm32f1xx_hal.h"
+
+void enter_stop(void)
+{
+    /* ① 可以先关掉不用的外设时钟省电 */
+    __HAL_RCC_GPIOA_CLK_DISABLE();
+    __HAL_RCC_GPIOB_CLK_DISABLE();
+
+    /* ② 配置唤醒源（比如 EXTI 中断） */
+    HAL_PWR_EnableWakeUpPin(PWR_WAKEUP_PIN_1);   /* WKUP 引脚 */
+
+    /* ③ 进入 Stop 模式 */
+    HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+
+    /* ④ 唤醒后会从这里继续执行 */
+    /* 但系统时钟变成了 HSI！必须重新配置 */
+    SystemClock_Config();
+}
+```
+
+:::danger[唤醒后时钟会变回 HSI（8MHz）！]
+**这是 Stop 模式最大的坑。**
+
+Stop 模式关掉了所有时钟，唤醒后硬件默认用 **HSI 8 MHz**。
+
+**如果你不重新调用 `SystemClock_Config()`**：
+
+- CPU 只跑 8MHz（慢 9 倍）
+- 串口波特率全错（乱码）
+- 定时器全错
+
+**规矩：`HAL_PWR_EnterSTOPMode` 之后第一件事就是重新配时钟。**
+:::
+
+## 用 RTC 定时唤醒
+
+最常用的场景：**每 X 秒醒一次采样上报，其余时间睡**。
+
+```c
+void enter_stop_with_rtc(uint32_t seconds)
+{
+    /* ① 设置 RTC 唤醒定时器 */
+    HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, seconds, RTC_WAKEUPCLOCK_CK_SPRE_16BITS);
+
+    /* ② 进 Stop */
+    HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+
+    /* ③ 唤醒后恢复时钟 */
+    SystemClock_Config();
+
+    /* ④ 清 RTC 唤醒标志 */
+    HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+}
+
+int main(void)
+{
+    /* 各种初始化... */
+
+    while (1)
+    {
+        /* 干活：读传感器 + 上报 */
+        float t = read_temperature();
+        printf("温度 %.1f\r\n", t);
+
+        /* 睡 10 秒 */
+        enter_stop_with_rtc(10);
+    }
+}
+```
+
+:::tip[这样能省多少电]
+假设：每 10 秒醒一次，每次活动 200ms，活动电流 20mA，睡眠 20µA。
+
+```text
+每天活动时间 = 8640 次 × 0.2 秒 = 1728 秒 = 0.48 小时
+每天活动耗电 = 0.48 × 20 mA ≈ 9.6 mAh
+每天睡眠耗电 ≈ 24 × 0.02 mA ≈ 0.5 mAh
+
+合计约 10 mAh/天 → 2000 mAh 电池约 200 天
+```
+
+**比一直运行（20mA → 4 天）强得多。**
+:::
+
+## Standby 模式
+
+**最省电，但代价大**：
+
+```c
+HAL_PWR_EnableWakeUpPin(PWR_WAKEUP_PIN_1);
+HAL_PWR_EnterSTANDBYMode();      /* 不返回 */
+
+/* 唤醒后等同于复位，从头跑 main() */
+```
+
+| 特点 | 说明 |
+| --- | --- |
+| 电流 | **2~3 µA** |
+| RAM | ❌ **全部丢失** |
+| 唤醒后 | **从头执行 `main()`** |
+| 唤醒源 | WKUP 引脚、RTC、NRST |
+
+:::warning[Standby 像"关机重启"]
+**变量全丢**——要保留数据必须：
+
+- 存 **NVS/Flash**（[第 22 课对应 ESP32 的 NVS](../esp-basics/22-nvs)）
+- 或存 **后备寄存器（Backup Register）**（只有几十字节）
+
+```c
+/* 后备寄存器：Standby 期间保留 */
+HAL_PWR_EnableBkUpAccess();
+WRITE_REG(BKP->DR1, 0x1234);
+```
+
+**STM32F103 只有 10 个 16 位后备寄存器（20 字节）**，放不了多少东西。
+:::
+
+## 低功耗设计清单
+
+:::danger[光靠低功耗模式不够，外设也要管]
+| 耗电来源 | 怎么办 |
+| --- | --- |
+| **没关的外设时钟** | `__HAL_RCC_xxx_CLK_DISABLE()` |
+| **LED 一直亮** | 几 mA！睡眠前关掉 |
+| **稳压芯片自身耗电** | 选低静态电流的 LDO |
+| **上拉电阻常态导通** | 用大阻值或改电路 |
+| **浮空输入引脚** | 设成模拟输入或加上下拉 |
+| **调试器连着** | **调试器会额外耗电几 mA** |
+| 未用的 GPIO 悬空 | 配置成输出低或模拟输入 |
+
+**很多人的"低功耗做不下来"，问题不在 MCU，而在这些外围。**
+:::
+
+### 具体做法
+
+```c
+void lowpower_prepare(void)
+{
+    /* ① 关所有不用的 GPIO 时钟 */
+    __HAL_RCC_GPIOA_CLK_DISABLE();
+    __HAL_RCC_GPIOB_CLK_DISABLE();
+    __HAL_RCC_GPIOC_CLK_DISABLE();
+    __HAL_RCC_GPIOD_CLK_DISABLE();
+
+    /* ② 关外设时钟 */
+    __HAL_RCC_USART1_CLK_DISABLE();
+    __HAL_RCC_ADC1_CLK_DISABLE();
+    __HAL_RCC_SPI1_CLK_DISABLE();
+
+    /* ③ 关掉 LED（很重要！） */
+    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+}
+```
+
+:::warning[关时钟前要保存状态]
+```c
+__HAL_RCC_USART1_CLK_DISABLE();      /* 关了串口就不能 printf 了 */
+```
+
+**关了时钟之后，那个外设就完全不能用了**——要用得重新 `ENABLE` 并重新初始化。
+
+**调试阶段建议先别关串口**，否则出问题看不到日志。
+:::
+
+## 用调试器测电流的注意事项
+
+:::danger[连着 ST-Link 时电流会高出很多]
+**ST-Link 会给板子供电，同时自己也在耗电**，测量结果完全不准。
+
+**正确测法**：
+
+1. 拔掉 ST-Link
+2. 用**外部电源**（电池或可调电源）供电
+3. 用**万用表串联**测电流（或专用电流表）
+4. 或者用 **Nucleo 板上的 IDD 跳线**（专门设计来测电流的）
+
+**很多人测出"低功耗只有 mA 级"就是这个原因。**
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 唤醒后没重配时钟 | 串口乱码、程序慢 | Stop 后时钟回 HSI | 调 `SystemClock_Config` |
+| 忘关 LED | 电流下不去 | LED 几 mA | 睡前关掉 |
+| 外设时钟没关 | 电流偏大 | 外设还在跑 | `CLK_DISABLE` |
+| 连着调试器测电流 | 数据不准 | ST-Link 供电 | 用外部电源 |
+| Standby 后变量丢了 | 数据重置 | RAM 全清 | 存后备寄存器/Flash |
+| 唤醒源没配 | 睡下去醒不来 | 没使能唤醒 | 配 EXTI/RTC |
+| 浮空引脚耗电 | 电流偏大 | 输入悬空 | 设模拟输入 |
+
+:::danger[睡下去醒不来的急救]
+如果不小心进了 Stop 而没配唤醒源：
+
+**板子看起来"死了"**（电流很低，但什么都不响应）。
+
+**急救办法**：
+
+1. 用 ST-Link 的 **"Connect under reset"** 连上
+2. 全片擦除（CubeProgrammer 的 `Full chip erase`）
+
+**所以调试低功耗代码时，一定先确认唤醒源配好了再烧。**
+:::
+
+## 本课自检
+
+- [ ] 能区分 Sleep / Stop / Standby 三档
+- [ ] **知道 Stop 是最常用的省电模式（20µA）**
+- [ ] **知道 Stop 唤醒后必须重新 `SystemClock_Config()`**
+- [ ] 会用 `HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI)`
+- [ ] 会用 RTC 唤醒定时器做周期唤醒
+- [ ] **知道 Standby 等于关机重启，RAM 全丢**
+- [ ] 知道后备寄存器很小，大量数据要存 Flash
+- [ ] **知道睡眠前要关外设时钟和 LED**
+- [ ] **知道连调试器测电流不准，要用外部电源**
+- [ ] 知道"睡下去醒不来"可以用全片擦除救
+
+## 下一步
+
+[20 调试、排错与下一步](./20-next) —— SWD 调试技巧、常见故障、往哪走。

@@ -1,0 +1,401 @@
+---
+id: 19-pointer-advanced
+title: 19 指针进阶
+sidebar_position: 19
+description: 函数指针的声明与用途、二级指针为什么需要、复杂声明的读法，以及回调函数这个核心模式。
+---
+
+# 19 指针进阶
+
+**本课目标**：看懂函数指针和二级指针，能读懂复杂的 C 声明。
+
+## 函数指针：指向函数的指针
+
+函数也有地址，也能用指针指向：
+
+```c
+int add(int a, int b) { return a + b; }
+
+int (*fp)(int, int) = add;      /* fp 指向 add */
+printf("%d\n", fp(3, 4));       /* 7 */
+printf("%d\n", (*fp)(3, 4));    /* 7，等价 */
+```
+
+### 声明怎么读
+
+```c
+int (*fp)(int, int);
+ ↑   ↑      ↑
+返回 名字   参数
+```
+
+:::tip[为什么要加括号 `(*fp)`]
+```c
+int (*fp)(int, int);      /* ✅ 函数指针 */
+int *fp(int, int);        /* ❌ 这是"返回 int* 的函数" */
+```
+
+因为 `()` 的优先级高于 `*`：
+
+- `int *fp(...)` → `fp` 先和 `()` 结合 → 是个**函数**，返回 `int *`
+- `int (*fp)(...)` → 括号强制 `fp` 先和 `*` 结合 → 是**指针**，指向函数
+
+**括号是必须的，它改变了结合顺序。**
+:::
+
+## 函数指针有什么用
+
+### 用途一：把函数当参数传（回调）
+
+这是最重要的用法。
+
+```c
+#include <stdio.h>
+
+int add(int a, int b) { return a + b; }
+int mul(int a, int b) { return a * b; }
+
+/* op 是一个函数指针参数 */
+int compute(int a, int b, int (*op)(int, int)) {
+    return op(a, b);
+}
+
+int main(void) {
+    printf("%d\n", compute(6, 2, add));     /* 8 */
+    printf("%d\n", compute(6, 2, mul));     /* 12 */
+    return 0;
+}
+```
+
+**同一个 `compute`，传入不同函数就做不同的事。** 这叫**回调（callback）**。
+
+### 用途二：标准库的 qsort
+
+`qsort` 是通用排序，能排任何类型——靠的就是函数指针：
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+/* 比较函数：a < b 返回负，a == b 返回 0，a > b 返回正 */
+int cmp_asc(const void *a, const void *b) {
+    int x = *(const int *)a;
+    int y = *(const int *)b;
+    return (x > y) - (x < y);        /* 安全写法，不会溢出 */
+}
+
+int main(void) {
+    int arr[] = {5, 2, 8, 1, 9};
+    int n = sizeof(arr) / sizeof(arr[0]);
+
+    qsort(arr, n, sizeof(int), cmp_asc);
+
+    for (int i = 0; i < n; i++) printf("%d ", arr[i]);
+    printf("\n");
+    return 0;
+}
+```
+
+输出：
+
+```text
+1 2 5 8 9
+```
+
+:::danger[比较函数别用 `a - b`]
+```c
+return *(int*)a - *(int*)b;      /* ⚠️ 大数相减会溢出 */
+```
+
+如果 `a` 是 2e9、`b` 是 -2e9，相减溢出成负数，排序结果就错了。
+
+**安全写法**：
+
+```c
+return (x > y) - (x < y);        /* 只返回 -1、0、1 */
+```
+:::
+
+:::tip[为什么 qsort 用 `const void *`]
+`void *` 是"无类型指针"，能指向任何类型——这样 `qsort` 才能排 `int`、`double`、结构体。
+
+在比较函数里要**转回真实类型**：
+
+```c
+int x = *(const int *)a;         /* 先转类型，再解引用 */
+```
+:::
+
+### 用途三：函数指针数组（跳转表）
+
+```c
+int add(int a, int b) { return a + b; }
+int sub(int a, int b) { return a - b; }
+int mul(int a, int b) { return a * b; }
+
+int (*ops[3])(int, int) = {add, sub, mul};
+const char *names[3] = {"add", "sub", "mul"};
+
+for (int i = 0; i < 3; i++) {
+    printf("%s(6,2) = %d\n", names[i], ops[i](6, 2));
+}
+```
+
+本机实测输出：
+
+```text
+add(6,2) = 8
+sub(6,2) = 4
+mul(6,2) = 12
+```
+
+:::tip[跳转表的实际价值]
+**用它代替长串 `switch`**：
+
+```c
+/* 不用跳转表 */
+switch (op) {
+    case 0: result = add(a, b); break;
+    case 1: result = sub(a, b); break;
+    case 2: result = mul(a, b); break;
+    /* 加一个操作就要改这里 */
+}
+
+/* 用跳转表 */
+result = ops[op](a, b);          /* 加操作只需改数组 */
+```
+
+**命令解析、状态机、中断向量表**都用这个模式。**嵌入式里非常常见。**
+:::
+
+### 用途四：typedef 简化
+
+```c
+typedef int (*BinOp)(int, int);      /* 给类型起名 */
+
+BinOp f = add;                       /* 不用再写一长串 */
+printf("%d\n", f(9, 3));
+```
+
+**强烈建议用 typedef**——`int (*)(int,int)` 这种写法太容易看错。
+
+## 二级指针：指向指针的指针
+
+```c
+int n = 42;
+int *p = &n;
+int **pp = &p;          /* pp 存 p 的地址 */
+```
+
+本机实测：
+
+```c
+printf("%d\n", **pp);       /* 42 */
+```
+
+| 表达式 | 类型 | 值 |
+| --- | --- | --- |
+| `n` | `int` | 42 |
+| `p` | `int *` | n 的地址 |
+| `*p` | `int` | 42 |
+| `pp` | `int **` | p 的地址 |
+| `*pp` | `int *` | n 的地址 |
+| `**pp` | `int` | 42 |
+
+## 二级指针的用途：让函数修改"指针本身"
+
+:::danger[这是二级指针最重要的用途]
+```c
+/* ❌ 错误的分配方式 */
+void alloc_wrong(int *p, int n) {
+    p = malloc(n * sizeof(int));     /* 只改了副本！ */
+}
+
+int main(void) {
+    int *arr = NULL;
+    alloc_wrong(arr, 5);
+    /* arr 还是 NULL —— 内存泄漏了，而且拿不到地址 */
+}
+```
+
+**`p` 是副本**，`malloc` 的地址赋给副本，函数返回后就丢了。
+
+**正确做法：传指针的地址**
+
+```c
+void alloc_right(int **p, int n) {
+    *p = malloc(n * sizeof(int));    /* 改的是外面的指针 */
+}
+
+int main(void) {
+    int *arr = NULL;
+    alloc_right(&arr, 5);            /* 传 &arr */
+    if (arr) {
+        /* 现在 arr 有效了 */
+        free(arr);
+    }
+}
+```
+:::
+
+本机实测完整示例：
+
+```c
+void alloc(int **p, int n) {
+    *p = malloc(n * sizeof(int));
+    if (*p) {
+        for (int i = 0; i < n; i++) (*p)[i] = i * 10;
+    }
+}
+
+int *p = NULL;
+alloc(&p, 3);
+/* p 现在是 {0, 10, 20} */
+```
+
+输出：
+
+```text
+0 10 20
+```
+
+:::tip[为什么交换指针也需要二级指针]
+```c
+void swap_ptr(int **a, int **b) {
+    int *t = *a;
+    *a = *b;
+    *b = t;
+}
+```
+
+**因为要改的是"指针的值"，所以必须传指针的地址。**
+
+**规律**：
+
+- 想改 `int` → 传 `int *`
+- 想改 `int *` → 传 `int **`
+- 想改 `int **` → 传 `int ***`
+:::
+
+## 复杂声明的读法
+
+C 的声明可以很吓人：
+
+```c
+int (*(*f)(int))[10];
+```
+
+:::tip[从内往外，先右后左]
+**规则**：
+
+1. 从变量名开始
+2. 先看右边的符号（`[]` 数组，`()` 函数）
+3. 再看左边的符号（`*` 指针）
+4. 遇到括号就跳出去，继续同样规则
+
+**例子**：
+
+```c
+int *a[10];          /* a 是数组[10]，元素是 int* → 指针数组 */
+int (*a)[10];        /* a 是指针，指向 int[10] → 数组指针 */
+int (*f)(int);       /* f 是指针，指向"接收 int 返回 int"的函数 */
+int *f(int);         /* f 是函数(int)，返回 int* */
+```
+
+**实用建议：看不懂就 typedef 拆开。**
+
+```c
+typedef int (*Callback)(int);        /* 先定义好 */
+Callback table[10];                  /* 再用，一眼就懂 */
+```
+:::
+
+## 完整示例：一个简易命令表
+
+```c
+#include <stdio.h>
+#include <string.h>
+
+void cmd_help(void)  { printf("可用命令：help, version, quit\n"); }
+void cmd_version(void) { printf("v1.0.0\n"); }
+void cmd_quit(void)  { printf("再见\n"); }
+
+typedef void (*Command)(void);
+
+typedef struct {
+    const char *name;
+    Command     func;
+} Entry;
+
+static const Entry commands[] = {
+    {"help",    cmd_help},
+    {"version", cmd_version},
+    {"quit",    cmd_quit},
+};
+
+int main(void) {
+    const int n = sizeof(commands) / sizeof(commands[0]);
+
+    const char *input = "version";
+
+    for (int i = 0; i < n; i++) {
+        if (strcmp(input, commands[i].name) == 0) {
+            commands[i].func();
+            return 0;
+        }
+    }
+    printf("未知命令：%s\n", input);
+    return 0;
+}
+```
+
+输出：
+
+```text
+v1.0.0
+```
+
+:::tip[这个模式就是"命令分发表"]
+**加一个新命令**只需要在 `commands` 数组里加一行，`main` 完全不用改。
+
+**这是 C 里实现"多态"最常用的手法**，比长串 `if-else` 好维护得多。
+
+（`struct` 下节课讲，这里先看整体结构。）
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `int *f(int)` 当函数指针 | 类型错 | 括号位置 | `int (*f)(int)` |
+| `alloc(arr)` 想分配内存 | arr 还是 NULL | 值传递 | `alloc(&arr)` |
+| 比较函数用 `a - b` | 大数排序错 | 溢出 | `(x>y)-(x<y)` |
+| `f = add()` 赋值 | 类型错 | 调用了函数 | `f = add`（不加括号） |
+| 调用 `(*fp)()` 写错 | 编译错 | 少括号 | `(*fp)(args)` |
+| 二级指针解引用层数错 | 值不对 | 少写或多写 `*` | 数清楚几层 |
+
+:::warning[函数名和函数调用别混]
+```c
+int (*fp)(int,int) = add;      /* ✅ 函数名本身就是地址 */
+int (*fp)(int,int) = add();    /* ❌ add() 是调用，返回 int */
+```
+
+**`add` 和 `&add` 等价**（函数名会退化成地址），但**`add()` 是调用**。
+:::
+
+## 本课自检
+
+- [ ] 会声明函数指针 `int (*fp)(int, int)`
+- [ ] 知道为什么必须加括号
+- [ ] 理解**回调**：把函数当参数传
+- [ ] 会用 `qsort`，知道比较函数怎么写
+- [ ] 知道比较函数别用 `a - b`
+- [ ] 会写函数指针数组（跳转表）
+- [ ] 用 `typedef` 简化函数指针类型
+- [ ] **知道二级指针用来"修改指针本身"**
+- [ ] 知道想改 `int*` 就要传 `int**`
+- [ ] 会用"从内往外、先右后左"读复杂声明
+
+## 下一步
+
+[20 动态内存 malloc/free](./20-malloc) —— 让程序在运行时决定要多少内存，也是内存泄漏的来源。

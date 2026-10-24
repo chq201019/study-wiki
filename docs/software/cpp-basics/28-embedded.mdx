@@ -1,0 +1,300 @@
+---
+id: 28-embedded
+title: 28 嵌入式 C++
+sidebar_position: 28
+description: 嵌入式为什么慎用 C++、异常与 RTTI 的代价、无堆编程、volatile、以及嵌入式 C++ 的实用规则。
+---
+
+# 28 嵌入式 C++
+
+**本课目标**：知道嵌入式里 C++ 能用什么、不能用什么，以及为什么。
+
+## 嵌入式为什么慎用 C++
+
+C++ 的特性很多，但**不是所有都适合单片机**：
+
+| 特性 | 嵌入式态度 | 原因 |
+| --- | --- | --- |
+| 类、封装 | ✅ 完全可用 | 零开销 |
+| 模板 | ✅ 可用（注意代码膨胀） | 编译期展开 |
+| RAII | ✅ **推荐** | 自动管理资源 |
+| **异常** | ⚠️ **常禁用** | 代码体积大、不确定延迟 |
+| **RTTI**（`dynamic_cast`） | ⚠️ **常禁用** | 运行时类型信息占空间 |
+| **堆分配** | ⚠️ **谨慎/禁用** | 碎片化、时间不确定 |
+| `std::string`/`vector` | ⚠️ 看资源 | 会用堆 |
+| 虚函数 | ✅ 可用（注意 vtable） | 一次间接跳转 |
+
+## 异常为什么被禁用
+
+:::danger[异常的三个代价]
+**① 二进制体积**
+
+编译器要生成**栈展开信息表**（记录每层作用域要析构什么）。ESP32 上可能增加几十 KB。
+
+**② 不确定的延迟**
+
+抛异常时要**逐层展开栈**、调用析构函数——**耗时不可预测**。实时控制里这是致命的。
+
+**③ 需要运行时支持库**
+
+`libstdc++` 的异常处理部分可能占不少空间。
+:::
+
+### 禁用方式
+
+```bash
+# GCC / Clang
+g++ -fno-exceptions -fno-rtti
+```
+
+**:warning: 禁用异常的后果**：
+
+```cpp
+try { ... } catch (...) { }      /* ❌ 编译错误 */
+throw std::runtime_error("x");   /* ❌ 编译错误 */
+```
+
+标准库的某些部分也会不可用（比如 `vector::at()` 抛的 `out_of_range` 就没了）。
+
+:::tip[禁用异常后怎么写错误处理]
+```cpp
+/* ① 返回错误码 */
+enum class Err { Ok, InvalidArg, NoMem };
+Err do_work(int x);
+
+/* ② 返回 optional（C++17，无异常） */
+std::optional<int> find_value(int key);
+
+/* ③ 返回 expected（C++23，或自己实现） */
+Result<int, Err> compute();
+
+/* ④ 断言（只在调试用） */
+assert(x > 0);
+```
+
+**ESP-IDF 默认就禁用了异常**——它的 API 全用 `esp_err_t` 返回码。
+:::
+
+## 堆分配为什么危险
+
+:::danger[三个问题]
+**① 碎片化**
+
+反复 `new`/`delete` 不同大小 → 内存被切成碎片 → 明明总量够，却分配失败。
+
+**② 时间不确定**
+
+`malloc` 耗时取决于堆状态，**最坏情况可能很久**。实时系统不能接受。
+
+**③ 分配失败**
+
+单片机上很容易 OOM。如果 `new` 抛 `bad_alloc` 而你禁用了异常 → **直接崩溃**。
+:::
+
+### 无堆编程的写法
+
+```cpp
+/* ❌ 运行时分配 */
+char *buf = new char[256];
+
+/* ✅ 静态/栈上固定大小 */
+static char buf[256];              /* 全局静态区 */
+
+/* ✅ 或成员数组 */
+class UartDriver {
+    char rx_buf_[256];             /* 编译期确定大小 */
+};
+```
+
+:::tip[嵌入式常用：静态分配 + 容量上限]
+```cpp
+template<typename T, size_t N>
+class StaticVector {
+public:
+    bool push_back(const T &v) {
+        if (size_ >= N) return false;      /* 满了返回失败，不分配 */
+        data_[size_++] = v;
+        return true;
+    }
+    size_t size() const { return size_; }
+    T &operator[](size_t i) { return data_[i]; }
+
+private:
+    T data_[N];
+    size_t size_ = 0;
+};
+```
+
+**行为完全可预测，没有堆分配，没有碎片。**
+
+（这是很多嵌入式库的做法。）
+:::
+
+## `volatile`：仍然是必学
+
+（[C 第 28 课](../c-basics/28-bitops) 提过）
+
+```cpp
+volatile uint32_t *reg = reinterpret_cast<volatile uint32_t *>(0x3FF44004);
+*reg |= (1u << 2);              /* 操作硬件寄存器 */
+```
+
+:::danger[`volatile` 保证什么、不保证什么]
+**保证**：
+
+- 每次都真实读写内存（不被优化掉）
+- 不重排（相对于其他 volatile 操作）
+
+**不保证**：
+
+- **原子性**（不是线程同步工具）
+- 跨核内存可见性（多核要内存屏障）
+
+```cpp
+volatile int flag = 0;
+
+/* 单核：中断里改 flag，主循环检查 → volatile 就够了 */
+while (!flag) { }
+
+/* 多核：还需要内存屏障/原子操作 */
+```
+:::
+
+## C++ 在嵌入式里的实用规则
+
+:::tip[推荐的做法]
+**① 用类和 RAII**
+```cpp
+class Led {
+public:
+    explicit Led(gpio_num_t pin) : pin_(pin) { gpio_set_direction(pin_, OUTPUT); }
+    void on()  { gpio_set_level(pin_, 1); }
+    void off() { gpio_set_level(pin_, 0); }
+private:
+    gpio_num_t pin_;
+};
+```
+
+**零开销，且比裸函数清晰。**
+
+**② 用 `constexpr` 做编译期计算**
+```cpp
+constexpr uint32_t baud_to_divisor(uint32_t baud) {
+    return 80000000u / (16u * baud);
+}
+constexpr auto DIV = baud_to_divisor(115200);    /* 编译期算好，不占运行时间 */
+```
+
+**③ 用 `enum class` 代替宏**
+```cpp
+enum class State { Idle, Running, Error };       /* 类型安全 */
+```
+
+**④ 用模板做零开销抽象**
+```cpp
+template<typename Pin>
+void toggle() { Pin::set(!Pin::get()); }         /* 编译期确定，无间接跳转 */
+```
+:::
+
+:::warning[避免的做法]
+| 避免 | 原因 |
+| --- | --- |
+| 异常（`-fno-exceptions`） | 体积大、延迟不确定 |
+| RTTI（`-fno-rtti`） | 占空间 |
+| `new`/`delete` 在运行时 | 碎片、时间不确定 |
+| `std::string`/`vector` 高频使用 | 用堆，可能 OOM |
+| 深递归 | 栈很小（几 KB） |
+| 频繁虚函数调用在中断里 | 间接跳转有开销 |
+| 大局部数组 | 栈溢出 |
+:::
+
+## 一个嵌入式风格的例子
+
+```cpp
+#include <cstdint>
+#include <array>
+
+/* 模拟寄存器访问 */
+volatile uint32_t g_ctrl_reg = 0;
+
+class Led {
+public:
+    explicit Led(uint32_t bit_mask) : mask_(bit_mask) {}
+
+    void on()  { g_ctrl_reg |= mask_; }
+    void off() { g_ctrl_reg &= ~mask_; }
+    bool is_on() const { return (g_ctrl_reg & mask_) != 0; }
+
+private:
+    uint32_t mask_;
+};
+
+/* 编译期计算的常量 */
+constexpr uint32_t bit(uint32_t n) { return 1u << n; }
+
+int main() {
+    Led led(bit(2));               /* 第 2 位控制 LED */
+
+    led.on();
+    bool state1 = led.is_on();
+
+    led.off();
+    bool state2 = led.is_on();
+
+    /* 用数组而不是 vector：编译期确定大小 */
+    std::array<uint8_t, 8> samples = {};
+    for (size_t i = 0; i < samples.size(); i++) {
+        samples[i] = static_cast<uint8_t>(i * 2);
+    }
+
+    return (state1 && !state2 && samples[7] == 14) ? 0 : 1;
+}
+```
+
+:::tip[这个例子的嵌入式特征]
+| 特征 | 体现在哪 |
+| --- | --- |
+| 无堆分配 | `std::array` 而非 `vector` |
+| 编译期常量 | `constexpr bit(2)` |
+| 寄存器操作 | `volatile` + 位运算 |
+| RAII 思路 | `Led` 构造时配置引脚 |
+| 零开销 | 类没有额外运行时成本 |
+:::
+
+## 什么时候可以用标准库
+
+| 组件 | 嵌入式可用性 |
+| --- | --- |
+| `std::array` | ✅ **完全可用**（无堆） |
+| `std::span`（C++20） | ✅ 可用 |
+| `std::vector` | ⚠️ 会分配堆，小规模可以 |
+| `std::string` | ⚠️ 同上 |
+| `std::map` | ⚠️ 每节点一次分配，不推荐 |
+| `std::sort` | ✅ 就地排序，可用 |
+| `std::unique_ptr` | ✅ 可用（但不该频繁 new） |
+| `std::shared_ptr` | ❌ 引用计数 + 控制块，不推荐 |
+| `<iostream>` | ❌ 体积巨大，用 `printf` 或 ROM 函数 |
+
+:::danger[`<iostream>` 在嵌入式里慎用]
+`std::cout` 会拉进大量代码（格式化、locale 等），**可能增加几十 KB**。
+
+**嵌入式里用 `printf`（或芯片厂商提供的轻量实现）**，甚至用 `ESP_LOGI` 这类宏。
+:::
+
+## 本课自检
+
+- [ ] 知道嵌入式对 C++ 各特性的取舍
+- [ ] **知道异常被禁用的三个原因**（体积、延迟、运行时库）
+- [ ] 知道 `-fno-exceptions -fno-rtti`
+- [ ] 知道禁用异常后怎么处理错误（返回码/optional）
+- [ ] **知道堆分配的三个问题**（碎片、时间不确定、OOM）
+- [ ] 会写无堆的数据结构（静态数组 + 容量上限）
+- [ ] 知道 `volatile` 保证什么、不保证什么
+- [ ] 知道推荐的用法（类/constexpr/enum class/模板）
+- [ ] 知道 `std::array` 可用但 `std::map` 不推荐
+- [ ] 知道 `<iostream>` 会增加大量体积
+
+## 下一步
+
+[29 现代 C++ 特性速览](./29-modern) —— C++11/14/17/20 里值得用的东西。

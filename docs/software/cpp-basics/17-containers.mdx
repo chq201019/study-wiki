@@ -1,0 +1,295 @@
+---
+id: 17-containers
+title: 17 STL 容器选型
+sidebar_position: 17
+description: vector、list、map、unordered_map、set 的复杂度与实际性能对比，以及为什么默认该用 vector。
+---
+
+# 17 STL 容器选型
+
+**本课目标**：能根据场景选对容器，不被"理论复杂度"误导。
+
+## 五种主力容器
+
+| 容器 | 底层结构 | 特点 |
+| --- | --- | --- |
+| `vector` | 动态数组 | 连续内存，随机访问 O(1) |
+| `list` | 双向链表 | 任意位置插入 O(1)，但不连续 |
+| `map` | 红黑树 | 有序，查找 O(log n) |
+| `unordered_map` | 哈希表 | 无序，查找 O(1) 平均 |
+| `set` | 红黑树 | 有序去重 |
+
+## 实测：查找性能
+
+本机实测（10 万元素，各查 1000 次）：
+
+```text
+vector 线性查找(1000次): 8292 us
+vector 二分查找(1000次):   19 us
+map 查找(1000次):          24 us
+unordered_map(1000次):      2 us
+set 查找(1000次):          23 us
+```
+
+:::warning[差距非常显著]
+- **线性查找 vs 二分查找：436 倍**
+- **`unordered_map` 比 `map` 快 12 倍**（哈希 vs 树）
+:::
+
+### 解读
+
+| 容器 | 复杂度 | 何时用 |
+| --- | --- | --- |
+| `vector` 线性 | O(n) | 元素很少（< 几十个） |
+| `vector` 排序+二分 | O(log n) | **数据不变、要大量查找** |
+| `map` / `set` | O(log n) | **需要有序遍历** |
+| `unordered_map` | O(1) 平均 | **只要查找，不在乎顺序** |
+
+:::tip[重要结论：有序的 vector + 二分比 map 更快]
+```text
+vector 二分查找: 19 us
+map 查找:        24 us
+```
+
+**即使理论复杂度相同（都 O(log n)），`vector` 更快**——因为内存连续，CPU 缓存命中率高。
+
+**所以：如果数据插入/删除不频繁，用排序后的 `vector` 比 `map` 更好。**
+:::
+
+## 实测：中间插入
+
+```text
+--- 中间插入 100 次 ---
+vector: 544 us
+list:   4806 us
+```
+
+:::danger[list 反而慢了 8.8 倍！]
+理论上 `list` 中间插入是 O(1)，`vector` 是 O(n)，应该 `list` 快。
+
+**但实测 `list` 慢了近 9 倍。** 原因：
+
+1. **`list` 每次插入要 `new` 一个节点**（堆分配很慢）
+2. **内存不连续**，每次都要跳着访问，缓存命中率极低
+3. `vector` 的插入虽然要移动元素，但**连续内存的 `memmove` 极快**
+
+**教训：理论复杂度不等于实际性能。缓存友好性往往更重要。**
+:::
+
+:::tip[什么时候 list 才有优势]
+只有这些情况：
+
+- 元素**非常大**（移动成本高）
+- 已经持有**插入位置的迭代器**（不用遍历去找）
+- **频繁在任意位置插入删除**，且不在乎遍历性能
+
+**日常开发中，`list` 的使用场景比想象中少得多。**
+
+Google 的 C++ 风格指南明确说：**"不要用 `std::list`，除非有明确理由"**。
+:::
+
+## 完整选型表
+
+| 需求 | 选什么 |
+| --- | --- |
+| **默认** | `std::vector` |
+| 需要按下标随机访问 | `vector` |
+| 频繁末尾增删 | `vector` |
+| 需要有序 + 频繁查找 | `map` / `set` |
+| 只要快速查找，不在乎顺序 | `unordered_map` / `unordered_set` |
+| 频繁在中间插入删除 | 先考虑 `vector`，真的不行再 `list` |
+| 需要去重且有序 | `set` |
+| 需要先进先出 | `std::queue`（默认底层 `deque`） |
+| 需要后进先出 | `std::stack` |
+| 需要双端增删 | `std::deque` |
+
+:::danger[默认用 vector，这是 90% 场景的正确答案]
+```cpp
+std::vector<int> v;          /* 默认选它 */
+```
+
+**理由**：
+
+1. 内存连续 → 缓存友好 → 实际最快
+2. 随机访问 O(1)
+3. 内存开销最小（3 个指针 vs 每节点一分配）
+4. 迭代器最简单，不易出错
+
+**除非有具体理由，否则就用 `vector`。**
+:::
+
+## 各容器的关键操作
+
+### vector
+
+```cpp
+std::vector<int> v = {1, 2, 3};
+
+v.push_back(4);              /* O(1) 均摊 */
+v.pop_back();                /* O(1) */
+v[0];                        /* O(1) 不检查越界 */
+v.at(0);                     /* O(1) 检查越界 */
+v.insert(v.begin(), 0);      /* O(n) 要移动后面元素 */
+v.erase(v.begin());          /* O(n) */
+v.reserve(100);              /* 预留容量 */
+```
+
+### map / unordered_map
+
+```cpp
+std::map<std::string, int> m;
+
+m["key"] = 1;                /* O(log n)，键不存在会创建 */
+m.at("key");                 /* 不存在抛异常 */
+m.count("key");              /* 0 或 1，用于判断存在 */
+m.find("key");               /* 返回迭代器，找不到 = m.end() */
+m.erase("key");
+
+/* 遍历（有序） */
+for (const auto &[k, v] : m) { }
+```
+
+:::danger[用 `[]` 查找会意外插入]
+```cpp
+std::map<std::string, int> m;
+if (m["not_exist"] == 0) { }     /* ⚠️ 这里创建了 "not_exist" 条目！ */
+```
+
+**`[]` 在键不存在时会默认构造一个值**，map 就变大了。
+
+**判断存在用 `count()` 或 `find()`**：
+
+```cpp
+if (m.count("key")) { }           /* ✅ 不修改容器 */
+if (m.find("key") != m.end()) { }
+```
+
+（`unordered_map` 也一样。）
+:::
+
+### set
+
+```cpp
+std::set<int> s = {3, 1, 2};
+
+s.insert(4);                 /* O(log n) */
+s.count(2);                  /* 1，用于判断存在 */
+s.erase(2);
+
+/* 遍历是升序 */
+for (int x : s) { }          /* 1 3 4 */
+```
+
+## `vector` 删除多个元素
+
+:::danger[遍历时删除的经典错误]
+```cpp
+for (auto it = v.begin(); it != v.end(); ++it) {
+    if (*it < 0) v.erase(it);        /* ❌ it 失效 */
+}
+```
+
+**三种正确写法**：
+
+```cpp
+/* ① erase 返回下一个有效迭代器 */
+for (auto it = v.begin(); it != v.end(); ) {
+    if (*it < 0) it = v.erase(it);
+    else ++it;
+}
+
+/* ② erase-remove 惯用法（C++11 起） */
+v.erase(std::remove_if(v.begin(), v.end(),
+                       [](int x) { return x < 0; }), v.end());
+
+/* ③ C++20 一行搞定 */
+std::erase_if(v, [](int x) { return x < 0; });
+```
+
+**推荐 ③，其次 ②。**
+:::
+
+## 完整示例：选型对照
+
+```cpp
+#include <iostream>
+#include <vector>
+#include <map>
+#include <unordered_map>
+#include <algorithm>
+#include <string>
+
+int main() {
+    /* 场景一：普通数组，随机访问 */
+    std::vector<int> scores = {85, 92, 78};
+    scores.push_back(95);
+    std::sort(scores.begin(), scores.end());
+    std::cout << "最高分 " << scores.back() << "\n";
+
+    /* 场景二：需要按名字查（不在乎顺序）→ unordered_map */
+    std::unordered_map<std::string, int> by_name;
+    by_name["Alice"] = 88;
+    by_name["Bob"] = 92;
+
+    if (auto it = by_name.find("Alice"); it != by_name.end()) {
+        std::cout << "Alice: " << it->second << "\n";
+    }
+
+    /* 场景三：查询后要按姓名排序输出 → map */
+    std::map<std::string, int> sorted_scores;
+    for (const auto &[k, v] : by_name) sorted_scores[k] = v;
+
+    std::cout << "按姓名排序：\n";
+    for (const auto &[name, score] : sorted_scores) {
+        std::cout << "  " << name << ": " << score << "\n";
+    }
+
+    /* 场景四：大量查找但数据不变 → 排序 vector + 二分 */
+    std::vector<int> ids;
+    for (int i = 0; i < 10; i++) ids.push_back(i * 10);
+    std::sort(ids.begin(), ids.end());
+
+    bool found = std::binary_search(ids.begin(), ids.end(), 50);
+    std::cout << "50 存在？ " << (found ? "是" : "否") << "\n";
+
+    return 0;
+}
+```
+
+输出：
+
+```text
+最高分 95
+Alice: 88
+按姓名排序：
+  Alice: 88
+  Bob: 92
+50 存在？ 是
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 无脑用 `list` | 反而更慢 | 内存不连续 | 用 `vector` |
+| `map["x"]` 只查不改 | 容器变大 | `[]` 会插入 | 用 `count`/`find` |
+| 遍历时 `erase` | 崩溃 | 迭代器失效 | 用返回值或 `erase_if` |
+| `vector` 不做 `reserve` | 反复扩容 | 没预留 | 预估后 `reserve` |
+| 需要顺序却用 `unordered_map` | 输出乱序 | 哈希无序 | 用 `map` |
+| 查找多却用 `vector` 线性扫 | 慢 400 倍 | O(n) | 排序二分或用哈希 |
+
+## 本课自检
+
+- [ ] 知道五种容器的底层结构与复杂度
+- [ ] **记住实测结论：默认用 `vector`**
+- [ ] **知道排序 vector + 二分比 map 更快**
+- [ ] **知道 list 中间插入实际可能更慢（缓存问题）**
+- [ ] 会按"需不需要顺序"选 `map` 还是 `unordered_map`
+- [ ] **知道 `map["x"]` 只查找也会插入**
+- [ ] 会用 `count()` / `find()` 判断存在
+- [ ] 会三种正确删除多个元素的方法
+- [ ] 知道 `reserve` 能避免反复扩容
+
+## 下一步
+
+[18 STL 算法与 lambda](./18-algorithms) —— `sort`、`find`、`for_each` 加上匿名函数，代码能短一截。

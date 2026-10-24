@@ -1,0 +1,87 @@
+---
+id: boot-03
+title: "03 验证"
+sidebar_position: 4
+description: "启动流程全链 第 3 部分：验证"
+---
+
+# 03 验证
+```bash
+# === 本机可做的（实测）===
+
+# 1. 看内核启动参数
+cat /proc/cmdline
+tr ' ' '\n' < /proc/cmdline
+
+# 2. 看 /boot 里有什么
+ls -lh /boot/vmlinuz-$(uname -r) /boot/initrd.img-$(uname -r)
+file /boot/vmlinuz-$(uname -r)
+
+# 3. 看 initramfs 里有什么
+lsinitramfs /boot/initrd.img-$(uname -r) | head -20
+
+# 4. 启动耗时分析
+systemd-analyze
+systemd-analyze blame | head -10
+
+# 5. 内核启动里程碑
+dmesg | grep -iE "Kernel command line|Run .* as init|VFS: Mounted|EXT4-fs"
+
+# 6. PID 1 是谁
+ps -p 1 -o pid,comm=
+readlink /proc/1/exe
+
+# 7. 根文件系统怎么挂的
+findmnt -no SOURCE,FSTYPE,OPTIONS -T /
+cat /etc/fstab
+```
+
+## 常见坑
+
+| 症状 | 病根 |
+| --- | --- |
+| 串口全是乱码 | **波特率错**。115200 最常见，但 RK/全志部分板子是 1500000 |
+| 串口完全无输出 | BootROM 前的问题：供电不足、TX/RX 没交叉、SD 卡没烧好、拨码开关错 |
+| `Unable to read file zImage` | boot 分区里没这个文件，或分区号写错（`mmc 0:1` vs `0:2`） |
+| `Wrong Image Format` | `bootm`/`bootz`/`booti` 用错，或镜像没用 `mkimage` 包装 |
+| `Starting kernel ...` 后死寂 | `console=` 参数错，或串口驱动没匹配（dtb 不对），加 `earlyprintk` |
+| `VFS: Unable to mount root fs` | `root=` 写错，或存储驱动没编进内核 |
+| 卡在 "Waiting for root device" | 存储驱动缺失（编成了模块），或没加 `rootwait` |
+| `No working init found` | rootfs 里没有 `/sbin/init`，或 BusyBox 没拷进去 |
+| 进了 shell 但 `ls` 等命令不存在 | BusyBox 没装全，或没建符号链接/硬链接 |
+| 改了 U-Boot 环境变量重启后丢失 | **忘了 `saveenv`** |
+| 内核起来了但 dtb 不对（外设不工作） | U-Boot 加载的 dtb 与板子不匹配；检查 `fdtfile` 变量 |
+| 启动特别慢 | 用 `systemd-analyze blame` 找慢服务；或内核驱动 probe 慢（`initcall_debug`） |
+| `quiet` 导致看不到内核日志 | 去掉 `quiet`，加 `ignore_loglevel` |
+| 加了 `rootwait` 还是挂载失败 | 可能是设备名不对（用 `PARTUUID` 或 `UUID` 更稳） |
+| NFS 根文件系统挂载失败 | 网卡驱动必须是**编进内核**（不能是模块）；检查 `ip=` 参数与 NFS 服务端 |
+| 内核 panic 后板子不重启 | 加 `panic=5` 参数让它 5 秒后自动重启 |
+
+## 自检清单
+
+- [ ] 按顺序列出从上电到应用的 5~7 个阶段
+- [ ] 说出 BootROM 的特点（固化、不可改、无串口输出）
+- [ ] 解释 **SPL 为什么必须存在**（DRAM 鸡生蛋问题）
+- [ ] 说出 U-Boot 相对于 SPL 能提供什么（DRAM 可用后的完整能力）
+- [ ] 说出 `bootcmd` 和 `bootargs` 各自的作用
+- [ ] 解释 `rootwait` 的必要性
+- [ ] 说出 `console=ttyS0,115200` 各部分含义
+- [ ] 说出 zImage / uImage / Image 的区别
+- [ ] 解释 **initramfs 解决什么问题**（驱动模块在根文件系统里的死锁）
+- [ ] 说出 initrd 与 initramfs 的区别
+- [ ] 看着 dmesg 说出 `Run /init as init process` 意味着什么
+- [ ] 说出内核找 init 程序的顺序
+- [ ] 日志停在 `Starting kernel ...` 之后无输出，该往哪个方向查
+- [ ] 说出 `VFS: Unable to mount root fs` 的三种常见原因
+- [ ] 说出排查启动卡住的"二分法"具体做法
+- [ ] 说出 `systemd-analyze blame` 的用途
+- [ ] 说出 `earlyprintk`、`ignore_loglevel`、`initcall_debug` 各自的用途
+
+## 下一步
+
+- [根文件系统](./rootfs)——内核起来了要挂载的那个 rootfs 是怎么做出来的
+- [内核与驱动入门](./kernel)——内核启动后干了什么（驱动 probe）
+
+---
+
+**翻页**：[← 上一页](./boot-02) · [返回目录](./)

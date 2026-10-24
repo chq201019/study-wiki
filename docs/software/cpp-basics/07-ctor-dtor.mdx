@@ -1,0 +1,370 @@
+---
+id: 07-ctor-dtor
+title: 07 构造函数与析构函数
+sidebar_position: 7
+description: 构造函数的写法与初始化列表、构造与析构的顺序、为什么必须用初始化列表，以及 RAII 的雏形。
+---
+
+# 07 构造函数与析构函数
+
+**本课目标**：掌握对象的创建与销毁，理解初始化列表为什么重要。
+
+## 构造函数：对象出生时调用
+
+```cpp
+class Account {
+public:
+    Account(std::string owner, double balance = 0.0)
+        : owner_(std::move(owner)), balance_(balance) {      /* 初始化列表 */
+        /* 函数体可以为空 */
+    }
+
+private:
+    std::string owner_;
+    double balance_;
+};
+
+Account a("Alice", 100);        /* 创建时自动调用 */
+```
+
+**构造函数的特点**：
+
+- 名字和类名相同
+- **没有返回类型**（连 `void` 都不写）
+- 创建对象时**自动调用**
+- 可以有多个（重载）
+
+## 初始化列表：为什么必须用
+
+```cpp
+/* ❌ 在函数体里赋值 */
+Account(std::string owner) {
+    owner_ = owner;              /* 这是"赋值"，不是"初始化" */
+}
+
+/* ✅ 初始化列表 */
+Account(std::string owner) : owner_(owner) { }
+```
+
+:::danger[不用初始化列表会多一次操作]
+对于 `std::string` 这样的类型：
+
+```cpp
+/* 函数体赋值的过程： */
+/* ① 先调用 string 的默认构造（创建空字符串） */
+/* ② 再调用 operator= （赋值） */
+
+/* 初始化列表的过程： */
+/* ① 直接调用 string 的拷贝/移动构造 */
+```
+
+**函数体赋值 = 默认构造 + 赋值 = 两步**
+**初始化列表 = 直接构造 = 一步**
+:::
+
+### 有些成员必须用初始化列表
+
+```cpp
+class Foo {
+public:
+    Foo(int n, int &ref) : num_(n), ref_(ref) { }
+
+private:
+    const int num_;          /* const 成员必须初始化 */
+    int &ref_;               /* 引用成员必须绑定 */
+};
+```
+
+**`const` 成员和引用成员无法在函数体里赋值**，只能用初始化列表。
+
+### 成员初始化顺序 = 声明顺序
+
+:::danger[这是初始化列表最隐蔽的坑]
+```cpp
+class Bad {
+public:
+    Bad(int v) : b_(v), a_(b_) { }      /* 看起来先 b 后 a */
+
+private:
+    int a_;
+    int b_;
+};
+```
+
+**实际顺序由声明顺序决定**：`a_` 先初始化（用 `b_`，但 `b_` 还没初始化！），然后才是 `b_`。
+
+**结果是未定义行为。**
+:::
+
+:::warning[编译器会警告]
+```text
+warning: field 'b_' will be initialized after field 'a_'
+```
+
+**规矩：初始化列表的顺序要和成员声明顺序一致**，否则容易出 bug。
+
+（这也是为什么建议一个成员一行声明，别挤在一起。）
+:::
+
+## 构造与析构的顺序
+
+本机实测：
+
+```cpp
+class Member { public: Member() { std::cout << "Member 构造\n"; } };
+
+class A {
+public:
+    A() { std::cout << "A 构造体\n"; }
+    ~A() { std::cout << "A 析构\n"; }
+private:
+    Member m_;              /* 成员对象 */
+};
+```
+
+输出：
+
+```text
+  Member 默认构造          ← 先构造成员
+  A 构造体                ← 再执行构造函数的函数体
+  A 析构                  ← 析构
+```
+
+:::tip[顺序规则]
+**构造**：基类 → 成员变量（按声明顺序）→ 自己的构造函数体
+
+**析构**：与构造**完全相反**：自己的析构函数体 → 成员变量（逆序）→ 基类
+
+**为什么析构要反过来**：因为后面的依赖前面的（先建的地基，最后拆）。
+:::
+
+## 析构函数：对象死亡时调用
+
+```cpp
+class FileHandle {
+public:
+    explicit FileHandle(const char *path) {
+        fp_ = std::fopen(path, "r");         /* 构造时打开 */
+    }
+
+    ~FileHandle() {
+        if (fp_) std::fclose(fp_);           /* 析构时自动关闭 */
+    }
+
+private:
+    std::FILE *fp_ = nullptr;
+};
+```
+
+**析构函数的特点**：
+
+- 名字是 `~类名`
+- 没有参数、没有返回类型
+- **不能重载**（只能有一个）
+- 离开作用域时**自动调用**
+
+:::tip[这就是 RAII 的雏形]
+```cpp
+{
+    FileHandle f("data.txt");
+    /* 用 f 读文件... */
+}   /* 出作用域，f 自动关闭文件 */
+```
+
+**不管中间是否 `return`、是否抛异常，析构都会执行**——文件一定会被关。
+
+**这是 C++ 最强大的设计**，第 12 课专门讲。
+:::
+
+## 默认构造函数
+
+如果你不写任何构造函数，编译器会生成一个**默认构造函数**（无参数）：
+
+```cpp
+class Empty {
+    int x_;                  /* 注意：内置类型不会被初始化！ */
+};
+
+Empty e;                     /* 调默认构造，x_ 是垃圾值 */
+```
+
+:::danger[成员没初始化就是垃圾值]
+```cpp
+class Point {
+public:
+    int x, y;                /* 没有初始化 */
+};
+
+Point p;                     /* p.x 和 p.y 是垃圾值 */
+```
+
+**在类内直接给默认值**（C++11）：
+
+```cpp
+class Point {
+public:
+    int x = 0;               /* 有默认值 */
+    int y = 0;
+};
+
+Point p;                     /* p.x = 0, p.y = 0 */
+```
+
+**规矩：所有成员都在声明处给默认值，或在构造函数里初始化。**
+:::
+
+### 一旦写了构造函数，默认的就没有了
+
+```cpp
+class A {
+public:
+    A(int x) { }             /* 写了带参构造 */
+};
+
+A a;                         /* ❌ 编译错：没有默认构造函数了 */
+A b(1);                      /* ✅ */
+```
+
+想要两者都有：
+
+```cpp
+class A {
+public:
+    A() = default;           /* 显式要求编译器生成默认构造 */
+    A(int x) { }
+};
+```
+
+## 用 `explicit` 防止隐式转换
+
+:::danger[单参数构造函数会隐式转换]
+```cpp
+class Vector {
+public:
+    Vector(int size) { }     /* 单参数构造 */
+};
+
+Vector v = 10;               /* ⚠️ 居然合法！等价于 Vector v(10); */
+```
+
+**这会带来意外**：
+
+```cpp
+void print(Vector v);
+print(10);                   /* ⚠️ 隐式转成了 Vector(10) */
+```
+
+**加 `explicit` 禁止隐式转换**：
+
+```cpp
+explicit Vector(int size) { }
+
+Vector v = 10;               /* ❌ 现在编译错 */
+Vector v(10);                /* ✅ 必须显式 */
+```
+
+**规矩：单参数构造函数一律加 `explicit`**，除非你确实想要隐式转换。
+:::
+
+## 完整示例
+
+```cpp
+#include <iostream>
+#include <string>
+#include <vector>
+
+class Student {
+public:
+    /* 初始化列表，顺序与声明一致 */
+    explicit Student(std::string name, int score = 0)
+        : name_(std::move(name)), score_(score) {
+        std::cout << "创建 " << name_ << "\n";
+    }
+
+    ~Student() {
+        std::cout << "销毁 " << name_ << "\n";
+    }
+
+    const std::string &name() const { return name_; }
+    int score() const { return score_; }
+
+    void set_score(int s) {
+        if (s >= 0 && s <= 100) score_ = s;
+    }
+
+private:
+    std::string name_;
+    int score_ = 0;          /* 类内默认值作为兜底 */
+};
+
+int main() {
+    std::cout << "--- 栈对象 ---\n";
+    {
+        Student s("Alice", 88);
+        s.set_score(92);
+        std::cout << s.name() << ": " << s.score() << "\n";
+    }
+
+    std::cout << "--- 容器里的对象 ---\n";
+    {
+        std::vector<Student> list;
+        list.emplace_back("Bob", 75);
+        list.emplace_back("Carol", 80);
+        std::cout << "共 " << list.size() << " 个学生\n";
+    }
+
+    std::cout << "--- 程序结束 ---\n";
+    return 0;
+}
+```
+
+输出：
+
+```text
+--- 栈对象 ---
+创建 Alice
+Alice: 92
+销毁 Alice
+--- 容器里的对象 ---
+创建 Bob
+创建 Carol
+销毁 Bob
+共 2 个学生
+销毁 Carol
+销毁 Bob
+--- 程序结束 ---
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 成员未初始化 | 垃圾值 | 内置类型不自动初始化 | 类内给默认值 |
+| 初始化列表顺序与声明不符 | 警告/UB | 实际按声明顺序 | 保持一致 |
+| `const`/引用成员在函数体赋值 | 编译错 | 只能初始化 | 用初始化列表 |
+| 单参数构造不加 `explicit` | 意外隐式转换 | 编译器自动转换 | 加 `explicit` |
+| 写了带参构造还 `A a;` | 编译错 | 默认构造没了 | `A() = default;` |
+| 析构里抛异常 | 可能 terminate | 析构不该抛 | 析构里吞掉异常 |
+
+:::danger[析构函数里不要抛异常]
+析构函数在栈展开（处理另一个异常）时被调用，此时再抛异常会导致程序直接 `std::terminate` 终止。
+
+**规矩：析构函数里绝不抛异常**，出错就记录日志。
+:::
+
+## 本课自检
+
+- [ ] 会写构造函数（名字=类名，无返回类型）
+- [ ] **知道要用初始化列表而不是函数体赋值**
+- [ ] 知道 `const` 成员和引用成员必须用初始化列表
+- [ ] **知道成员初始化顺序由声明顺序决定**
+- [ ] 会写析构函数 `~类名()`
+- [ ] 知道构造顺序（基类→成员→函数体）和析构顺序（相反）
+- [ ] 知道成员没初始化就是垃圾值
+- [ ] 会用 `= default` 保留默认构造
+- [ ] **知道单参数构造要加 `explicit`**
+- [ ] 知道析构里不该抛异常
+
+## 下一步
+
+[08 拷贝构造与赋值](./08-copy) —— 对象复制时会发什么，以及为什么有时必须自己写。

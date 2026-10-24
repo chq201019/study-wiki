@@ -1,0 +1,369 @@
+---
+id: 16-grep-sed-awk
+title: 16 文本处理三剑客
+sidebar_position: 16
+description: grep 筛行、sed 改行、awk 逐字段处理，以及日志分析中真正用得上的组合。
+---
+
+# 16 文本处理三剑客
+
+**本课目标**：会 `grep` 筛、`sed` 改、`awk` 算，能写出实用的日志分析管道。
+
+## 三者分工
+
+| 工具 | 干什么 | 一句话 |
+| --- | --- | --- |
+| **`grep`** | **筛选行** | 找出匹配的行 |
+| **`sed`** | **编辑行** | 替换、删除、插入 |
+| **`awk`** | **处理字段** | 按列计算、格式化输出 |
+
+```bash
+命令 | grep 条件 | sed 修改 | awk 统计
+```
+
+## `grep`：筛选行
+
+```bash
+grep "error" app.log                # 含 error 的行
+grep -i "error" app.log             # 忽略大小写
+grep -c "error" app.log             # 只输出行数
+grep -v "error" app.log             # 反向（不含 error）
+grep -n "error" app.log             # 带行号
+grep -r "error" /var/log/           # 递归目录
+```
+
+### 正则表达式
+
+```bash
+grep -E "error|fail" app.log        # 或
+grep "^ERROR" app.log               # 行首
+grep "done$" app.log                # 行尾
+grep "[0-9]\+" app.log              # 一个或多个数字
+```
+
+本机实测：
+
+```bash
+grep -E 'a|c' t.txt
+# a 1
+# c 3
+```
+
+:::tip[`grep -E` 和 `egrep`]
+```bash
+grep -E "a|b"       # ✅ 现代写法（POSIX 扩展正则）
+egrep "a|b"         # ⚠️ 已废弃
+grep "a\|b"         # ✅ 基础正则里 `\|` 表示或
+```
+
+**推荐 `grep -E`**——`|` 不用转义，可读性好。
+:::
+
+### 只输出匹配的部分
+
+```bash
+grep -o "error[0-9]*" app.log       # 只打印匹配到的片段
+```
+
+### 前后文
+
+```bash
+grep -A 3 "error" app.log           # 后面 3 行
+grep -B 3 "error" app.log           # 前面 3 行
+grep -C 3 "error" app.log           # 前后各 3 行
+```
+
+:::tip[`-C` 看日志错的重要]
+日志里错误行往往带**堆栈信息在后面几行**。
+
+```bash
+grep -C 5 "Exception" app.log | less
+```
+
+**比只看错误那一行有用得多。**
+:::
+
+## `sed`：编辑行
+
+### 替换
+
+```bash
+sed 's/old/new/' file               # 每行第一个
+sed 's/old/new/g' file              # 每行全部（global）
+sed 's/old/new/2' file              # 每行第 2 个
+sed -i 's/old/new/g' file           # **直接改文件**
+```
+
+本机实测：
+
+```bash
+sed 's/b/BB/' t.txt
+# a 1
+# BB 2
+# c 3
+```
+
+:::danger[`-i` 直接改文件，没有撤销]
+```bash
+sed -i 's/foo/bar/g' important.conf
+```
+
+**改错了没法恢复。**
+
+**安全做法**：先不带 `-i` 看一眼输出：
+
+```bash
+sed 's/foo/bar/g' important.conf | less     # 预览
+sed -i.bak 's/foo/bar/g' important.conf     # 改的同时备份成 .bak
+```
+:::
+
+### 按行操作
+
+```bash
+sed -n '2p' file                    # 只打印第 2 行
+sed '1d' file                       # 删除第 1 行
+sed '1,5d' file                     # 删除 1-5 行
+sed -n '10,20p' file                # 打印 10-20 行
+```
+
+本机实测：
+
+```text
+sed -n '2p'  →  b 2
+sed '1d'     →  b 2 / c 3
+```
+
+:::tip[`-n` 和 `p` 必须配对]
+```bash
+sed -n '2p'         # ✅ 只输出第 2 行
+sed '2p'            # ❌ 每行都输出，第 2 行输出两次
+```
+
+`sed` 默认会打印所有行。`-n` 关掉默认输出，`p` 才显式打印。
+:::
+
+### 删除空行
+
+```bash
+sed '/^$/d' file                    # 删空行
+sed '/^[[:space:]]*$/d' file        # 删纯空白行
+```
+
+## `awk`：处理字段
+
+### 基本结构
+
+```text
+awk '模式 {动作}' 文件
+```
+
+```bash
+awk '{print $1}' file               # 打印第 1 列
+awk '{print $1, $3}' file           # 打印 1、3 列
+awk '{print NR": "$0}' file         # 带行号
+```
+
+| 变量 | 含义 |
+| --- | --- |
+| `$0` | 整行 |
+| `$1` `$2` ... | 第 1、2 列 |
+| `NF` | **当前行有多少列** |
+| `NR` | **当前行号** |
+| `FS` | 输入分隔符（默认空格） |
+
+本机实测：
+
+```bash
+awk '{print $2}' t.txt
+# 1
+# 2
+# 3
+```
+
+### 计算
+
+```bash
+awk '{s+=$2} END {print s}' t.txt          # 求和
+awk '{s+=$2} END {print s/NR}' t.txt       # 平均
+awk 'BEGIN{max=0} $1>max{max=$1} END{print max}' file   # 最大值
+```
+
+本机实测（`a 1 / b 2 / c 3`）：
+
+```bash
+awk '{s+=$2} END {print s}' t.txt
+# 6
+```
+
+### 条件筛选
+
+```bash
+awk '$2 > 1 {print $1}' t.txt              # 第 2 列大于 1 的行
+awk 'NR > 10' file                         # 第 10 行之后
+awk '/error/ {print $0}' file              # 含 error 的行
+```
+
+本机实测：
+
+```bash
+awk '$2 > 1 {print $1}' t.txt
+# b
+# c
+```
+
+### 指定分隔符
+
+```bash
+awk -F: '{print $1}' /etc/passwd           # 用 : 分隔
+awk -F, '{print $2}' data.csv              # CSV
+```
+
+:::tip[`/etc/passwd` 是最经典的练习]
+```bash
+awk -F: '{print $1}' /etc/passwd           # 所有用户名
+awk -F: '$3 >= 1000 {print $1}' /etc/passwd  # uid >= 1000 的（普通用户）
+```
+
+**系统里 `uid >= 1000` 的一般是真实用户**，小于的是系统账户。
+:::
+
+## 实战组合
+
+### ① 统计日志里各状态码数量
+
+```bash
+awk '{print $9}' access.log | sort | uniq -c | sort -rn
+```
+
+### ② 找访问量最大的 10 个 IP
+
+```bash
+awk '{print $1}' access.log | sort | uniq -c | sort -rn | head -10
+```
+
+:::tip[这个管道每一步在干什么]
+```text
+awk '{print $1}'      → 取出第 1 列（IP）
+sort                  → 排序（让相同 IP 相邻）
+uniq -c               → 相邻重复的计数
+sort -rn              → 按数字倒序
+head -10              → 取前 10
+```
+
+**`uniq` 必须配合 `sort`**（[第 6 课](./06-view)讲过）。
+:::
+
+### ③ 找错误并看上下文
+
+```bash
+grep -C 3 -i "error" app.log | less
+```
+
+### ④ 提取特定时间段日志
+
+```bash
+awk '$0 >= "2024-01-01 10:00" && $0 <= "2024-01-01 11:00"' app.log
+```
+
+### ⑤ 批量重命名（`sed` + `for`）
+
+```bash
+for f in *.txt; do
+    mv "$f" "$(echo "$f" | sed 's/old/new/')"
+done
+```
+
+### ⑥ 统计某字段总和
+
+```bash
+awk -F, 'NR>1 {s+=$3} END {printf "总计: %.2f\n", s}' data.csv
+```
+
+## 三者怎么选
+
+:::tip[实用判断]
+| 需求 | 用什么 |
+| --- | --- |
+| 找出符合条件的行 | **`grep`** |
+| 替换文本 | **`sed`** |
+| 按列取值/求和/格式化 | **`awk`** |
+| 复杂逻辑（多条件分支） | **写成脚本**（Python/bash） |
+:::
+
+:::warning[别把 awk 写成程序]
+```bash
+awk 'BEGIN{...} {...复杂逻辑...} END{...}'    # ⚠️ 超过 2 行就该换工具
+```
+
+**awk 适合"一行搞定的数据处理"**。逻辑一复杂，用 Python 更清晰。
+:::
+
+## 完整示例
+
+```bash
+# 造一份测试数据
+cat > /tmp/sales.csv << 'EOF'
+name,price,qty
+apple,5,10
+banana,3,20
+cherry,8,5
+EOF
+
+# ① 去掉表头
+sed '1d' /tmp/sales.csv
+
+# ② 取第 2 列
+awk -F, 'NR>1 {print $2}' /tmp/sales.csv
+
+# ③ 算总价 = price * qty
+awk -F, 'NR>1 {s += $2*$3} END {print "总价:", s}' /tmp/sales.csv
+
+# ④ 找单价大于 4 的
+awk -F, 'NR>1 && $2 > 4 {print $1}' /tmp/sales.csv
+
+# ⑤ 把 apple 换成 Apple
+sed 's/apple/Apple/' /tmp/sales.csv
+
+# ⑥ 组合：单价降序
+awk -F, 'NR>1 {print $2, $1}' /tmp/sales.csv | sort -rn
+```
+
+输出（第 ③ 步）：
+
+```text
+总价: 150
+```
+
+（5×10 + 3×20 + 8×5 = 50 + 60 + 40 = 150）
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `sed '2p'` 输出两遍 | 每行都打印 | 没加 `-n` | `sed -n '2p'` |
+| `-i` 改错没法恢复 | 文件坏了 | 没备份 | `-i.bak` |
+| `uniq` 不去重 | 还有重复 | 没先 sort | `sort \| uniq` |
+| `awk` 取不到列 | 分隔符不对 | 默认空格 | `-F,` 指定 |
+| `grep` 正则不生效 | 用了扩展语法 | 基础正则不支持 | 加 `-E` |
+| 中文被 `awk` 切错 | 多字节字符 | `$1` 按字节/字符 | 检查 locale |
+| 通配符在引号外 | 提前展开 | shell 先处理 | 加引号 |
+
+## 本课自检
+
+- [ ] 分清 `grep` / `sed` / `awk` 的职责
+- [ ] 会用 `grep -i -c -v -n -r -o`
+- [ ] **会用 `grep -C` 看上下文**
+- [ ] **知道 `grep -E` 比 `egrep` 更推荐**
+- [ ] 会用 `sed 's/a/b/g'` 替换
+- [ ] **知道 `-i` 危险，要 `-i.bak` 备份**
+- [ ] **知道 `sed -n '2p'` 必须配对**
+- [ ] 会用 `awk '{print $1}'` 取列
+- [ ] 会用 `awk -F,` 指定分隔符
+- [ ] 会用 `awk` 求和、平均、条件筛选
+- [ ] 记得 `NR`（行号）和 `NF`（列数）
+- [ ] 能写出 `awk | sort | uniq -c | sort -rn | head` 这个日志分析管道
+
+## 下一步
+
+[17 Shell 脚本入门](./17-shell) —— 把命令组合成可复用的脚本。

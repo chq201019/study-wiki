@@ -1,0 +1,318 @@
+---
+id: troubleshoot
+title: 系统故障排查
+sidebar_position: 21
+description: 机器起不来、变慢、磁盘满、服务不启动、网络不通——五类常见故障的系统化排查顺序，以及每条命令该看哪一列。
+---
+
+# 系统故障排查
+
+**本课目标**：面对"机器不对了"有一套可执行的顺序，而不是乱试。
+
+## 万能第一步：先看整体
+
+```bash
+uptime                  # 负载
+free -h                 # 内存
+df -h /                 # 磁盘
+systemctl --failed      # 失败的服务
+journalctl -p err -b    # 本次启动以来的错误
+dmesg -T | tail -50     # 内核最近的日志
+```
+
+:::tip[`uptime` 的负载数字要结合核数看]
+```text
+load average: 8.00, 6.50, 5.20
+
+核数 = nproc = 4   → 负载 8 意味着队列长度是核数的 2 倍 → 明显过载
+核数 = 16          → 负载 8 完全正常
+```
+
+**三个数字分别是 1/5/15 分钟平均值。** 上升趋势比绝对值更重要。
+:::
+
+## 场景一：机器起不来
+
+:::info[排查顺序（从硬件往软件）]
+```text
+① 有电吗？风扇转吗？指示灯？
+② 屏幕有输出吗？
+   ├─ 完全没输出 → 电源 / 主板 / 内存
+   ├─ 有 BIOS 但停在自检 → 硬件自检失败（看报错）
+   └─ 进了 GRUB 但进不去系统 → 见下
+③ 进恢复模式（GRUB 里选 recovery 或在 kernel 行加 single）
+```
+
+**进恢复模式后在 kernel 参数行末尾加**：
+
+```text
+systemd.unit=rescue.target        # 单用户，只挂根分区
+rd.break                          # 更早：initramfs 阶段就中断
+```
+:::
+
+:::danger[最常见：磁盘满 / fstab 写错导致起不来]
+**`fstab` 里写了一个不存在的设备** → 启动卡在 `emergency mode`。
+
+```bash
+# 进去后
+mount -o remount,rw /            # 根分区默认只读，先重挂可写
+vi /etc/fstab                    # 改掉错的条目，或加 nofail
+```
+
+**给非关键挂载加 `nofail`，这样它挂不上也不阻塞启动**：
+
+```text
+UUID=xxxx /data ext4 defaults,nofail 0 2
+```
+:::
+
+**磁盘满导致起不来**：
+
+```bash
+df -h /                    # 确认哪个分区满
+journalctl --vacuum-size=200M     # 清日志
+rm -rf /var/cache/*        # 清缓存（注意别删正在用的）
+```
+
+:::warning[根分区满时很多命令会"莫名失败"]
+写不了临时文件、`systemctl` 报错、`sshd` 无法创建会话 —— **都可能是磁盘满引起的**。
+
+**所以"任何奇怪故障"都先 `df -h` 一下。**
+:::
+
+## 场景二：系统变慢
+
+```bash
+# ① 谁在吃 CPU
+top -b -n1 | head -15
+pidstat -p ALL 1 5          # 按进程看 user/sys/iowait
+
+# ② 是不是在等 IO
+vmstat 1 5                  # 看 wa 列和 b 列
+iostat -x 1 5               # 看 %util 和 await
+
+# ③ 内存压力
+free -h ; vmstat 1 5        # 看 si/so（swap 换入换出）
+
+# ④ 定位到具体进程
+perf top -p <pid>           # 或 perf record -g
+```
+
+:::tip[区分三种"慢"]
+| 症状 | 判定 | 方向 |
+| --- | --- | --- |
+| `us` 高（用户态） | CPU 在算 | `perf` 找热点函数 |
+| `sy` 高（内核态） | 系统调用频繁 | `strace -c` 看哪个调用 |
+| **`wa` 高（等 IO）** | **磁盘慢** | `iostat` / `iotop` |
+| `si`/`so` 非 0 | 内存不足在换页 | 加内存或减负载 |
+
+**`us + sy + wa + id ≈ 100`** —— 先把这块分解清楚再动手。
+:::
+
+:::danger[负载高但 CPU 空闲 = 在做不可中断 IO]
+```text
+load average: 12.00   ← 很高
+top: %Cpu(s): 2.0 us, 1.0 sy, 0.0 wa, 96.0 id   ← CPU 几乎空闲
+```
+
+**这种"负载高但 CPU 闲"的经典原因：大量进程卡在 `D` 状态（不可中断睡眠）**，通常是磁盘或 NFS 故障。
+
+```bash
+ps -eo state,pid,comm | awk '$1=="D"'      # 找出 D 状态进程
+```
+
+**`D` 状态的进程连 `kill -9` 都杀不掉** —— 只能等 IO 完成或修好设备。
+:::
+
+## 场景三：磁盘满了
+
+```bash
+df -h / ; df -i /                       # 空间还是 inode？
+
+# 找大目录
+du -h -x --max-depth=1 / 2>/dev/null | sort -rh | head
+
+# 找大文件
+find / -xdev -type f -size +500M -exec ls -lh {} + 2>/dev/null
+
+# 关键：找"已删除但仍被打开"的文件
+lsof +L1 2>/dev/null | head
+```
+
+:::tip[`df` 满了但 `du` 找不到时]
+**99% 是"文件被删了但进程还开着 fd"**。
+
+```bash
+lsof +L1 | grep deleted
+# 清那个 fd（不重启进程）
+: > /proc/<pid>/fd/<n>
+```
+
+**或者重启对应进程。**
+:::
+
+:::danger[清日志的正确方式]
+```bash
+rm /var/log/app.log              # ❌ 空间可能不释放
+: > /var/log/app.log             # ✅ 清空内容，inode 不变
+```
+
+**另外**：
+
+```bash
+journalctl --vacuum-time=7d      # 只保留 7 天
+journalctl --vacuum-size=500M    # 限制总大小
+```
+:::
+
+## 场景四：服务起不来
+
+```bash
+systemctl status myservice              # 先看退出码
+journalctl -u myservice -n 100 --no-pager
+systemctl cat myservice                 # 看实际生效的配置（含默认值）
+systemd-analyze verify /etc/systemd/system/myservice.service
+```
+
+:::tip[按退出码快速定位]
+| 退出码 | 含义 |
+| --- | --- |
+| **203/EXEC** | 可执行文件不存在 / 没执行权限 / **shebang 有 CRLF** |
+| 200/CHDIR | `WorkingDirectory` 不存在 |
+| 226/NAMESPACE | 沙箱/命名空间配置错 |
+| 1 | 程序自己返回 1（看它自己的日志） |
+| `signal=TERM` | 被 SIGTERM 杀（可能是 OOM 或手动） |
+:::
+
+```bash
+# 手动跑 ExecStart 那条命令，看是不是程序本身的问题
+sudo -u <User> /path/to/binary --args
+
+# 看是不是端口被占
+ss -tlnp | grep :8080
+
+# 看是不是权限/路径
+namei -l /path/to/binary
+```
+
+:::warning[`status` 里的 "Loaded" 和 "Active" 都要看]
+```text
+Loaded: loaded (/etc/systemd/system/x.service; enabled; preset: enabled)
+        ↑ 路径对不对、是否 enabled
+Active: failed (Result: exit-code) since ...
+        ↑ 当前状态与原因
+```
+
+**"enabled 但 inactive" = 开机启动但当前没跑** → 说明启动时失败或被人为停了。
+:::
+
+## 场景五：网络不通
+
+:::tip[分层排查，别一上来就抓包]
+```bash
+# ① 链路层：网卡 UP 吗？有 IP 吗？
+ip link show
+ip addr show
+
+# ② 路由：网关对吗？能到目标网段吗？
+ip route
+ip route get 8.8.8.8
+
+# ③ 邻居：ARP 能解析吗？
+ip neigh
+
+# ④ 连通性：能不能到？
+ping -c2 8.8.8.8              # IP 层
+ping -c2 example.com          # 顺带测 DNS
+
+# ⑤ 端口：目标端口开着吗？
+nc -zv host 22
+ss -tlnp | grep :22           # 本机监听情况
+
+# ⑥ 应用层
+curl -v https://example.com
+dig example.com
+```
+
+**逐层确认，找到第一个不通的层次就是问题所在。**
+:::
+
+| 现象 | 最可能原因 |
+| --- | --- |
+| `ping` 通但域名不通 | **DNS**（`/etc/resolv.conf`） |
+| 本机能连、别的机器不能 | **防火墙**（`nft list ruleset` / `iptables -L`） |
+| `Connection refused` | 服务没监听 / 只听 127.0.0.1 |
+| `Connection timed out` | 防火墙 DROP / 路由不通 |
+| 时通时不通 | 丢包 / 双网卡路由冲突 / MTU |
+| 连上就断 | MTU 不匹配（VPN 常见） |
+
+:::danger[`ping` 通不代表端口通]
+ICMP 和 TCP 是两回事，防火墙常常"放 ICMP 但封 TCP"。
+
+**必须用 `nc -zv host port` 或 `curl` 测实际端口。**
+:::
+
+## 万能诊断包
+
+:::tip[一次性收集所有信息，便于求助或事后分析]
+```bash
+{
+  date
+  uptime
+  free -h
+  df -h
+  df -i /
+  systemctl --failed --no-pager
+  journalctl -p err -b --no-pager | tail -100
+  dmesg -T | tail -100
+  ss -s
+  ps aux --sort=-rss | head -15
+} > /tmp/diag-$(date +%s).txt 2>&1
+```
+
+**出问题时先跑一遍存下来** —— 事后系统状态就变了，原始信息最值钱。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 任何奇怪故障 | **磁盘满** | **先 `df -h`** |
+| 负载高 CPU 闲 | 进程卡 `D` 状态 | 查磁盘/NFS |
+| 起不来卡 emergency | fstab 有错条目 | 加 `nofail` 或修正 |
+| 清日志空间没释放 | 文件被进程打开 | `: > file` 或重启进程 |
+| 服务 203/EXEC | 路径/权限/CRLF | `namei -l`、`file` |
+| `ping` 通但端口不通 | 防火墙只放 ICMP | 用 `nc` 测端口 |
+| 时通时不通 | MTU / 双网卡 | `ping -M do -s 1400` 测 MTU |
+| 重启后服务没起 | 没 `enable` | `systemctl enable` |
+
+:::tip[怀疑 MTU 问题时]
+```bash
+ping -M do -s 1472 -c2 8.8.8.8      # 1500 - 28 = 1472
+# 不通就往下试 1400、1300
+```
+
+**VPN / 隧道环境经常需要调小 MTU。**
+:::
+
+## 本课自检
+
+- [ ] 会用"万能第一步"五条命令建立全貌
+- [ ] **知道 `uptime` 负载要除以核数来判断**
+- [ ] 会用 GRUB 恢复模式 / `rd.break` 救起不来的系统
+- [ ] **知道给非关键挂载加 `nofail` 防止卡启动**
+- [ ] **知道"任何奇怪故障先 `df -h`"**
+- [ ] 能分解 `us/sy/wa/id` 判断慢在哪
+- [ ] **知道"负载高但 CPU 空闲"通常是 `D` 状态进程**
+- [ ] 会用 `lsof +L1` 找"删除但仍被打开"的文件
+- [ ] **知道清日志用 `: > file` 而非 `rm`**
+- [ ] 会按退出码定位服务启动失败（尤其 `203/EXEC`）
+- [ ] 会按链路→路由→邻居→连通→端口→应用六层排查网络
+- [ ] **知道 `ping` 通不代表端口通**
+- [ ] 会用 `ping -M do -s` 测 MTU
+- [ ] 会跑"万能诊断包"一次性收集信息
+
+## 下一步
+
+[性能分析：perf 与火焰图](./performance) 或 [内存管理深入](./memory-deep)。

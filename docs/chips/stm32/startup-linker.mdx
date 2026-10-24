@@ -1,0 +1,312 @@
+---
+id: startup-linker
+title: "09 启动流程与链接脚本"
+sidebar_position: 9
+description: 从上电到 main() 之间到底发生了什么、.data 和 .bss 怎么处理、链接脚本怎么读怎么改、栈和堆的大小在哪配置。
+---
+
+# 09 启动流程与链接脚本
+
+**本课目标**：看得懂启动文件和 `.ld` 文件，知道变量在内存里的位置。
+
+## 从上电到 main()
+
+```text
+上电 / 复位
+   ↓
+① 硬件从 0x08000000 读出前 4 字节 → 装进 MSP（栈指针）
+   ↓
+② 从 0x08000004 读出 Reset_Handler 地址 → 跳过去
+   ↓
+③ Reset_Handler（启动文件里，汇编）：
+     a. 把 .data 段从 Flash 拷到 RAM
+     b. 把 .bss 段清零
+     c. 调 SystemInit()
+     d. 调 __libc_init_array()（C++ 全局构造）
+     e. 跳 main()
+   ↓
+④ main()
+```
+
+:::danger[前 4 字节是栈顶值，不是代码地址]
+```text
+0x08000000: 0x20005000   ← 栈顶地址（SRAM 高地址）
+0x08000004: 0x080001C1   ← Reset_Handler 地址（注意末位是 1）
+```
+
+**末位那个 1 是 Thumb 模式标志**——Cortex-M 只支持 Thumb 指令集，地址最低位必须为 1。
+
+**如果你自己跳转到应用，写的是 `0x08010000` 但读到的是 `0x08010001`，这是正常的。**
+:::
+
+## 为什么 .data 要拷、.bss 要清零
+
+:::info[三种变量，三种存放方式]
+| 段 | 内容 | 初值 | 运行时位置 |
+| --- | --- | --- | --- |
+| `.text` | 代码、常量 | — | **Flash**（只读） |
+| **`.data`** | **有初值的全局/静态变量** | **非零** | **RAM**（初值存在 Flash，启动时拷过去） |
+| **`.bss`** | **无初值或初值为 0 的** | **0** | **RAM**（启动时清零） |
+:::
+
+```c
+int g_initialized = 42;      /* .data：初值 42 存在 Flash，启动时拷到 RAM */
+int g_zero;                  /* .bss ：启动时清零 */
+static int s_count = 0;      /* .bss ：初值 0，等价于没写，进 bss 更省 Flash */
+const int g_table[3] = {1,2,3};   /* .rodata：留在 Flash，不占 RAM */
+```
+
+:::tip[为什么 `= 0` 的变量放 .bss 更省]
+```c
+int a[1000] = {0};      /* 编译器会放进 .bss —— Flash 里不占空间 */
+int b[1000] = {1};      /* 放进 .data —— Flash 里要存 4000 字节初值 */
+```
+
+**`.bss` 在 Flash 里零占用**（只需要记录"多大、在哪"），所以**大数组清零初始化要显式写 `= {0}`**。
+:::
+
+**改 `.data` 的类比值验证**（📋 示例，你的工程里可以自己试）：
+
+```c
+int g_data = 42;
+int g_bss;
+
+int main(void) {
+    printf("g_data=%d g_bss=%d\n", g_data, g_bss);      /* 42  0 */
+    /* 如果启动文件的拷贝循环被破坏，这里会打出随机值 */
+}
+```
+
+## 链接脚本的结构
+
+```ld
+/* STM32F103C8T6：64KB Flash + 20KB RAM */
+MEMORY
+{
+  FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 64K
+  RAM   (xrw) : ORIGIN = 0x20000000, LENGTH = 20K
+}
+
+_estack = ORIGIN(RAM) + LENGTH(RAM);      /* 栈顶 = RAM 末尾 */
+
+SECTIONS
+{
+  /* ① 向量表和代码放 Flash，紧接在最前面 */
+  .isr_vector :
+  {
+    . = ALIGN(4);
+    KEEP(*(.isr_vector))                  /* KEEP 防止被优化删除 */
+    . = ALIGN(4);
+  } >FLASH
+
+  .text :
+  {
+    *(.text)
+    *(.text*)
+    *(.rodata)
+    *(.rodata*)
+    . = ALIGN(4);
+    _etext = .;
+  } >FLASH
+
+  /* ② .data：运行时在 RAM，但初值存在 Flash */
+  _sidata = LOADADDR(.data);              /* 初值在 Flash 的地址 */
+  .data :
+  {
+    . = ALIGN(4);
+    _sdata = .;                            /* RAM 中起始地址 */
+    *(.data)
+    *(.data*)
+    . = ALIGN(4);
+    _edata = .;
+  } >RAM AT> FLASH                         /* ← AT> 是关键：运行在 RAM，加载自 Flash */
+
+  /* ③ .bss：只占 RAM，不占 Flash */
+  .bss :
+  {
+    _sbss = .;
+    *(.bss)
+    *(.bss*)
+    *(COMMON)
+    . = ALIGN(4);
+    _ebss = .;
+  } >RAM
+
+  /* ④ 栈和堆 */
+  ._user_heap_stack :
+  {
+    . = ALIGN(8);
+    _end = .;
+    . = . + _Min_Heap_Size;
+    . = . + _Min_Stack_Size;
+    . = ALIGN(8);
+  } >RAM
+}
+```
+
+:::danger[`>RAM AT> FLASH` 是 .data 的核心]
+```ld
+.data : { ... } >RAM AT> FLASH
+```
+
+**两个地址**：
+
+- **运行地址（VMA）= RAM** —— 程序访问 `g_data` 时用这个
+- **加载地址（LMA）= Flash** —— 启动时从这个位置往 RAM 拷
+
+**写成 `>RAM` 而没有 `AT> FLASH`**，初值就没地方存，启动时拷的是垃圾。
+:::
+
+## 启动文件和链接脚本的对应关系
+
+:::info[启动文件里那些符号名，就是链接脚本定义的]
+```asm
+; startup_stm32f103xb.s 片段
+Reset_Handler:
+    ldr   r0, =_sidata      ; 初值在 Flash 的起始地址
+    ldr   r1, =_sdata       ; RAM 中目标起始
+    ldr   r2, =_edata       ; RAM 中目标结束
+    ; 循环拷贝 (r1) ← (r0)
+    ...
+    ldr   r1, =_sbss        ; bss 起始
+    ldr   r2, =_ebss
+    ; 循环清零 (r1)
+    ...
+```
+
+**所以链接脚本改错符号名 → 启动文件找不到 → 链接报错 `undefined reference to _sidata`。**
+:::
+
+## 栈和堆的大小在哪配
+
+:::warning[有两个地方，别改错]
+**① 启动文件里的弱符号（实际生效的是链接脚本的值）**
+
+```asm
+; startup 文件末尾
+.global _Min_Stack_Size
+.equ    _Min_Stack_Size, 0x400      ; 1KB
+```
+
+**② 链接脚本里的符号**
+
+```ld
+_Min_Heap_Size  = 0x200;      /* 512 字节 */
+_Min_Stack_Size = 0x400;      /* 1KB */
+```
+
+**CubeMX 生成的项目改链接脚本就行**（启动文件里的是默认值）。
+
+**栈溢出是嵌入式最常见的死机原因**——大局部数组、深递归、`printf` 都吃栈。
+:::
+
+:::tip[怎么判断栈够不够]
+**方法一：启动时把栈区涂成固定图案，运行一段时间后看被涂掉多少**
+
+```c
+/* main 开头调用 */
+void stack_paint(void)
+{
+    extern uint32_t _estack;
+    uint32_t *p = &_estack - 256;      /* 假设栈 1KB，从顶部往下涂 256 个字 */
+    for (int i = 0; i < 256; i++) p[i] = 0xDEADBEEF;
+}
+
+uint32_t stack_used_words(void)
+{
+    extern uint32_t _estack;
+    uint32_t *p = &_estack - 256;
+    uint32_t n = 0;
+    while (n < 256 && p[n] == 0xDEADBEEF) n++;
+    return 256 - n;                     /* 被改写的字数 ≈ 用掉的栈 */
+}
+```
+
+**方法二：在 HardFault 里看栈指针离 `_estack` 多远**
+
+**方法三：直接开太大**——F103 有 20KB RAM，给栈 4KB 不算奢侈。
+:::
+
+## 常用定制
+
+### 放到指定段的变量
+
+```c
+/* 不掉电清除的变量（复位后保留）—— 需要链接脚本配合 */
+uint32_t boot_count __attribute__((section(".noinit")));
+
+/* 放到 CCM RAM（F4 才有，不参与 DMA） */
+uint32_t fast_buf[256] __attribute__((section(".ccmram")));
+```
+
+:::warning[`section` 属性只是"声明"，还得链接脚本接收]
+```c
+uint32_t x __attribute__((section(".mysec")));
+```
+
+如果 `.mysec` 在链接脚本里没被任何输出段收集，**它会被丢弃或放到默认位置**，行为不一定符合预期。
+
+**正确做法**：链接脚本里加
+
+```ld
+.mysec :
+{
+  KEEP(*(.mysec))
+} >RAM
+```
+:::
+
+### 让固件能被 CRC 校验
+
+```ld
+/* 在代码末尾放一个 CRC 占位 */
+.crc :
+{
+  . = ALIGN(4);
+  KEEP(*(.crc))
+} >FLASH
+```
+
+配合 `__attribute__((section(".crc"))) const uint32_t fw_crc = 0xFFFFFFFF;`，出厂时用工具回填。
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 全局变量初值不对 | `.data` 拷错了 | 检查 `AT> FLASH` 和 `_sidata` |
+| 偶发死机、返回地址乱 | 栈溢出 | 加大 `_Min_Stack_Size` |
+| `malloc` 失败 | 堆太小 | 加大 `_Min_Heap_Size` |
+| 链接失败 `undefined reference to _sidata` | 链接脚本缺符号 | 补上 `_sidata/_sdata/_edata` |
+| 改链接脚本后不生效 | 改了启动文件里的 `_Min_Stack_Size` | 改链接脚本 |
+| C++ 全局对象没构造 | 没调 `__libc_init_array` | 用 C++ 时启动文件要保留这步 |
+| Flash 用量超出实际 | 大数组写了非零初值进了 .data | 改成 `= {0}` 进 .bss |
+
+:::danger[`KEEP()` 不能省]
+```ld
+KEEP(*(.isr_vector))
+```
+
+**没有 `KEEP` 时，链接器的 `--gc-sections` 会把"看起来没人引用"的向量表整个删掉** —— 烧进去后一上电就 HardFault。
+
+**中断处理函数也是一样**（它们只在向量表里被引用，代码里没有调用点）。
+:::
+
+## 本课自检
+
+- [ ] 能说出上电到 main 的完整流程
+- [ ] **知道 Flash 前 4 字节是栈顶值，第 5~8 字节是 Reset_Handler 地址**
+- [ ] **知道向量表里的地址末位是 1（Thumb 标志），不是错误**
+- [ ] 能区分 `.text`/`.data`/`.bss` 三者
+- [ ] **理解 `.data` 初值存 Flash、运行时在 RAM，靠启动代码拷贝**
+- [ ] **知道 `= {0}` 会进 `.bss`，Flash 里零占用**
+- [ ] 能读懂 `MEMORY` 和 `SECTIONS` 两大部分
+- [ ] **理解 `>RAM AT>FLASH` 的 VMA/LMA 双地址含义**
+- [ ] 知道启动文件里的 `_sidata/_sdata/_edata` 来自链接脚本
+- [ ] **知道栈和堆大小在链接脚本里配**
+- [ ] 会用量栈法估算栈用量
+- [ ] 知道 `__attribute__((section()))` 需要链接脚本配合
+- [ ] **知道 `KEEP()` 不加会导致向量表被 gc-sections 删掉**
+
+## 下一步
+
+[10 Bootloader 与 IAP 升级](./bootloader) —— 自己实现固件升级。

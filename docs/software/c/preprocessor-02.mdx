@@ -1,0 +1,233 @@
+---
+id: preprocessor-02
+title: "02 可变参数宏（C99）"
+sidebar_position: 3
+description: "预处理器 第 2 部分：可变参数宏（C99）"
+---
+
+# 02 可变参数宏（C99）
+```c
+#define LOG(fmt, ...) printf("[LOG] " fmt, __VA_ARGS__)
+```
+
+实测：
+
+```c
+LOG("x=%d y=%s\n", 42, "ok");
+```
+
+```text
+=== variadic macro ===
+[LOG] x=42 y=ok
+```
+
+要点：
+
+1. `...` 表示可变参数，`__VA_ARGS__` 在替换列表里代表它们
+2. **字符串字面量拼接**：`"..."` 和 `fmt` 相邻会自动拼接（C 的特性），这是日志宏的常见写法
+3. **C99 引入**；之前是 GNU 扩展（用 `args...` 语法）
+
+:::caution[零参数时的问题]
+```c
+LOG("hello\n");   /* __VA_ARGS__ 为空 → printf("[LOG] " "hello\n", ) → 多了个逗号 */
+```
+标准 C 会报语法错误。GCC 扩展用 `##__VA_ARGS__`（`##` 在 `__VA_ARGS__` 前会吃掉多余的逗号）：
+
+```c
+#define LOG(fmt, ...) printf("[LOG] " fmt, ##__VA_ARGS__)
+```
+这是 GNU 扩展，非标准。C23 有更好的方案。
+:::
+
+## 六、预定义宏
+
+标准规定的：
+
+| 宏 | 含义 |
+| --- | --- |
+| `__FILE__` | 当前文件名 |
+| `__LINE__` | 当前行号 |
+| `__DATE__` | 编译日期 `"Mmm dd yyyy"` |
+| `__TIME__` | 编译时间 `"hh:mm:ss"` |
+| `__func__` | **当前函数名**（C99，注意它不是宏而是预定义标识符） |
+| `__STDC__` | 是否为标准 C（通常为 1） |
+| `__STDC_VERSION__` | 标准版本：`199901L`/`201112L`/`201710L` |
+| `__STDC_HOSTED__` | 是否有宿主环境（1）还是独立/裸机（0） |
+
+实测：
+
+```text
+=== predefined macros ===
+__FILE__     = C:\cprobe\macro.c
+__LINE__     = 40
+__STDC__     = 1
+__STDC_VERSION__ = 201710
+__func__     = main
+```
+
+`__STDC_VERSION__ = 201710` 确认了本机用 `-std=c17` 时报告 **C17**。
+
+常用编译器扩展（非标准但普遍支持）：
+
+`__GNUC__`、`__clang__`、`_MSC_VER`、`__BYTE_ORDER__`、`__SIZEOF_POINTER__`
+
+### 断言宏的标准写法
+
+```c
+#define ASSERT(cond) \
+    do { \
+        if (!(cond)) { \
+            printf("ASSERT FAILED: %s @ %s:%d\n", #cond, __FILE__, __LINE__); \
+            abort(); \
+        } \
+    } while (0)
+```
+
+`#cond` 让你能打印出失败的表达式文本，`__FILE__`/`__LINE__` 定位位置。
+
+## 七、条件编译
+
+### 指令一览
+
+```c
+#if 表达式                  /* 表达式必须是常量表达式 */
+#ifdef NAME                /* 等价于 #if defined(NAME) */
+#ifndef NAME               /* 等价于 #if !defined(NAME) */
+#elif / #else / #endif
+#error "消息"               /* 直接报错停止编译 */
+#warning "消息"             /* 非标准（C23 才有），gcc/clang 支持 */
+```
+
+### 实测：`#if` / `#elif` / `#else`
+
+```c
+#if defined(DEBUG) && DEBUG > 0
+#define LEVEL 3
+#elif defined(VERBOSE)
+#define LEVEL 2
+#else
+#define LEVEL 1
+#endif
+```
+
+默认编译（`LEVEL` 应为 1）：
+
+```bash
+gcc -E -P pp.c | grep -E 'LEVEL'
+```
+
+```text
+    printf("r=%d s=%s myVar=%d LEVEL=%d HAVE_C11=%d\n", r, s, myVar, 1, 1);
+```
+
+`LEVEL` 是 **1**。
+
+带 `-DDEBUG=2` 编译：
+
+```bash
+gcc -E -P -DDEBUG=2 pp.c | grep -E 'LEVEL'
+```
+
+```text
+    printf("r=%d s=%s myVar=%d LEVEL=%d HAVE_C11=%d\n", r, s, myVar, 3, 1);
+```
+
+`LEVEL` 变成 **3**——`#if defined(DEBUG) && DEBUG > 0` 成立。
+
+:::info[未定义的标识符在 `#if` 里是 0]
+```c
+#if FOO == 1    /* 如果 FOO 未定义，这等价于 #if 0 == 1 */
+```
+这条规则很实用，但也容易埋坑：拼错的宏名会静默变成 0，不报错。
+
+**防御手段**：用 `#ifdef` 检查关键宏是否已定义，或用 `#error` 强制要求：
+```c
+#ifndef CONFIG_FREQ
+#error "CONFIG_FREQ must be defined"
+#endif
+```
+:::
+
+### `#if` 支持 `defined` 和完整运算符
+
+```c
+#if defined(A) && defined(B)     /* 且 */
+#if defined(A) || defined(B)     /* 或 */
+#if !defined(A)                  /* 非 */
+#if (VERSION + 0) >= 20000       /* 算术，注意未定义时为 0 */
+```
+
+### 常见用途
+
+| 用途 | 写法 |
+| --- | --- |
+| 调试开关 | `#ifdef DEBUG ... #endif` |
+| 平台适配 | `#if defined(__GNUC__) ... #elif defined(_MSC_VER) ...` |
+| 防止重复包含 | include guard（见下） |
+| 特性检测 | `#if __STDC_VERSION__ >= 201112L` |
+| 版本控制 | `#if FW_VERSION >= 200` |
+
+### `HAVE_C11` 的实测
+
+```c
+#if __STDC_VERSION__ >= 201112L
+#define HAVE_C11 1
+#else
+#define HAVE_C11 0
+#endif
+```
+
+实测输出里 `HAVE_C11=1`——因为 `__STDC_VERSION__` 是 `201710`，大于 `201112`。
+
+## 八、include guard vs `#pragma once`
+
+两者都用于防止头文件被重复包含。
+
+### include guard（传统方式）
+
+```c
+#ifndef MYLIB_H
+#define MYLIB_H
+
+/* 内容 */
+
+#endif /* MYLIB_H */
+```
+
+### `#pragma once`
+
+```c
+#pragma once
+
+/* 内容 */
+```
+
+### 对比
+
+| 维度 | include guard | `#pragma once` |
+| --- | --- | --- |
+| 标准化 | **标准 C 惯用法**（用标准指令组合实现） | **非标准**（`#pragma` 是实现定义的） |
+| 支持度 | 所有编译器 | 几乎所有现代编译器（gcc/clang/MSVC 都支持），但极老的或特殊的编译器可能不支持 |
+| 工作原理 | 靠宏是否定义 | 靠编译器记住**文件的物理身份** |
+| 宏名冲突 | 可能（两个头文件用了同样的 guard 名） | 无 |
+| 符号链接/硬链接同一文件 | 会被重复包含（认为是不同文件） | **可能失效**（依赖编译器能否识别出是同一文件） |
+| 编译速度 | 每次都要打开头文件判断（现代编译器有优化） | 通常略快（直接跳过） |
+| 拷贝粘贴错误 | 容易忘改宏名 | 无此问题 |
+
+:::tip[实际建议]
+现代项目里 **`#pragma once` 是默认选择**——它更短、不会拼错、不会重名。ESP-IDF 的新代码和大多数现代 C 库都用它。
+
+但如果你的代码可能跑在冷门编译器上，或者构建系统里有复杂的符号链接/多路径引用同一文件的情况，**用 include guard 更保险**。
+
+**也可以两个都写**（`#pragma once` + guard），代价是冗余，收益是双保险。这不是常见做法，但确实有人这么做以获得"pragma once 的速度 + guard 的可靠性"。
+:::
+
+:::warning[`#pragma` 的性质]
+标准说：未识别的 `#pragma` **必须被忽略且不能报错**。所以 `#pragma once` 在不支持的编译器上会**静默失效**——你的头文件可能被重复包含而你不自知。
+
+这就是"非标准"的真实代价：不是报错，是静默错误。
+:::
+
+---
+
+**翻页**：[← 上一页](./preprocessor-01) · [下一页 →](./preprocessor-03) · [返回目录](./)

@@ -1,0 +1,314 @@
+---
+id: 29-debug
+title: 29 调试技巧与常见错误
+sidebar_position: 29
+description: 段错误的成因与定位、AddressSanitizer 抓内存错误、gdb 基础、打印调试法，以及常见崩溃的排查清单。
+---
+
+# 29 调试技巧与常见错误
+
+**本课目标**：程序崩溃时知道从哪查，会用工具抓内存错误。
+
+## C 调试为什么难
+
+| 问题 | 说明 |
+| --- | --- |
+| **崩溃没有提示** | 只有 `Segmentation fault`，不告诉你在哪行 |
+| **越界不报错** | 写超了可能"看起来正常" |
+| **内存错误延迟暴露** | `free` 之后才崩，离出错点很远 |
+| **换环境就变** | 本地正常，客户机器崩 |
+
+**所以必须主动用工具检查，不能只靠"跑起来没崩"。**
+
+## 最常见的崩溃：段错误
+
+:::danger[Segmentation fault 的四大原因]
+```c
+/* ① 解引用空指针 */
+int *p = NULL;
+*p = 1;                    /* 崩溃 */
+
+/* ② 使用未初始化的指针（野指针） */
+int *q;                    /* 垃圾值 */
+*q = 1;                    /* 崩溃 */
+
+/* ③ 数组越界 */
+int arr[5];
+arr[100] = 1;              /* 可能崩溃 */
+
+/* ④ 释放后继续使用 */
+int *r = malloc(10);
+free(r);
+r[0] = 1;                  /* 崩溃 */
+```
+:::
+
+本机实测空指针崩溃：
+
+```c
+int *p = NULL;
+*p = 42;
+```
+
+**结果**：程序直接终止，退出码 `-1073741819`（即 `0xC0000005`，Windows 的访问冲突）。
+
+**没有任何有用的错误信息**——这就是 C 调试难的地方。
+
+## 工具一：编译警告（最便宜的第一道防线）
+
+```bash
+gcc -Wall -Wextra -g main.c -o prog
+```
+
+:::tip[一定要开 `-Wall -Wextra`]
+```bash
+gcc main.c -o prog                    # 什么警告都没有
+gcc -Wall -Wextra main.c -o prog      # 能发现大部分隐患
+```
+
+**能抓到的典型问题**：
+
+| 警告 | 含义 |
+| --- | --- |
+| `unused variable` | 定义了没用（可能是写错变量名） |
+| `implicit declaration` | 用了没声明的函数（忘了 include） |
+| `assignment as condition` | `if (x = 1)` 少了个 `=` |
+| `uninitialized` | 用了未初始化的变量 |
+| `format specifies type X but argument has type Y` | `printf` 格式符错误 |
+
+**警告不是建议，是潜在 bug。** 看到就修。
+:::
+
+## 工具二：AddressSanitizer（抓内存错误的神器）
+
+```bash
+gcc -g -fsanitize=address main.c -o prog
+```
+
+:::danger[它能抓到普通运行抓不到的问题]
+**本机实测**：故意数组越界
+
+```c
+int *a = malloc(4 * sizeof(int));
+a[4] = 42;              /* 越界 1 个 */
+```
+
+**不加 ASan**：可能静默通过，也可能随机崩溃。
+
+**加 ASan 后**，立即报错：
+
+```text
+==8840==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x12f0184a0040
+WRITE of size 4 at 0x12f0184a0040 thread T0
+    #0 0x7ff6fb0114cd in main /tmp/oob.c:3:54
+0x12f0184a0040 is located 0 bytes after 16-byte region [0x12f0184a0030,0x12f0184a0040)
+allocated by thread T0 here:
+    #0 0x7ffa0527d9d1 in malloc ...
+    #1 0x7ff6fb01148d in main /tmp/oob.c:3:26
+```
+
+**信息量极大**：
+
+- 错误类型：`heap-buffer-overflow`（堆缓冲区溢出）
+- 操作：`WRITE of size 4`
+- **精确位置**：`oob.c:3:54`
+- **越界了多少**：`0 bytes after 16-byte region`
+- **这块内存是谁分配的**：`malloc` 调用的位置
+:::
+
+### ASan 能抓什么
+
+| 错误 | ASan 报的错误名 |
+| --- | --- |
+| 数组/堆越界 | `heap-buffer-overflow` / `stack-buffer-overflow` |
+| 释放后使用 | `heap-use-after-free` |
+| 重复释放 | `attempting double-free` |
+| 内存泄漏 | `LeakSanitizer: detected memory leaks` |
+| 返回局部变量的地址 | `stack-use-after-return` |
+
+**开发阶段一律开 ASan 跑一遍**，能省掉大量排查时间。
+
+:::warning[ASan 只在调试时用]
+```bash
+gcc -g -fsanitize=address main.c -o prog_debug     # 开发用
+gcc -O2 main.c -o prog_release                     # 发布用
+```
+
+ASan 会显著拖慢程序（2~10 倍）并增加内存占用。**发布版本不要带。**
+:::
+
+## 工具三：gdb（交互式调试）
+
+```bash
+gcc -g main.c -o prog        # -g 加调试信息
+gdb ./prog
+```
+
+常用命令：
+
+| 命令 | 简写 | 作用 |
+| --- | --- | --- |
+| `run` | `r` | 运行 |
+| `break 行号` | `b` | 设断点 |
+| `next` | `n` | 下一行（不进函数） |
+| `step` | `s` | 进入函数 |
+| `print 变量` | `p` | 打印变量值 |
+| `backtrace` | `bt` | **看调用栈（崩溃后最关键）** |
+| `continue` | `c` | 继续 |
+| `quit` | `q` | 退出 |
+
+### 崩溃后看 `bt`
+
+```text
+Program received signal SIGSEGV, Segmentation fault.
+0x0000555555555161 in crash () at main.c:5
+5       *p = 42;
+(gdb) bt
+#0  0x0000555555555161 in crash () at main.c:5
+#1  0x0000555555555189 in process (data=0x0) at main.c:12
+#2  0x00005555555551a5 in main () at main.c:20
+```
+
+**`bt` 会告诉你完整的调用链**：`main` → `process` → `crash`。
+
+**看到 `data=0x0` 就知道传了个空指针进来。**
+
+:::tip[gdb 的核心价值：能看"当时的状态"]
+崩溃时你最想知道的是：**"那一刻变量的值是什么？"**
+
+`print` 能查看任何变量，`bt` 能看调用链，`frame N` 能切换到上层函数的上下文。
+
+**这比加 `print` 强无数倍**——不用改代码重跑。
+:::
+
+## 工具四：打印调试法
+
+简单粗暴但很有效：
+
+```c
+fprintf(stderr, "[DEBUG] 进入 process，data=%p\n", (void *)data);
+```
+
+:::tip[三个实用技巧]
+**① 用 `stderr` 而不是 `stdout`**
+
+`stderr` 不会被缓冲，程序崩溃时**已输出的内容不会丢**。
+
+**② 用宏自动带文件名行号**
+
+```c
+#define DBG(fmt, ...) \
+    fprintf(stderr, "[%s:%d] " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__)
+
+DBG("value = %d", x);
+/* 输出：[main.c:42] value = 42 */
+```
+
+**③ 崩溃前的最后一条日志就是线索**
+
+```c
+DBG("准备调用 foo");
+foo();                    /* 崩在这里 */
+DBG("foo 返回了");         /* 没打印 → 确认是 foo 崩的 */
+```
+:::
+
+## 常见错误速查表
+
+| 现象 | 最可能的原因 | 怎么查 |
+| --- | --- | --- |
+| 立刻崩在 `*p = x` | 空指针/野指针 | 打印指针值，看是否 NULL |
+| 数组循环后崩溃 | 越界 | ASan，或检查循环边界 `<=` |
+| `free` 时崩溃 | 重复释放/野指针 | 检查是否 free 两次 |
+| 数据莫名被改 | 越界写了别处 | ASan |
+| 换机器就崩 | 未定义行为 | ASan + 开优化复现 |
+| 结果时对时错 | 未初始化变量/UB | 开 `-Wall`，检查初始化 |
+| 程序越跑越慢 | 内存泄漏 | ASan LeakSanitizer |
+| 输出乱码 | 字符串没 `\0` | `strncpy` 后补 `\0` |
+
+:::danger[调 C 的 bug 的顺序]
+1. **先看有没有警告**（`-Wall -Wextra`）
+2. **用 ASan 跑一遍**（能抓 80% 的内存错误）
+3. **看崩溃位置和调用栈**（gdb `bt`）
+4. **加打印缩小范围**（二分法）
+5. **检查最近的改动**（常常是刚改的地方）
+
+**不要一上来就瞎改代码。**
+:::
+
+## 一个完整的排查示例
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+char *make_greeting(const char *name) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Hello, %s!", name);
+    return buf;                 /* ❌ 返回局部数组的地址 */
+}
+
+int main(void) {
+    char *msg = make_greeting("World");
+    printf("%s\n", msg);        /* 未定义行为 */
+    return 0;
+}
+```
+
+:::danger[返回局部变量的地址是最阴险的 bug]
+`buf` 在函数返回时就被销毁了（栈帧回收），**返回的指针指向已释放的栈内存**。
+
+**症状**：
+
+- 有时能正常打印（内存还没被覆盖）
+- 有时是乱码
+- 有时崩溃
+
+**换编译器、开关优化、加几行代码都会让行为改变**——极难排查。
+:::
+
+**修复**：
+
+```c
+char *make_greeting(const char *name) {
+    char *buf = malloc(64);              /* 堆上分配，不会随函数返回销毁 */
+    if (buf == NULL) return NULL;
+    snprintf(buf, 64, "Hello, %s!", name);
+    return buf;                          /* 调用者负责 free */
+}
+```
+
+:::warning[ASan 能抓这个]
+`stack-use-after-return` 就是专门检测这种情况的。
+
+**但默认配置可能不启用**，需要 `ASAN_OPTIONS=detect_stack_use_after_return=1`。
+
+**最简单的预防：绝不要返回局部变量的地址。** 看到 `return 局部数组名` 就是错的。
+:::
+
+## 常见错误
+
+| 错误做法 | 问题 | 正确做法 |
+| --- | --- | --- |
+| 不开警告编译 | 漏掉大量隐患 | `-Wall -Wextra` |
+| 只看"跑起来没崩" | 内存错误可能隐藏 | 用 ASan 跑 |
+| 崩溃了就瞎改 | 可能引入新 bug | 先定位再看 |
+| 不保存复现步骤 | 改完不知道好没好 | 记下输入和现象 |
+| 忽略"偶发"问题 | 通常是 UB | 一定要查到底 |
+
+## 本课自检
+
+- [ ] 知道段错误的四大原因
+- [ ] **知道必须开 `-Wall -Wextra`**
+- [ ] 会用 AddressSanitizer（`-fsanitize=address`）
+- [ ] 知道 ASan 能抓越界、泄漏、重复释放
+- [ ] 会用 gdb 的 `bt` 看调用栈
+- [ ] 知道 `-g` 才带调试信息
+- [ ] 会用 `fprintf(stderr, ...)` 打印调试
+- [ ] **知道不要返回局部变量的地址**
+- [ ] 知道排查顺序：警告 → ASan → 调用栈 → 打印
+
+## 下一步
+
+[30 实战：学生成绩管理](./30-project-scores) —— 综合运用全部知识做完整项目。

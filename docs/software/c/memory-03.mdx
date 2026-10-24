@@ -1,0 +1,224 @@
+---
+id: memory-03
+title: "03 内存错误四大类与检测"
+sidebar_position: 4
+description: "内存模型 第 3 部分：内存错误四大类与检测"
+---
+
+# 03 内存错误四大类与检测
+### 1. 内存泄漏（memory leak）
+
+分配了不释放，可用内存越来越少。
+
+```c
+int main(void) {
+    int *a = (int *)malloc(100);
+    a[0] = 1;
+    printf("leaked ptr=%p a[0]=%d\n", (void *)a, a[0]);
+    return 0;   /* 没有 free */
+}
+```
+
+:::info[关于 LeakSanitizer 的实测结果]
+在本机用 `clang -fsanitize=address` 编译运行：
+
+```text
+leaked ptr=00001197F41A0040 a[0]=1
+```
+
+**程序正常退出，没有报泄漏。** 原因是 **LeakSanitizer (LSan) 在 Windows 上不受支持**——AddressSanitizer 的堆越界/use-after-free/double-free 检测在 Windows 上工作正常，但泄漏检测依赖 `ptrace` 式的进程内存扫描，只在 Linux/macOS 可用。
+
+**这是实测得出的结论，请按你的平台验证。** 在 Linux 上同样的编译命令会得到：
+```text
+==12345==ERROR: LeakSanitizer: detected memory leaks
+```
+:::
+
+**嵌入式上的替代手段**（没有 ASan 时）：
+
+| 方法 | 说明 |
+| --- | --- |
+| 堆水位监控 | FreeRTOS 的 `xPortGetFreeHeapSize()` / `esp_get_free_heap_size()`，定期打印看趋势 |
+| 分配计数 | 包装 `malloc`/`free`，统计次数和总量，配对检查 |
+| 静态分析 | `cppcheck`、`clang-tidy` |
+| 人工审查 | 每个 `malloc` 都问"谁在什么时候 free" |
+
+对嵌入式来说**最简单有效的办法是：干脆不在运行期 `malloc`**。启动时分配完，之后不再分配——这样就没有泄漏也没有碎片。
+
+### 2. 重复释放（double free）
+
+```c
+int *p = (int *)malloc(16);
+free(p);
+free(p);   /* 第二次：堆元数据已损坏 */
+```
+
+用 ASan 编译运行：
+
+```bash
+clang -fsanitize=address -g -O0 df.c -o df.exe && ./df.exe
+```
+
+```text
+==19016==ERROR: AddressSanitizer: attempting double-free on 0x1258745a0030 in thread T0:
+    #0 0x7ffde893d8c1 in free .../asan_malloc_win.cpp:78:3
+    #1 0x7ff738e21548 in main C:\cprobe/df.c:10:5
+0x1258745a0030 is located 0 bytes inside of 16-byte region [0x1258745a0030,0x1258745a0040)
+freed by thread T0 here:
+    #1 0x7ff738e21533 in main C:\cprobe/df.c:8:5
+```
+
+ASan 不仅报出第二次 `free`，还**指出了第一次释放的位置**（`df.c:8`）——这正是排查所需的全部信息。
+
+**没有 ASan 时**：double free 会破坏堆的空闲链表，表现为"在某个完全无关的地方崩溃"，极难排查。
+
+### 3. 使用已释放内存（use-after-free）
+
+```c
+int *p = (int *)malloc(4 * sizeof(int));
+for (int i = 0; i < 4; i++) p[i] = i;
+free(p);
+printf("use after free: p[0] = %d\n", p[0]);
+```
+
+ASan 输出：
+
+```text
+==10336==ERROR: AddressSanitizer: heap-use-after-free on address 0x121010aa0030 at pc 0x7ff6ee34153f bp 0x000f5ddafbb0 sp 0x000f5ddafbf8
+READ of size 4 at 0x121010aa0030 thread T0
+    #0 0x7ff6ee34153e in main C:\cprobe/uaf.c:8:43
+0x121010aa0030 is located 0 bytes inside of 16-byte region [0x121010aa0030,0x121010aa0040)
+freed by thread T0 here:
+    #1 0x7ff6ee341506 in main C:\cprobe/uaf.c:7:5
+```
+
+注意它区分了 **READ/WRITE**、给出了地址所属区域的边界。
+
+### 4. 越界访问（out-of-bounds）
+
+```c
+int *p = malloc(4);
+p[5] = 1;
+```
+
+ASan：
+
+```text
+==15196==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x12751d5a0044 at pc 0x7ff6046714ce bp 0x00e8a2d7f6b0 sp 0x00e8a2d7f6f8
+WRITE of size 4 at 0x12751d5a0044 thread T0
+    #0 0x7ff6046714cd in main C:\cprobe/asan.c:2:38
+0x12751d5a0044 is located 16 bytes after 4-byte region [0x12751d5a0030,0x12751d5a0034)
+```
+
+**"located 16 bytes after 4-byte region"** —— 精确量化了越界距离。
+
+### ASan 的用法与局限
+
+```bash
+# 编译
+clang -fsanitize=address -g -O1 -fno-omit-frame-pointer src.c -o out
+
+# 运行，出问题就打印详细报告
+./out
+```
+
+| 维度 | 说明 |
+| --- | --- |
+| 能抓 | 堆/栈/全局越界、use-after-free、double-free、栈溢出、返回后使用 |
+| 抓不到 | 未初始化读（用 MSan）、UB 的其他类型（用 UBSan）、泄漏（Windows 上不支持） |
+| 开销 | 内存约 2-3 倍，速度约慢 2 倍 |
+| **嵌入式可用性** | **基本不可用**——需要大量内存和运行时库，MCU 上跑不了 |
+
+:::tip[嵌入式怎么测]
+MCU 上跑不了 ASan，但**可以在 PC 上测**：
+
+把硬件无关的核心逻辑（协议解析、状态机、算法）抽出来，在 PC 上用 ASan/UBSan 跑单元测试。这是嵌入式行业的主流做法——**在 host 上测逻辑，在 target 上测集成**。
+
+ESP-IDF 支持在 Linux 上用 CMock/Unity 跑组件测试，就是这个思路。
+:::
+
+### 栈溢出
+
+递归太深或局部数组太大：
+
+```c
+int deep(int n) {
+    volatile char pad[1024];
+    pad[0] = (char)n;
+    if (n <= 0) return pad[0];
+    return deep(n - 1) + pad[0];
+}
+int main(void) { int r = deep(100000); printf("r=%d\n", r); }
+```
+
+```bash
+gcc -std=c17 -O0 ovf.c -o ovf.exe && ./ovf.exe
+echo "exit=$?"
+```
+
+程序崩溃，退出码（Windows）：
+
+```text
+exit=-1073741571
+```
+
+`-1073741571` 转十六进制是 `0xC00000FD`——**STATUS_STACK_OVERFLOW**。
+
+:::danger[栈溢出在 MCU 上是最隐蔽的故障]
+PC 上有 OS 保护，栈溢出立刻崩溃，容易发现。**裸机 MCU 上没有任何保护**——栈会静默地覆盖掉 `.bss`/`.data`/堆，程序继续跑，表现是"奇怪的数据变化"或随机 HardFault。
+
+ESP32 上 FreeRTOS 任务有独立的栈，栈溢出会触发 `vApplicationStackOverflowHook`（需要配置 `CONFIG_FREERTOS_CHECK_STACKOVERFLOW`）。
+
+**准则**：MCU 上避免深递归，避免大局部数组（几百字节以上放 `static` 或全局），用 `uxTaskGetStackHighWaterMark()` 监控栈水位。
+:::
+
+## 常见坑
+
+| 陷阱 | 现象 | 原因 | 正确做法 |
+| --- | --- | --- | --- |
+| 返回局部变量地址 | 值随机 | 栈帧销毁 | 用 `static`、调用方提供缓冲区或堆分配 |
+| 以为 `malloc` 给零内存 | 有时正常有时脏数据 | 未指定内容 | 用 `calloc` 或 `memset` |
+| `p = realloc(p, n)` | 失败时泄漏原内存 | 失败返回 NULL 但原块仍有效 | 用临时指针接收 |
+| `free` 后继续用 | 偶发崩溃/脏数据 | use-after-free UB | `free` 后立刻置 NULL |
+| 对同一指针 `free` 两次 | 堆损坏，无关处崩溃 | double free | 置 NULL + 明确所有权 |
+| `free` 非 `malloc` 返回值 | 崩溃 | 只能 free 堆指针 | 只 free 自己分配/文档规定要 free 的 |
+| 以为静态变量在栈上 | 生命周期判断错 | `static` 改存储期 | 记住 `static` → 静态区 |
+| 大局部数组 | 栈溢出 | 栈空间有限（PC 默认 1-8MB，MCU 任务栈常 2-8KB） | 用 `static`/全局/堆 |
+| 深递归 | 栈溢出 | 每层消耗栈帧 | 改迭代，或增大栈 |
+| 频繁小块 `malloc`/`free` | 内存碎片，最终分配失败 | 外部碎片 + 元数据开销 | 内存池 / 固定块 / 一次性分配 |
+| 用 `long` 存指针 | 64 位截断 | LLP64 | `uintptr_t` |
+| 依赖 `malloc(0)` 的返回值 | 移植后行为不同 | 实现定义 | 不要请求 0 字节 |
+| 结构体大小比预期大 | 内存浪费 | padding | 重排成员（大到小） |
+| `packed` 结构体取成员指针 | 某些架构崩溃 | 非对齐访问 | 用 `memcpy` 访问 |
+| 以为 ASan 能抓所有问题 | 漏掉 UB 和（Windows 上）泄漏 | 工具有边界 | 配合 UBSan/静态分析/代码审查 |
+
+## 自检清单
+
+- [ ] 能说出四个内存区域分别放什么吗？
+- [ ] 能用实测地址说明 `static` 局部变量不在栈上吗？
+- [ ] 栈向高地址还是低地址增长？（提示：本机实测是递减）
+- [ ] 四种存储期分别是什么？各自初值是零还是未定义？
+- [ ] 能列出"指针什么时候失效"的完整清单吗？
+- [ ] `malloc` 的两个系统调用路径是什么？为什么大块走 `mmap`？
+- [ ] 为什么程序 `free` 了很多内存，RSS 却不下降？
+- [ ] 知道 `realloc` 失败时原指针仍然有效吗？正确写法是什么？
+- [ ] `malloc(0)` 的行为是标准规定的还是实现定义的？
+- [ ] `calloc` 和 `malloc` 的唯一区别是清零吗？还有什么？
+- [ ] 结构体 padding 的三条规则是什么？为什么总大小要向上取整？
+- [ ] 重排结构体成员为什么能省内存？能举出实测例子吗？
+- [ ] `packed` 有什么风险？什么时候才该用？
+- [ ] 四类内存错误分别是什么？ASan 能抓哪些、不能抓哪些？
+- [ ] 知道为什么 MCU 上跑不了 ASan 吗？替代方案是什么？
+- [ ] 栈溢出在 PC 和 MCU 上的表现有什么不同？
+
+## 下一步
+
+- [复合类型](./aggregate) —— 结构体的内存布局与 padding 详细实测
+- [函数](./functions) —— 栈帧的具体结构，递归为什么吃栈
+- [指针专章](./pointers) —— 悬垂指针的成因
+- [嵌入式 C](./embedded) —— ESP32 的 heap caps、栈溢出检测、启动流程
+- [回到导读](./)
+
+---
+
+**翻页**：[← 上一页](./memory-02) · [返回目录](./)

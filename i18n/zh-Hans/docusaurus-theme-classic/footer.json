@@ -1,0 +1,54 @@
+{
+  "link.title.快速上手": {
+    "message": "快速上手",
+    "description": "The title of the footer links column with title=快速上手 in the footer"
+  },
+  "link.title.完整教程": {
+    "message": "完整教程",
+    "description": "The title of the footer links column with title=完整教程 in the footer"
+  },
+  "link.title.资源": {
+    "message": "资源",
+    "description": "The title of the footer links column with title=资源 in the footer"
+  },
+  "link.item.label.认识开发板": {
+    "message": "认识开发板",
+    "description": "The label of footer link with label=认识开发板 linking to /docs/quickstart/board"
+  },
+  "link.item.label.烧录与串口": {
+    "message": "烧录与串口",
+    "description": "The label of footer link with label=烧录与串口 linking to /docs/quickstart/first-blink"
+  },
+  "link.item.label.Arduino 编程入门": {
+    "message": "Arduino 编程入门",
+    "description": "The label of footer link with label=Arduino 编程入门 linking to /docs/quickstart/arduino-basics"
+  },
+  "link.item.label.L0 预备知识": {
+    "message": "L0 预备知识",
+    "description": "The label of footer link with label=L0 预备知识 linking to /docs/course/l0-basics"
+  },
+  "link.item.label.L2 编程模型": {
+    "message": "L2 编程模型",
+    "description": "The label of footer link with label=L2 编程模型 linking to /docs/course/l2-programming-model"
+  },
+  "link.item.label.L5 无线与网络": {
+    "message": "L5 无线与网络",
+    "description": "The label of footer link with label=L5 无线与网络 linking to /docs/course/l5-wireless"
+  },
+  "link.item.label.参考示例库": {
+    "message": "参考示例库",
+    "description": "The label of footer link with label=参考示例库 linking to /docs/reference/examples"
+  },
+  "link.item.label.错误码速查": {
+    "message": "错误码速查",
+    "description": "The label of footer link with label=错误码速查 linking to /docs/reference/error-codes"
+  },
+  "link.item.label.引脚映射": {
+    "message": "引脚映射",
+    "description": "The label of footer link with label=引脚映射 linking to /docs/reference/pinout"
+  },
+  "copyright": {
+    "message": "Copyright © 2026 study.chennet.dpdns.org · Built with Docusaurus.",
+    "description": "The footer copyright"
+  }
+}

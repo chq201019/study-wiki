@@ -1,0 +1,317 @@
+---
+id: concurrency
+title: 多线程与原子操作
+sidebar_position: 12
+description: pthread 的四种用法、互斥锁为什么必须配条件变量、原子操作能省掉什么、数据竞争的表现与 ThreadSanitizer 检测。
+---
+
+# 多线程与原子操作
+
+**本课目标**：会写正确的多线程 C 代码，知道数据竞争长什么样。
+
+## 最小可用的线程
+
+```c
+#include <pthread.h>
+#include <stdio.h>
+
+void *worker(void *arg)
+{
+    int id = *(int *)arg;
+    printf("线程 %d 运行\n", id);
+    return NULL;
+}
+
+int main(void)
+{
+    pthread_t t;
+    int id = 1;
+
+    if (pthread_create(&t, NULL, worker, &id) != 0) {
+        perror("pthread_create");
+        return 1;
+    }
+
+    pthread_join(t, NULL);      /* 等它结束 */
+    return 0;
+}
+```
+
+:::danger[编译时必须加 `-pthread`，不是 `-lpthread`]
+```bash
+gcc main.c -pthread -o main
+```
+
+**`-pthread` 会同时设置编译宏和链接参数**；只写 `-lpthread` 在某些平台上会导致 `_REENTRANT` 没定义，从而用了非线程安全的库函数版本。
+:::
+
+:::warning[`pthread_join` 不能省]
+不 join 就退出 `main` → 主线程结束 → 整个进程终止 → **其他线程被强行杀死**（可能正在写文件）。
+
+**要么 join，要么 `pthread_detach` 让线程自己管自己**（但那样就拿不到返回值和退出状态了）。
+:::
+
+## 数据竞争：最隐蔽的 bug
+
+![数据竞争时序：线程 A 和 B 都读到旧值 5，各自加 1 写回 6，两次自增只生效一次](/img/diagrams/c-data-race.svg)
+
+
+:::danger[`counter++` 不是原子操作]
+```c
+int counter = 0;
+
+void *worker(void *arg)
+{
+    for (int i = 0; i < 100000; i++) {
+        counter++;              /* ❌ 读 → 加 → 写 三步 */
+    }
+    return NULL;
+}
+```
+
+两个线程各加 10 万次，**最终结果几乎肯定小于 20 万**。
+
+**原因**：两个线程可能同时读到 `counter = 5`，各自加 1 写回 6 —— 有一次自增丢失了。
+:::
+
+:::tip[怎么复现和验证]
+```bash
+gcc race.c -pthread -fsanitize=thread -g -o race
+./race
+```
+
+**ThreadSanitizer 会直接指出哪两行代码发生了竞争**：
+
+```text
+WARNING: ThreadSanitizer: data race
+  Write of size 4 at 0x... by thread T2:
+    #0 worker race.c:7
+  Previous write of size 4 at 0x... by thread T1:
+    #0 worker race.c:7
+```
+
+**这是排查并发问题最有效的工具**，比加 printf 快一个数量级。
+:::
+
+## 修法一：互斥锁
+
+```c
+#include <pthread.h>
+
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static int counter = 0;
+
+void *worker(void *arg)
+{
+    for (int i = 0; i < 100000; i++) {
+        pthread_mutex_lock(&lock);
+        counter++;
+        pthread_mutex_unlock(&lock);
+    }
+    return NULL;
+}
+```
+
+:::warning[锁的粒度很重要]
+上面这样写**结果正确但很慢** —— 20 万次加锁解锁，锁的开销远大于自增本身。
+
+**更好的做法：局部累加，最后一次性提交**
+
+```c
+void *worker(void *arg)
+{
+    int local = 0;
+    for (int i = 0; i < 100000; i++) local++;   /* 局部变量不用锁 */
+
+    pthread_mutex_lock(&lock);
+    counter += local;
+    pthread_mutex_unlock(&lock);
+    return NULL;
+}
+```
+
+**这是并发编程的通用技巧：把共享操作聚合成批次。**
+:::
+
+## 修法二：原子操作
+
+```c
+#include <stdatomic.h>
+
+static atomic_int counter = 0;
+
+void *worker(void *arg)
+{
+    for (int i = 0; i < 100000; i++) {
+        atomic_fetch_add(&counter, 1);      /* 单指令完成，无需锁 */
+    }
+    return NULL;
+}
+```
+
+:::tip[原子操作比锁快在哪]
+| 方式 | 底层 | 开销 |
+| --- | --- | --- |
+| 互斥锁 | 系统调用或 futex 路径 | 数十到数百周期 |
+| **原子操作** | **单条 CPU 指令**（x86 是 `lock xadd`） | **几个周期** |
+
+**但原子操作只保证"单个操作"原子，不能保护多条语句的组合。**
+:::
+
+:::danger[原子操作不能替代锁]
+```c
+atomic_int a = 0, b = 0;
+
+/* 想让 a 和 b 同时变化 —— 做不到！ */
+atomic_store(&a, 1);
+atomic_store(&b, 1);      /* 这两条之间别的线程能看到 a=1,b=0 的中间态 */
+```
+
+**需要"多条语句作为一个整体"时，还是要用锁。**
+:::
+
+## 条件变量：等待某个条件成立
+
+:::danger[互斥锁不能用来"等"]
+```c
+/* ❌ 忙等，烧 CPU 且可能永远等不到（编译器可能把读提到循环外） */
+while (!ready) { }
+```
+
+```c
+/* ❌ 只加锁，仍然忙等 */
+while (1) {
+    pthread_mutex_lock(&lock);
+    if (ready) { pthread_mutex_unlock(&lock); break; }
+    pthread_mutex_unlock(&lock);        /* 解锁后到下次加锁之间，可能错过通知 */
+}
+```
+:::
+
+```c
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  cond = PTHREAD_COND_INITIALIZER;
+static int ready = 0;
+
+/* 等待方 */
+pthread_mutex_lock(&lock);
+while (!ready) {                        /* ← 必须是 while，不是 if */
+    pthread_cond_wait(&cond, &lock);    /* 原子地释放锁并睡眠 */
+}
+pthread_mutex_unlock(&lock);
+
+/* 通知方 */
+pthread_mutex_lock(&lock);
+ready = 1;
+pthread_mutex_unlock(&lock);
+pthread_cond_signal(&cond);             /* 唤醒一个等待者 */
+```
+
+:::danger[为什么 `pthread_cond_wait` 要用 `while` 而不是 `if`]
+**三个原因**：
+
+1. **虚假唤醒（spurious wakeup）** —— POSIX 明确允许 `cond_wait` 无缘无故返回
+2. **多个等待者被唤醒** —— `broadcast` 唤醒全部，但只有一个能拿到资源，其余要重新等
+3. **条件在拿锁后可能又变回 false**
+
+**`while` 让每次醒来都重新检查条件 —— 这是唯一正确的写法。**
+:::
+
+:::warning[`pthread_cond_wait` 内部做了什么]
+```text
+① 原子地：释放 mutex + 进入等待
+② （被 signal 唤醒后）
+③ 原子地：重新获取 mutex
+④ 返回
+```
+
+**所以调用它时你必须已经持有锁**，否则行为未定义。
+:::
+
+## 生产者-消费者：一个完整例子
+
+```c
+#define QSZ 8
+
+static int buf[QSZ];
+static int head = 0, tail = 0, count = 0;
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t not_empty = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t not_full  = PTHREAD_COND_INITIALIZER;
+
+void put(int v)
+{
+    pthread_mutex_lock(&lock);
+    while (count == QSZ) {                      /* 队列满 → 等空位 */
+        pthread_cond_wait(&not_full, &lock);
+    }
+    buf[tail] = v;
+    tail = (tail + 1) % QSZ;
+    count++;
+    pthread_cond_signal(&not_empty);            /* 通知消费者 */
+    pthread_mutex_unlock(&lock);
+}
+
+int get(void)
+{
+    pthread_mutex_lock(&lock);
+    while (count == 0) {                        /* 队列空 → 等数据 */
+        pthread_cond_wait(&not_empty, &lock);
+    }
+    int v = buf[head];
+    head = (head + 1) % QSZ;
+    count--;
+    pthread_cond_signal(&not_full);             /* 通知生产者 */
+    pthread_mutex_unlock(&lock);
+    return v;
+}
+```
+
+:::tip[这里用 `signal` 而不是 `broadcast` 是对的]
+**只有一个空位时，只需要唤醒一个生产者**（唤醒全部只会让其余的去竞争然后重新睡）。
+
+**什么时候必须用 `broadcast`**：
+
+- 一次改变了多个消费者都能用的条件
+- 唤醒者不确定该叫谁（比如关闭标志位，所有人都该退出）
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 计数总是偏小 | `counter++` 非原子 | 加锁或 `atomic_fetch_add` |
+| 偶发死锁 | 两个锁反序获取 | 规定全局加锁顺序 |
+| `cond_wait` 后逻辑错乱 | 用了 `if` 而不是 `while` | 改 `while` |
+| 程序偶发卡住 | 忘记 `signal` 或 `unlock` | 用 `-fsanitize=thread` 查 |
+| 有锁但依然出错 | 有路径没加锁 | 统一封装加锁函数 |
+| 性能极差 | 锁粒度太大 | 局部累加后批量提交 |
+| 编译报 `undefined reference to pthread_create` | 没加 `-pthread` | 编译和链接都要加 |
+| 退出时数据丢失 | 没 `join` 就 `exit` | 主线程 `join` 所有线程 |
+
+:::danger[一个线程崩溃 = 整个进程死]
+**同一进程内的线程共享地址空间**。一个线程踩坏内存，所有线程都受影响。
+
+**没有"只让这个线程退出"的机制**（`pthread_exit` 只对自己有效，别人崩了照样带走全进程）。
+
+**所以**：多线程程序的健壮性要求比多进程高得多。
+:::
+
+## 本课自检
+
+- [ ] 会写 `pthread_create` + `pthread_join`
+- [ ] **知道编译要 `-pthread` 而不是 `-lpthread`**
+- [ ] **知道 `counter++` 不是原子操作**
+- [ ] **会用 `-fsanitize=thread` 检测数据竞争**
+- [ ] 知道互斥锁的粒度影响性能
+- [ ] 会写"局部累加再批量提交"
+- [ ] **知道原子操作只保证单个操作，不能保护多条语句**
+- [ ] **理解条件变量必须配 `while` 而不是 `if` 的三个原因**
+- [ ] 知道 `pthread_cond_wait` 内部要释放并重新获取锁
+- [ ] 会写生产者-消费者队列
+- [ ] 知道什么时候用 `signal`、什么时候必须 `broadcast`
+- [ ] **知道一个线程崩溃会让整个进程死**
+
+## 下一步
+
+[工具链与构建](./toolchain) 讲了怎么和构建系统配合。

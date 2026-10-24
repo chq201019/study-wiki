@@ -1,0 +1,326 @@
+---
+id: 24-build
+title: 24 编译与链接
+sidebar_position: 24
+description: C++ 的四阶段编译、名字修饰、ODR 规则、头文件的作用，以及常见链接错误的排查。
+---
+
+# 24 编译与链接
+
+**本课目标**：理解 C++ 从源码到可执行文件的过程，能排查链接错误。
+
+## 四个阶段（和 C 一样，但有 C++ 特有的坑）
+
+```mermaid
+flowchart LR
+    A["main.cpp"] -->|预处理| B["展开后源码"]
+    B -->|编译| C["main.o 目标文件"]
+    C -->|链接| D["prog 可执行文件"]
+```
+
+C 的详解见 [C 第 3 课](../c-basics/03-compile)。本课只讲 **C++ 特有的部分**。
+
+## C++ 特有第一点：名字修饰（name mangling）
+
+:::tip[为什么 C++ 需要名字修饰]
+C 里函数名 `add` 编译后就叫 `add`。
+
+C++ 有**函数重载**——三个 `add` 必须区分开：
+
+```cpp
+int    add(int, int);
+double add(double, double);
+```
+
+编译器会把名字"改写"成唯一形式（GCC 大致是 `_Z3addii`、`_Z3adddd`）。
+
+**这叫 name mangling。**
+:::
+
+### 后果：C 和 C++ 混编要 `extern "C"`
+
+```cpp
+/* ❌ 在 C++ 里直接用 C 的头文件，链接时找不到函数 */
+#include "c_library.h"
+```
+
+因为 C 编译器生成的符号是 `foo`，而 C++ 期待的是 `_Z3foov`。
+
+**正确做法**：
+
+```cpp
+extern "C" {
+#include "c_library.h"
+}
+```
+
+或者 C 头文件本身加：
+
+```c
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void foo(void);
+
+#ifdef __cplusplus
+}
+#endif
+```
+
+:::danger[这是 C++ 调用 C 库最常见的坑]
+链接错误长这样：
+
+```text
+undefined reference to `foo()'
+```
+
+但 `foo` 明明在 C 库里定义着——**就是名字修饰不匹配**。
+:::
+
+### 看真实的符号名
+
+```bash
+# 编译成目标文件，查看符号
+g++ -c main.cpp -o main.o
+nm main.o | grep add
+```
+
+会看到类似：
+
+```text
+U _Z3addii           ← C++ 修饰后的名字
+```
+
+如果加了 `extern "C"`：
+
+```text
+U add                ← 未修饰，C 风格
+```
+
+## C++ 特有第二点：ODR 规则
+
+![声明与定义的区别及能否放头文件：普通函数定义不能进头文件，inline/模板/类定义可以；ODR 违反的两种典型报错](/img/diagrams/cpp-odr.svg)
+
+
+:::danger[ODR = One Definition Rule（单一定义规则）]
+**同一个实体在整个程序里只能有一个定义。**
+
+| 实体 | 允许的定义数量 |
+| --- | --- |
+| 普通函数、变量 | **1** |
+| 类定义、模板、`inline` 函数 | 可以多份，但**必须完全相同** |
+:::
+
+违反 ODR 的典型后果：
+
+```text
+multiple definition of `foo()'
+```
+
+### 为什么头文件不能放普通函数定义
+
+```cpp
+/* mylib.h */
+void helper() { }           /* ❌ 每个包含它的 .cpp 都定义一份 */
+```
+
+两个 `.cpp` 都包含 → 链接时 `multiple definition`。
+
+**解决**：
+
+```cpp
+/* 方案一：inline */
+inline void helper() { }     /* ✅ inline 允许多份相同定义 */
+
+/* 方案二：声明放头文件，定义放 .cpp */
+void helper();               /* .h */
+void helper() { }            /* .cpp */
+```
+
+:::tip[哪些东西**可以**放头文件]
+| 可以 | 原因 |
+| --- | --- |
+| 类/结构体定义 | 允许多份相同定义 |
+| `inline` 函数 | 同上 |
+| 模板 | 需要定义可见（[第 20 课](./20-templates)） |
+| `constexpr` 变量/函数 | 隐含 `inline` |
+| `const` 全局变量 | 内部链接（每个翻译单元一份） |
+
+**不可以**：普通函数定义、非 `const` 全局变量定义。
+:::
+
+## C++ 特有第三点：模板定义必须在头文件
+
+（[第 20 课](./20-templates)讲过）
+
+```text
+undefined reference to `int my_max<int>(int, int)'
+```
+
+**模板不是真实代码，编译器需要看到完整定义才能实例化。**
+
+**所以模板的定义也必须放头文件。**
+
+## 实际的编译与链接
+
+```bash
+# 一步到位
+g++ -std=c++17 -Wall -Wextra main.cpp mylib.cpp -o prog
+
+# 分步（能看清过程）
+g++ -std=c++17 -c main.cpp -o main.o
+g++ -std=c++17 -c mylib.cpp -o mylib.o
+g++ main.o mylib.o -o prog
+```
+
+:::tip[分步编译的好处：增量构建]
+改了 `main.cpp`，只需重新编译 `main.o`，`mylib.o` 直接复用。
+
+**Makefile / CMake 的核心价值就是自动化这件事**（下一课）。
+:::
+
+## 常见链接错误排查表
+
+| 错误 | 含义 | 常见原因 | 解决 |
+| --- | --- | --- | --- |
+| `undefined reference to 'foo()'` | 找不到定义 | 没链接对应 `.cpp` | 加入编译命令 |
+| 同上，但函数确实存在 | 名字修饰不匹配 | C/C++ 混编 | `extern "C"` |
+| 同上，模板函数 | 模板定义不可见 | 定义在 `.cpp` | 移到头文件 |
+| 同上，标准库函数 | 没链接库 | 如 `-lm`、`-pthread` | 加链接选项 |
+| `multiple definition of 'x'` | 定义了多次 | 头文件放定义 | 改 `inline` 或移 `.cpp` |
+| `undefined reference to 'main'` | 没有入口 | `main` 拼错或没编译 | 检查 `main` |
+| `undefined reference to 'vtable for X'` | 虚函数没定义 | 声明了虚函数没实现 | 补上所有虚函数定义 |
+
+:::danger[`undefined reference to vtable for X` 是什么意思]
+某个类声明了虚函数，但**没有给出定义**。
+
+常见于：
+
+```cpp
+class Base {
+public:
+    virtual void foo();      /* 只在头文件声明，忘了写定义 */
+};
+
+Base b;                       /* 需要 vtable → 链接失败 */
+```
+
+**解决**：给每个声明的虚函数写定义，或者改成纯虚 `= 0`。
+:::
+
+## 看符号的工具
+
+```bash
+# 查看目标文件的符号（U = 未定义，T = 已定义代码段）
+nm main.o
+
+# C++ 的符号要 demangle 才看得懂
+nm -C main.o
+```
+
+`nm -C` 会把 `_Z3addii` 显示成 `add(int, int)`。
+
+## 完整示例
+
+**`math.h`**：
+
+```cpp
+#pragma once
+
+namespace math {
+
+/* 普通函数：只声明 */
+int add(int a, int b);
+int mul(int a, int b);
+
+/* inline 函数：定义可以放头文件 */
+inline int square(int x) { return x * x; }
+
+/* 模板：定义必须放头文件 */
+template<typename T>
+T my_max(T a, T b) { return a > b ? a : b; }
+
+}  /* namespace math */
+```
+
+**`math.cpp`**：
+
+```cpp
+#include "math.h"
+
+namespace math {
+
+int add(int a, int b) { return a + b; }
+int mul(int a, int b) { return a * b; }
+
+}  /* namespace math */
+```
+
+**`main.cpp`**：
+
+```cpp
+#include <iostream>
+#include "math.h"
+
+int main() {
+    std::cout << "add(2,3) = " << math::add(2, 3) << "\n";
+    std::cout << "mul(2,3) = " << math::mul(2, 3) << "\n";
+    std::cout << "square(5) = " << math::square(5) << "\n";
+    std::cout << "my_max(2.5, 1.5) = " << math::my_max(2.5, 1.5) << "\n";
+    return 0;
+}
+```
+
+编译运行：
+
+```bash
+g++ -std=c++17 -Wall -Wextra main.cpp math.cpp -o prog
+./prog
+```
+
+输出：
+
+```text
+add(2,3) = 5
+mul(2,3) = 6
+square(5) = 25
+my_max(2.5, 1.5) = 2.5
+```
+
+:::tip[注意三种东西放在哪里]
+| 东西 | 位置 | 原因 |
+| --- | --- | --- |
+| `add` / `mul` | 声明在 `.h`，定义在 `.cpp` | 普通函数只能定义一次 |
+| `square` | **定义在 `.h`（inline）** | `inline` 允许多份 |
+| `my_max` | **定义在 `.h`（模板）** | 模板需要定义可见 |
+
+**这是正确组织头文件的模板。**
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 头文件放普通函数定义 | `multiple definition` | 违反 ODR | 加 `inline` 或移 `.cpp` |
+| 忘加 `extern "C"` | `undefined reference` | 名字修饰不同 | 加 `extern "C"` |
+| 模板定义放 `.cpp` | `undefined reference` | 定义不可见 | 移到头文件 |
+| 忘链接某个 `.cpp` | `undefined reference` | 没参与编译 | 加入命令行 |
+| 虚函数只声明不定义 | `vtable for X` 未定义 | 缺实现 | 补定义或纯虚 |
+| 用 `nm` 看不懂符号 | —— | 名字修饰 | `nm -C` |
+
+## 本课自检
+
+- [ ] 知道 C++ 有名字修饰（name mangling）
+- [ ] **知道 C/C++ 混编要 `extern "C"`**
+- [ ] 会用 `nm` / `nm -C` 看符号
+- [ ] 理解 ODR：普通实体只能定义一次
+- [ ] **知道哪些东西可以放头文件（类/inline/模板/constexpr）**
+- [ ] 知道模板定义必须在头文件
+- [ ] 会分步编译（`-c` 然后链接）
+- [ ] 能区分 `undefined reference` 的各种原因
+- [ ] 知道 `vtable for X` 未定义意味着虚函数缺实现
+
+## 下一步
+
+[25 CMake 入门](./25-cmake) —— 现代 C++ 工程的标准构建工具。

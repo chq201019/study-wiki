@@ -1,0 +1,345 @@
+---
+id: 23-const
+title: 23 const 的完全指南
+sidebar_position: 23
+description: const 在六个不同位置的含义、const 成员函数、const 与指针的组合、constexpr，以及 const 正确性。
+---
+
+# 23 const 的完全指南
+
+**本课目标**：搞清 `const` 在不同位置的含义，养成「const 正确性」的习惯。
+
+## `const` 的核心含义
+
+**`const` = 承诺「不修改」。** 位置不同，修饰的对象不同。
+
+| 位置 | 含义 |
+| --- | --- |
+| `const int x` | `x` 的值不能改 |
+| `void f(const int x)` | 函数内不改这个参数（对调用方无影响） |
+| `void f(const T &x)` | 不修改 x 指向的对象 |
+| `void f() const` | 成员函数不修改对象 |
+| `const int *p` | 指向的值不能改 |
+| `int *const p` | 指针本身不能改 |
+
+## 一、const 变量
+
+```cpp
+const int MAX = 100;
+MAX = 200;                  /* ❌ 编译错误 */
+```
+
+## 二、const 参数（按值）
+
+```cpp
+void f(const int x) {
+    x = 1;                  /* ❌ 编译错误 */
+}
+```
+
+:::warning[按值加 `const` 对调用方没意义]
+```cpp
+void f(int x);              /* 和下面完全等价（对调用方） */
+void f(const int x);
+```
+
+因为按值传参是**副本**，函数里改不改都不影响实参。
+
+**只在函数声明和定义分离时有点用**（防止你在实现里手滑改了参数）。
+
+**真正有意义的是 `const T&`。**
+:::
+
+## 三、`const` 引用参数（最常用）
+
+```cpp
+void print(const std::string &s);        /* 不复制、不修改 */
+void process(const std::vector<int> &v);
+```
+
+**两个好处一次拿到**：不复制（性能）+ 不会改（安全）。
+
+（[第 3 课](./03-reference)详细讲过。）
+
+## 四、`const` 成员函数
+
+```cpp
+class Widget {
+public:
+    int value() const { return value_; }      /* const 成员函数 */
+    void set(int v) { value_ = v; }           /* 非 const */
+
+private:
+    int value_ = 0;
+};
+```
+
+本机实测：
+
+```cpp
+const Widget &cw = w;
+cw.value();                 /* ✅ const 对象能调 const 成员函数 */
+cw.set(1);                  /* ❌ const 对象不能调非 const 成员函数 */
+```
+
+:::tip[规则：不修改成员的函数都加 `const`]
+```cpp
+class Account {
+public:
+    double balance() const { return balance_; }     /* ✅ */
+    const std::string &owner() const { return owner_; }
+
+private:
+    double balance_;
+    std::string owner_;
+};
+```
+
+**不加 `const` 的后果**：`const Account&` 调不了这个方法，很多地方就用不了你的类。
+
+**这是 C++ 里最常见的「接口设计失误」。**
+:::
+
+### const 与非 const 版本重载
+
+```cpp
+class Widget {
+public:
+    int &value() { return value_; }                 /* 非 const：可写 */
+    const int &value() const { return value_; }     /* const：只读 */
+};
+```
+
+本机实测：
+
+```text
+  w.value_ref()=42（非 const 版本）
+  cw.value_ref()=42（const 版本）
+```
+
+**编译器按对象的 const 性自动选择**。这样 `const` 对象只能拿到只读引用。
+
+## 五、const 与指针（最容易搞混）
+
+```cpp
+int x = 1;
+
+const int *p1 = &x;         /* 指向 const int：*p1 不能改，p1 可以改 */
+int *const p2 = &x;         /* const 指针：*p2 能改，p2 不能改 */
+const int *const p3 = &x;   /* 都不能改 */
+```
+
+本机实测：
+
+```text
+  x=9  p1->2  p2->9  p3->9
+```
+
+（`p1 = &y` 后指向 y=2；`*p2 = 9` 改了 x；`p3` 两样都锁死。）
+
+:::tip[读法：从变量名往右，再往左]
+```cpp
+const int *p        /* p is a pointer to const int */
+int *const p        /* p is a const pointer to int */
+```
+
+**扫描技巧**：找到 `*`，看 `const` 在它左边还是右边：
+
+- `const` 在 `*` **左边** → **值**不能改
+- `const` 在 `*` **右边** → **指针**不能改
+
+**记忆口诀**：`const` 挨着谁就锁谁。
+
+```cpp
+const int *p;       /* const 挨着 int → 锁值 */
+int *const p;       /* const 挨着 p   → 锁指针 */
+```
+:::
+
+## 六、`constexpr`：编译期常量
+
+```cpp
+const int n = 10;
+int arr[n];                 /* ⚠️ C++ 里 const int 通常可以，但标准保证的是 constexpr */
+
+constexpr int N = 10;
+int arr2[N];                /* ✅ 绝对是编译期常量 */
+```
+
+本机实测：`sizeof(arr2)=40`（10 个 int）
+
+:::tip[`const` vs `constexpr`]
+| | `const` | `constexpr` |
+| --- | --- | --- |
+| 含义 | 运行时不修改 | **编译期就能算出** |
+| 能当数组大小 | ⚠️ 看情况 | ✅ 保证 |
+| 能用于模板参数 | ⚠️ | ✅ |
+
+**能写 `constexpr` 就写 `constexpr`**——语义更强，编译器能做更多优化。
+:::
+
+## const 正确性（const correctness）
+
+:::tip[核心原则]
+> **能加 `const` 的地方都加上。**
+
+好处：
+
+1. **编译器帮你检查**：想改就报错，防止手滑
+2. **接口自文档化**：看到 `const` 就知道不会改
+3. **能接受更多参数**：`const T&` 能接收 `const` 和非 `const` 对象；`T&` 只能接收非 `const`
+:::
+
+### 一个具体例子
+
+```cpp
+class Buffer {
+public:
+    /* 没加 const：const Buffer 对象调不了 */
+    size_t size() { return data_.size(); }
+
+    /* 加了 const：任何地方都能调 */
+    size_t size2() const { return data_.size(); }
+
+private:
+    std::vector<char> data_;
+};
+
+void process(const Buffer &b) {
+    b.size();           /* ❌ 编译错：size() 不是 const */
+    b.size2();          /* ✅ */
+}
+```
+
+**一个漏写的 `const`，就让你的类在 const 场景下不可用。**
+
+## 完整示例
+
+```cpp
+#include <iostream>
+#include <string>
+#include <vector>
+
+class Inventory {
+public:
+    void add(const std::string &item, int qty) {
+        items_.push_back({item, qty});
+    }
+
+    /* 只读查询：全部加 const */
+    size_t count() const { return items_.size(); }
+
+    int total_qty() const {
+        int sum = 0;
+        for (const auto &it : items_) sum += it.qty;
+        return sum;
+    }
+
+    /* 返回 const 引用，防止外部修改内部数据 */
+    const std::string &name_at(size_t i) const {
+        return items_.at(i).name;
+    }
+
+    void print() const {
+        for (const auto &it : items_) {
+            std::cout << "  " << it.name << ": " << it.qty << "\n";
+        }
+    }
+
+private:
+    struct Item {
+        std::string name;
+        int qty;
+    };
+
+    std::vector<Item> items_;
+};
+
+/* 注意参数是 const&，所以里面只能调 const 成员函数 */
+void report(const Inventory &inv) {
+    std::cout << "共 " << inv.count() << " 种，总量 " << inv.total_qty() << "\n";
+    inv.print();
+}
+
+int main() {
+    Inventory inv;
+    inv.add("苹果", 10);
+    inv.add("香蕉", 5);
+
+    report(inv);
+
+    /* constexpr 编译期常量 */
+    constexpr int BUFFER_SIZE = 256;
+    char buf[BUFFER_SIZE];
+    std::cout << "缓冲区 " << sizeof(buf) << " 字节\n";
+
+    return 0;
+}
+```
+
+输出：
+
+```text
+共 2 种，总量 15
+  苹果: 10
+  香蕉: 5
+缓冲区 256 字节
+```
+
+:::tip[这个例子的设计要点]
+`report(const Inventory&)` 能工作，**全靠 `Inventory` 的查询方法都加了 `const`**。
+
+如果 `count()` 忘了 `const`，`report` 就编译不过——然后你会想去掉 `report` 的 `const`，**这就越改越糟**。
+
+**"加 const 比减 const 容易"——一开始就写对最重要。**
+:::
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 只读方法忘 `const` | const 对象调不了 | 接口缺陷 | 全部加 `const` |
+| `const int *p` 想改值 | 编译错 | const 在 `*` 左 | 去掉 const 或用非 const 指针 |
+| `int *const p` 想改指向 | 编译错 | const 在 `*` 右 | 去掉 const |
+| `const` 成员函数里改成员 | 编译错 | const 承诺 | 用 `mutable`（慎用）或去掉 const |
+| 用 `const` 期待编译期常量 | 数组大小报错 | 不保证 | 用 `constexpr` |
+| `const` 参数按值传 | 无实际效果 | 副本 | 改成 `const T&` |
+
+:::warning[`mutable` 是个例外口子]
+```cpp
+class Cache {
+public:
+    int get() const {
+        if (!computed_) {          /* const 函数里改成员 */
+            value_ = compute();
+            computed_ = true;      /* 需要 mutable */
+        }
+        return value_;
+    }
+private:
+    mutable int value_ = 0;
+    mutable bool computed_ = false;
+};
+```
+
+`mutable` 允许在 `const` 成员函数里修改某些成员（通常用于缓存）。
+
+**但要克制使用**——它破坏了 const 的语义。
+:::
+
+## 本课自检
+
+- [ ] 知道 `const` 变量不能修改
+- [ ] 知道 `const T&` 参数是最常用的形式
+- [ ] **知道只读成员函数必须加 `const`**
+- [ ] 知道 const 与非 const 成员函数可以重载
+- [ ] **能分清 `const int *p` 和 `int *const p`**
+- [ ] 记住口诀「`const` 挨着谁就锁谁」
+- [ ] 知道 `constexpr` 是编译期常量
+- [ ] 知道能写 `constexpr` 就别写 `const`
+- [ ] 理解 const 正确性的三个好处
+- [ ] 知道 `mutable` 是例外，要克制使用
+
+## 下一步
+
+[24 编译与链接](./24-build) —— 从源码到可执行文件的完整流程，以及 C++ 特有的坑。

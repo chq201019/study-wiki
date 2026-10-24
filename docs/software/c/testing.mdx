@@ -1,0 +1,307 @@
+---
+id: testing
+title: C 单元测试
+sidebar_position: 13
+description: 不用框架的最小测试套路、断言宏怎么写、怎么对静态函数做测试、怎么模拟（mock）系统调用、以及内存错误怎么自动抓到。
+---
+
+# C 单元测试
+
+**本课目标**：能在纯 C 项目里建立起可用的测试。
+
+## 不用框架也能测
+
+```c
+/* test_calc.c */
+#include <stdio.h>
+#include <string.h>
+#include "calc.h"
+
+static int g_fail = 0;
+static int g_total = 0;
+
+#define CHECK(expr)                                                  \
+    do {                                                             \
+        g_total++;                                                   \
+        if (!(expr)) {                                               \
+            g_fail++;                                                \
+            printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #expr);   \
+        }                                                            \
+    } while (0)
+
+int main(void)
+{
+    CHECK(add(1, 2) == 3);
+    CHECK(add(-1, 1) == 0);
+
+    printf("\n%d/%d 通过\n", g_total - g_fail, g_total);
+    return g_fail == 0 ? 0 : 1;
+}
+```
+
+:::tip[`#expr` 让失败信息自解释]
+`CHECK(add(1,2) == 3)` 失败时打印：
+
+```text
+FAIL test_calc.c:21  add(1, 2) == 3
+```
+
+**打印的是表达式本身** —— 不用再写一遍说明文字。
+
+**`do { } while (0)` 是为了让宏在 `if` 后面也能安全使用**：
+
+```c
+if (cond) CHECK(x);      /* 展开成 if (cond) do{...}while(0); 安全 */
+```
+:::
+
+:::danger[断言宏里不能有副作用]
+```c
+CHECK(count++ == 5);      /* ❌ 失败时会执行得"不一样"？*/
+```
+
+**更麻烦的是**：如果以后改成 `#ifdef NDEBUG` 把 CHECK 变成空，`count++` 就消失了。
+
+**规矩：断言里只放"读"，不放"写"。**
+:::
+
+## 测试静态函数
+
+:::warning[`static` 函数外部看不见，怎么测]
+三种做法：
+:::
+
+**① 在测试文件里 `#include` 被测的 `.c`（最常用）**
+
+```c
+/* test_internal.c */
+#include "../src/parser.c"        /* ← 直接包含源文件 */
+
+void test_parse_token(void) {
+    /* 现在能看见 static 函数了 */
+    CHECK(parse_token("abc") == TOK_IDENT);
+}
+```
+
+**代价**：被测文件的 `main` 也会进来，所以被测文件最好不写 `main`（或加宏开关）。
+
+**② 用条件编译暴露**
+
+```c
+#ifdef UNIT_TEST
+  #define STATIC
+#else
+  #define STATIC static
+#endif
+
+STATIC int parse_token(const char *s) { ... }
+```
+
+编译测试时 `-DUNIT_TEST`。
+
+**③ 把内部函数抽到单独文件**（最干净，但要改结构）
+
+## 模拟（mock）系统调用
+
+:::info[C 没有依赖注入，通常靠"链接时替换"]
+被测代码：
+
+```c
+/* file_op.c */
+int read_config(const char *path, char *buf, size_t n) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    size_t got = fread(buf, 1, n, f);
+    fclose(f);
+    return (int)got;
+}
+```
+:::
+
+**做法：在测试里提供同名符号，链接时优先使用**
+
+```c
+/* mock.c —— 只参与测试构建 */
+#include <string.h>
+
+static const char *g_fake_content = "key=value\n";
+
+FILE *fopen(const char *path, const char *mode) {
+    (void)path; (void)mode;
+    return (FILE *)0x1;              /* 假句柄 */
+}
+
+size_t fread(void *p, size_t sz, size_t n, FILE *f) {
+    (void)f;
+    size_t len = strlen(g_fake_content);
+    if (len > sz * n) len = sz * n;
+    memcpy(p, g_fake_content, len);
+    return len / sz;
+}
+
+int fclose(FILE *f) { (void)f; return 0; }
+```
+
+:::danger[这样替换 `fopen` 会干扰整个可执行文件]
+**包括 libc 内部自己调用的 `fopen`**（如果有），可能出奇怪问题。
+
+**更安全的做法**：被测代码不直接调 `fopen`，而是调自己封装的一层：
+
+```c
+/* port.h —— 可替换的平台层 */
+FILE *port_fopen(const char *p, const char *m);
+```
+
+```c
+/* port_posix.c —— 生产用 */
+FILE *port_fopen(const char *p, const char *m) { return fopen(p, m); }
+
+/* port_mock.c —— 测试用 */
+FILE *port_fopen(const char *p, const char *m) { ... }
+```
+
+**链接不同的 `port_*.c` 就能切换实现** —— 这就是 C 里的依赖注入。
+:::
+
+## 自动抓内存错误
+
+:::tip[AddressSanitizer 是最高性价比的工具]
+```bash
+gcc -fsanitize=address -g main.c -o test
+./test
+```
+
+**它能在越界访问的那一刻报错**：
+
+```text
+==12345==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x...
+WRITE of size 1 at 0x... thread T0
+    #0 0x... in main main.c:8
+0x... is located 0 bytes after 16-byte region [0x...,0x...+16)
+allocated by thread T0 here:
+    #0 0x... in malloc
+    #1 0x... in main main.c:6
+```
+
+**直接指出"16 字节区域之后 0 字节处越界"，还告诉你哪行分配的。**
+:::
+
+| 工具 | 抓什么 | 开销 |
+| --- | --- | --- |
+| **AddressSanitizer** (`-fsanitize=address`) | 越界、UAF、双重释放、泄漏 | 2~3 倍 |
+| **UndefinedBehaviorSanitizer** (`-fsanitize=undefined`) | 有符号溢出、空指针、非对齐 | 小 |
+| Valgrind（memcheck） | 内存错误（无需重编译） | **10~30 倍** |
+| `-fsanitize=thread` | 数据竞争 | 5~15 倍 |
+
+```bash
+# 组合使用
+gcc -fsanitize=address,undefined -g main.c -o test
+
+# 泄漏检测（ASan 内含 LeakSanitizer）
+ASAN_OPTIONS=detect_leaks=1 ./test
+```
+
+:::warning[ASan 不能和静态链接、某些优化一起用]
+- **需要动态链接的运行时**（大部分环境没问题）
+- **`-O2` 下栈帧可能被优化，报错行号偶尔不准**（用 `-O1` 或 `-O0`）
+- **嵌入式交叉编译时 ASan 通常不可用**（没有对应的运行时）
+:::
+
+## 测试的组织方式
+
+```text
+project/
+├── src/
+│   ├── calc.c
+│   └── parser.c
+├── include/
+│   └── calc.h
+├── tests/
+│   ├── test_main.c        # 汇总入口
+│   ├── test_calc.c
+│   ├── test_parser.c
+│   └── mock_port.c
+└── Makefile
+```
+
+```makefile
+CFLAGS  = -std=c11 -Wall -Wextra -g -fsanitize=address,undefined
+SRCS    = src/calc.c src/parser.c
+TESTS   = tests/test_main.c tests/test_calc.c tests/test_parser.c tests/mock_port.c
+
+test: $(SRCS) $(TESTS)
+	$(CC) $(CFLAGS) $^ -o test_runner
+	./test_runner
+```
+
+:::tip[每个测试文件暴露一个注册函数]
+```c
+/* test_calc.c */
+void register_calc_tests(void);      /* 在 test_main.c 里调 */
+
+void register_calc_tests(void) {
+    CHECK(add(1,2) == 3);
+    /* ... */
+}
+```
+
+**`test_main.c` 里依次调各模块的注册函数**，避免一个巨大的 `main`。
+:::
+
+## 该测什么
+
+:::tip[C 项目最该测的四类]
+1. **边界与溢出**：空指针、长度 0、`SIZE_MAX`、负数
+2. **错误返回**：`malloc` 失败、文件打不开、参数非法
+3. **解析/编码逻辑**：协议解析、字符串处理（最容易出错）
+4. **曾经出过 bug 的地方**（回归测试）
+:::
+
+:::danger[模拟 `malloc` 失败是很有价值的测试]
+```c
+void *malloc(size_t n);      /* 假实现，返回 NULL */
+```
+
+**很多 C 代码在"内存分配失败"路径上是完全没测过的** —— 而那条路径往往一跑就崩（没判空）。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 测试和被测都定义了 `main` | 一起链接 | 被测文件用 `#ifndef UNIT_TEST` 包住 main |
+| `static` 函数测不到 | 内部链接 | `#include` 源文件或加宏开关 |
+| mock 了 `fopen` 导致奇怪问题 | 全局替换影响 libc | 走自己的平台层 |
+| ASan 报错但 line 不准 | 优化级别高 | 用 `-O0`/`-O1` + `-g` |
+| 测试跑得比 CI 超时还慢 | ASan 开销 + 大循环 | 缩小测试数据规模 |
+| `CHECK` 里带副作用 | 宏可能被禁用 | 只放读操作 |
+| 浮点断言直接 `==` | 精度 | 用 `fabs(a-b) < eps` |
+
+:::warning[浮点相等要用误差比较]
+```c
+CHECK(x == 0.1 + 0.2);              /* ❌ 几乎一定失败 */
+CHECK(fabs(x - 0.3) < 1e-9);        /* ✅ */
+```
+
+**这在任何语言的测试里都一样。**
+:::
+
+## 本课自检
+
+- [ ] 能不用框架写出带 `CHECK` 宏的测试
+- [ ] **知道 `#expr` 让失败信息包含表达式本身**
+- [ ] 知道断言宏为什么要 `do {} while(0)` 包裹
+- [ ] **知道断言里不能放带副作用的表达式**
+- [ ] **会测 `static` 函数（`#include` 源文件 / 条件编译）**
+- [ ] 理解 C 里"链接时替换"来做 mock
+- [ ] **知道全局替换 `fopen` 会干扰 libc，应走自己的平台层**
+- [ ] **知道 AddressSanitizer 能报"多少字节区域之后越界"**
+- [ ] 知道 ASan 的开销是 2~3 倍，Valgrind 是 10~30 倍
+- [ ] 知道 `-fsanitize=address,undefined` 可以组合
+- [ ] 能说出 C 项目最该测的四类
+- [ ] **知道浮点比较要用误差而非 `==`**
+
+## 下一步
+
+[多线程与原子操作](./concurrency) 讲了并发相关的正确性；
+或者看 [陷阱与未定义行为](./pitfalls)。

@@ -1,0 +1,174 @@
+---
+title: 02 安装与验证环境
+sidebar_position: 2
+description: Windows/macOS/Linux 三种系统的 Python 安装步骤，如何验证装好了，以及装完必须做的两件事。
+id: 02-install
+---
+
+# 02 安装与验证环境
+
+**本课目标**：让 `python --version` 在你的电脑上成功输出，并跑出第一个程序。
+
+## Windows 安装（最常见）
+
+### 第一步：下载
+
+打开 [https://www.python.org/downloads/](https://www.python.org/downloads/)，点页面顶部的黄色按钮下载最新稳定版。
+
+> **不要**去各种「软件园」下载。那些站点的安装包常被捆绑广告，甚至夹带恶意程序。**只从 python.org 下。**
+
+### 第二步：安装（这一步有个必须勾的选项）
+
+双击安装包，**在第一个界面底部勾选 `Add python.exe to PATH`**，然后点 `Install Now`。
+
+:::danger[忘了勾 Add to PATH 会怎样]
+不勾的话，你在终端输入 `python` 会提示「不是内部或外部命令」，后面所有课都进行不下去。
+
+**补救办法**（不用重装）：重新运行安装包，选 `Modify` → 一路下一步 → 勾上 `Add Python to environment variables` → 完成。
+:::
+
+### 第三步：验证
+
+按 `Win + R`，输入 `cmd`，回车打开终端，输入：
+
+```bash
+python --version
+```
+
+应该看到类似输出：
+
+```text
+Python 3.12.4
+```
+
+再输入：
+
+```bash
+python -c "print('Hello, World')"
+```
+
+看到 `Hello, World` 就成功了。
+
+:::tip[如果 `python` 不行，试试 `py`]
+Windows 上有时 `python` 命令被系统的应用商店占位程序劫持（输入后弹出应用商店）。试试：
+
+```bash
+py --version
+```
+
+`py` 是 Windows 官方的 Python 启动器，通常更可靠。
+:::
+
+## macOS 安装
+
+macOS 自带一个 Python 3，但版本较老且不建议直接用来开发。推荐两种方式：
+
+### 方式一：官网安装包（最简单）
+
+下载 [https://www.python.org/downloads/macos/](https://www.python.org/downloads/macos/) 的安装包，双击安装。验证：
+
+```bash
+python3 --version
+```
+
+:::info[为什么是 python3 而不是 python]
+macOS 上 `python` 命令可能指向系统自带的 Python 2 或根本不存在。**用 `python3`**，这是 macOS 的惯例。
+:::
+
+### 方式二：Homebrew（推荐给愿意折腾的人）
+
+```bash
+brew install python@3.12
+```
+
+好处是升级方便（`brew upgrade`），坏处是要先装 Homebrew。
+
+## Linux 安装
+
+大多数发行版自带 Python 3。验证：
+
+```bash
+python3 --version
+```
+
+没装的话：
+
+```bash
+# Debian/Ubuntu
+sudo apt update && sudo apt install python3 python3-pip python3-venv
+
+# Fedora/RHEL
+sudo dnf install python3 python3-pip
+
+# Arch
+sudo pacman -S python python-pip
+```
+
+:::warning[Linux 上不要尝试卸载系统 Python]
+Ubuntu 等系统的很多工具（包括部分系统管理命令）依赖系统自带的 Python。**强行卸载或替换会搞坏系统。**
+
+要装新版本，用 `pyenv` 或发行版提供的版本化包（如 `python3.12`），不要动系统的 `python3`。
+:::
+
+## 装完必须做的两件事
+
+### 一、确认 pip 可用
+
+`pip` 是 Python 的包管理器，用来安装第三方库。验证：
+
+```bash
+python -m pip --version
+```
+
+:::tip[为什么用 `python -m pip` 而不是直接 `pip`]
+电脑上可能装了多个 Python（系统一个、conda 一个、你自己装一个），`pip` 命令不一定属于你正在用的那个 Python。
+
+`python -m pip` 的意思是「**用当前这个 python 去运行它自带的 pip 模块**」，绝对不会装错地方。这是个好习惯，建议一直这么写。
+:::
+
+### 二、认识交互模式
+
+在终端直接输入 `python`（macOS/Linux 用 `python3`），会进入**交互模式**：
+
+```text
+Python 3.11.9 (main, ...) [MSC v.1938 64 bit (AMD64)] on win32
+Type "help", "copyright", "credits" or "license" for more information.
+>>>
+```
+
+看到 `>>>` 就是进去了。在这里可以一行一行试代码：
+
+```text
+>>> 1 + 1
+2
+>>> print("测试")
+测试
+>>> exit()
+```
+
+**退出**：输入 `exit()`，或按 `Ctrl+D`（macOS/Linux）、`Ctrl+Z` 回车（Windows）。
+
+这个模式叫 REPL（读取-求值-打印-循环），是**学 Python 最快的工具**——想验证一个想法，直接敲进去看结果，不用建文件。
+
+## 常见问题
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `python` 不是内部或外部命令 | 没加 PATH | 重装时勾 Add to PATH |
+| 输入 python 弹出应用商店 | Windows 占位程序 | 改用 `py` 命令 |
+| `python --version` 显示 2.7 | 系统里有 Python 2 | 用 `python3` 或调整 PATH |
+| `pip` 命令找不到 | pip 没装 | `python -m ensurepip --upgrade` |
+| 安装时报权限错误 | 没管理员权限 | 右键「以管理员身份运行」安装包 |
+| 中文路径下 pip 报错 | 路径含中文 | 换到纯英文路径 |
+
+## 本课自检
+
+- [ ] `python --version`（或 `py`/`python3`）能输出 3.x 版本号
+- [ ] 跑通了 `print('Hello, World')`
+- [ ] `python -m pip --version` 有输出
+- [ ] 知道 `>>>` 是交互模式，会用 `exit()` 退出
+- [ ] 知道该用 `python -m pip` 而不是裸 `pip`
+
+## 下一步
+
+[03 认识终端与运行方式](./03-terminal) —— 学会用终端运行 .py 文件，这是所有后续课程的基础。

@@ -1,0 +1,308 @@
+---
+id: tools-process
+title: 进程与信号工具
+sidebar_position: 26
+description: ps 的 STAT 列含义、top 的关键指标、kill 的信号选择、pgrep/pkill 的坑、以及为什么 kill -9 不该是第一选择。
+---
+
+# 进程与信号工具
+
+**本课目标**：会看进程状态，会安全地终止进程。
+
+## `ps` 的 STAT 列
+
+```bash
+ps aux                    # BSD 风格（含 %CPU %MEM）
+ps -ef                    # System V 风格（含 PPID）
+ps -eo pid,ppid,stat,pcpu,pmem,etime,cmd --sort=-pcpu | head
+```
+
+:::info[STAT 列常见字母]
+| 字母 | 含义 |
+| --- | --- |
+| `R` | 运行中/可运行 |
+| `S` | 可中断睡眠（**最常见，正常**） |
+| **`D`** | **不可中断睡眠（等 IO，连 `kill -9` 都杀不掉）** |
+| `Z` | 僵尸（已退出但父进程没 wait） |
+| `T` | 被暂停（Ctrl+Z / SIGSTOP） |
+| `I` | 空闲内核线程 |
+| `s` | 会话首进程（修饰符） |
+| `l` | 多线程（修饰符） |
+| `+` | 在前台进程组（修饰符） |
+| `<` | 高优先级 |
+| `N` | 低优先级 |
+:::
+
+**组合读法**：`Ss` = 可中断睡眠的会话首进程；`Rl+` = 前台运行的多线程进程。
+
+:::danger[`D` 状态是唯一"杀不掉"的]
+```bash
+kill -9 <pid>          # 对 D 状态无效
+```
+
+**`D` 表示进程卡在内核里等一个不可中断的 IO**（磁盘、NFS、驱动）。
+
+**能做的只有**：
+
+- 等 IO 完成（有时几秒，有时永不）
+- 修好设备（NFS 服务器恢复）
+- **重启机器**（如果一直不返回）
+
+**大量 `D` 状态 = 存储层出问题了**，不是应用的问题。
+:::
+
+```bash
+# 找出所有 D 状态进程
+ps -eo state,pid,comm | awk '$1 ~ /^D/'
+```
+
+## `top` / `htop` 的关键指标
+
+```text
+top - 10:23:45 up 3 days,  load average: 2.00, 1.80, 1.50
+Tasks: 200 total,  2 running, 197 sleeping,  0 stopped,  1 zombie
+%Cpu(s): 12.0 us,  3.0 sy,  0.0 ni, 82.0 id,  3.0 wa,  0.0 hi,  0.0 si
+MiB Mem :  32000.0 total,   2000.0 free,  12000.0 used,  18000.0 buff/cache
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `us` | 用户态 CPU |
+| `sy` | 内核态 CPU |
+| `wa` | **等 IO** |
+| `id` | 空闲 |
+| `hi` / `si` | 硬中断 / 软中断 |
+
+:::tip[`us + sy + wa + id ≈ 100`]
+**先把这块分解清楚再动手**：
+
+- `us` 高 → 算得多 → `perf` 找热点
+- `sy` 高 → 系统调用多 → `strace -c`
+- **`wa` 高 → 等磁盘 → `iostat`**
+- `id` 高但慢 → 不是在等 CPU，去查 IO/网络/锁
+:::
+
+:::warning[`load average` 要除以核数]
+```bash
+nproc                       # 核数
+uptime                      # 负载
+```
+
+**负载 8 在 4 核机器上是过载，在 16 核机器上很轻松。**
+
+**负载包含 `D` 状态进程** —— 所以"负载高但 CPU 空闲"通常就是卡 IO。
+:::
+
+## `kill` 的信号选择
+
+```bash
+kill <pid>              # 默认 SIGTERM（15）
+kill -9 <pid>           # SIGKILL
+kill -HUP <pid>         # SIGHUP（常用于"重载配置"）
+kill -l                 # 列出所有信号
+pkill -f 'pattern'      # 按命令行匹配
+killall nginx           # 按进程名
+```
+
+:::danger[`SIGTERM` 先，`SIGKILL` 后]
+```bash
+kill <pid>                      # 1. 请它优雅退出（能保存数据、关连接）
+sleep 5
+kill -9 <pid>                   # 2. 还不走就强杀
+```
+
+**`kill -9` 直接杀，程序没机会：**
+
+- 刷新缓冲区（日志丢失）
+- 提交数据库事务（可能留下不一致）
+- 删除临时文件
+- 通知对端关闭连接
+
+**"`kill -9` 是最后手段"这条规则值得刻在脑子里。**
+:::
+
+| 信号 | 编号 | 用途 |
+| --- | --- | --- |
+| `SIGHUP` | 1 | 终端断开 / **重载配置**（许多守护进程约定） |
+| `SIGINT` | 2 | Ctrl+C |
+| `SIGQUIT` | 3 | Ctrl+\ （通常带 core dump） |
+| **`SIGTERM`** | **15** | **默认，请求优雅退出** |
+| `SIGKILL` | 9 | **强杀，不可捕获** |
+| `SIGSTOP` | 19 | 暂停（不可捕获） |
+| `SIGCONT` | 18 | 继续 |
+| `SIGUSR1/2` | 10/12 | 自定义用途 |
+
+:::warning[`SIGKILL` 和 `SIGSTOP` 不能被捕获]
+**所以程序无法"处理"它们** —— 这是设计的（否则杀不掉）。
+
+**但也意味着用 `kill -9` 时，程序连日志都来不及打。**
+:::
+
+## `pgrep` / `pkill` 的坑
+
+```bash
+pgrep -a nginx           # 匹配进程名，显示命令行
+pgrep -f 'gunicorn.*8000' # 匹配完整命令行
+pkill -f 'python.*worker'
+```
+
+:::danger[`pkill -f` 会匹配到自己]
+```bash
+pkill -f 'python worker.py'
+# 可能把执行这条命令的 shell 也杀了（如果它的命令行含这个字符串）
+```
+
+**安全做法**：
+
+```bash
+# 先看会匹配到谁
+pgrep -af 'python worker.py'
+
+# 再杀
+pkill -f 'python worker.py'
+```
+
+**或者用更精确的模式**：
+
+```bash
+pkill -f '^python /opt/app/worker\.py'
+```
+:::
+
+:::warning[`pkill` 默认信号是 SIGTERM]
+```bash
+pkill -9 -f pattern        # 强杀（危险）
+```
+
+**在脚本里不要用 `pkill -9`** —— 应该先 TERM 再等。
+:::
+
+## 进程树与父子关系
+
+```bash
+pstree -p 1234                   # 进程树
+ps -eo pid,ppid,cmd --forest     # 树形显示
+ps --ppid 1234                   # 某进程的所有子进程
+```
+
+:::tip[杀一整个进程组]
+```bash
+kill -TERM -1234                 # 负号表示"进程组 1234"
+```
+
+**这比逐个杀子进程可靠** —— 尤其对 shell 启动的一串命令。
+:::
+
+:::danger[父进程死了，子进程会怎样]
+- **不会自动死**（除非它显式处理或被 `prctl(PR_SET_PDEATHSIG)`）
+- 会被 init/systemd 收养（`PPID` 变成 1）
+- **这就是"孤儿进程"**
+
+**所以 `kill` 掉服务主进程后，工作进程可能还活着** —— 要杀整个进程组或用 `systemctl stop`（它按 cgroup 杀）。
+:::
+
+## 僵尸进程
+
+```bash
+ps -eo stat,pid,ppid,cmd | awk '$1 ~ /^Z/'
+```
+
+:::info[僵尸是"已退出但父进程没调 wait"]
+- 它**不占 CPU、不占内存**
+- 只占一个 PID 和一条进程表项
+- **杀不掉**（已经死了）
+
+**处理办法：让父进程调 `wait()`，或杀掉父进程（僵尸会被 init 收走）。**
+:::
+
+```bash
+# 如果父进程是 1（已被 init 收养），僵尸会很快消失
+# 如果父进程还在，说明它没正确处理子进程退出
+```
+
+:::warning[少量僵尸无害，大量僵尸说明父进程有 bug]
+**服务里 fork 子进程却不 wait，一天能攒几千个僵尸** → 最终耗尽 PID。
+
+**修法**：用 `SIGCHLD` 处理或 `waitpid(-1, ..., WNOHANG)` 循环收割。
+:::
+
+## 常用组合
+
+```bash
+# CPU 前 5
+ps -eo pid,pcpu,pmem,comm --sort=-pcpu | head -6
+
+# 内存前 5
+ps -eo pid,rss,comm --sort=-rss | head -6
+
+# 某个程序的所有实例
+pgrep -af nginx
+
+# 进程运行了多久
+ps -eo pid,etime,cmd -p 1234
+
+# 看进程打开的文件
+lsof -p 1234 | head
+
+# 看进程的工作目录与启动命令
+ls -l /proc/1234/cwd /proc/1234/exe
+tr '\0' ' ' < /proc/1234/cmdline ; echo
+```
+
+:::tip[`/proc/<pid>/` 是最原始的信息源]
+| 文件 | 内容 |
+| --- | --- |
+| `cmdline` | 启动命令（NUL 分隔） |
+| `cwd` | 工作目录（符号链接） |
+| `exe` | 可执行文件（符号链接，带 `(deleted)` 说明已被替换） |
+| `fd/` | 打开的文件描述符 |
+| `environ` | 环境变量（NUL 分隔） |
+| `status` | 内存、线程、信号状态 |
+| `limits` | 资源限制 |
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `kill -9` 无效 | `D` 状态 | 只能等 IO 或重启 |
+| 杀了主进程子进程还在 | 不是同一进程组 | `kill -TERM -<pgid>` |
+| `pkill -f` 杀了自己 | 模式匹配到自身命令行 | 先 `pgrep -af` 确认 |
+| 大量僵尸 | 父进程没 wait | 修父进程或用 `--init` |
+| `ps aux` 看不到某进程 | 权限（不同用户/命名空间） | `sudo` 或用 `ps -e` |
+| 负载高 CPU 闲 | `D` 状态堆积 | 查磁盘/NFS |
+| `top` 的 CPU 加起来不到 100 | 多核（需 `I` 键切到 Irix 模式） | 按 `I` |
+| `SIGHUP` 把服务杀了 | 该程序没处理 HUP | 用 `systemctl reload` |
+
+:::danger[在容器里 `ps` 只看到自己]
+**PID namespace 隔离** —— 容器里看不到宿主的其他进程。
+
+**要从宿主看**：
+
+```bash
+docker top <container>          # 容器内进程
+ps -ef | grep containerd         # 宿主视角
+```
+
+**这也是容器里 `--init` 重要的原因**：它当 PID 1 负责收割僵尸。
+:::
+
+## 本课自检
+
+- [ ] 会读 `ps` 的 STAT 列字母
+- [ ] **知道 `D` 状态连 `kill -9` 都杀不掉**
+- [ ] 会分解 `us/sy/wa/id` 判断瓶颈
+- [ ] **知道 `load average` 要除以核数**
+- [ ] **知道"先 SIGTERM 后 SIGKILL"的理由**
+- [ ] 知道 `SIGKILL`/`SIGSTOP` 不能被捕获
+- [ ] 知道 `SIGHUP` 常被用作"重载配置"
+- [ ] **知道 `pkill -f` 可能匹配到自己，要先 `pgrep -af` 确认**
+- [ ] 会杀整个进程组（`kill -TERM -<pgid>`）
+- [ ] **知道父进程死了子进程不会自动死（孤儿进程）**
+- [ ] 知道僵尸杀不掉，要靠父进程 wait 或杀父进程
+- [ ] 会用 `/proc/<pid>/` 的各文件
+- [ ] **知道容器里 `ps` 只看得到自己（PID namespace）**
+
+## 下一步
+
+[日志与 journalctl](./tools-journal) 或 [性能分析](./performance)。

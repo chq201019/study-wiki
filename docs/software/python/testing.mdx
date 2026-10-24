@@ -1,0 +1,280 @@
+---
+id: testing
+title: pytest 与测试设计
+sidebar_position: 14
+description: fixture 的作用域陷阱、参数化怎么组织测试、mock 该打在哪里、什么时候不该写测试，以及 flaky 测试的常见来源。
+---
+
+# pytest 与测试设计
+
+**本课目标**：会写可维护的测试，知道哪些测试其实在浪费时间。
+
+## 最小测试
+
+```python
+# tests/test_calc.py
+def add(a, b):
+    return a + b
+
+def test_add():
+    assert add(1, 2) == 3
+```
+
+```bash
+pytest                    # 自动发现 test_*.py 里的 test_* 函数
+pytest -q                 # 简略输出
+pytest -k "add"           # 只跑名字含 add 的
+pytest -x                 # 第一个失败就停
+pytest --lf               # 只重跑上次失败的
+```
+
+:::tip[用 `assert` 而不是 `self.assertEqual`]
+**pytest 会重写 `assert` 语句**，失败时能打印出中间值：
+
+```text
+assert add(1, 2) == 4
+       ^^^^^^^^^
+E       assert 3 == 4
+E        +  where 3 = add(1, 2)
+```
+
+**比 `unittest` 的 `self.assertEqual(3, 4)` 信息量大得多。**
+:::
+
+## fixture：准备与清理
+
+![pytest fixture 四种作用域：function 每个测试一次、class/module/session 逐级放大；放大能提速但有状态污染风险](/img/diagrams/py-pytest-scope.svg)
+
+
+```python
+import pytest
+
+@pytest.fixture
+def db():
+    conn = connect(":memory:")
+    conn.execute("CREATE TABLE t (x INTEGER)")
+    yield conn                    # ← yield 之前是准备，之后是清理
+    conn.close()
+
+def test_insert(db):
+    db.execute("INSERT INTO t VALUES (1)")
+    assert db.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 1
+```
+
+:::danger[fixture 作用域搞错会共享状态]
+| 作用域 | 创建次数 |
+| --- | --- |
+| `function`（默认） | **每个测试函数一次** |
+| `class` | 每个类一次 |
+| `module` | 每个模块一次 |
+| `session` | 整个测试会话一次 |
+
+```python
+@pytest.fixture(scope="module")      # ❌ 有状态的 db 不要用 module
+def db():
+    ...
+```
+
+**用 `module`/`session` 跑得快，但如果 fixture 带可变状态，测试之间会互相污染**——表现为"单独跑通过、一起跑失败"。
+
+**规矩**：默认用 `function`，只有当 fixture **确实无状态且创建很贵**时才放宽。
+:::
+
+:::warning[`yield` fixture 里的清理代码在测试失败时也会执行吗]
+**会**。pytest 用生成器的 `close()` 机制，即使测试抛异常，`yield` 之后的清理仍会执行。
+
+**但如果是 `session` 作用域的 fixture 里的清理出错，会被记为 error 而不是 failure** —— 容易误判。
+:::
+
+## 参数化：一次写多组数据
+
+```python
+import pytest
+
+@pytest.mark.parametrize("a,b,expected", [
+    (1, 2, 3),
+    (0, 0, 0),
+    (-1, 1, 0),
+    (1.5, 2.5, 4.0),
+])
+def test_add(a, b, expected):
+    assert add(a, b) == expected
+```
+
+**pytest 会给每组生成一个独立测试**，失败时能看出是哪组：
+
+```text
+test_calc.py::test_add[1-2-3]        PASSED
+test_calc.py::test_add[0-0-0]        PASSED
+test_calc.py::test_add[-1-1-0]       PASSED
+test_calc.py::test_add[1.5-2.5-4.0]  PASSED
+```
+
+:::tip[给参数化加可读的 id]
+```python
+@pytest.mark.parametrize("s,expected", [
+    ("", 0),
+    ("a", 1),
+    ("abc", 3),
+], ids=["empty", "single", "multi"])
+```
+
+**测试报告里显示 `test_len[empty]` 而不是 `test_len[s0-0]`** —— 失败时一眼知道是哪种情况。
+:::
+
+:::danger[参数化 + fixture 的组合要注意顺序]
+```python
+@pytest.mark.parametrize("x", [1, 2, 3])
+def test_something(db, x):        # ✅ fixture 在前，参数在后
+    ...
+```
+
+**反过来写（参数在前）会报错**：pytest 要求 fixture 参数在前，参数化的参数在后。
+
+**另外多个 `parametrize` 叠加是"笛卡尔积"，不是"一一对应"**：
+
+```python
+@pytest.mark.parametrize("a", [1, 2])
+@pytest.mark.parametrize("b", [10, 20])
+def test(a, b): ...
+# 生成 4 个测试：(1,10) (1,20) (2,10) (2,20)
+```
+:::
+
+## mock：打在哪一层
+
+```python
+from unittest.mock import patch, MagicMock
+
+# 被测代码
+# mymodule/client.py
+import requests
+
+def fetch_user(uid):
+    r = requests.get(f"https://api.example.com/users/{uid}")
+    r.raise_for_status()
+    return r.json()
+```
+
+:::danger[要 patch "被测代码看得到的位置"，不是定义位置]
+```python
+# ❌ 错：patch 了 requests 内部，但 mymodule.client 已经 import 了自己的引用
+@patch("requests.get")
+def test_fetch(mock_get): ...
+
+# ✅ 对：patch mymodule.client 里那个名字
+@patch("mymodule.client.requests.get")
+def test_fetch(mock_get):
+    mock_get.return_value.json.return_value = {"id": 1}
+    assert fetch_user(1)["id"] == 1
+```
+
+**原理**：`import requests` 在 `mymodule.client` 的命名空间里创建了一个指向模块的引用。**patch 必须改那个引用。**
+:::
+
+:::tip[用 `autospec` 让 mock 检查签名]
+```python
+@patch("mymodule.client.requests.get", autospec=True)
+def test_fetch(mock_get): ...
+```
+
+**这样调用参数写错时测试会失败**，而不是静默接受任何参数。
+
+**普通 `MagicMock` 接受任意参数和任意属性访问** —— 很容易测出一个"假通过"。
+:::
+
+:::warning[mock 用多了说明设计有问题]
+**如果一个函数要 mock 五六个东西才能测，通常意味着它耦合太重。**
+
+**更好的做法**：把外部依赖作为参数传进来（依赖注入），测试时传假对象，连 patch 都不需要。
+
+```python
+def fetch_user(uid, http=requests):
+    r = http.get(f".../{uid}")
+    ...
+```
+
+```python
+def test_fetch():
+    fake = MagicMock()
+    fake.get.return_value.json.return_value = {"id": 1}
+    assert fetch_user(1, http=fake)["id"] == 1
+```
+:::
+
+## 该测什么，不该测什么
+
+:::tip[值得测的]
+- **边界条件**：空输入、单元素、最大长度、负数
+- **错误路径**：非法参数、超时、外部服务失败
+- **曾经出过 bug 的地方**（回归测试最有价值）
+- **复杂的纯逻辑**：解析、算法、状态机
+:::
+
+:::danger[不值得测的]
+- **语言/框架本身的行为**（测 `list.append` 会不会加进去）
+- **纯 getter/setter**
+- **实现细节**（测"函数内部调用了 3 次 helper"——重构就废）
+- **UI 的具体像素**
+
+**测试的目标是"行为契约"，不是"实现快照"。**
+:::
+
+:::warning["覆盖率 100%"是个陷阱]
+**覆盖率只衡量"哪些行被执行过"，不衡量"是否验证了正确性"**：
+
+```python
+def test_useless():
+    add(1, 2)          # 覆盖到了，但没有任何断言！
+```
+
+**这行代码覆盖率算 100%，但什么都没测。**
+
+**更有价值的指标**：
+
+- 关键路径是否都有断言
+- 边界和错误路径是否覆盖
+- 是否有回归测试
+:::
+
+## flaky 测试的常见来源
+
+| 现象 | 来源 | 解决 |
+| --- | --- | --- |
+| 单独跑过，一起跑挂 | 共享状态（模块级变量、DB） | fixture 用 `function` 作用域 |
+| 随机失败 | 依赖时间 | 注入时钟或用 `freezegun` |
+| 随机失败 | 依赖字典/set 迭代顺序 | 排序后比较，或比较集合 |
+| 随机失败 | 依赖网络/文件 | mock 掉 |
+| 时快时慢失败 | 并发竞态 | 加同步或改成串行 |
+| CI 上挂本地过 | 时区、路径分隔符、locale | 显式指定 |
+| 顺序依赖 | 测试间有隐式依赖 | `pytest-randomly` 打乱顺序暴露 |
+
+:::tip[用 `pytest-randomly` 主动发现顺序依赖]
+```bash
+pip install pytest-randomly
+pytest
+# 每次以不同顺序跑测试
+```
+
+**如果打乱顺序后开始失败，说明你的测试之间有隐藏依赖** —— 这比在生产上炸出来好得多。
+:::
+
+## 本课自检
+
+- [ ] 会用 `assert`，知道 pytest 会重写以获得更好报错
+- [ ] 会写 `yield` fixture（准备 + 清理）
+- [ ] **知道 fixture 默认 `function` 作用域，放宽会共享状态**
+- [ ] 会用 `parametrize`，知道能加 `ids` 提升可读性
+- [ ] **知道多个 `parametrize` 叠加是笛卡尔积**
+- [ ] **知道 mock 要 patch "被测代码看得到的位置"**
+- [ ] 会用 `autospec=True` 让 mock 检查签名
+- [ ] **知道 mock 太多说明耦合太重，应改用依赖注入**
+- [ ] 能说出该测什么（边界/错误路径/回归/复杂逻辑）
+- [ ] **知道覆盖率不衡量正确性**
+- [ ] 能诊断 flaky 测试的六种来源
+- [ ] 会用 `pytest-randomly` 暴露顺序依赖
+
+## 下一步
+
+[类型注解与静态检查](./typing) 是同一层的质量保障；
+或者看 [演示与脚本工程化](./engineering)。

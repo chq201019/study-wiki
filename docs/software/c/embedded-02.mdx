@@ -1,0 +1,246 @@
+---
+id: embedded-02
+title: "02 中断服务程序（ISR）的约束"
+sidebar_position: 3
+description: "嵌入式 C 关键 第 2 部分：中断服务程序（ISR）的约束"
+---
+
+# 02 中断服务程序（ISR）的约束
+ISR 是**异步**执行的——它在任意时刻打断主程序。这带来一系列硬约束。
+
+### ISR 的六条准则
+
+:::danger[1. 越快越好]
+ISR 运行期间（默认）其他中断被屏蔽。长 ISR 会：
+- 增加其他中断的延迟
+- 可能错过后续的中断
+- 在 RTOS 上推迟高优先级任务
+
+**正确模式：ISR 只做最少的事（清中断标志、把数据放进队列），实际处理交给任务。**
+
+```c
+/* FreeRTOS 风格 */
+static void IRAM_ATTR gpio_isr_handler(void *arg) {
+    uint32_t gpio_num = (uint32_t)arg;
+    xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);   /* 只发个消息 */
+}
+
+static void gpio_task(void *arg) {
+    uint32_t io_num;
+    for (;;) {
+        if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
+            handle_gpio_event(io_num);   /* 真正的工作在这里做 */
+        }
+    }
+}
+```
+:::
+
+:::warning[2. 不能调用阻塞函数]
+ISR 里**不能**调用：
+- `vTaskDelay()` / `delay()`
+- 获取可能已持有的互斥锁（会阻塞）
+- 带超时的队列接收
+- 任何可能阻塞的 API
+
+**可以用**的是带 `FromISR` 后缀的版本：`xQueueSendFromISR`、`xSemaphoreGiveFromISR`、以及 ESP-IDF 的 `portYIELD_FROM_ISR`。
+
+`printf` 在 ISR 里也是危险的——它可能加锁、可能很慢。**ESP-IDF 的 `ESP_LOG` 不能在 ISR 里用**，要用 `ESP_EARLY_LOG` 或直接不用。
+:::
+
+:::warning[3. 共享变量必须 `volatile` + 临界区]
+```c
+volatile uint32_t tick_count;    /* ISR 里递增 */
+
+void SysTick_Handler(void) {
+    tick_count++;    /* volatile 保证真实写内存 */
+}
+```
+
+但 `tick_count++` **不是原子的**！如果主程序要读一个 32 位计数器而它是 8/16 位 MCU，一次读不完就被打断，会读到"半新半旧"的值。
+
+**解决**：
+- 读之前关中断（临界区），读完再开
+- 或用原子操作
+- 或用硬件提供的"锁存读"功能
+
+```c
+uint32_t read_tick(void) {
+    uint32_t v;
+    taskENTER_CRITICAL();
+    v = tick_count;
+    taskEXIT_CRITICAL();
+    return v;
+}
+```
+:::
+
+:::warning[4. ESP32 上 ISR 要加 `IRAM_ATTR`]
+```c
+void IRAM_ATTR my_isr(void *arg) { }
+```
+
+原因：ESP32 从 Flash 执行代码（通过 cache）。如果 ISR 期间发生 **Flash 写操作**（如 SPIFFS/NVS 写入），cache 会被禁用，**Flash 里的 ISR 代码就执行不了**，直接崩溃。
+
+`IRAM_ATTR` 把函数放进内部 RAM（IRAM），保证任何时刻都能执行。
+
+**同理，ISR 调用的**所有**函数也必须在 IRAM 里。**
+:::
+
+:::warning[5. 不能返回任何东西，参数也受限]
+ISR 由硬件直接调用，没有返回值给谁看。签名通常是 `void isr(void)` 或 `void isr(void *arg)`。
+:::
+
+:::warning[6. 清中断标志的时机]
+通常要**先**清中断标志**再**做处理，否则可能一退出 ISR 就立刻再次进入（中断电平还在）。
+
+但有些硬件要求先读某寄存器再清——**以芯片手册为准**。
+:::
+
+### ISR 相关的存储类
+
+| 存储类 | 用途 |
+| --- | --- |
+| `IRAM_ATTR` | 函数放进内部 RAM（ISR 必需） |
+| `DRAM_ATTR` | 数据放进 DRAM（ISR 访问的数据，避免 Flash cache 问题） |
+| `RTC_IRAM_ATTR` | 放进 RTC 慢速内存（深度睡眠期间要保留的代码） |
+| `RTC_NOINIT_ATTR` | 深度睡眠期间保留的变量 |
+
+## 五、可重入性（reentrancy）
+
+**定义**：一个函数在被"再次调用"（打断后重新进入）时，仍能正确工作。
+
+不可重入的来源：
+
+| 来源 | 例子 | 后果 |
+| --- | --- | --- |
+| 使用静态/全局变量 | `static char buf[64];` 在多次调用间共享 | 被打断后数据被覆盖 |
+| 返回静态缓冲区 | `char *itoa(int)` 返回 `static char[]` | 第二次调用覆盖第一次的结果 |
+| 调用不可重入的函数 | `strtok`（用内部静态状态） | 交错调用导致状态错乱 |
+| 自己修改自己的代码 | 极罕见 | — |
+
+### 经典例子
+
+```c
+/* 不可重入 */
+char *format_time(int sec) {
+    static char buf[16];       /* 静态缓冲区！ */
+    sprintf(buf, "%02d:%02d", sec / 60, sec % 60);
+    return buf;                /* 返回静态缓冲区的指针 */
+}
+
+/* 调用 */
+printf("%s %s\n", format_time(60), format_time(120));
+/* 可能打印 "02:00 02:00" —— 两次都指向同一个 buf！ */
+```
+
+```c
+/* 可重入 */
+void format_time_r(int sec, char *buf, size_t len) {
+    snprintf(buf, len, "%02d:%02d", sec / 60, sec % 60);
+}
+/* 调用方提供缓冲区 */
+```
+
+注意 `_r` 后缀是 C 标准库的约定，表示 "reentrant"：`strtok_r`、`gmtime_r`、`localtime_r`、`rand_r`。
+
+### 中断与主循环的冲突
+
+```c
+/* 危险 */
+char g_buf[64];
+
+void main_loop(void) {
+    strcpy(g_buf, "hello");
+    process(g_buf);        /* 如果这里被 ISR 打断，ISR 改了 g_buf... */
+}
+
+void isr(void) {
+    strcpy(g_buf, "ISR");  /* ...主循环继续时 g_buf 变了 */
+}
+```
+
+即使 `g_buf` 是 `volatile` 也没用——`volatile` 不解决**逻辑上的**数据竞争。
+
+**解决**：
+1. ISR 不碰主循环的数据（只往队列里放）
+2. 用临界区保护共享数据
+3. 用双缓冲
+
+### 可重入 vs 线程安全
+
+| 概念 | 含义 | 关系 |
+| --- | --- | --- |
+| **可重入** | 能在执行中被再次调用 | 强要求 |
+| **线程安全** | 多线程同时调用安全 | 可以用锁实现 |
+
+**可重入 ⟹ 线程安全**（通常），但**线程安全 ⇏ 可重入**（用锁实现的线程安全函数，如果在 ISR 里被重入会死锁）。
+
+## 六、栈溢出
+
+[内存页](./memory)讲过原理，这里聚焦嵌入式。
+
+### 为什么 MCU 上特别危险
+
+| 平台 | 栈溢出后果 |
+| --- | --- |
+| PC（有 OS） | 立刻崩溃（`0xC00000FD`），容易发现 |
+| **裸机 MCU** | **没有任何保护**——栈默默覆盖 `.bss`/`.data`/堆，程序继续跑 |
+
+实测（PC 上）：
+
+```bash
+gcc -std=c17 -O0 ovf.c -o ovf.exe && ./ovf.exe ; echo "exit=$?"
+```
+
+```text
+exit=-1073741571
+```
+
+`-1073741571` = `0xC00000FD` = **STATUS_STACK_OVERFLOW**。PC 上有 OS 拦住了。
+
+MCU 上没人拦，症状是：
+- 某个全局变量莫名其妙变了
+- 某个任务突然 HardFault
+- 串口输出乱码
+- 极难复现、与编译选项相关
+
+### MCU 上的栈预算
+
+| 平台 | 典型栈大小 |
+| --- | --- |
+| PC 主线程 | 1~8 MB |
+| FreeRTOS 任务栈 | **2~8 KB**（典型） |
+| ESP32 主任务 | 默认 3~8 KB（可配） |
+| 裸机 MSP | 几 KB（链接脚本定义） |
+
+**一个 256 字节的局部数组，占掉任务栈的 5%。**
+
+### 检测手段
+
+| 方法 | 说明 |
+| --- | --- |
+| **栈水位** | FreeRTOS `uxTaskGetStackHighWaterMark()`——返回运行以来的最小剩余栈。**留 20%+ 余量** |
+| **栈溢出钩子** | ESP-IDF 配 `CONFIG_FREERTOS_CHECK_STACKOVERFLOW=2`，溢出时调 `vApplicationStackOverflowHook` |
+| **填充模式** | 启动时把栈填成 `0xA5A5A5A5`，运行后检查还剩多少没被改写 |
+| **静态分析** | 编译器的 `-fstack-usage` 生成每个函数的栈用量报告 |
+| **链接期检查** | 链接脚本里的栈大小和静态栈用量对比 |
+
+```bash
+# 生成每个函数的栈使用报告
+gcc -fstack-usage -Os main.c
+cat main.su
+```
+
+:::tip[避免栈溢出的编码准则]
+1. **不在函数里放超过几百字节的局部数组**——用 `static` 或全局
+2. **避免深递归**——改写成循环
+3. **避免大的局部结构体**——或用指针传
+4. **小心变长数组 VLA**（C99）——大小是运行时的，栈消耗不可静态分析。**MISRA 禁止 VLA**
+5. **注意 `printf` 系列**——`printf` 本身可能用几百字节到几 KB 栈（浮点格式化更多）。ESP32 上 `snprintf` 一个浮点可能用 1KB+
+6. 定期用 `uxTaskGetStackHighWaterMark` 实测
+:::
+
+---
+
+**翻页**：[← 上一页](./embedded-01) · [下一页 →](./embedded-03) · [返回目录](./)

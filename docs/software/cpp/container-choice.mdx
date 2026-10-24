@@ -1,0 +1,310 @@
+---
+id: container-choice
+title: STL 容器选型实战
+sidebar_position: 18
+description: 八种容器的真实开销对比、什么时候 vector 反而是最优、unordered_map 的哈希陷阱、小容器用 flat_map 的收益、以及内存布局为什么比算法更重要。
+---
+
+# STL 容器选型实战
+
+**本课目标**：面对一个需求能直接选对容器，并知道备选方案的代价。
+
+## 一张决策表
+
+| 需求 | 首选 | 备选 |
+| --- | --- | --- |
+| 顺序访问、遍历为主 | **`vector`** | `array`（编译期定长） |
+| 频繁头尾增删 | **`deque`** | `list`（极少见） |
+| 需要稳定迭代器 + 中间插入 | `list` | `std::list` 的替代：`std::vector` + 索引 |
+| 键值查找、无序 | **`unordered_map`** | `map` |
+| 需要有序遍历 | **`map`** | 排序后的 `vector` |
+| 只判存在 | **`unordered_set`** | `set` |
+| 固定小集合（`<16`） | **排序 `vector`** | `array` + 线性查找 |
+| 栈/队列 | `vector`（栈）/ `deque`（队列） | `stack`/`queue` 适配器 |
+
+:::danger[默认答案就是 `vector`]
+**"不知道该用哪个就用 `vector`"** —— 这不是偷懒，而是有数据支持的：
+
+- **内存连续** → 缓存命中率最高
+- **预取友好** → CPU 硬件预取器能预测下一条
+- **无额外指针开销** → 每元素只占 `sizeof(T)`
+
+**很多"需要链表"的直觉是错的** —— 见下。
+:::
+
+## 为什么 `list` 常常比 `vector` 慢
+
+:::info[链表的理论优势和现实]
+| 操作 | `vector` | `list` |
+| --- | --- | --- |
+| 尾部插入 | 均摊 O(1) | O(1) |
+| **中间插入** | **O(n) 搬移** | **O(1)** |
+| 遍历 | **顺序访问，缓存友好** | 每节点一次指针跳转 |
+| 内存 | `n × sizeof(T)` | `n × (sizeof(T) + 16)` |
+
+**中间插入看起来 `list` 赢 —— 但实际测量常常相反。**
+
+**原因**：`vector` 搬移 1MB 连续内存（`memmove`）比遍历链表 1 万个分散节点还快，因为前者能跑满内存带宽，后者每次都要等缓存未命中。
+:::
+
+:::tip[什么时候 `list` 真的值得]
+1. **元素很大**（搬移成本高，如每个元素 1KB 以上）
+2. **需要"插入后迭代器/引用保持有效"**（`vector` 扩容会让所有失效）
+3. **确实要在已知位置反复插入/删除**（而不是"先查找再插入"）
+
+**只有第三条 + 大元素时才明显划算。**
+:::
+
+## `unordered_map` 的三个陷阱
+
+:::danger[① 迭代顺序完全不确定（且可能随版本变化）]
+```cpp
+std::unordered_map<std::string, int> m;
+for (auto& [k, v] : m) { /* 顺序不可依赖 */ }
+```
+
+**测试里依赖了顺序 → 换个编译器/标准库版本就挂。**
+:::
+
+:::danger[② rehash 会让所有迭代器失效]
+```cpp
+auto it = m.begin();
+m["new_key"] = 1;        // 可能触发 rehash
+*it;                     // ❌ 未定义行为
+```
+
+**预防**：
+
+```cpp
+m.reserve(expected_size);      // 提前分配桶
+```
+
+**`reserve` 对 `unordered_*` 是"预留桶数"，对 `vector` 是"预留元素数"** —— 语义不同但都很有用。
+:::
+
+:::danger[③ 自定义 key 必须提供 hash 与相等]
+```cpp
+struct Point { int x, y; };
+
+// ❌ 缺 hash
+std::unordered_map<Point, int> m;
+
+// ✅ 提供两者
+struct PointHash {
+    size_t operator()(const Point& p) const noexcept {
+        return std::hash<int>{}(p.x) ^ (std::hash<int>{}(p.y) << 1);
+    }
+};
+struct PointEq {
+    bool operator()(const Point& a, const Point& b) const noexcept {
+        return a.x == b.x && a.y == b.y;
+    }
+};
+std::unordered_map<Point, int, PointHash, PointEq> m;
+```
+
+**坏 hash（比如全返回 0）会让它退化成链表** —— O(1) 变 O(n)。
+:::
+
+:::warning[字符串 key 的开销]
+`unordered_map<std::string, T>` 每次查找都要：
+
+1. 构造/传入 `std::string`（如果传的是 `const char*` → 一次堆分配）
+2. 计算哈希（遍历整个字符串）
+3. 比较（可能多次）
+
+**优化**：C++20 的异构查找（heterogeneous lookup）
+
+```cpp
+struct StringHash {
+    using is_transparent = void;
+    size_t operator()(std::string_view s) const noexcept {
+        return std::hash<std::string_view>{}(s);
+    }
+};
+std::unordered_map<std::string, int, StringHash, std::equal_to<>> m;
+m.find("literal");      // ✅ 不构造 std::string
+```
+:::
+
+## 小容器的真相
+
+:::tip[元素少于 16 个时，排序 vector 往往最快]
+```cpp
+// 小集合查找：线性扫描
+bool contains(const std::vector<int>& v, int x) {
+    return std::find(v.begin(), v.end(), x) != v.end();
+}
+```
+
+**因为**：
+
+- `vector` 的数据全在一两条缓存行里
+- `unordered_map` 每次要算 hash + 至少一次指针跳转
+- 16 个元素的线性扫描可能比 hash 计算还快
+
+**这也是 `boost::flat_map` / C++23 的 `std::flat_map` 存在的理由**：用有序 `vector` 实现 map。
+:::
+
+```cpp
+// 中等规模：排序 + 二分
+std::sort(v.begin(), v.end());
+bool found = std::binary_search(v.begin(), v.end(), x);
+```
+
+:::warning[实测过的一般规律（仅作参考）]
+| 元素数 | 推荐 |
+| --- | --- |
+| < 10 | 线性扫描 `vector` |
+| 10 ~ 1000 | 排序 `vector` + 二分 |
+| > 1000 | `unordered_map` / `map` |
+
+**但这些边界取决于元素大小、hash 成本、访问模式 —— 自己的场景要自己测。**
+:::
+
+## `deque` 的实际用途
+
+```cpp
+std::deque<Task> q;
+q.push_back(t);          // 入队
+auto t = q.front(); q.pop_front();    // 出队（O(1)）
+```
+
+:::info[`deque` 的内存布局]
+**分段连续**：多个固定大小的块 + 一个"块指针数组"。
+
+**所以**：
+
+- 两端插入/删除都是 O(1)
+- 按索引访问是 O(1)（两次间接）
+- **但比 `vector` 慢一点**（多一层寻址）
+- **不保证整体连续** → 不能传给 C API 当数组用
+:::
+
+:::danger[`deque` 不能 `data()`]
+```cpp
+std::deque<int> d{1,2,3};
+d.data();        // ❌ 没有这个成员
+```
+
+**需要连续内存就必须用 `vector`。**
+:::
+
+## 内存布局 > 算法复杂度
+
+:::danger[一个真实的例子]
+```cpp
+// 版本 A：链表遍历（O(n)）
+for (auto& x : list) sum += x;
+
+// 版本 B：连续数组遍历（O(n)）
+for (auto& x : vec) sum += x;
+```
+
+**两者的"算法复杂度"完全一样，但实测 `vec` 常常快 5~10 倍。**
+
+**原因**：
+
+- 连续内存 → 每次缓存行（64 字节）载入 16 个 `int`，利用率 100%
+- 链表 → 每个节点一次缓存未命中，**内存延迟 ~100ns 而 CPU 周期只有 0.3ns**
+:::
+
+**这就是为什么现代 C++ 的建议是：**
+
+1. **优先连续存储**（`vector` / `array` / `flat_map`）
+2. 需要间接时，用**索引而不是指针**（`vector<uint32_t>` 存下标）
+3. 真需要链表时才用链表
+
+:::tip["用索引代替指针"的好处]
+```cpp
+struct Node { int value; uint32_t next; };      // 索引
+std::vector<Node> nodes;                        // 连续存储
+```
+
+**好处**：
+
+- 遍历时缓存友好（节点都在一块内存里）
+- 序列化简单（不需要处理指针）
+- 删除时用"空闲链表"复用槽位
+- 没有悬垂指针问题（用 `0xFFFFFFFF` 表示无）
+
+**游戏引擎、ECS 架构大量用这个模式。**
+:::
+
+## 各容器的迭代器失效规则
+
+:::danger[这是最容易出 bug 的地方]
+| 容器 | 什么操作会让迭代器失效 |
+| --- | --- |
+| **`vector`** | **扩容（所有）、插入/删除点之后** |
+| `deque` | 中间插入/删除（两端插入只影响被删的） |
+| `list` / `forward_list` | **只有被删的那个** |
+| `map` / `set` | 只有被删的那个 |
+| `unordered_*` | **rehash 时全部失效** |
+:::
+
+```cpp
+// 删除时正确写法
+for (auto it = v.begin(); it != v.end(); ) {
+    if (should_remove(*it)) it = v.erase(it);    // ✅ 接返回值
+    else ++it;
+}
+
+// ❌ 错误
+for (auto it = v.begin(); it != v.end(); ++it) {
+    if (should_remove(*it)) v.erase(it);         // it 已失效，++it 是 UB
+}
+```
+
+:::warning[C++20 的 `std::erase_if` 更省事]
+```cpp
+std::erase_if(v, [](int x){ return x < 0; });        // vector
+std::erase_if(m, [](auto& kv){ return kv.second == 0; });  // map
+```
+
+**它内部就是这个正确循环，直接用。**
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `list` 比 `vector` 慢 | 缓存不友好 | 用 `vector` |
+| `unordered_map` 很慢 | hash 冲突多 / 没 `reserve` | 换好 hash、`reserve` |
+| 迭代器偶发失效 | 循环里修改容器 | 用 `erase` 返回值或 `erase_if` |
+| `deque` 传给 C API 出错 | 不保证连续 | 改 `vector` |
+| `map` 内存占用大 | 每节点 3 指针 + 颜色位 | 小数据用排序 vector |
+| 字符串 map 查找慢 | 每次构造 string | 异构查找 / `string_view` |
+| `vector<bool>` 行为怪 | 它是位压缩特化 | 用 `vector<char>` 或 `bitset` |
+
+:::danger[`vector<bool>` 是个特化的坑]
+```cpp
+std::vector<bool> v{true, false};
+bool& r = v[0];          // ❌ 编译不过（没有真正的 bool&）
+auto x = v[0];           // 返回的是代理对象，不是 bool&
+```
+
+**它是按位压缩的特化** —— 省内存（8 倍）但**不能取地址、不能传给期望 `bool*` 的 C API、多线程写不同元素有数据竞争**。
+
+**需要 `vector<bool>` 时优先用 `std::bitset`（定长）或 `std::vector<char>`。**
+:::
+
+## 本课自检
+
+- [ ] **知道"不知道用哪个就用 `vector`"是有数据支持的**
+- [ ] **理解 `list` 常常比 `vector` 慢（缓存不友好）**
+- [ ] 知道 `list` 真正值得的三种场景
+- [ ] **知道 `unordered_map` 迭代顺序不可依赖**
+- [ ] **知道 `reserve` 对 `unordered_*` 是桶数、对 `vector` 是元素数**
+- [ ] 会为自定义类型提供 hash 与相等
+- [ ] **知道"元素 < 16 时排序 vector 往往最快"**
+- [ ] 知道 `deque` 分段连续、不能 `data()`
+- [ ] **理解"内存布局比算法复杂度更重要"**
+- [ ] 知道"用索引代替指针"的四个好处
+- [ ] **能背出各容器的迭代器失效规则**
+- [ ] 会用 `erase` 返回值或 C++20 `erase_if`
+- [ ] **知道 `vector<bool>` 是位压缩特化，不能取地址**
+
+## 下一步
+
+[STL 算法](./stl-algorithms) 或 [字符串处理](./strings)。

@@ -1,0 +1,296 @@
+---
+id: sysctl
+title: 内核参数调优
+sidebar_position: 29
+description: sysctl 的临时与永久设置、网络/内存/文件描述符三组最常调的参数、每个参数解决什么问题、以及三个不该动的参数。
+---
+
+# 内核参数调优
+
+**本课目标**：遇到"连接数上不去""内存不够""端口耗尽"知道该调哪个参数。
+
+## 基本用法
+
+```bash
+sysctl -a | grep somaxconn          # 查
+sysctl net.core.somaxconn           # 查单个
+sysctl -w net.core.somaxconn=4096   # 临时改（重启失效）
+sysctl -p                           # 从 /etc/sysctl.conf 重载
+```
+
+**永久生效**：
+
+```bash
+# 推荐：放一个独立文件，便于版本管理和排查
+echo 'net.core.somaxconn = 4096' > /etc/sysctl.d/99-tuning.conf
+sysctl -p /etc/sysctl.d/99-tuning.conf
+```
+
+:::warning[`/etc/sysctl.conf` 与 `sysctl.d/` 的优先级]
+**`/etc/sysctl.d/*.conf` 按文件名字典序加载，后面的覆盖前面的。**
+
+**`/etc/sysctl.conf` 通常最后加载**（所以它能覆盖 `sysctl.d`）。
+
+**但不同发行版的 systemd 版本行为有差异** —— 用 `sysctl --system` 统一应用全部，然后用 `sysctl <key>` 验证生效值。
+:::
+
+## 文件描述符：最常撞的墙
+
+:::danger["Too many open files" 要从三个地方一起改]
+```bash
+# ① 系统总上限
+sysctl fs.file-max                    # 通常几十万，一般够
+
+# ② systemd 给服务的限制（这是最常被忽略的）
+systemctl show nginx -p LimitNOFILE
+```
+
+```ini
+# /etc/systemd/system/nginx.service.d/limits.conf
+[Service]
+LimitNOFILE=65536
+```
+
+```bash
+# ③ 用户的软/硬限制
+ulimit -n                             # 当前 shell
+prlimit --pid <pid>                   # 某个进程
+```
+
+**三个都要够大** —— 只改 `ulimit` 而 systemd 服务有自己的限制，改了没用。
+:::
+
+| 参数 | 位置 | 说明 |
+| --- | --- | --- |
+| `fs.file-max` | sysctl | 系统级总数 |
+| `LimitNOFILE` | systemd unit | **服务的限制** |
+| `nofile` | `/etc/security/limits.conf` | 登录用户的限制 |
+| `nofile` | `prlimit` | 运行中进程的实际值 |
+
+## 网络：连接数与队列
+
+:::info[四个与"连接上不去"相关的参数]
+| 参数 | 默认 | 作用 |
+| --- | --- | --- |
+| `net.core.somaxconn` | 4096 | **`listen()` backlog 上限** |
+| `net.ipv4.tcp_max_syn_backlog` | 1024 | 半连接队列（SYN 收到但未完成握手） |
+| `net.core.netdev_max_backlog` | 1000 | 网卡收包队列 |
+| `net.ipv4.ip_local_port_range` | `32768 60999` | **出向连接的本地端口范围** |
+:::
+
+```bash
+# 高并发服务端
+sysctl -w net.core.somaxconn=32768
+sysctl -w net.ipv4.tcp_max_syn_backlog=16384
+
+# 大量出向连接（如代理/爬虫）
+sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+```
+
+:::danger[`somaxconn` 要和应用的 backlog 一起改]
+```c
+listen(fd, 128);        /* 应用只请求 128 */
+```
+
+**即使 `somaxconn` 调到 32768，内核仍会取 `min(应用请求, somaxconn)`** —— 应用侧也得改。
+
+**另外注意 3.x 内核里 `somaxconn` 的默认值只有 128**（现在是 4096），老系统要确认内核版本。
+:::
+
+:::tip[怎么知道是队列溢出]
+```bash
+nstat -az | grep -i -E 'listen|syn'
+# TcpExtListenOverflows    120        ← backlog 满导致的丢弃
+# TcpExtListenDrops        120
+# TcpExtTCPReqQFullDrop    0          ← syn queue 满
+```
+
+**`ListenOverflows` 持续增长就说明要调大 backlog。**
+:::
+
+```bash
+# SYN 洪水防护（默认已开）
+sysctl net.ipv4.tcp_syncookies=1
+```
+
+## 内存
+
+```bash
+vm.swappiness                     # 默认 60
+vm.overcommit_memory              # 0 启发式 / 1 总是允许 / 2 严格
+vm.dirty_ratio                    # 默认 20（脏页占比上限）
+vm.dirty_background_ratio         # 默认 10（开始回写的阈值）
+vm.max_map_count                  # 默认 65530（mmap 区域数上限）
+```
+
+:::danger[`vm.max_map_count` 是很多程序的隐形杀手]
+```text
+max virtual memory areas vm.max_map_count [65530] is too low
+```
+
+**Elasticsearch、Redis、一些 JVM 配置、游戏服务器都会撞到。**
+
+```bash
+sysctl -w vm.max_map_count=262144
+```
+
+**症状**：程序启动就崩或 `mmap` 失败，但错误信息很不直观。
+:::
+
+:::warning[调 `swappiness` 的实际含义]
+- **`60`（默认）** —— 平衡
+- **`10`** —— 尽量少用 swap（数据库、低延迟服务）
+- **`1`** —— 内核 3.5+ 的"最小换出"
+- **`0`** —— 尽量不用，**但不是禁用**（内存压力大时仍会换）
+
+**真要禁用用 `swapoff -a`。**
+:::
+
+:::tip[`dirty_ratio` 影响写突发]
+```bash
+# 默认：脏页到内存 20% 才强制回写 → 可能造成长时间 IO 卡顿
+vm.dirty_ratio = 20
+vm.dirty_background_ratio = 10
+```
+
+**降低它能让回写更平滑**（代价是更频繁的小 IO）：
+
+```bash
+vm.dirty_background_ratio = 5
+vm.dirty_ratio = 10
+```
+
+**数据库服务器通常这么调。**
+:::
+
+## 三个不该动的参数
+
+:::danger[① `net.ipv4.tcp_tw_recycle` 已经被移除]
+**Linux 4.12 起删除了它** —— 在 NAT 环境下会丢弃合法连接（依赖时间戳，NAT 后多个客户端时钟不一致）。
+
+**老系统里如果还设着，删掉。**
+:::
+
+:::danger[② `net.ipv4.tcp_tw_reuse` 只帮"主动连接"的一方]
+**TIME_WAIT 出现在主动关闭方。**
+
+- 客户端大量短连接 → `tcp_tw_reuse=1` 有用
+- 服务端被动关闭 → 没用，只能减少短连接或扩端口范围
+
+**别指望它能解决服务端的 TIME_WAIT 堆积。**
+:::
+
+:::danger[③ 不要关 `tcp_syncookies`]
+```bash
+sysctl net.ipv4.tcp_syncookies=0      # ❌ 关掉会更容易被 SYN 洪水打挂
+```
+
+**它在 SYN 队列满时用加密 cookie 代替排队** —— 是防护而不是漏洞。
+:::
+
+:::warning[`overcommit_memory=1` 是危险的]
+```bash
+vm.overcommit_memory = 1      # 总是允许分配，从不拒绝
+```
+
+**Redis 官方建议设 1（避免 fork 时分配失败），但这意味着 OOM 会来得更突然。**
+
+**`=2` 是"严格不超发"** —— 容易导致正常程序分配失败。
+
+**默认 `=0`（启发式）对大多数场景最合适。**
+:::
+
+## 网络进阶参数
+
+```bash
+# TCP 缓冲区上限（大带宽长距离链路需要调大）
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+# 连接跟踪表（做 NAT/防火墙时）
+net.netfilter.nf_conntrack_max = 262144
+```
+
+:::danger[`nf_conntrack` 满了会静默丢包]
+```bash
+dmesg | grep -i conntrack
+# nf_conntrack: table full, dropping packet
+```
+
+**症状**：`ping` 通但 TCP 连接随机失败、没有明显错误码。
+
+**调大 `nf_conntrack_max` 并相应调 `nf_conntrack_buckets`**（通常是 max/4）。
+:::
+
+:::tip[怎么判断该不该调缓冲区]
+```bash
+sysctl net.ipv4.tcp_rmem        # 内核会自动在 min/max 之间调整
+ss -tim | head                  # 看实际连接的内存使用
+```
+
+**只有"高带宽 × 长距离（高 BDP）"才需要手动调大** —— 局域网里调大只是浪费内存。
+:::
+
+## 调优的正确流程
+
+:::tip[四步，不要凭感觉调]
+```text
+① 先测量，找到真正的瓶颈
+   ss -s / nstat / vmstat / iostat / perf
+
+② 确认是内核参数问题，而不是应用问题
+   （连接数上不去，先看应用 listen 的 backlog、
+     再看 ulimit、最后才看 sysctl）
+
+③ 改一个参数，观察效果
+   一次改多个会分不清是哪个起作用
+
+④ 记录改动与理由
+   写进 /etc/sysctl.d/99-tuning.conf 的注释里
+```
+:::
+
+:::danger[网上抄来的"优化大全"要谨慎]
+**很多流传的"Linux 性能优化 30 条"包含**：
+
+- 已废弃的参数（`tcp_tw_recycle`）
+- 对现代内核无效的（老版本的默认值已经改好）
+- 有风险的（`overcommit_memory=1`、`swappiness=0`）
+
+**每个参数都要能回答"它解决我的什么问题"** —— 答不上来就不要改。
+:::
+
+## 常见坑
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 改了 sysctl 没生效 | 没重载或文件优先级不对 | `sysctl --system` 后验证 |
+| 重启后丢失 | 只用了 `sysctl -w` | 写进 `sysctl.d/` |
+| 服务 fd 上限没变 | 只改了 `ulimit` | 改 systemd `LimitNOFILE` |
+| 连接数上不去 | backlog 是 `min(应用, somaxconn)` | 两边都调 |
+| mmap 失败 | `max_map_count` 太小 | 调大 |
+| NAT 后随机丢包 | `nf_conntrack` 满 | 调大并看 dmesg |
+| TIME_WAIT 堆积 | 短连接太多 | 减少短连接，别指望调参 |
+| 调完性能更差 | 抄了不适用的参数 | 只改能说明理由的 |
+
+## 本课自检
+
+- [ ] 会用 `sysctl -a` / `-w` / `-p` 与 `sysctl.d/` 持久化
+- [ ] **知道 `Too many open files` 要同时改三处（系统/服务/用户）**
+- [ ] **知道 systemd 服务有自己的 `LimitNOFILE`，改 `ulimit` 不够**
+- [ ] **知道 `somaxconn` 与应用的 `listen(n)` 取 `min`，两边都要调**
+- [ ] 会用 `nstat | grep Listen` 判断队列溢出
+- [ ] **知道 `vm.max_map_count` 太小会让很多程序启动失败**
+- [ ] **知道 `swappiness=0` 不等于禁用 swap**
+- [ ] 知道 `dirty_ratio` 影响写突发卡顿
+- [ ] **知道 `tcp_tw_recycle` 已被移除、`tcp_tw_reuse` 只帮主动连接方**
+- [ ] **知道不该关 `tcp_syncookies`**
+- [ ] **知道 `overcommit_memory=1` 有风险**
+- [ ] **知道 `nf_conntrack` 满了会静默丢包（看 dmesg）**
+- [ ] 知道调优要"先测量、改一个、记录理由"
+
+## 下一步
+
+[性能分析：perf 与火焰图](./performance) 或 [系统故障排查](./troubleshoot)。

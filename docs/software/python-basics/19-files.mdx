@@ -1,0 +1,358 @@
+---
+id: 19-files
+title: 19 文件读写
+sidebar_position: 19
+description: open 与 with 的用法、读写的四种模式、中文乱码的根本原因、以及用 pathlib 更优雅地处理路径。
+---
+
+# 19 文件读写
+
+**本课目标**：会读写文本文件，并且**永远不再被中文乱码坑**。
+
+## 为什么需要文件
+
+程序里的数据（变量、列表）**关机就没了**。要把东西留下来，就得写进文件。
+
+典型用途：
+
+- 保存用户配置
+- 记录日志
+- 读写 CSV / JSON 数据
+- 处理批量文本
+
+## 三步走：打开 → 读写 → 关闭
+
+```python
+# ① 打开
+f = open("test.txt", "w", encoding="utf-8")
+
+# ② 写入
+f.write("你好，文件")
+
+# ③ 关闭
+f.close()
+```
+
+**但这个写法有问题**：如果中间出错（比如磁盘满），`close()` 就不会执行，文件句柄泄漏。
+
+## 正确写法：with 语句（必须用）
+
+```python
+with open("test.txt", "w", encoding="utf-8") as f:
+    f.write("你好，文件")
+```
+
+**`with` 会在代码块结束时自动关闭文件**，哪怕中间抛出异常。
+
+:::tip[永远用 with，不用手动 close]
+```python
+# ✅ 推荐
+with open("a.txt", encoding="utf-8") as f:
+    content = f.read()
+
+# ❌ 不推荐
+f = open("a.txt", encoding="utf-8")
+content = f.read()
+f.close()          # 一旦前面报错，这行就不执行
+```
+
+**这是 Python 的标准做法**，所有涉及资源（文件、网络连接、数据库）的地方都该用 `with`。
+:::
+
+## 四种模式
+
+| 模式 | 含义 | 文件不存在时 | 已有内容时 |
+| --- | --- | --- | --- |
+| `"r"` | 只读 | **报错** | 保留 |
+| `"w"` | 只写 | 创建 | **全部清空！** |
+| `"a"` | 追加 | 创建 | 保留，写在末尾 |
+| `"x"` | 排他创建 | 创建 | **报错** |
+
+:::danger[`"w"` 会清空文件，这是最危险的一点]
+```python
+with open("重要数据.txt", "w", encoding="utf-8") as f:
+    f.write("新内容")
+```
+
+**原来文件里的所有内容都没了！** 不是覆盖某一行，是整个清空。
+
+只想在末尾加内容，用 `"a"`：
+
+```python
+with open("log.txt", "a", encoding="utf-8") as f:
+    f.write("新的一行\n")
+```
+
+**养成习惯：不确定时用 `"a"` 或 `"r"`，除非你确实想清空重写。**
+:::
+
+默认模式是 `"r"`，所以读文件可以不写：
+
+```python
+with open("a.txt", encoding="utf-8") as f:
+    ...
+```
+
+## 编码：中文乱码的根本原因
+
+:::danger[`encoding="utf-8"` 必须显式写]
+```python
+with open("a.txt", "w") as f:      # 没写 encoding
+    f.write("中文")
+```
+
+在 Windows 上，`open()` 默认用**系统本地编码**（中文 Windows 是 GBK）。这会导致两个后果：
+
+1. 用别的程序打开时是乱码
+2. 换个系统读同一个文件时乱码
+
+**正确做法：永远显式指定 `encoding="utf-8"`。**
+:::
+
+```python
+# ✅ 写
+with open("a.txt", "w", encoding="utf-8") as f:
+    f.write("中文内容")
+
+# ✅ 读
+with open("a.txt", encoding="utf-8") as f:
+    print(f.read())
+```
+
+:::warning[读到乱码怎么办]
+症状：`UnicodeDecodeError: 'gbk' codec can't decode byte...`
+
+原因：文件实际是 UTF-8，但读取时用了 GBK。
+
+**两种解法**：
+
+**① 指定正确编码**（首选）
+
+```python
+with open("a.txt", encoding="utf-8") as f:
+    content = f.read()
+```
+
+**② 容错读取**（文件编码不确定时）
+
+```python
+with open("a.txt", encoding="utf-8", errors="ignore") as f:
+    content = f.read()
+```
+
+`errors="ignore"` 会跳过无法解码的字节，虽然会丢字，但至少不会崩。
+
+**排查编码**：用 VS Code 打开文件，右下角会显示实际编码，点它可以转换。
+:::
+
+## 读文件的三种方式
+
+### ① read()：一次读全部
+
+```python
+with open("a.txt", encoding="utf-8") as f:
+    content = f.read()
+print(content)
+```
+
+适合小文件。**大文件不要用**，会把整个文件塞进内存。
+
+### ② readlines()：读成列表
+
+```python
+with open("a.txt", encoding="utf-8") as f:
+    lines = f.readlines()
+print(lines)
+```
+
+输出（注意**保留了换行符**）：
+
+```text
+['第一行\n', '第二行\n', '第三行\n']
+```
+
+:::warning[readlines 的每行都带 `\n`]
+```python
+for line in lines:
+    print(line.strip())      # 用 strip() 去掉换行
+```
+
+不做处理的话，`print` 会多出一个空行（因为 `\n` 加上 `print` 自己的换行）。
+:::
+
+### ③ 逐行遍历（推荐，省内存）
+
+```python
+with open("a.txt", encoding="utf-8") as f:
+    for i, line in enumerate(f, start=1):
+        print(f"{i}: {line.rstrip()}")
+```
+
+输出：
+
+```text
+1: 第一行
+2: 第二行
+3: 第三行
+```
+
+:::tip[为什么推荐逐行遍历]
+**它一次只在内存里放一行**，处理几个 G 的日志文件也不会爆内存。
+
+```python
+# 处理 10GB 日志，内存占用不到 10MB
+with open("huge.log", encoding="utf-8") as f:
+    for line in f:
+        if "ERROR" in line:
+            print(line.rstrip())
+```
+
+`read()` 和 `readlines()` 都要把整个文件读进来，大文件会直接卡死。
+:::
+
+## 写文件
+
+```python
+# 写多行
+with open("out.txt", "w", encoding="utf-8") as f:
+    f.write("第一行\n")
+    f.write("第二行\n")
+
+# 或者用 writelines（注意要自己加换行）
+lines = ["第一行\n", "第二行\n"]
+with open("out2.txt", "w", encoding="utf-8") as f:
+    f.writelines(lines)
+```
+
+:::tip[`write` 不会自动加换行]
+```python
+with open("a.txt", "w", encoding="utf-8") as f:
+    f.write("第一行")
+    f.write("第二行")
+```
+
+结果文件里是 `第一行第二行`（**粘在一起**）。
+
+**必须自己加 `\n`**，这和 `print()` 不同（`print` 会自动换行）。
+:::
+
+## pathlib：更现代的路径处理
+
+`pathlib` 比传统的 `os.path` 好用得多：
+
+```python
+from pathlib import Path
+
+# 当前目录
+print(Path.cwd())
+
+# 拼接路径（用 / 运算符，很直观）
+p = Path("data") / "2026" / "log.txt"
+print(p)
+
+# 文件是否存在
+print(p.exists())
+
+# 建立目录（parents=True 会创建所有中间目录，exist_ok 表示已存在不报错）
+Path("output/reports").mkdir(parents=True, exist_ok=True)
+
+# 直接读写（小文件很方便）
+Path("a.txt").write_text("内容", encoding="utf-8")
+print(Path("a.txt").read_text(encoding="utf-8"))
+
+# 遍历目录下所有 .txt
+for f in Path(".").glob("*.txt"):
+    print(f.name, f.stat().st_size, "字节")
+```
+
+:::tip[pathlib 相比 os.path 的优势]
+```python
+# 旧写法
+import os
+path = os.path.join("data", "file.txt")
+if os.path.exists(path):
+    ...
+
+# 新写法（Python 3.4+）
+from pathlib import Path
+path = Path("data") / "file.txt"
+if path.exists():
+    ...
+```
+
+- 路径拼接用 `/`，不用记 `join`
+- 路径是一个**对象**，方法挂在上面（`.exists()`、`.name`、`.suffix`）
+- 跨平台自动处理分隔符（Windows `\`、Linux `/`）
+
+**新代码建议用 pathlib。**
+:::
+
+## 读取 CSV（实战常见）
+
+不用第三方库也能读：
+
+```python
+import csv
+
+# 写
+with open("data.csv", "w", encoding="utf-8", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["姓名", "年龄"])
+    writer.writerow(["小明", 18])
+    writer.writerow(["小红", 17])
+
+# 读
+with open("data.csv", encoding="utf-8", newline="") as f:
+    reader = csv.reader(f)
+    for row in reader:
+        print(row)
+```
+
+输出：
+
+```text
+['姓名', '年龄']
+['小明', '18']
+['小红', '17']
+```
+
+:::warning[写 CSV 要加 `newline=""`]
+不加的话，Windows 上每行之间会多出空行（因为 CSV 模块自己写 `\n`，而 Windows 会把 `\n` 转成 `\r\n`，变成 `\r\r\n`）。
+
+**规则：用 csv 模块写文件时总是加 `newline=""`。**
+:::
+
+注意：**读出来的所有数据都是字符串**，`'18'` 不是数字 18。要计算得转换：
+
+```python
+for row in reader:
+    age = int(row[1])
+```
+
+## 常见错误
+
+| 错误 | 报错 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| 读不存在的文件 | FileNotFoundError | 路径错或文件没建 | 检查路径、用 `exists()` 判断 |
+| 中文乱码 | UnicodeDecodeError | 没指定 encoding | 加 `encoding="utf-8"` |
+| 写文件后内容没了 | 数据丢失 | 用了 `"w"` | 用 `"a"` 追加 |
+| 读到的行有 `\n` | 多空行 | 没 strip | `line.strip()` |
+| 大文件卡死 | 内存爆 | 用了 `read()` | 逐行遍历 |
+| 文件没保存 | 内容为空 | 没关闭/没进 with | 用 `with` |
+| csv 多空行 | —— | 没加 `newline=""` | 加上 |
+
+## 本课自检
+
+- [ ] 会用 `with open(...) as f:` 读写文件
+- [ ] 知道 `"w"` 会清空文件，`"a"` 是追加
+- [ ] **记得永远写 `encoding="utf-8"`**
+- [ ] 会用 `read()` / `readlines()` / 逐行遍历
+- [ ] 知道大文件要用逐行遍历
+- [ ] 知道 `write()` 不自动换行
+- [ ] 会用 pathlib 拼接路径、判断存在、读写小文件
+- [ ] 会用 csv 模块读写，知道加 `newline=""`
+- [ ] 知道 CSV 读出来都是字符串
+
+## 下一步
+
+[20 异常处理](./20-exceptions) —— 让程序在出错时不会崩溃，而是优雅地处理。

@@ -1,0 +1,277 @@
+---
+id: 02-install
+title: 02 安装编译器
+sidebar_position: 2
+description: Windows/macOS/Linux 三种系统装 C 编译器的方法，验证是否装好，以及用命令行编译运行第一个程序。
+---
+
+# 02 安装编译器
+
+**本课目标**：装好编译器，能在终端里编译并运行一个 C 程序。
+
+## 需要装什么
+
+C 语言本身只是一套标准，**具体干活的是"编译器"**——把 `.c` 源码翻译成可执行文件的程序。
+
+常见编译器：
+
+| 编译器 | 平台 | 说明 |
+| --- | --- | --- |
+| **GCC** | Linux / macOS / Windows (MinGW) | 最通用，教程通常默认它 |
+| **Clang** | 全平台 | macOS 默认，报错更友好 |
+| **MSVC** | Windows | Visual Studio 自带 |
+
+**本教程的命令用 `gcc`**，装 Clang 的话把命令里的 `gcc` 换成 `clang` 即可，用法几乎一样。
+
+## Windows 安装
+
+Windows 没有自带 C 编译器，需要装一个。三种方案：
+
+### 方案一：MSYS2（推荐）
+
+1. 到 [msys2.org](https://www.msys2.org/) 下载安装包，一路默认安装
+2. 安装完成后打开 **MSYS2 UCRT64** 终端
+3. 执行：
+
+```bash
+pacman -S mingw-w64-ucrt-x86_64-gcc
+```
+
+4. 把 `C:\msys64\ucrt64\bin` 加进系统 PATH
+
+:::tip[为什么要加 PATH]
+不加 PATH 的话，在普通命令行里敲 `gcc` 会提示"不是内部或外部命令"。
+
+**加 PATH 步骤**：
+
+1. `Win + R` 输入 `sysdm.cpl` 回车
+2. 「高级」→「环境变量」
+3. 在「系统变量」里找到 `Path`，双击
+4. 点「新建」，填入 `C:\msys64\ucrt64\bin`
+5. 一路确定，然后**重新打开命令行**（必须重开才生效）
+:::
+
+### 方案二：w64devkit（最轻量）
+
+到 [github.com/skeeto/w64devkit](https://github.com/skeeto/w64devkit/releases) 下载 zip，解压到 `C:\w64devkit`，然后把 `C:\w64devkit\bin` 加进 PATH。
+
+**优点**：不用装包管理器，解压即用。
+
+### 方案三：Visual Studio（重但完整）
+
+到 [visualstudio.microsoft.com](https://visualstudio.microsoft.com/) 下载 **Community 版**，安装时勾选「使用 C++ 的桌面开发」。
+
+**注意**：它用的是 MSVC，命令是 `cl` 而不是 `gcc`，本教程的命令需要调整。
+
+:::warning[新手建议选方案一或二]
+Visual Studio 有几个 GB，而且命令不同，容易和教程对不上。
+
+**除非你确定要用 VS，否则选 MSYS2 或 w64devkit。**
+:::
+
+## macOS 安装
+
+macOS 装 Xcode 命令行工具就有 Clang 了：
+
+```bash
+xcode-select --install
+```
+
+弹出窗口点「安装」，等几分钟。验证：
+
+```bash
+clang --version
+```
+
+也可以用 Homebrew 装 GCC：
+
+```bash
+brew install gcc
+```
+
+（注意装出来的命令叫 `gcc-13` 之类的带版本号名字。）
+
+## Linux 安装
+
+大多数发行版没预装，一条命令搞定：
+
+```bash
+# Debian / Ubuntu
+sudo apt update && sudo apt install build-essential
+
+# Fedora / RHEL
+sudo dnf install gcc
+
+# Arch
+sudo pacman -S gcc
+```
+
+`build-essential` 会一起装 `gcc`、`make`、标准库头文件，省事。
+
+## 验证装好了
+
+打开**新的**终端窗口，执行：
+
+```bash
+gcc --version
+```
+
+成功的话会看到类似输出（不同版本数字不同）：
+
+```text
+gcc (GCC) 15.2.0
+Copyright (C) 2025 Free Software Foundation, Inc.
+...
+```
+
+:::warning[提示"不是内部或外部命令"]
+说明 PATH 没配好。三步排查：
+
+1. **重新开一个终端**（改 PATH 后旧窗口不生效）
+2. 确认路径填的是 `bin` 目录，不是上一级
+3. 在终端执行 `where gcc`（Windows）/ `which gcc`（macOS/Linux），看能不能找到
+
+还不行就把 PATH 配置步骤重做一遍。
+:::
+
+## 第一个程序：hello.c
+
+在你喜欢的目录下（**路径别带中文和空格**），新建文件 `hello.c`：
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    printf("Hello, C!\n");
+    return 0;
+}
+```
+
+### 编译
+
+```bash
+gcc hello.c -o hello
+```
+
+- `hello.c`：源文件
+- `-o hello`：输出的可执行文件名（o = output）
+
+**没有任何输出就代表成功**（Unix 哲学：没消息就是好消息）。
+
+### 运行
+
+```bash
+# Windows
+hello.exe
+# 或
+.\hello.exe
+
+# macOS / Linux
+./hello
+```
+
+输出：
+
+```text
+Hello, C!
+```
+
+:::tip[为什么 Windows 要加 `.\`]
+Windows 命令行默认不会从当前目录找程序，只从 PATH 里的目录找。加 `.\` 表示"就在当前目录"。
+
+macOS/Linux 用 `./hello` 也是同样的道理。
+
+**如果直接敲 `hello` 报"找不到命令"，就是缺这个前缀。**
+:::
+
+## 编译报错长什么样
+
+故意把分号去掉试试：
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    printf("Hello, C!\n")
+    return 0;
+}
+```
+
+编译：
+
+```text
+hello.c: In function 'main':
+hello.c:4:24: error: expected ';' before 'return'
+    4 |     printf("Hello, C!\n")
+      |                        ^
+      |                        ;
+```
+
+:::tip[读报错的格式]
+```
+hello.c:4:24: error: expected ';' before 'return'
+  ↑     ↑ ↑    ↑                       ↑
+文件名  行 列  错误类型              具体说明
+```
+
+**关键信息是「文件:行:列」和最后的说明。** 编译器甚至会告诉你"要不要加分号"（下面是 `^ ;`）。
+
+第 29 课会详细讲怎么读各种报错。现在只要知道**先看行号**就行。
+:::
+
+## 常用编译命令
+
+```bash
+# 基本编译
+gcc hello.c -o hello
+
+# 打开所有警告（强烈建议一直加）
+gcc -Wall -Wextra hello.c -o hello
+
+# 指定 C 标准
+gcc -std=c17 hello.c -o hello
+
+# 加调试信息（后面用 gdb 调试需要）
+gcc -g hello.c -o hello
+
+# 优化（发布用，-O2 是常用档位）
+gcc -O2 hello.c -o hello
+
+# 一次性都给（日常推荐）
+gcc -std=c17 -Wall -Wextra -g hello.c -o hello
+```
+
+:::danger[永远加 `-Wall -Wextra`]
+```bash
+gcc hello.c -o hello              # 只报严重错误
+gcc -Wall -Wextra hello.c -o hello   # 连可疑写法都提醒
+```
+
+C 语言很多问题是**"能编译通过，但逻辑有隐患"**——比如用了未初始化的变量、把 `=` 写成 `==`。这些只有开了警告才会提示。
+
+**养成习惯：所有编译命令都带 `-Wall -Wextra`。**
+:::
+
+## 常见问题
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| `gcc: command not found` | 没装或没配 PATH | 见上文，重开终端 |
+| `No such file or directory` | 文件不在当前目录 | 用 `dir`/`ls` 确认，`cd` 过去 |
+| `Permission denied` | Linux 下没执行权限 | `chmod +x hello` |
+| 中文路径下编译失败 | 路径编码问题 | 换纯英文路径 |
+| 敲 `hello` 找不到 | 缺 `./` 或 `.\` | 加上前缀 |
+| 输出了 exe 但运行闪退 | 双击运行的窗口会立即关闭 | 在终端里运行 |
+
+## 本课自检
+
+- [ ] `gcc --version` 能输出版本号
+- [ ] 成功编译并运行了 hello.c
+- [ ] 知道 `-o` 是干什么的
+- [ ] 知道 Windows 运行要加 `.\`
+- [ ] 见过一次编译报错，知道看行号
+- [ ] 知道应该加 `-Wall -Wextra`
+
+## 下一步
+
+[03 编译与运行：四个阶段](./03-compile) —— 搞清编译器到底对代码做了什么，这能解释 90% 的"链接错误"。

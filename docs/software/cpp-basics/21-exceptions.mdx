@@ -1,0 +1,361 @@
+---
+id: 21-exceptions
+title: 21 异常处理
+sidebar_position: 21
+description: try/catch 的用法、异常类型选择、栈展开与 RAII 的配合、异常安全的三个等级，以及哪些地方不该抛异常。
+---
+
+# 21 异常处理
+
+**本课目标**：会用异常传递错误，理解异常与 RAII 的配合。
+
+## 为什么需要异常
+
+C 用返回码传错误（[C 第 20 课](../c-basics/20-malloc)）：
+
+```c
+int ret = do_something();
+if (ret != 0) { /* 处理 */ }        /* 容易被忽略 */
+```
+
+:::danger[返回码的三个问题]
+```c
+int a = f1();
+if (a != 0) return a;          /* 每个调用都要检查 */
+int b = f2();
+if (b != 0) return a;          /* 忘检查就出错 */
+int c = f3();                  /* ❌ 忘了检查 */
+```
+
+1. **容易忘**（编译器不强制）
+2. **错误处理代码淹没正常逻辑**
+3. **构造函数没法返回错误码**
+
+**异常解决这三点：不处理就传播，不能忽略。**
+:::
+
+## 基本语法
+
+```cpp
+#include <stdexcept>
+
+try {
+    risky_operation();
+} catch (const std::exception &e) {
+    std::cerr << "出错了：" << e.what() << "\n";
+}
+```
+
+本机实测：
+
+```text
+  invalid_argument: 不能为 0
+  runtime_error: 不能为负
+```
+
+## 标准异常类型
+
+| 类型 | 含义 | 头文件 |
+| --- | --- | --- |
+| `std::exception` | 所有标准异常的基类 | `<exception>` |
+| `std::logic_error` | 程序逻辑错误（可避免） | `<stdexcept>` |
+| `std::invalid_argument` | 参数非法 | `<stdexcept>` |
+| `std::out_of_range` | 下标越界 | `<stdexcept>` |
+| `std::runtime_error` | 运行时错误（不可避免） | `<stdexcept>` |
+| `std::bad_alloc` | 内存分配失败 | `<new>` |
+
+:::tip[`logic_error` vs `runtime_error`]
+- **`logic_error`**：程序员的 bug，理论上可以避免
+  - 参数越界、状态不对
+- **`runtime_error`**：外部原因，无法避免
+  - 文件打不开、网络断了、磁盘满
+
+**这两个分类体现在异常名上，方便排查。**
+:::
+
+## 捕获顺序：从具体到宽泛
+
+:::danger[顺序错了后面的永远捕获不到]
+```cpp
+try {
+    ...
+} catch (const std::exception &e) {      /* ❌ 太宽，下面白写 */
+    ...
+} catch (const std::invalid_argument &e) {
+    ...
+}
+```
+
+**`catch` 按顺序匹配，第一个匹配的胜出。** `invalid_argument` 是 `exception` 的子类，会被第一个捕获。
+
+**正确顺序：具体 → 宽泛**
+:::
+
+```cpp
+try {
+    ...
+} catch (const std::invalid_argument &e) {
+    /* 先处理具体类型 */
+} catch (const std::exception &e) {
+    /* 兜底：其他所有标准异常 */
+}
+```
+
+:::warning[按引用捕获，不要按值]
+```cpp
+catch (const std::exception &e)      /* ✅ 引用，不复制、不切片 */
+catch (std::exception e)             /* ⚠️ 按值：会切片，丢失子类信息 */
+```
+
+**按值捕获会发生对象切片**（[第 10 课](./10-inherit)讲过），`e.what()` 可能变成基类版本。
+
+**规矩：`catch (const T &e)`。**
+:::
+
+## 抛出
+
+```cpp
+throw std::invalid_argument("参数不能为负");
+```
+
+:::danger[不要 `throw` 裸指针或内置类型]
+```cpp
+throw 42;                    /* ❌ 谁该捕获它？ */
+throw new std::string();     /* ❌ 谁来 delete？ */
+throw std::runtime_error("x"); /* ✅ 按值抛出，按引用捕获 */
+```
+
+**规矩：抛出标准异常（或你自己的异常类），按值抛，按引用捕获。**
+:::
+
+## 自定义异常
+
+```cpp
+class AppError : public std::runtime_error {
+public:
+    explicit AppError(const std::string &msg, int code)
+        : std::runtime_error(msg), code_(code) {}
+
+    int code() const { return code_; }
+
+private:
+    int code_;
+};
+
+/* 抛出 */
+throw AppError("连接失败", 1001);
+
+/* 捕获 */
+try {
+    ...
+} catch (const AppError &e) {
+    std::cerr << "错误 " << e.code() << ": " << e.what() << "\n";
+}
+```
+
+**继承 `std::runtime_error`**，这样能被 `catch (const std::exception&)` 兜住。
+
+## 异常与 RAII：最重要的配合
+
+:::danger[手动管理资源时，异常会漏资源]
+```c
+FILE *fp = fopen(...);
+do_something_that_throws();     /* 抛异常 → fclose 永远不执行 → 泄漏 */
+fclose(fp);
+```
+:::
+
+用 RAII（[第 12 课](./12-raii)）：
+
+```cpp
+{
+    std::ifstream f("data.txt");       /* 构造：打开 */
+    do_something_that_throws();        /* 抛异常 */
+    /* ... */
+}   /* 栈展开，f 析构 → 自动关闭，不泄漏 */
+```
+
+本机实测：
+
+```cpp
+try {
+    auto p = std::make_unique<Box<int>>(1);
+    risky(0);                     /* 抛异常 */
+} catch (const std::exception &e) {
+    /* p 已自动释放 */
+}
+```
+
+输出：
+
+```text
+  捕获: 不能为 0（p 已自动释放）
+```
+
+:::tip[这是 C++ 异常安全的基础]
+**异常抛出时，所有已构造的局部对象都会被析构**（栈展开 stack unwinding）。
+
+所以只要**用 RAII 管理所有资源**，异常就不会造成泄漏。
+
+**这就是为什么 C++ 强调 "不要手动 new/delete"。**
+:::
+
+## 异常安全的三个等级
+
+| 等级 | 保证 | 难度 |
+| --- | --- | --- |
+| **基本保证** | 不泄漏、对象仍可用（但状态可能变） | 容易 |
+| **强保证** | 要么全成功，要么完全不变（事务性） | 中等 |
+| **不抛保证** | 承诺不抛异常（`noexcept`） | 用于析构、移动 |
+
+:::tip[实践中怎么选]
+- **大部分函数**：做到基本保证（不泄漏）就够
+- **关键操作**（如赋值）：尽量做到强保证
+- **析构、移动构造、swap**：必须 `noexcept`
+
+**强保证的实现技巧：先在新对象上操作，成功了再 swap。**
+
+```cpp
+T &operator=(const T &other) {
+    T tmp(other);          /* 可能抛异常，此时 *this 完全没变 */
+    swap(*this, tmp);      /* swap 是 noexcept */
+    return *this;
+}   /* 强保证：要么成功，要么完全不变 */
+```
+:::
+
+## 什么时候不该用异常
+
+:::danger[这些场景要避免异常]
+**① 嵌入式/资源极紧的环境**
+
+异常需要额外的运行时支持（栈展开信息表），会增大二进制体积。很多嵌入式项目直接 `-fno-exceptions` 禁用。
+
+**② 析构函数里**
+
+会触发 `std::terminate` 直接终止程序。
+
+**③ 高频路径**
+
+抛异常很慢（比返回码慢几百倍）。**不要用异常做正常的控制流**。
+
+```cpp
+/* ❌ 用异常跳出循环 */
+try {
+    for (;;) if (found) throw FoundException();
+} catch (...) { }
+
+/* ✅ 用 break */
+for (;;) if (found) break;
+```
+:::
+
+**正常情况**（"没找到"、"文件不存在"）用返回值表示；**异常情况**（"参数非法"、"内存耗尽"）才抛异常。
+
+## 完整示例
+
+```cpp
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+class AppError : public std::runtime_error {
+public:
+    explicit AppError(const std::string &msg, int code = 0)
+        : std::runtime_error(msg), code_(code) {}
+    int code() const { return code_; }
+private:
+    int code_;
+};
+
+class FileGuard {              /* RAII：自动关闭文件 */
+public:
+    explicit FileGuard(const std::string &path)
+        : f_(path), path_(path) {
+        if (!f_.is_open()) {
+            throw AppError("打不开文件：" + path, 1001);
+        }
+    }
+    std::ifstream &stream() { return f_; }
+private:
+    std::ifstream f_;
+    std::string path_;
+};
+
+/* 可能抛异常的函数 */
+void process(int mode) {
+    if (mode == 1) throw std::invalid_argument("mode 不能为 1");
+    if (mode == 2) throw AppError("业务错误", 2001);
+    std::cout << "  mode=" << mode << " 处理成功\n";
+}
+
+int main() {
+    /* ① 分别捕获不同类型 */
+    for (int m : {0, 1, 2}) {
+        try {
+            process(m);
+        } catch (const std::invalid_argument &e) {
+            std::cout << "  [参数错误] " << e.what() << "\n";
+        } catch (const AppError &e) {
+            std::cout << "  [业务错误 " << e.code() << "] " << e.what() << "\n";
+        } catch (const std::exception &e) {
+            std::cout << "  [其他] " << e.what() << "\n";
+        }
+    }
+
+    /* ② RAII + 异常：资源自动释放 */
+    std::cout << "\n--- RAII 保护 ---\n";
+    try {
+        FileGuard f("no_such_file.txt");       /* 抛异常 */
+        std::cout << "  这行不会执行\n";
+    } catch (const AppError &e) {
+        std::cout << "  捕获：" << e.what()
+                  << "（code=" << e.code() << "）\n";
+    }
+
+    return 0;
+}
+```
+
+输出：
+
+```text
+  mode=0 处理成功
+  [参数错误] mode 不能为 1
+  [业务错误 2001] 业务错误
+
+--- RAII 保护 ---
+  捕获：打不开文件：no_such_file.txt（code=1001）
+```
+
+## 常见错误
+
+| 错误 | 现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `catch` 顺序从宽到窄 | 具体分支不执行 | 第一个匹配就跳出 | 从具体到宽泛 |
+| 按值捕获异常 | 切片，信息丢失 | 复制成基类 | `catch (const T &e)` |
+| 析构里抛异常 | 程序 terminate | 栈展开时二次异常 | 析构里捕获所有 |
+| 用异常做控制流 | 慢 | 异常开销大 | 用返回值/break |
+| 抛裸指针 | 内存泄漏 | 谁 delete | 抛对象 |
+| 捕获了不处理 | 问题被隐藏 | `catch(...) { }` | 至少记日志 |
+
+## 本课自检
+
+- [ ] 会写 `try` / `catch`，知道 `catch` 按顺序匹配
+- [ ] **知道捕获顺序必须从具体到宽泛**
+- [ ] **知道要 `catch (const T &e)` 而不是按值**
+- [ ] 记得住 `invalid_argument` / `out_of_range` / `runtime_error`
+- [ ] 知道 `logic_error`（可避免）和 `runtime_error`（外部原因）的区别
+- [ ] 会写自定义异常（继承 `std::runtime_error`）
+- [ ] **理解异常时栈展开会析构所有局部对象**
+- [ ] 知道异常安全的三个等级
+- [ ] 知道析构里不能抛异常
+- [ ] **知道不该用异常做正常控制流**
+- [ ] 知道嵌入式可能禁用异常
+
+## 下一步
+
+[22 命名空间与头文件](./22-namespace) —— 组织大型项目的代码结构。

@@ -1,0 +1,345 @@
+---
+title: 13 元组与集合
+sidebar_position: 13
+description: 元组的不可变与解包、集合的去重与交并差、以及为什么判断存在性用集合更快。
+id: 13-tuple-set
+---
+
+# 13 元组与集合
+
+**本课目标**：掌握最后两种容器，知道什么场景该用哪个。
+
+## 元组 tuple：不能改的列表
+
+```python
+point = (3, 5)
+colors = ("红", "绿", "蓝")
+single = (42,)          # 只有一个元素，必须带逗号
+empty = ()
+```
+
+:::danger[单元素元组必须带逗号]
+```python
+a = (42)       # 这是整数 42，不是元组！
+b = (42,)      # 这才是元组
+print(type(a))  # <class 'int'>
+print(type(b))  # <class 'tuple'>
+```
+
+括号会被当成普通的数学括号。**必须加逗号**。
+:::
+
+### 元组能做的：索引、切片、遍历
+
+```python
+point = (3, 5, 7)
+
+print(point[0])       # 3
+print(point[-1])      # 7
+print(point[1:])      # (5, 7)
+print(len(point))     # 3
+
+for v in point:
+    print(v)
+```
+
+### 元组不能做的：修改
+
+```python
+point = (3, 5)
+point[0] = 10
+```
+
+报错：
+
+```text
+TypeError: 'tuple' object does not support item assignment
+```
+
+:::tip[不可变的好处]
+既然不能改，为什么还要元组？
+
+1. **更安全**：数据不会被意外改动
+2. **能做字典的键**（列表不行）
+3. **速度略快**，内存略小
+4. **表达意图**：「这组数据本来就是固定的」，比如坐标、RGB 值、日期
+
+```python
+rgb = (255, 128, 0)
+location = (39.9, 116.4)     # 经纬度
+```
+:::
+
+## 解包：元组最好用的特性
+
+```python
+point = (3, 5)
+x, y = point
+print(x, y)
+```
+
+输出：
+
+```text
+3 5
+```
+
+**元组可以直接拆成几个变量**，这在接收函数返回值时极其常用。
+
+```python
+# 交换变量（本质就是元组解包）
+a, b = 1, 2
+a, b = b, a
+print(a, b)
+```
+
+输出：
+
+```text
+2 1
+```
+
+### 用 * 收集剩余
+
+```python
+first, *rest = (1, 2, 3, 4)
+print(first)     # 1
+print(rest)      # [2, 3, 4]  注意 rest 是列表
+
+*init, last = (1, 2, 3, 4)
+print(init)      # [1, 2, 3]
+print(last)      # 4
+```
+
+### 忽略不需要的值
+
+```python
+name, _, score = ("小明", 18, 95)
+print(name, score)    # 小明 95
+```
+
+`_` 是约定俗成的「我不关心这个值」。
+
+## 集合 set：自动去重 + 快速查找
+
+```python
+nums = {1, 2, 3, 2, 1}
+print(nums)
+```
+
+输出：
+
+```text
+{1, 2, 3}
+```
+
+**重复的元素自动被去掉。**
+
+:::warning[空集合不能写 `{}`]
+```python
+a = {}          # 这是空字典！
+b = set()       # 这才是空集合
+print(type(a))  # <class 'dict'>
+print(type(b))  # <class 'set'>
+```
+:::
+
+### 最常用场景：去重
+
+```python
+numbers = [1, 2, 2, 3, 3, 3, 4]
+unique = list(set(numbers))
+print(unique)
+```
+
+输出（顺序不保证）：
+
+```text
+[1, 2, 3, 4]
+```
+
+:::warning[set 会打乱顺序]
+集合**不保证顺序**，转回列表后顺序可能和原来不同。
+
+如果需要「去重但保持原顺序」，用：
+
+```python
+seen = set()
+result = []
+for n in numbers:
+    if n not in seen:
+        seen.add(n)
+        result.append(n)
+print(result)
+```
+
+或者 Python 3.7+ 可以用 `list(dict.fromkeys(numbers))`。
+:::
+
+### 交、并、差
+
+```python
+a = {1, 2, 3}
+b = {2, 3, 4}
+
+print(a | b)      # 并集 {1, 2, 3, 4}
+print(a & b)      # 交集 {2, 3}
+print(a - b)      # 差集 {1}（在 a 不在 b）
+print(a ^ b)      # 对称差 {1, 4}（只在其中一个里）
+```
+
+| 运算 | 符号 | 方法 |
+| --- | --- | --- |
+| 并集 | `\|` | `a.union(b)` |
+| 交集 | `&` | `a.intersection(b)` |
+| 差集 | `-` | `a.difference(b)` |
+| 对称差 | `^` | `a.symmetric_difference(b)` |
+
+```python
+# 实战：找出两门课都选了的学生
+math = {"小明", "小红", "小刚"}
+english = {"小红", "小刚", "小李"}
+
+both = math & english
+print(f"两门都选：{both}")
+
+only_math = math - english
+print(f"只选数学：{only_math}")
+```
+
+输出：
+
+```text
+两门都选：{'小红', '小刚'}
+只选数学：{'小明'}
+```
+
+### 集合的增删
+
+```python
+s = {1, 2}
+
+s.add(3)          # 加一个
+print(s)
+
+s.remove(3)       # 删一个（不存在会报错）
+print(s)
+
+s.discard(99)     # 删一个（不存在不报错）
+print(s)
+
+s.update([4, 5])  # 加多个
+print(s)
+```
+
+:::tip[remove vs discard]
+- `remove(x)`：x 不存在 → **报 KeyError**
+- `discard(x)`：x 不存在 → **静默忽略**
+
+不确定存在时用 `discard`。
+:::
+
+## 关键差异：in 的查找速度
+
+这是集合最重要的性能特性：
+
+```python
+import time
+
+big_list = list(range(100000))
+big_set = set(range(100000))
+
+# 列表查找
+start = time.perf_counter()
+for _ in range(1000):
+    99999 in big_list
+t_list = time.perf_counter() - start
+
+# 集合查找
+start = time.perf_counter()
+for _ in range(1000):
+    99999 in big_set
+t_set = time.perf_counter() - start
+
+print(f"列表：{t_list:.4f} 秒")
+print(f"集合：{t_set:.4f} 秒")
+print(f"列表慢 {t_list / t_set:.0f} 倍")
+```
+
+本机实测输出（你的数字会不同，但倍数关系类似）：
+
+```text
+列表：0.0620 秒
+集合：0.0001 秒
+列表慢 620 倍
+```
+
+:::tip[深入一点：为什么会差这么多]
+- **列表**：从头到尾一个个比对，10 万个元素平均要看 5 万次。叫 **O(n)**
+- **集合/字典**：用哈希算出位置，直接跳过去看。叫 **O(1)**，跟元素多少无关
+
+**第一遍不懂可跳过**，记住实用结论：
+
+**「判断某个东西在不在」的数据量一大，就该用 set 或 dict，不要用 list。**
+
+```python
+# 慢
+if user_id in user_id_list:
+
+# 快
+if user_id in user_id_set:
+```
+:::
+
+## 三种容器怎么选
+
+| 容器 | 写法 | 有序 | 可改 | 能重复 | 适合 |
+| --- | --- | --- | --- | --- | --- |
+| `list` | `[1, 2]` | ✅ | ✅ | ✅ | 一堆同类数据，顺序重要 |
+| `tuple` | `(1, 2)` | ✅ | ❌ | ✅ | 固定的一组值（坐标、RGB） |
+| `dict` | `{"a": 1}` | ✅ | ✅ | 键不重复 | 名字查值 |
+| `set` | `{1, 2}` | ❌ | ✅ | ❌ | 去重、快速查找、集合运算 |
+
+:::tip[一句话选择法]
+- 要**按顺序**存一堆 → `list`
+- 要**用名字查** → `dict`
+- 只关心**有没有**、要**去重** → `set`
+- 数据**固定不变**、要当 dict 的键 → `tuple`
+:::
+
+## 类型转换
+
+```python
+print(list((1, 2)))       # [1, 2]      元组 → 列表
+print(tuple([1, 2]))      # (1, 2)      列表 → 元组
+print(set([1, 1, 2]))     # {1, 2}      去重
+print(list("abc"))        # ['a','b','c'] 字符串 → 列表
+print(list({"a": 1}))     # ['a']       字典 → 键列表
+```
+
+## 常见错误
+
+| 错误 | 报错/现象 | 原因 | 解决 |
+| --- | --- | --- | --- |
+| `(42)` 当元组 | 是 int | 少逗号 | `(42,)` |
+| 修改元组 | TypeError | 元组不可变 | 改用列表 |
+| `{}` 当空集合 | 是 dict | 语法歧义 | `set()` |
+| 用 set 后顺序乱 | 顺序变了 | set 无序 | 用 dict.fromkeys 保序去重 |
+| `remove` 不存在元素 | KeyError | remove 严格 | 用 `discard` |
+| 把 list 放进 set | TypeError unhashable | 列表不可哈希 | 用 tuple |
+
+## 本课自检
+
+- [ ] 会创建元组，知道单元素要写 `(42,)`
+- [ ] 知道元组不可变，理解为什么还要用它
+- [ ] 会用元组解包 `x, y = point`
+- [ ] 会用 `*rest` 收集剩余
+- [ ] 会用 `set()` 去重，知道 `{}` 是字典
+- [ ] 会做交并差：`& | - ^`
+- [ ] 分清 `remove` 和 `discard`
+- [ ] 知道 `in` 在 set 里比在 list 里快得多
+- [ ] 能根据场景选对容器
+
+## 下一步
+
+[14 阶段实战：猜数字游戏](./14-project-guess) —— 把前 9 课的知识串成一个完整可玩的程序。

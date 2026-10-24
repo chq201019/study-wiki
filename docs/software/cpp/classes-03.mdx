@@ -1,0 +1,240 @@
+---
+id: classes-03
+title: "03 this 指针"
+sidebar_position: 4
+description: "类与对象 第 3 部分：this 指针"
+---
+
+# 03 this 指针
+`this` 是成员函数里指向当前对象的指针：
+
+- 非 const 成员函数里：`T* const this`
+- const 成员函数里：`const T* const this`
+
+```cpp
+// this_demo.cpp
+#include <cstdio>
+
+struct Counter {
+    int value = 0;
+    Counter& inc()  { ++value; return *this; }   // 返回 *this 支持链式调用
+    Counter& add(int n) { value += n; return *this; }
+    const Counter* self() const { return this; }  // const 版本返回 const 指针
+    Counter* self() { return this; }
+};
+
+int main() {
+    Counter c;
+    c.inc().add(5).inc();       // 链式
+    std::printf("c.value = %d\n", c.value);
+    std::printf("&c = %p, c.self() = %p\n", (void*)&c, (void*)c.self());
+}
+```
+
+**实测输出：**
+
+```text
+c.value = 7
+&c = 000000E3DBB3F6EC, c.self() = 000000E3DBB3F6EC
+```
+
+:::caution[返回 `*this` 时返回类型必须是引用]
+`Counter inc()`（返回**值**）会拷贝一份，链式调用作用在临时对象上，原对象不变。**必须写 `Counter&`。**
+:::
+
+## 6. static 成员
+
+### static 数据成员：属于类，不属于对象
+
+```cpp
+// static_member.cpp
+#include <cstdio>
+
+struct Widget {
+    int id;
+    static int count;              // 声明（不占对象空间）
+    static constexpr int MAX = 100;  // C++17 起 inline，可直接用
+
+    Widget() : id(++count) {}
+    ~Widget() { --count; }
+    static int alive() { return count; }   // static 成员函数：没有 this
+};
+
+int Widget::count = 0;   // 定义（必须在某个 .cpp 里，C++17 前）
+
+int main() {
+    std::printf("sizeof(Widget) = %zu   (static 成员不占空间)\n", sizeof(Widget));
+    std::printf("initial alive = %d\n", Widget::alive());
+    {
+        Widget a, b, c;
+        std::printf("alive = %d, ids = %d %d %d\n", Widget::alive(), a.id, b.id, c.id);
+    }
+    std::printf("alive = %d\n", Widget::alive());
+    std::printf("MAX = %d\n", Widget::MAX);
+}
+```
+
+**实测输出：**
+
+```text
+sizeof(Widget) = 4   (static 成员不占空间)
+initial alive = 0
+alive = 3, ids = 1 2 3
+alive = 0
+MAX = 100
+```
+
+关键点：
+- `sizeof(Widget)` 只有 4（`int id`），**static 成员不占对象空间**
+- static 成员函数**没有 `this`**，所以只能访问 static 成员
+- C++17 起 `static constexpr` 成员隐式 `inline`，**不需要在 .cpp 里再定义**；非 constexpr 的普通 static 成员仍需类外定义
+
+:::tip[C++17 的替代方案]
+如果你还在 C++11/14，用 `static const int MAX = 100;` 在类内初始化是可以的，但**一旦对它取地址就必须有类外定义**。C++17 的 `inline` 变量彻底解决了这个麻烦：
+
+```cpp
+struct S {
+    inline static int counter = 0;   // C++17：类内定义，干净
+};
+```
+:::
+
+### 函数内的 static：局部静态变量
+
+```cpp
+// static_local.cpp
+#include <cstdio>
+
+int& get_counter() {
+    static int counter = 0;   // 只初始化一次
+    return counter;
+}
+
+void bump() {
+    static int calls = 0;     // 线程安全问题见下
+    std::printf("  calls = %d\n", ++calls);
+}
+
+int main() {
+    std::printf("counter = %d\n", get_counter());
+    get_counter() = 5;
+    std::printf("counter = %d\n", get_counter());
+    bump(); bump(); bump();
+}
+```
+
+**实测输出：**
+
+```text
+counter = 0
+counter = 5
+  calls = 1
+  calls = 2
+  calls = 3
+```
+
+:::info[C++11 保证线程安全初始化]
+C++11 起，局部 static 变量的**初始化**是线程安全的（"magic statics"）：多个线程同时首次进入该函数，只有一个执行初始化，其它阻塞等待。
+
+**但初始化之后的读写不保证线程安全**——那是 `std::atomic` 或互斥锁的事。
+
+这个特性常被用来做线程安全的单例（Meyers Singleton）：
+
+```cpp
+Config& config() {
+    static Config instance;   // C++11 起线程安全
+    return instance;
+}
+```
+:::
+
+## 7. 友元：打破封装的正确姿势
+
+`friend` 让某个函数或类能访问私有成员。它是**封装的受控例外**，不是封装的替代品。
+
+```cpp
+// friend_demo.cpp
+#include <cstdio>
+#include <iostream>
+
+class Box {
+private:
+    int w_ = 0, h_ = 0;
+public:
+    Box(int w, int h) : w_(w), h_(h) {}
+    int area() const { return w_ * h_; }
+
+    friend int perimeter(const Box& b);          // 友元函数
+    friend class Inspector;                      // 友元类
+    friend std::ostream& operator<<(std::ostream&, const Box&);
+};
+
+int perimeter(const Box& b) { return 2 * (b.w_ + b.h_); }  // 能访问 w_/h_
+
+class Inspector {
+public:
+    static void dump(const Box& b) {
+        std::printf("  Inspector: w=%d h=%d\n", b.w_, b.h_);   // 能访问
+    }
+};
+
+int main() {
+    Box b(3, 4);
+    std::printf("area=%d perimeter=%d\n", b.area(), perimeter(b));
+    Inspector::dump(b);
+}
+```
+
+**实测输出：**
+
+```text
+area=12 perimeter=14
+  Inspector: w=3 h=4
+```
+
+:::warning[友元的三个性质，容易记错]
+1. **友元关系不能传递**：A 是 B 的友元，B 是 C 的友元，不意味着 A 能访问 C
+2. **友元关系不能继承**：基类的友元不是派生类的友元
+3. **友元声明不受访问控制影响**：写在 `private:` 还是 `public:` 段里都一样
+
+**什么时候该用友元？** 最正当的场景是**运算符重载**：`operator<<(ostream&, const T&)` 必须是非成员函数（左操作数是 `ostream`），但它需要访问 T 的内部——友元正合适。除此之外，优先考虑"提供足够的 public 接口"。
+:::
+
+## 常见坑
+
+| 坑 | 现象 | 解法 |
+| --- | --- | --- |
+| 初始化列表顺序 ≠ 声明顺序 | 成员用未初始化的值 | 顺序保持一致（开 `-Wreorder`） |
+| 只写析构不写拷贝 | double free | Rule of 0 或 Rule of 3/5 |
+| 析构函数抛异常 | `std::terminate` | 析构永远 `noexcept` |
+| 返回 `*this` 写成值 | 链式调用作用在临时对象上 | 返回 `T&` |
+| 声明移动后拷贝消失 | 突然不能拷贝了 | 需要拷贝就显式 `= default` |
+| 假设被移动对象为空 | 依赖实现细节 | 只当它"有效但未指定" |
+| static 成员忘了类外定义 | 链接错误 undefined reference | C++17 用 `inline static` |
+| 用友元代替 public 接口 | 封装被破坏 | 只在运算符重载等必要处用 |
+| 浅拷贝裸指针 | double free | 用 `std::string`/`unique_ptr` |
+| 误解局部 static 的线程安全 | 初始化安全但读写不安全 | 需要 `std::atomic`/锁 |
+
+## 自检清单
+
+- [ ] 说出基类、成员、函数体三者的构造顺序和析构顺序
+- [ ] 区分拷贝构造和拷贝赋值各自在什么场合被调用
+- [ ] 用一句话解释 RAII，并说明为什么它对异常安全至关重要
+- [ ] 判断一个给定类应该遵守 Rule of 0、3 还是 5
+- [ ] 解释为什么"只写析构不写拷贝"会导致 double free
+- [ ] 说出 `= default` 和 `= delete` 各自的作用
+- [ ] 知道被移动后的对象可以做什么、不能做什么
+- [ ] 解释 static 成员为什么不占对象空间
+- [ ] 说出局部 static 变量在 C++11 起的线程安全保证的**边界**
+- [ ] 举出友元的三个性质和一个正当使用场景
+
+## 下一步
+
+- RAII 的具体工具 → [资源管理与智能指针](./raii-smartptr)
+- 移动到底发生了什么 → [移动语义与完美转发](./move-semantics)
+- 析构与异常的交互 → [进阶特性](./advanced)
+- 回到 [C++ 主线导读](./)
+
+---
+
+**翻页**：[← 上一页](./classes-02) · [返回目录](./)
