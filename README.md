@@ -85,7 +85,16 @@ python scripts/gen_diagrams.py        # 输出到 static/img/diagrams/
 
 ## 许可
 
-内容（`docs/` 下的教程文字与图片）采用 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/deed.zh)，
-代码（`scripts/`、`src/`、配置文件）采用 [MIT](https://opensource.org/licenses/MIT)。
+本仓库采用**双许可**，按内容类型区分：
 
-引用或转载教程内容请注明来源并保留相同许可；商业使用请联系作者。
+| 范围 | 许可 | 全文 |
+| --- | --- | --- |
+| 教程内容：`docs/`、`static/img/`、`PROJECT.md` | **CC BY-NC-SA 4.0**（署名—非商业—相同方式共享） | [LICENSE-CONTENT-CC-BY-NC-SA-4.0.md](./LICENSE-CONTENT-CC-BY-NC-SA-4.0.md) |
+| 代码：`scripts/`、`src/`、配置文件 | **MIT** | [LICENSE](./LICENSE) |
+
+简而言之：
+
+- 转载/改编教程请**署名 + 注明是否修改 + 用同样许可**分发，且**不能用于商业目的**
+- 脚本和站点代码随便用，保留版权声明即可
+
+商业使用请联系作者单独授权。
