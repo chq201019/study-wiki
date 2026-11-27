@@ -2,7 +2,9 @@
 
 一个开源的**中文编程与嵌入式教程站**源码。用 [Docusaurus 3](https://docusaurus.io/) 构建，纯静态、无后端依赖。
 
-线上站点：<https://study.chennet.dpdns.org>
+> **线上站点**：<https://study.chennet.dpdns.org>
+> **内容后台**：<https://study.chennet.dpdns.org/admin/>
+> **仓库地址**：<https://github.com/chq201019/study-wiki>
 
 ## 这个站讲什么
 
@@ -55,6 +57,77 @@ docs/
 static/img/diagrams/     示意图（由 scripts/gen_diagrams*.py 生成，可重跑）
 scripts/                 示意图生成器 + 内容校验脚本
 ```
+
+## 部署
+
+### 环境与前置
+
+| 项 | 要求 |
+| --- | --- |
+| Node.js | **>= 20**（`package.json` 的 `engines` 限定，低版本构建直接失败） |
+| 依赖安装 | `npm install`（首次或 `package-lock.json` 变更后） |
+| 服务器 | 已装好 nginx + cloudflared + `systemctl` 的 Linux 主机 |
+
+服务器上的目录约定（`/opt/study-wiki/`）：
+
+```text
+app/         站点源码，线上就是从它构建的（node_modules 已装好）
+www/         构建产物，nginx 指向这里
+backups/     后台每次保存前的 mdx 备份
+build.log    构建日志
+publish.sh   发布脚本：预压缩 + 原子替换 www/ + reload nginx
+admin/       内容后台服务（零依赖 Node）
+```
+
+### 方式一：内容后台（只改 `docs/**/*.mdx` 时最快）
+
+打开 <https://study.chennet.dpdns.org/admin/> → 输密码 → 点页面 → 改 → **保存并发布**。
+
+后台自动完成：备份旧版到 `backups/` → 构建 → 预压缩 → 原子替换 `www/` → 重载 nginx，约 40 秒。**构建失败不会影响线上**，仍是上一个可用版本。编辑框上方有「选择图片」，上传后自动插入 `![说明](路径)`。
+
+> ⚠️ 后台只接受 `docs/**/*.mdx`。改 `docusaurus.config.ts`、`sidebars.ts`、`src/`、`static/` 必须走方式二。
+
+### 方式二：本地改完推送（改配置 / 侧边栏 / 首页时用）
+
+```powershell
+npm run build                          # 先在本地确认构建通过
+.\scripts\push.ps1                     # 打包 → 上传 → 服务器构建 → 发布
+```
+
+`push.ps1` 打包 `docs/ src/ static/ docusaurus.config.ts sidebars.ts scripts package.json package-lock.json`，上传后在服务器解包构建并发布，执行时会提示输入服务器密码。
+
+手动等价流程（`push.ps1` 不可用时）：
+
+```bash
+# 本地
+tar -czf content.tar.gz -C . docs src static docusaurus.config.ts sidebars.ts scripts package.json package-lock.json
+# 上传后，在服务器执行
+tar -xzf content.tar.gz -C /opt/study-wiki/app
+cd /opt/study-wiki/app && npm run build && sh /opt/study-wiki/publish.sh build
+```
+
+### 回滚
+
+后台每次保存都在 `backups/` 留了旧版，直接覆盖回去再重新发布：
+
+```bash
+ls -t /opt/study-wiki/backups/ | head              # 找要回滚的 .bak
+cp /opt/study-wiki/backups/<文件名>.bak /opt/study-wiki/app/docs/<原路径>
+cd /opt/study-wiki/app && npm run build && sh /opt/study-wiki/publish.sh build
+```
+
+### 常见故障
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| 发布后页面没变化 | 只改了 `docs/` 之外的文件 | 配置类改动走 `push.ps1`，后台不处理 |
+| 构建卡住或内存爆掉 | `.cache/` 原生插件缓存异常 | 删掉 `/opt/study-wiki/.cache/` 后重跑构建 |
+| 后台打不开 | `study-admin` 服务挂了 | `systemctl status study-admin` / `journalctl -u study-admin -f` |
+| 站点 502 | nginx 或 cloudflared 异常 | `nginx -t && systemctl reload nginx` |
+
+### 部署前自检
+
+本地 `npm run build` 必须通过——**MDX 编译错误会让整站发布失败**，而服务器上的失败只在 `build.log` 里看得到。提交前再跑一遍下面「内容校验」里的脚本。
 
 ## 内容校验
 

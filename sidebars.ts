@@ -12,7 +12,21 @@ const sidebars: SidebarsConfig = {
   // ============================================================
   // 软件总览 / 硬件总览（两个总入口页，保留原 sidebar id）
   // ============================================================
-  softwareSidebar: ['software/index'],
+  softwareSidebar: [
+    'software/index',
+    {
+      // 来自知识库同步的模块实战篇（docs/software/*.mdx 顶层文件）
+      type: 'category',
+      label: '模块实战（4 篇）',
+      collapsed: true,
+      items: [
+        'software/iot-protocols',
+        'software/data-logging',
+        'software/pid-control',
+        'software/line-following',
+      ],
+    },
+  ],
   hardwareSidebar: ['hardware/index'],
 
   // ============================================================
@@ -514,6 +528,29 @@ const sidebars: SidebarsConfig = {
         'quickstart/bus',
         'quickstart/wifi',
         'quickstart/mqtt',
+      ],
+    },
+    {
+      // 来自知识库同步的模块实战篇（docs/hardware/*.mdx 顶层文件，与 ESP32 强相关）
+      type: 'category',
+      label: '模块实战（15 篇）',
+      collapsed: true,
+      items: [
+        'hardware/power-levels',
+        'hardware/i2c-addresses',
+        'hardware/driver-timing',
+        'hardware/esp-idf-peripherals',
+        'hardware/flash-nvs',
+        'hardware/sd-card',
+        'hardware/power-battery',
+        'hardware/servo',
+        'hardware/motor-driver',
+        'hardware/huskylens-deep',
+        'hardware/audio-i2s',
+        'hardware/camera-esp32',
+        'hardware/motor-4ch-encoder',
+        'hardware/unihiker-k10',
+        'hardware/unihiker-m10',
       ],
     },
   ],
