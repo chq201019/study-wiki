@@ -1,0 +1,446 @@
+---
+title: 电机驱动 L298N / TB6612 / DRV8833
+description: 三种常用直流电机驱动模块的选型对比、H 桥与 PWM 调速原理、正反转真值表、完整接线与 Arduino/ESP-IDF 双份代码，以及烧板子之前必须知道的七个坑
+sidebar_position: 105
+---
+
+# 电机驱动 L298N / TB6612 / DRV8833
+
+直流电机不能直接接 GPIO。这一节讲清楚为什么、选哪颗芯片、怎么接线、怎么写代码。
+
+## 先看结论：怎么选
+
+| 维度 | L298N | TB6612FNG | DRV8833 |
+|---|---|---|---|
+| 内部结构 | 双极性达林顿 BJT | MOSFET | MOSFET |
+| 单通道连续电流 | 2 A（散热片到位） | 1.2 A | 1.5 A |
+| 单通道峰值电流 | 3 A | 3.2 A | 2 A |
+| 电机电压 VM | 5 ~ 35 V | 2.5 ~ 13.5 V | 2.7 ~ 10.8 V |
+| 逻辑供电 | 5 V（板载 78M05） | 2.7 ~ 5.5 V 独立 VCC 脚 | 无独立脚，内部从 VM 生成 |
+| 导通压降 | 单管 1.4 V，H 桥总压降 2.8 V 起 | 0.5 Ω × I，1 A 时约 0.5 V | 0.36 Ω × I，1 A 时约 0.36 V |
+| 效率 | 50 ~ 70 % | 90 % 以上 | 90 % 以上 |
+| 发热 | 大，2 A 时不加散热片会烫手降额 | 1 A 内基本温的 | 1 A 内基本温的 |
+| 推荐 PWM 频率 | 8 ~ 20 kHz | 8 ~ 20 kHz（上限 100 kHz） | 8 ~ 20 kHz（上限 100 kHz） |
+| 待机脚 | 无 | STBY，**必须拉高** | nSLEEP，**必须拉高** |
+| 电流检测输出 | 无 | 无 | 有 AISEN / BISEN |
+| 模块参考价 | ¥8 ~ 12 | ¥6 ~ 10 | ¥5 ~ 8 |
+
+一句话：**12 V 以上大电机用 L298N；小车、电池供电、要效率用 TB6612 或 DRV8833。**
+TB6612 和 DRV8833 接线几乎一样，教程可以互换；L298N 的坑最多，也最容易被当成"通用模块"乱用。
+
+## 为什么不能直接用 GPIO 驱动电机
+
+ESP32 一个 GPIO 的绝对最大灌/拉电流是 40 mA，推荐长期工作 20 mA 以内，输出高电平 3.3 V。
+一个 TT 马达（黄色减速箱）空载 150 mA，堵转 1.2 A，启动瞬间更高。
+用 GPIO 直连的结果不是"转得慢"，而是**GPIO 驱动级当场烧穿，整颗芯片报废**，而且往往连带把 3.3 V LDO 拖死。
+
+电机还必须是**双向**的：正转、反转、刹车三种状态。单个三极管只能单向，所以需要四个开关组成一个 **H 桥**：
+
+```text
+        VM (电池 +)
+          │
+     ┌────┴────┐
+    S1         S3          S1+S4 导通 → 电流从左往右 → 正转
+     │          │          S2+S3 导通 → 电流从右往左 → 反转
+     ├──[ M ]───┤          S1+S3 导通 → 电机两端短路 → 刹车
+     │          │          S2+S4 导通 → 电机两端短路 → 刹车
+    S2         S4          全关         → 悬空滑行 → coast
+     │          │
+     └────┬────┘
+          │
+        GND
+```
+
+驱动芯片替你做了三件事：把 3.3 V 逻辑电平抬到 VM 电压去控制上桥臂、把 4 个开关的时序做成不会直通（上下同时导通 = 电池直接短路）的电路、以及内置续流二极管吸收电机断电瞬间的反电动势。
+
+## PWM 调速：占空比就是平均电压
+
+电机是电感负载，对高频 PWM 的响应是"电流被平均掉"。
+占空比 50 % 时，电机两端看到的平均电压约等于 VM × 0.5，转速大致线性跟随（空载时），带载时略低于线性。
+
+频率怎么选：
+
+| 频率 | 现象 |
+|---|---|
+| 100 ~ 500 Hz | 明显能听到"哒哒"或尖锐啸叫，低速抖动，扭矩脉动大 |
+| 1 ~ 4 kHz | 仍有可听啸叫，**Arduino Uno 的 `analogWrite` 默认 490 Hz / 980 Hz 就落在这里** |
+| 8 ~ 20 kHz | 甜点区。大多数人听不到，开关损耗可控 |
+| 25 kHz 以上 | 对孩子仍然可能听见（儿童听觉上限接近 20 kHz），且 L298N 的达林顿开关太慢，损耗急剧上升 |
+
+两条硬约束：
+
+1. **低于 L/R 时间常数对应的频率会变成"通断"而不是调速。** TT 马达 L 约 0.5 mH、R 约 5 Ω，时间常数 0.1 ms，对应 1.6 kHz。低于这个频率，电流根本来不及被电感平滑。
+2. **频率 × 2^分辨率 ≤ 定时器时钟。** ESP32 的 LEDC 用 80 MHz APB 时钟，所以 20 kHz + 12 位（4096 级）= 20000 × 4096 = 8.2 × 10⁷ > 8 × 10⁷，**超了，配不上**。20 kHz 时用 11 位或 10 位。
+
+## 正反转控制真值表
+
+三颗芯片的逻辑一致，只是引脚名字不同。**PWM 加在 EN / PWM 脚上，方向加在 IN 脚上**，这是最简单也最不容易出错的接法（sign-magnitude 模式）。
+
+| 芯片 | 使能脚 | 方向脚 A | 方向脚 B | STBY / nSLEEP |
+|---|---|---|---|---|
+| L298N | ENA / ENB（拔掉跳线帽才是 PWM 输入） | IN1 / IN3 | IN2 / IN4 | 无 |
+| TB6612FNG | PWMA / PWMB | AIN1 / BIN1 | AIN2 / BIN2 | STBY |
+| DRV8833 | 无（用 IN 脚直接 PWM） | AIN1 / BIN1 | AIN2 / BIN2 | nSLEEP |
+
+| A 脚 | B 脚 | 使能 | 电机状态 |
+|---|---|---|---|
+| 0 | 0 | 任意 | 悬空滑行（coast），能自由转动 |
+| 1 | 0 | PWM | 正转，转速随占空比 |
+| 0 | 1 | PWM | 反转 |
+| 1 | 1 | 任意 | 刹车（brake），电机两端短路，阻力很大 |
+| 1 | 0 | 0 | 停转但两端悬空 |
+
+:::warning[L298N 的跳线帽是新手第一个坑]
+模块上 ENA、ENB 两个位置各有一个黑色跳线帽。**装着跳线帽时 EN 被硬拉到 5 V，PWM 信号进不去，电机只会全速转或者不转**。
+要用 PWM 调速，必须把两个跳线帽拔掉，把 PWM 接到 ENA/ENB 排针上。
+:::
+
+:::tip[DRV8833 没有独立使能脚]
+DRV8833 用 **IN 脚直接打 PWM**：AIN1 输 PWM、AIN2 拉低 → 正转调速。
+不要在 AIN1/AIN2 上同时给 PWM 又给方向逻辑，两路 PWM 反相也行但没必要，教学项目用单边 PWM + 另一边固定电平最清楚。
+:::
+
+## 完整接线（以 TB6612 驱动两轮小车为例）
+
+```text
+  电池 7.4V ────┬─────────────── VM   TB6612   VM ──── 左电机 M1 (两根线，不分正负)
+                │               AO1 ───────────────── 左电机 M1
+                │               AO2 ───────────────── 左电机 M1
+                │               BO1 ───────────────── 右电机 M2
+                │               BO2 ───────────────── 右电机 M2
+                │               VCC ──── 3.3V (逻辑供电，可以接 ESP32 的 3V3)
+                │               GND ────┬──────────── ESP32 GND  ← 必须共地
+                │                        │
+                └── 470µF 电解 ∥ 100nF ──┴── GND      ← 并在线端子两端，抑制电机噪声
+
+  ESP32 GPIO25 ── PWMA      ESP32 GPIO26 ── AIN1      ESP32 GPIO27 ── AIN2
+  ESP32 GPIO14 ── PWMB      ESP32 GPIO12 ── BIN1      ESP32 GPIO13 ── BIN2
+  ESP32 GPIO33 ── STBY（拉高才工作，很多模块板载已上拉，没上拉就飞线到 3V3）
+```
+
+引脚选择的硬限制：
+
+- **不能用 GPIO6 ~ GPIO11**：这几个脚连着板载 SPI Flash，一驱动板子立刻死。
+- **不能用 GPIO34 ~ GPIO39**：这些是输入专用脚，没有输出驱动能力，接上去电机纹丝不动。
+- **尽量避开 GPIO0 / 2 / 12 / 15**：strapping pin，上电瞬间电平决定启动模式，电机驱动的上电毛刺会让板子进不了下载模式或反复重启。
+- **GPIO12 尤其危险**：上电时被拉高会让 ESP32 的 Flash 供电变成 1.8 V，直接起不来。上表里 BIN1 用 GPIO12 只是示例，**换成 GPIO16 更稳**。
+
+## 代码一：Arduino（ESP32 Arduino core 3.x）
+
+```cpp
+// TB6612 双电机驱动，带差速转向
+// ESP32 Arduino core 3.x：用 ledcAttach(pin, freq, res) + ledcWrite(pin, duty)
+
+constexpr int PIN_PWMA = 25, PIN_AIN1 = 26, PIN_AIN2 = 27;   // 左轮
+constexpr int PIN_PWMB = 14, PIN_BIN1 = 16, PIN_BIN2 = 13;   // 右轮
+constexpr int PIN_STBY = 33;
+
+constexpr int PWM_FREQ = 20000;   // 20 kHz，人耳听不到
+constexpr int PWM_RES  = 10;      // 10 位 → 0..1023，且 20000*1024 = 2.05e7 < 80e6 合法
+constexpr int PWM_MAX  = (1 << PWM_RES) - 1;
+
+void motorInit()
+{
+    pinMode(PIN_AIN1, OUTPUT); pinMode(PIN_AIN2, OUTPUT);
+    pinMode(PIN_BIN1, OUTPUT); pinMode(PIN_BIN2, OUTPUT);
+    pinMode(PIN_STBY, OUTPUT);
+
+    ledcAttach(PIN_PWMA, PWM_FREQ, PWM_RES);   // core 3.x 新 API
+    ledcAttach(PIN_PWMB, PWM_FREQ, PWM_RES);
+
+    digitalWrite(PIN_STBY, HIGH);
+    motorStop();
+}
+
+// duty 取值 -PWM_MAX ~ +PWM_MAX，负数是反转
+void motorLeft(int duty)
+{
+    if (duty >= 0) {
+        digitalWrite(PIN_AIN1, HIGH); digitalWrite(PIN_AIN2, LOW);
+    } else {
+        digitalWrite(PIN_AIN1, LOW);  digitalWrite(PIN_AIN2, HIGH);
+        duty = -duty;
+    }
+    ledcWrite(PIN_PWMA, duty > PWM_MAX ? PWM_MAX : duty);   // core 3.x 传的是 pin
+}
+
+void motorRight(int duty)
+{
+    if (duty >= 0) {
+        digitalWrite(PIN_BIN1, HIGH); digitalWrite(PIN_BIN2, LOW);
+    } else {
+        digitalWrite(PIN_BIN1, LOW);  digitalWrite(PIN_BIN2, HIGH);
+        duty = -duty;
+    }
+    ledcWrite(PIN_PWMB, duty > PWM_MAX ? PWM_MAX : duty);
+}
+
+// 差速：base 基础速度，turn 为正值右转
+void drive(int base, int turn)
+{
+    motorLeft(base - turn);
+    motorRight(base + turn);
+}
+
+void motorStop()
+{
+    digitalWrite(PIN_AIN1, LOW); digitalWrite(PIN_AIN2, LOW);
+    digitalWrite(PIN_BIN1, LOW); digitalWrite(PIN_BIN2, LOW);
+    ledcWrite(PIN_PWMA, 0); ledcWrite(PIN_PWMB, 0);
+}
+
+void setup()
+{
+    Serial.begin(115200);
+    motorInit();
+    delay(1000);   // 等电源稳定，避免上电瞬间抢电流把 ESP32 拉复位
+}
+
+void loop()
+{
+    drive(400, 0);    delay(1500);   // 直行
+    drive(400, 250);  delay(600);    // 右转
+    drive(0, 0);      delay(1000);   // 停
+}
+```
+
+:::danger[Arduino core 2.x 和 3.x 的 LEDC API 不兼容]
+2.x：`ledcSetup(ch, freq, res); ledcAttachPin(pin, ch); ledcWrite(ch, duty);`
+3.x：`ledcAttach(pin, freq, res); ledcWrite(pin, duty);`
+在 3.x 上照抄 2.x 的代码，编译报 `'ledcSetup' was not declared`；反过来在 2.x 上写 `ledcWrite(pin, ...)` 会把 pin 当成通道号，输出到错误的通道上，表现是"电机不转但别的引脚乱跳"。
+:::
+
+## 代码二：ESP-IDF（LEDC + GPIO）
+
+```c
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+
+static const char *TAG = "motor";
+
+#define PIN_PWMA   GPIO_NUM_25
+#define PIN_AIN1   GPIO_NUM_26
+#define PIN_AIN2   GPIO_NUM_27
+#define PIN_PWMB   GPIO_NUM_14
+#define PIN_BIN1   GPIO_NUM_16
+#define PIN_BIN2   GPIO_NUM_13
+#define PIN_STBY   GPIO_NUM_33
+
+#define PWM_FREQ_HZ   20000
+#define PWM_RES       LEDC_TIMER_10_BIT     // 1023 级；20000*1024=2.05e7 < 80e6，合法
+#define PWM_MAX       1023
+
+static void motor_gpio_init(void)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << PIN_AIN1) | (1ULL << PIN_AIN2) |
+                        (1ULL << PIN_BIN1) | (1ULL << PIN_BIN2) |
+                        (1ULL << PIN_STBY),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io));
+    gpio_set_level(PIN_STBY, 1);          // 忘记这一行，TB6612 完全没反应
+}
+
+static void motor_pwm_init(void)
+{
+    ledc_timer_config_t t = {
+        .speed_mode      = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = PWM_RES,
+        .timer_num       = LEDC_TIMER_0,
+        .freq_hz         = PWM_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK,   // 自动挑 APB 80MHz
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&t));
+
+    ledc_channel_config_t c0 = {
+        .gpio_num   = PIN_PWMA,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel    = LEDC_CHANNEL_0,
+        .timer_sel  = LEDC_TIMER_0,
+        .duty       = 0,
+        .hpoint     = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&c0));
+    c0.gpio_num = PIN_PWMB;
+    c0.channel  = LEDC_CHANNEL_1;
+    ESP_ERROR_CHECK(ledc_channel_config(&c0));
+}
+
+static void set_duty(ledc_channel_t ch, int duty)
+{
+    if (duty > PWM_MAX) duty = PWM_MAX;
+    if (duty < 0) duty = 0;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, ch, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, ch);   // 少了这一句，占空比不会生效
+}
+
+static void motor_left(int duty)
+{
+    bool fwd = duty >= 0;
+    if (!fwd) duty = -duty;
+    gpio_set_level(PIN_AIN1, fwd);
+    gpio_set_level(PIN_AIN2, !fwd);
+    set_duty(LEDC_CHANNEL_0, duty);
+}
+
+static void motor_right(int duty)
+{
+    bool fwd = duty >= 0;
+    if (!fwd) duty = -duty;
+    gpio_set_level(PIN_BIN1, fwd);
+    gpio_set_level(PIN_BIN2, !fwd);
+    set_duty(LEDC_CHANNEL_1, duty);
+}
+
+void app_main(void)
+{
+    motor_gpio_init();
+    motor_pwm_init();
+    ESP_LOGI(TAG, "motor driver ready");
+
+    while (1) {
+        motor_left(400);  motor_right(400);  vTaskDelay(pdMS_TO_TICKS(1500));
+        motor_left(400);  motor_right(-400); vTaskDelay(pdMS_TO_TICKS(600));   // 原地转
+        motor_left(0);    motor_right(0);    vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+```
+
+`ledc_update_duty` 是 ESP-IDF 里最常见的"PWM 写了没反应"原因。`ledc_set_duty` 只是写寄存器影子值，必须 `ledc_update_duty` 才会在下一个周期装载。
+
+## 坑 1：必须外部供电，并且和主控共地
+
+电机电源**不能**从 ESP32 的 5V / VIN 脚取。USB 口限流 500 mA，一个 TT 马达启动瞬间就超了：
+电压瞬间掉到 3 V 以下，ESP32 的 brownout 检测器触发，板子反复重启，串口里刷一堆 `Brownout detector was triggered` 或 `rst:0xc (RTC_SW_CPU_RST)`。
+
+正确做法：电机走独立电池（4 节 AA = 6 V，或 2 节 18650 = 7.4 V），ESP32 用 USB 或另一路 5 V。
+
+**共地是必须的**：两颗芯片之间只有 GND 是公共参考点。ESP32 的 GPIO 输出 3.3 V，是"相对它的 GND"。如果驱动板的 GND 和 ESP32 的 GND 没接在一起，两者没有共同参考，TB6612 收到的信号电压是浮动的，表现是：
+
+- 电机完全不转
+- 或者电机转但不受控，一上电就全速
+- 或者时转时不转，手一碰就好了（人体提供了一条地通路）
+
+**接线顺序**：先接 GND，再接信号，最后接电机电源。反过来的顺序容易在插拔时打火。
+
+## 坑 2：L298N 有 1.4 V 压降，全变成热
+
+L298N 内部是达林顿三极管，每颗管的饱和压降典型 1.4 V。H 桥回路上永远串着两颗管（一颗上桥 + 一颗下桥），所以实际加在电机上的电压是：
+
+```text
+V_motor = V_battery - 1.4 - 1.4 = V_battery - 2.8   (1 A 时)
+电流越大压降越大：2 A 时总压降接近 4 V
+```
+
+后果：
+
+- 用 5 V 供电时，电机实际只拿到 2.2 V，转速掉一半，扭矩掉更多，看起来像"电池没电"。
+- 那 2.8 V × 2 A = 5.6 W 全部变成热，模块上的金属散热片会烫到 80 ℃ 以上，摸一下会真的烫伤。**L298N 不加散热片、不加风扇，2 A 连续工作是撑不住的。**
+- 解决：要么把电池电压提高 3 V 补偿，要么直接换 TB6612 / DRV8833。
+
+TB6612 是 MOSFET，导通电阻 0.5 Ω（上下管之和），1 A 时压降只有 0.5 V，发热是 L298N 的四分之一。**同样的电池，换芯片就能明显跑得更快更久。**
+
+## 坑 3：反电动势要续流二极管，不然炸芯片
+
+电机是电感。断电瞬间，线圈里的电流不能突变，会产生一个反向高压尖峰（几十伏，取决于线圈电感和电流下降速度）。这个尖峰如果不给一条泄放通路，会直接击穿 H 桥的开关管。
+
+解决方案分三种情况：
+
+| 情况 | 是否需要外接二极管 |
+|---|---|
+| 常见的红色 L298N 模块 | **不需要**，模块板上已经有 8 颗 1N4007 续流二极管 |
+| 裸的 L298N 芯片（多瓦特封装） | **必须**外接 8 颗快恢复二极管（1N5819 肖特基更好） |
+| TB6612 / DRV8833 | **不需要**，MOSFET 的体二极管天然充当续流二极管 |
+
+但**电源端一定要并电容**：电机线两端并 100 nF 瓷片电容，电源输入端并 470 µF 电解 + 100 nF。
+没有这几个电容，电刷火花产生的高频噪声会通过电源线窜进 ESP32，典型症状是"电机一转 WiFi 就断"或"电机一转串口就乱码"。
+
+## 坑 4：堵转电流是额定的 3~5 倍
+
+| 电机 | 额定（空载/轻载） | 堵转 |
+|---|---|---|
+| TT 马达（黄色双轴减速箱，6 V） | 150 ~ 200 mA | 1.0 ~ 1.5 A |
+| N20 减速电机（6 V） | 60 ~ 100 mA | 0.6 ~ 1.2 A |
+| JGA25-370（12 V） | 250 ~ 350 mA | 2.5 ~ 3.5 A |
+| 37GB 减速电机（12 V，大扭矩） | 300 mA | 5 A 以上 |
+
+小车顶到墙、轮子被卡住、齿轮卡死，都会让电流一瞬间冲到堵转值。这意味着：
+
+1. **选驱动芯片要按堵转电流选，不是按额定电流。** 两个 TT 马达同时堵转 = 3 A，TB6612 单通道 1.2 A 连续就危险了（虽然峰值 3.2 A 能扛一下）。这种情况要么降 PWM、要么加限流、要么换 DRV8871 这类大电流芯片。
+2. **电源要能供出这个电流。** 用 9 V 方块电池（6F22）驱动小车是经典错误：它的内阻大，输出 200 mA 就压降严重，两个马达一起转电压直接掉到 5 V，ESP32 立刻复位。**9 V 方块电池不能驱动电机，只能用 4×AA 或锂电池。**
+3. **加软件限流**：不断加速的斜坡（ramp）比一步到位温和得多，也更省电。
+
+```cpp
+// 斜坡启动：每 10 ms 把目标速度靠近一点，避免启动电流冲击
+void rampTo(int targetL, int targetR, int stepMs)
+{
+    static int curL = 0, curR = 0;
+    while (curL != targetL || curR != targetR) {
+        curL += (targetL > curL) ? (targetL - curL > 20 ? 20 : targetL - curL)
+                                 : (curL - targetL > 20 ? -20 : targetL - curL);
+        curR += (targetR > curR) ? (targetR - curR > 20 ? 20 : targetR - curR)
+                                 : (curR - targetR > 20 ? -20 : targetR - curR);
+        motorLeft(curL);
+        motorRight(curR);
+        delay(stepMs);
+    }
+}
+```
+
+## 坑 5：电机有启动死区
+
+PWM 低于 20 % ~ 30 % 时，电机根本不转，只会"嗡嗡"响并发热。原因是静摩擦和减速箱阻力。
+
+所以：
+
+- 调速范围实际是 **30 % ~ 100 %**，映射时把 0 ~ 100 的输入映射到 300 ~ 1023，而不是 0 ~ 1023。
+- PID 输出直接送进电机时，**要么做死区补偿，要么接受"小误差时小车不动"**。更稳的做法是给一个基础速度（base speed）+ PID 只调差速。
+
+```cpp
+// 把 0..100 的"想要的速度"映射到电机的有效区间
+int mapToMotor(int speed)   // speed: 0..100
+{
+    const int DEAD = 300, MAXD = 1023;
+    if (speed <= 0) return 0;
+    return DEAD + (MAXD - DEAD) * speed / 100;
+}
+```
+
+## 坑 6：STBY / nSLEEP 没拉高
+
+TB6612 的 STBY 和 DRV8833 的 nSLEEP 是**低电平休眠**。悬空时电平不确定，可能上电就是休眠，表现为"接线全对、代码全对、电机一动不动、芯片完全不发热"。
+
+排查方法：万用表量 STBY 对 GND 的电压，必须 > 2.0 V。悬空就飞线到 3V3。
+
+## 坑 7：车轮转向反了 / 一侧正常一侧反
+
+电机两根线没有正负极之分，接反就是反转。第一次上电**一定会**遇到某个轮子方向反了。两个办法：
+
+1. 硬件：把那一路电机的两根线对调。
+2. 软件：在 `motorLeft` / `motorRight` 里加一个 `constexpr int LEFT_SIGN = -1;`，把 duty 取反。
+
+推荐软件方式，因为拆线容易把端子扯坏。左右轮的符号常量放在文件顶部，调试时改一个数字就行。
+
+## 上电自检清单
+
+按这个顺序查，能定位 90 % 的问题：
+
+| 步骤 | 检查项 | 期望现象 |
+|---|---|---|
+| 1 | 不接电机，只上电 | ESP32 串口正常打印，不重启 |
+| 2 | 量驱动板 VM 对 GND | 等于电池电压 |
+| 3 | 量驱动板 VCC 对 GND | 3.3 V（TB6612 接 3V3）或 5 V |
+| 4 | 量 STBY 对 GND | 大于 2.0 V |
+| 5 | 量 ESP32 GND 与驱动板 GND 之间 | 0 Ω（导通档响） |
+| 6 | 给一个方向、duty 给 500，量 AO1 对 AO2 | 有电压，且方向改变时符号相反 |
+| 7 | 接上电机，空转 | 转动平稳，无啸叫 |
+| 8 | 手轻捏车轮 | 扭矩足够，电流不爆表 |
+
+第 6 步是分水岭：**有电压说明驱动和代码都对，问题在电机或机械；没电压说明问题在供电、共地或使能脚。**

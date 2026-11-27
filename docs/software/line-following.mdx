@@ -1,0 +1,599 @@
+---
+title: 循迹与避障
+description: 五路灰度传感器的加权平均偏差算法、单双路简化方案、超声波避障状态机、红外与超声波的互补分工，以及遮光、盲区、地面反射率这三个躲不开的坑
+sidebar_position: 108
+---
+
+# 循迹与避障
+
+循迹回答「沿线走」，避障回答「别撞上」。两者共用同一套驱动和同一条控制循环，但优先级不同：**避障永远高于循迹**。
+
+## 五路灰度传感器的加权平均
+
+### 传感器长什么样
+
+常见模块是 TCRT5000 红外对管：一颗 IR LED 发射，一颗光敏三极管接收。
+**白底反射强 → 接收管导通 → 输出低电平；黑线反射弱 → 接收管截止 → 输出高电平**（多数模块如此，但也有相当一部分是反的，第一次使用必须实测确认）。
+
+五路排布间距通常 10 ~ 12 mm，覆盖 50 ~ 60 mm 宽的检测带。黑线宽度 15 ~ 20 mm 最好用——太窄会有两路同时压线，太宽会把相邻几路一起遮住。
+
+### 加权平均求偏差
+
+给每一路一个对称的权重，把「哪几路看到了黑线」变成一个连续的偏差值：
+
+```text
+传感器:   S0      S1      S2      S3      S4
+权重:    -200    -100      0     +100    +200
+           ↑                       ↑
+         最左                     最右
+
+偏差 error = Σ(weight[i] × active[i]) / Σ(active[i])
+```
+
+几组典型读数：
+
+| S0 | S1 | S2 | S3 | S4 | error | 含义 |
+|---|---|---|---|---|---|---|
+| 0 | 0 | 1 | 0 | 0 | 0 | 正中，直行 |
+| 0 | 1 | 1 | 0 | 0 | -50 | 略微偏右（线在左），要左打 |
+| 1 | 0 | 0 | 0 | 0 | -200 | 严重偏右，线在最左 |
+| 0 | 0 | 0 | 1 | 1 | +150 | 略微偏左，要右打 |
+| 0 | 0 | 0 | 0 | 0 | **无定义** | 脱线！必须特殊处理 |
+
+这个公式的好处是**分辨率远高于 5 路本身**：五路只有 5 个离散位置，加权平均后能给出 -200 ~ +200 之间的任意值（-50、-150 等），相当于把分辨率提高了 4 倍，PID 才能平滑工作。
+
+### 完整实现
+
+```cpp
+// 五路灰度循迹，返回 -200 .. +200，0 表示居中
+// 约定：1 表示压黑线（模块若是反的，把 == 1 改成 == 0）
+
+constexpr int LINE_PINS[5]   = {34, 35, 32, 33, 25};
+constexpr int LINE_WEIGHT[5] = {-200, -100, 0, 100, 200};
+
+constexpr int ERR_LOST = 9999;
+
+void lineInit()
+{
+    for (int i = 0; i < 5; i++) pinMode(LINE_PINS[i], INPUT);
+}
+
+int readLineError()
+{
+    int32_t sum_w = 0;
+    int32_t cnt = 0;
+
+    for (int i = 0; i < 5; i++) {
+        if (digitalRead(LINE_PINS[i]) == 1) {      // 压黑线
+            sum_w += LINE_WEIGHT[i];
+            cnt++;
+        }
+    }
+
+    if (cnt == 0) return ERR_LOST;                 // 全白 = 脱线
+    return (int)(sum_w / cnt);
+}
+
+// 脱线找回：记住最后一次有效偏差的方向，往那边猛打
+int last_valid_error = 0;
+
+int readLineErrorRobust()
+{
+    int e = readLineError();
+    if (e == ERR_LOST) {
+        return (last_valid_error < 0) ? -250 : +250;
+    }
+    last_valid_error = e;
+    return e;
+}
+```
+
+:::danger[脱线处理决定生死]
+五路全白时如果直接返回 0，车会以为「我在正中」然后**直行冲出赛道**。这是循迹车最常见的失败方式。
+两种正确处理：
+1. **记忆法**（推荐）：记录最后一次有效偏差的符号，全白时朝那个方向打满。线通常就是从边缘滑出去的，方向已知。
+2. **搜索扫描**：全白时原地或小半径朝一侧旋转，直到重新看到线（配合超时，转超过 2 秒判定彻底丢失，停车）。
+:::
+
+### 模拟量 vs 数字量
+
+上面用的是模块的数字输出（自带比较器 + 蓝色电位器调阈值）。也可以接模拟量做更精细的判断：
+
+```cpp
+// 模拟量读法：用反射强度做权重，分辨率更高，但更怕环境光
+int readLineErrorAnalog()
+{
+    int32_t sum = 0, cnt = 0;
+    for (int i = 0; i < 5; i++) {
+        int raw = analogRead(LINE_PINS[i]);       // ESP32 12 位，0..4095
+        int black = 4095 - raw;                   // 黑线反射弱 → ADC 值小 → black 大
+        if (black > 1500) {                       // 阈值必须现场标定
+            sum += (int32_t)LINE_WEIGHT[i] * black;
+            cnt += black;
+        }
+    }
+    if (cnt == 0) return ERR_LOST;
+    return (int)(sum / cnt);
+}
+```
+
+:::danger[ESP32 的 ADC 有一个致命限制]
+**ADC2 在 WiFi 开启时完全不可用。** ADC2 对应 GPIO 0/2/4/12/13/14/15/25/26/27。
+不开 WiFi 时 analogRead 一切正常，一旦 WiFi.begin()，这些脚全部返回 0 或 4095，且不报错。
+**必须把模拟量传感器接在 ADC1 上：GPIO 32 ~ 39。**
+上面例子的 LINE_PINS 里 GPIO25 是 ADC2 脚，用 digitalRead 没问题，改成 analogRead 就必须换到 32~39（注意 34/35/36/37/39 是输入专用且无内部上拉）。
+:::
+
+## 单路 / 双路简化方案
+
+### 单路：只能做「有线/无线」判断
+
+一路传感器给不出方向信息，只能二值判断。适合最简单的「沿线走、到终点停」项目：
+
+```cpp
+// 单路：压线就直行，脱线就按上次方向找
+void loopSingle()
+{
+    bool onLine = (digitalRead(PIN_LINE) == 1);
+
+    if (onLine) {
+        motorLeft(500); motorRight(500);                        // 直行
+    } else if (lastSeenLeft) {
+        motorLeft(200); motorRight(500);                        // 左转找线
+    } else {
+        motorLeft(500); motorRight(200);                        // 右转找线
+    }
+}
+```
+
+这种方式没有比例控制，车会「点头式」走：偏出去、发现、猛打回来、再偏出去。速度只能开很低（PWM 300 以内）。
+
+### 双路：能给出方向，但只有三档
+
+两路并排**跨线**安装（各在线的两侧），组合出三种状态：
+
+| 左路 | 右路 | 状态 | 动作 |
+|---|---|---|---|
+| 白 | 白 | 正中对准 | 直行 |
+| 黑 | 白 | 车偏右了（线在左边） | 左转 |
+| 白 | 黑 | 车偏左了 | 右转 |
+| 黑 | 黑 | 十字路口 / 横线 / 停止线 | 按业务逻辑处理 |
+
+```cpp
+void loopDual()
+{
+    bool l = (digitalRead(PIN_L) == 1);
+    bool r = (digitalRead(PIN_R) == 1);
+
+    if      (!l && !r) { motorLeft(500); motorRight(500); }   // 居中
+    else if ( l && !r) { motorLeft(150); motorRight(500); }   // 左转
+    else if (!l &&  r) { motorLeft(500); motorRight(150); }   // 右转
+    else               { motorLeft(500); motorRight(500); }   // 十字，直行
+}
+```
+
+:::tip[双路的隐藏问题：十字和终点分不清]
+「两路同时压黑」可能是十字路口、T 型路口、也可能是赛道终点的横线。想区分必须加**计时**：这个状态持续超过 100 ms 才算「真的遇到横线」，因为斜穿一个路口时两路不会同时压线很久。
+或者用三路：左中右，**中间那路**持续压线才是真的横线。
+:::
+
+### 三路：性价比最高的方案
+
+权重 -100 / 0 / +100，组合出 -100 / 0 / +100 以及全黑（路口）四种状态，对 PID 已经够用：
+
+```cpp
+int readLine3()
+{
+    static const int W[3] = {-100, 0, 100};
+    int s = 0, c = 0;
+    for (int i = 0; i < 3; i++) {
+        if (digitalRead(LINE_PINS[i]) == 1) { s += W[i]; c++; }
+    }
+    return (c == 0) ? ERR_LOST : (s / c);
+}
+```
+
+## 超声波避障的状态机
+
+### HC-SR04 怎么工作
+
+1. Trig 脚给一个 **10 µs 以上的高电平脉冲**
+2. 模块发射 8 个 40 kHz 方波
+3. Echo 脚变高，收到回波后变低
+4. **Echo 高电平持续时间 ÷ 58 = 距离（厘米）**
+
+声速 343 m/s 时，往返 2 cm 用 58 µs，所以 distance_cm = echo_us / 58。
+
+| 参数 | 值 | 说明 |
+|---|---|---|
+| 供电 | **5 V** | 3.3 V 供电时测距范围缩水到 20 cm 以内 |
+| 工作电流 | 15 mA | 便宜，可以从板子取电 |
+| 测量范围 | 2 ~ 400 cm | 2 cm 以内是盲区 |
+| 精度 | ±3 mm | 目标面角度 > 15° 时回波丢失 |
+| 测量周期 | ≥ 60 ms | 间隔太短会被上一次余波干扰 |
+
+### 读 Echo 的三种方式
+
+| 方式 | 问题 |
+|---|---|
+| pulseIn(pin, HIGH) | 阻塞，默认超时 1 秒。**必须显式传超时**：pulseIn(pin, HIGH, 30000)（30 ms ≈ 5 m） |
+| 硬件定时器捕获 | 最准，代码量大 |
+| micros() 轮询 | 简单可控，推荐下面这种 |
+
+```cpp
+constexpr int PIN_TRIG = 26;
+constexpr int PIN_ECHO = 27;      // ECHO 输出 5V，进 ESP32 建议串 1k + 2k 分压
+
+long readDistanceCm()
+{
+    digitalWrite(PIN_TRIG, LOW);
+    delayMicroseconds(3);
+    digitalWrite(PIN_TRIG, HIGH);
+    delayMicroseconds(12);          // 至少 10µs
+    digitalWrite(PIN_TRIG, LOW);
+
+    unsigned long t0 = micros();
+    while (digitalRead(PIN_ECHO) == LOW) {          // 等回波起点
+        if (micros() - t0 > 30000UL) return -1;     // 无回波
+    }
+    unsigned long rise = micros();
+
+    while (digitalRead(PIN_ECHO) == HIGH) {         // 等回波结束
+        if (micros() - rise > 30000UL) return -1;
+    }
+    unsigned long fall = micros();
+
+    return (long)(fall - rise) / 58;
+}
+```
+
+:::danger[HC-SR04 的 Echo 是 5V 输出]
+HC-SR04 供 5 V 时 Echo 也输出 5 V。ESP32 的 GPIO **不是 5 V 容忍**的（绝对最大 3.6 V），长期直连会缓慢击穿输入级，症状是几个月后某个引脚突然不响应。
+两种处理：**电阻分压**（1 kΩ + 2 kΩ 串联，中点接 GPIO，实际得到 3.3 V）或换 **HC-SR04P / US-100** 这类 3.3 V 版本。
+:::
+
+### 三状态机：前进 / 后退 / 转向
+
+不要写成 if (dist < 20) turn();——那样在临界值附近会疯狂抖动。用状态机 + 迟滞：
+
+```cpp
+enum class AvoidState { CRUISE, STOP, BACKUP, TURN };
+
+AvoidState state = AvoidState::CRUISE;
+uint32_t state_since = 0;
+
+constexpr long DIST_STOP   = 20;      // 20 cm 内停车
+constexpr long DIST_RESUME = 35;      // 退到 35 cm 才恢复（15cm 迟滞）
+constexpr uint32_t STOP_MS   = 100;
+constexpr uint32_t BACKUP_MS = 400;
+constexpr uint32_t TURN_MS   = 500;
+
+long readDistanceFiltered()
+{
+    long a = readDistanceCm();
+    long b = readDistanceCm();
+    long c = readDistanceCm();
+    if (a < 0) a = 999;
+    if (b < 0) b = 999;
+    if (c < 0) c = 999;
+
+    // 三数取中，杀单次异常
+    if (a > b) { long t = a; a = b; b = t; }
+    if (b > c) { long t = b; b = c; c = t; }
+    if (a > b) { long t = a; a = b; b = t; }
+    return b;
+}
+
+bool avoidUpdate(uint32_t now)      // 返回 true 表示避障正在接管
+{
+    long d = readDistanceFiltered();
+
+    switch (state) {
+    case AvoidState::CRUISE:
+        if (d > 0 && d < DIST_STOP) {
+            motorStop();
+            state = AvoidState::STOP;
+            state_since = now;
+        }
+        return false;               // 巡航时不接管，交给循迹
+
+    case AvoidState::STOP:
+        if (now - state_since > STOP_MS) {
+            motorLeft(-400); motorRight(-400);
+            state = AvoidState::BACKUP;
+            state_since = now;
+        }
+        return true;
+
+    case AvoidState::BACKUP:
+        if (now - state_since > BACKUP_MS) {
+            motorLeft(-350); motorRight(350);      // 原地左转
+            state = AvoidState::TURN;
+            state_since = now;
+        }
+        return true;
+
+    case AvoidState::TURN:
+        if (now - state_since > TURN_MS) {
+            motorStop();
+            state = AvoidState::CRUISE;
+            state_since = now;
+        }
+        return true;
+    }
+    return true;
+}
+```
+
+三个设计要点：
+
+- **STOP 状态是必要的**：直接从「前进」切到「后退」，H 桥瞬间反向，反向电动势叠加电池电压，电流冲击可能烧驱动。停 100 ms 让电流降到 0。
+- **迟滞 15 cm** 防止在 20 cm 边界反复进出状态。
+- **每个状态都有超时**，防止某个状态因为条件永不满足而卡死。
+
+## 红外避障与超声波的互补
+
+### 红外（TCRT5000 / E18-D80NK）
+
+| 特性 | 说明 |
+|---|---|
+| 原理 | 发射红外，看反射光强，超过阈值输出低电平 |
+| 检测距离 | **5 ~ 30 cm，靠电位器调，不能测距** |
+| 响应时间 | 微秒级 |
+| 受环境光影响 | **大**，阳光直射下基本失效 |
+| 受颜色影响 | **大**，黑色物体吸光，探测距离可能只有白墙的三分之一 |
+| 受表面角度影响 | 大，斜面和镜面会漏检 |
+| 成本 | ¥1 ~ 3 |
+
+### 超声波
+
+| 特性 | 说明 |
+|---|---|
+| 原理 | 声波往返计时 |
+| 检测距离 | 2 ~ 400 cm，**能给出距离数值** |
+| 响应时间 | 每次 30 ~ 60 ms（慢） |
+| 受环境光影响 | 无 |
+| 受颜色影响 | 无 |
+| 受材质影响 | 大，**海绵、棉布、绒毛吸声，几乎测不到** |
+| 盲区 | 2 cm 以内测不到 |
+| 成本 | ¥5 ~ 10 |
+
+### 三种配合方案
+
+**方案 1：红外做侧向，超声波做前方**
+
+```text
+            [超声]  ← 前方 0~400cm，主避障，需要距离数值
+   [红外]  车体  [红外]  ← 左右两侧 5~30cm，防擦墙、沿墙对齐
+```
+
+侧向只需要「有没有」这个二值信息，红外又快又便宜；前方需要距离来决定减速时机，用超声波。
+
+**方案 2：红外做「近距兜底」**
+
+超声波有 2 cm 盲区。车已经贴到障碍物上时，超声波反而返回「无目标」，程序判定前方畅通而继续撞。
+加一对红外补上 < 5 cm 这个窗口：
+
+```cpp
+long d = readDistanceCm();
+bool near = (digitalRead(PIN_IR_FRONT) == LOW);
+
+if (near || (d > 0 && d < 15)) {
+    avoidTriggered = true;
+}
+```
+
+**方案 3：红外朝下做「桌沿/黑线边界」检测**
+
+朝下装一对红外，检测桌面边缘或黑白边界。超声波朝前，两者完全不冲突。
+
+### 融合时的优先级
+
+```text
+优先级 1：红外近距触发（< 10cm） → 立即停车，最高优先级
+优先级 2：超声波 < DIST_STOP   → 进避障状态机
+优先级 3：循迹偏差              → 正常转向
+```
+
+写成代码就是**先判避障，再判循迹**：
+
+```cpp
+void controlLoop()
+{
+    // 一、安全层
+    if (avoidUpdate(millis())) return;      // 避障接管，循迹不参与
+
+    // 二、导航层
+    int e = readLineErrorRobust();
+    float steer = pid.compute((float)(-e), 0.01f);
+    applyMotion(BASE_SPEED, (int)steer);
+}
+```
+
+## 坑 1：灰度传感器对环境光敏感
+
+TCRT5000 的接收管对**阳光中的红外成分**极其敏感。阳光直射时接收管已经饱和，黑线白线都读成同一值。
+
+现场表现：
+
+- 教室里调试完美，拿到体育馆或走廊就完全失灵
+- 上午能跑，下午太阳角度变了就跑偏
+- 靠近窗口的那一段赛道总是出错
+
+**解决：加遮光罩。**
+
+```text
+        ┌──────────────┐   ← 黑色 3D 打印件 / 电工胶布，必须不透红外
+        │  ┌────────┐  │
+        │  │  传感器 │  │
+        │  └────────┘  │
+        └──────┬───────┘
+               │ 5mm          ← 离地高度固定 5mm，罩下沿离地 1~2mm
+        ═══════════════════  地面
+```
+
+三条要求：
+
+1. **遮光材料必须不透红外**：黑色 PLA / ABS 可以；**透明和白色材料不行**（红外能穿透，等于没装）。最省事的是电工胶布卷一圈。
+2. **离地高度固定且低**：5 mm 是甜点。太高（> 15 mm）反射强度不够，太低（< 2 mm）会刮地。用铜柱或 3D 打印支架固定，**不要用双面胶**——震动后会掉。
+3. **阈值必须在最终环境里调**：不要桌面调好阈值再拿去赛场。模块上的蓝色电位器就是干这个的，调到「放白纸上 LED 灭、放黑胶带上 LED 亮」，让黑白之间留最大余量。
+
+环境光变化后重新标定是常态，不是故障。比赛前一定跑两圈确认。
+
+## 坑 2：超声波有最小距离盲区
+
+HC-SR04 数据手册写 2 cm，实际使用中：
+
+| 距离 | 现象 |
+|---|---|
+| 0 ~ 2 cm | **完全测不到**，Echo 超时无回波 |
+| 2 ~ 5 cm | 不稳定，可能返回固定的 2 cm，也可能丢 |
+| 5 ~ 30 cm | 稳定准确 |
+| 30 ~ 200 cm | 稳定，误差 ±3 mm |
+| 200 ~ 400 cm | 需要平整大面积的反射面，小物体测不到 |
+| > 400 cm | 无回波 |
+
+**致命组合**：车贴着墙停下 → 距离 < 2 cm → 超声波返回「无目标」→ 程序判为「前方畅通」→ 撞墙。
+
+处理：
+
+1. **把「无回波」当成「有障碍」处理**（保守策略）。代价是空旷场地也会误触发，所以要配合红外或加连续确认次数。
+2. **用距离的差分判断**：上一拍是 8 cm，这一拍变成「无回波」，多半是贴太近了，不是真的清空。
+3. **机械上保证永远贴不到 2 cm 内**：车头装一根防撞杆，物理上让传感器离障碍至少 3 cm。
+
+还有一个反直觉的盲区：**斜面镜面反射**。对着 45° 的斜面，声波被反射到别处不回来，测出「无目标」。车斜对着墙角走时，超声波什么都看不到。
+
+## 坑 3：地面材质决定成败
+
+灰度传感器的本质是比较白底和黑线的反射强度差，这个差值和材质关系极大：
+
+| 地面 / 赛道材质 | 白底反射 | 黑线反射 | 对比度 | 结论 |
+|---|---|---|---|---|
+| 白打印纸 + 黑电工胶布 | 强 | 弱 | 很好 | 理想，教学首选 |
+| 白瓷砖 + 黑胶带 | 强（镜面反射） | 弱 | 好，但**镜面反光会漏检** | 可用，传感器要正对 |
+| 木地板 + 黑胶带 | 中 | 弱 | 中等 | 可用，阈值要重调 |
+| **灰地胶 + 黑胶带** | 中 | 中 | **差** | 经常误判，需要换底纸 |
+| **黑地胶 + 白胶带** | — | — | 反过来了，**判断逻辑必须反转** | 常见于比赛场地 |
+| **亮面亚克力** | 极强 + 定向反射 | — | 角度一变读数就变 | 基本不能用 |
+| 磨砂地板 / 水泥地 | 弱 | 弱 | 差 | 不推荐 |
+| 有花纹或文字的地面 | 不均匀 | — | 花纹会被当成黑线 | 必须铺纯色底纸 |
+
+:::danger[白瓷砖是最坑的场地]
+白瓷砖釉面会在特定角度形成镜面反射：红外光打到白瓷砖上，反射光正好射向接收管时强度极高；小车轻微倾斜或颠簸一下，反射光偏离，接收强度骤降——**传感器就认为「这里是黑线」**。
+现象：在瓷砖场地上，车会在完全正常的路段随机「看到黑线」然后打方向。
+处理：传感器离地高度降到 3 ~ 5 mm（减少角度变化的杠杆效应），且必须加遮光罩。
+:::
+
+## 校准代码（必写，不是可选项）
+
+换场地前跑一次，把「凭感觉调电位器」变成「看数字」：
+
+```cpp
+int thresholds[5];
+
+void calibrate()
+{
+    int white[5] = {0}, black[5] = {0};
+
+    Serial.println("把车放在白色区域，3 秒后采样...");
+    delay(3000);
+    for (int k = 0; k < 50; k++) {
+        for (int i = 0; i < 5; i++) white[i] += analogRead(LINE_PINS[i]);
+        delay(10);
+    }
+    for (int i = 0; i < 5; i++) white[i] /= 50;
+
+    Serial.println("把车放在黑线上，3 秒后采样...");
+    delay(3000);
+    for (int k = 0; k < 50; k++) {
+        for (int i = 0; i < 5; i++) black[i] += analogRead(LINE_PINS[i]);
+        delay(10);
+    }
+    for (int i = 0; i < 5; i++) black[i] /= 50;
+
+    for (int i = 0; i < 5; i++) {
+        thresholds[i] = (white[i] + black[i]) / 2;
+        int contrast = abs(white[i] - black[i]);
+        Serial.printf("S%d white=%d black=%d thr=%d contrast=%d %s\n",
+                      i, white[i], black[i], thresholds[i], contrast,
+                      contrast < 800 ? "<-- 对比度不足，检查遮光和高度" : "OK");
+    }
+}
+```
+
+通过标准：**白区与黑线上每一路的读数差距都 > 30 %**，否则先解决遮光和离地高度，不要急着调 PID。
+
+## 坑 4：循迹和避障抢方向盘
+
+最常见的设计错误：循迹 PID 每 10 ms 写一次电机，避障逻辑每 60 ms 判一次距离直接调 motorStop()。结果避障刚停住，下一个 10 ms 循迹又把它开起来，车在原地抽搐。
+
+正确做法是**分层 + 单一写入口**：
+
+```cpp
+// 全局唯一的电机输出点
+void applyMotion(int base, int steer)
+{
+    int l = constrain(base - steer, -1023, 1023);
+    int r = constrain(base + steer, -1023, 1023);
+    motorLeft(l);
+    motorRight(r);
+}
+
+void controlLoop10ms()
+{
+    int base = 0, steer = 0;
+
+    if (estop) {                          // 急停层
+        base = 0; steer = 0;
+    } else if (avoidUpdate(millis())) {   // 避障层优先
+        return;                           // 避障自己已经写了电机
+    } else {                              // 循迹层
+        int e = readLineErrorRobust();
+        steer = (int)pid.compute((float)(-e), 0.01f);
+        base  = BASE_SPEED;
+    }
+
+    applyMotion(base, steer);
+}
+```
+
+超声波读距离慢（3 次中值 + 30 ms 超时，最坏 90 ms），**不能放在 10 ms 控制循环里**。做法是单独一个低频任务更新全局变量：
+
+```c
+static volatile long g_distance_cm = 999;
+
+static void ultrasonic_task(void *arg)
+{
+    while (1) {
+        g_distance_cm = readDistanceFiltered();
+        vTaskDelay(pdMS_TO_TICKS(50));     // 20 Hz，不阻塞控制循环
+    }
+}
+```
+
+## 坑 5：delay() 打断控制周期
+
+循迹循环里写 delay(10) 来「等传感器稳定」，结果周期变成 10 ms + 循迹计算时间 + 其他逻辑，而且随分支浮动。上一节讲的 Ki/Kd 会跟着漂。
+
+正确做法：用 millis() 节拍判断，或 vTaskDelayUntil。**永远不要在实时控制循环里用 delay() 控制节奏。**
+
+## 坑 6：传感器离地高度和震动
+
+- 高度每变 1 mm，黑线检测宽度变化明显。用铜柱固定，不要用扎带（会松）。
+- 电池从满电到没电，车身高度会变（悬挂压缩）。设计时让传感器支架连接**底盘硬点**，不要挂在电池仓上。
+- 高速过弯时车身倾斜，遮光罩边缘刮地造成误差。罩下沿离地至少留 1.5 mm。
+
+## 现场调试顺序
+
+按这个顺序，每步都有明确通过标准：
+
+| 步骤 | 做什么 | 通过标准 |
+|---|---|---|
+| 1 | 只接传感器，串口打印五路原始值 | 白区/黑线数值差 > 30 % |
+| 2 | 手推车沿赛道走，打印 error | 连续变化无跳变，脱线段能看出 ERR_LOST |
+| 3 | 车架空，手动给 steer | 左右轮方向正确，符号不反 |
+| 4 | 低速（base = 200）纯 P 循迹 | 能跟完一圈，允许摆动 |
+| 5 | 加 D，提速到 400 | 摆动消失 |
+| 6 | 单独测避障（手持挡板） | 停车 → 后退 → 转向 → 恢复，顺序正确 |
+| 7 | 两者联跑 | 避障时不抽搐，避障后能重新找到线 |
+| 8 | 换场地重跑 | 重新校准阈值后仍能跑 |

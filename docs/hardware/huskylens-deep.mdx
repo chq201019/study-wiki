@@ -1,0 +1,329 @@
+---
+title: 二哈 HuskyLens 深度用法
+description: I2C 与 UART 接法对比、七种算法的学习流程与调用、坐标语义、ESP32 完整代码与实战坑
+sidebar_position: 109
+---
+
+# 二哈 HuskyLens 深度用法
+
+HuskyLens 是板载 K210 的视觉模块：图像识别在模块内完成，主控只负责发指令、读结果。所以 UNO、micro:bit、掌控板这类算力几乎为零的主控也能做视觉。
+
+它的失败案例高度集中在三件事上：**供电不够**、**屏幕协议与代码不一致**、**没学习就调 available()**。下面按接线、算法、坐标、代码、坑的顺序给可直接用的内容。
+
+## 一、接线前先看屏幕
+
+HuskyLens 背面有 2.0 寸屏，左上角常驻显示当前**协议类型**和**地址**。出厂默认 I2C，地址 0x32。
+
+:::danger[协议类型必须在屏幕上切]
+屏幕：设置 → 协议类型 → I2C / UART / SPI。
+
+代码用 UART 而屏幕停在 I2C，现象是「完全没有数据」，库的 `begin()` 一直返回 false，看起来像线断了。
+
+**接线前先读屏幕左上角那一行**，比查线快十倍。
+:::
+
+## 二、I2C 与 UART 详细对比
+
+| 项目 | I2C | UART |
+| --- | --- | --- |
+| 信号线 | SDA + SCL（2 根） | TX + RX（2 根，**必须交叉**） |
+| 接线总数 | 4 根（含 VCC/GND） | 4 根（含 VCC/GND） |
+| 地址 / 端口 | 固定 0x32，**不可改** | 无地址，独占一个 UART 外设 |
+| 总线速率 | 100 kHz（模块只支持标准模式） | 9600 8N1 默认，可改到 115200 |
+| 单帧线时间 | 约 1.5 ms | 9600 下约 17 ms；115200 下约 1.5 ms |
+| 一轮 request+read | 约 10~20 ms | 约 10~25 ms（9600 时更长） |
+| 占用资源 | 2 个 GPIO + 1 条 I2C 总线 | 2 个 GPIO + **1 个完整 UART** |
+| 多设备共存 | 可与 OLED/时钟挂同一条总线 | 不能，一个 UART 只接它 |
+| ESP32 可行性 | 随便哪两个 GPIO | 有 3 个 UART，但要避开 USB 串口 |
+| 长线抗干扰 | 差，> 30 cm 开始随机失败 | 好，几米没问题 |
+| 典型失败现象 | 扫不到 0x32 / 读到随机值 | 全是 0 或无任何字节 |
+
+### 什么时候选 I2C
+
+- 主控 IO 紧张（micro:bit、掌控板）
+- 总线上已经有 OLED、DS3231，想共用一对线
+- 线短（< 20 cm），板上直连
+- 代码最省事：`Wire` 已经有了
+
+### 什么时候必须选 UART
+
+- 需要连续读多个识别块：I2C 每读一块要一次完整事务，5 个目标时帧率掉一半；UART 是流式，一次读回全部
+- 线要拉长（小车底盘到云台 40 cm 以上）
+- 主控 I2C 已被占用（同时挂了 4 个 I2C 器件）
+
+### ESP32 推荐引脚
+
+| 用途 | ESP32-S3 | 经典 ESP32 |
+| --- | --- | --- |
+| I2C SDA | GPIO8 | GPIO21 |
+| I2C SCL | GPIO9 | GPIO22 |
+| UART TX（接 HUSKY RX） | GPIO17 | GPIO17 |
+| UART RX（接 HUSKY TX） | GPIO16 | GPIO16 |
+
+:::warning[UART 一定交叉]
+HUSKY 的 **TX 接主控 RX**、**RX 接主控 TX**。接成 TX-TX 直连时一个字节都不会来。
+
+用 ESP32 时别用 GPIO19/20（原生 USB），也别用 GPIO0/3/45/46（strapping pin），上电瞬间会干扰启动。
+:::
+
+## 三、供电：300 mA 峰值，必须独立供电
+
+| 状态 | 电流 |
+| --- | --- |
+| 待机（屏幕亮、无识别） | 约 150~220 mA |
+| 摄像头开启 + 屏幕全亮 | 约 250 mA |
+| **识别瞬间峰值** | **约 300 mA** |
+
+从主控的 3.3V LDO 取电（多数开发板 LDO 只有 500 mA 余量，还要带 WiFi）会直接触发两件事：
+
+1. 电压被拉低 → 主控 brownout 复位
+2. HuskyLens 自己重启（屏幕黑一下再亮，连接断了，学习数据还在）
+
+正确接法：
+
+```text
+5V/1A 独立电源 ──┬── HuskyLens VCC
+                  └── GND ──┬── HuskyLens GND
+                            └── 主控 GND   ← 必须共地
+```
+
+:::danger[独立供电但忘了共地]
+GND 不连，I2C 没有参考电平，波形全是飘的，扫描能扫到但读数据全错。
+
+这是「接了独立电源反而更不稳定」的唯一原因。
+:::
+
+## 四、七种算法
+
+屏幕：功能 → 选算法。代码里的 `writeAlgorithm()` 必须与屏幕一致，不一致时返回结果结构对不上，读出来全是 0。
+
+| 算法 | 宏 | 是否必须学习 | 输出类型 |
+| --- | --- | --- | --- |
+| 人脸识别 | `ALGORITHM_FACE_RECOGNITION` | 学习才给人脸 ID，不学习只给框 | block + ID |
+| 物体追踪 | `ALGORITHM_OBJECT_TRACKING` | 必须 | block + ID |
+| 物体识别 | `ALGORITHM_OBJECT_RECOGNITION` | 不用（20 类预训练） | block + ID |
+| 巡线 | `ALGORITHM_LINE_TRACKING` | 必须 | **arrow**（起点/终点） |
+| 颜色识别 | `ALGORITHM_COLOR_RECOGNITION` | 必须 | block + ID |
+| 标签识别 | `ALGORITHM_TAG_RECOGNITION` | 不用（AprilTag） | block + ID |
+| 物体计数 | `ALGORITHM_OBJECT_COUNTING` | 必须 | block + ID + 计数 |
+
+### 通用学习流程（所有需要学习的算法都一样）
+
+1. 屏幕切到目标算法
+2. 把目标放进画面中央，占据画面高度约 1/2
+3. 按模块上的**学习键**（屏幕出现黄色框 + 确认提示）
+4. 再按一次学习键**确认**
+5. 屏幕显示 `ID1`，学习完成；重复可学 ID2、ID3……
+
+:::danger[没学习 = available() 永远 false]
+除物体识别和标签识别外，没学习时模块**不返回任何结果**，`available()` 一直是 false。
+
+这**不是模块坏了**。第一次用 HuskyLens 的人 90% 卡在这里。先按学习键。
+:::
+
+:::warning[换算法必须重新学习]
+学习数据是**按算法分开存的**。从颜色识别切到人脸识别再切回来，颜色数据还在；但在人脸识别里学习的脸，切到颜色识别后不会自动变成「颜色 1」。
+
+换目标、换光照、换算法之后，先按学习键重新录一遍。
+:::
+
+### 各算法的学习要点
+
+**人脸识别**：学习时保持实际使用时的状态——平时戴眼镜就戴着学。人脸占画面高度 1/2 最准，太近（占满）会认不出，太远（< 1/5）只给框不给 ID。多人场景先学的人拿 ID1。
+
+**物体追踪**：框住目标后按学习键，之后模块逐帧跟踪这个目标的位移。目标出画面再进来会重新捕获，ID 保持不变。适合云台跟随、手势指向。
+
+**物体识别**：20 类预训练（人、车、猫、狗、杯、瓶等），**不用学习**，上电就能用。识别不准时不要反复学习，改用物体追踪。
+
+**巡线**：把线放在画面中下部，按学习键。输出的是 **arrow 类型的起点/终点**，不是 block。做循迹小车要自己算线中心与画面中心的偏差。
+
+**颜色识别**：学习时让色块占满中央方框。对光照色温极敏感——日光灯下学的红，搬到窗边自然光下可能识别不出，需要重学。
+
+**标签识别**：识别 AprilTag（TAG16H5 / TAG25H9 / TAG36H11）。模块不用学习，但代码里要处理 ID 十进制值与标签编号的对应。教室里打印标签时**别用同一张 TAG36H11 的两个副本**，模块不区分副本。
+
+**物体计数**：统计画面内同学过的目标个数。两个人贴在一起常被算成 1 个，演示时让学生分散站位。
+
+## 五、坐标语义：全是相对画面左上角的值
+
+`HUSKYLENSResult` 里四个字段：
+
+| 字段 | 含义 | 典型取值范围 |
+| --- | --- | --- |
+| `xCenter` | 框中心横向位置 | 0 ~ 320 |
+| `yCenter` | 框中心纵向位置 | 0 ~ 240 |
+| `width` | 框宽 | 0 ~ 320 |
+| `height` | 框高 | 0 ~ 240 |
+
+关键点：**这些值是相对画面左上角的坐标，不是角度、不是屏幕像素、也不随模块屏幕尺寸变化**。画面基准 320×240，原点左上，x 向右，y 向下。
+
+所以：
+
+- 想做云台跟随，用 `error_x = xCenter - 160`、`error_y = yCenter - 120`，正负号直接决定往哪转，比例控制就够，**不需要把像素换算成角度**
+- 想做「目标在画面中间」判断，用归一化：`|xCenter/320 - 0.5| < 0.05`
+- 想估算距离，用 `height` 相对画面的比例，不要用绝对像素——换算法时画面基准会变
+
+:::warning[巡线的 arrow 没有 xCenter]
+巡线返回 `command == COMMAND_RETURN_ARROW`，字段是 `xOrigin/yOrigin/xTarget/yTarget`，没有 `xCenter`。
+
+代码里按 `command` 分支处理，别一股脑读 `xCenter`，否则巡线时读到的全是 0。
+:::
+
+## 六、完整 ESP32 示例：I2C + 云台跟随
+
+Arduino 框架，两块 SG90 舵机做二自由度云台，人脸居中。可直接编译上传。
+
+```cpp
+#include <Wire.h>
+#include "HUSKYLENS.h"
+#include <ESP32Servo.h>
+
+#define I2C_SDA    8
+#define I2C_SCL    9
+#define SERVO_PAN  4
+#define SERVO_TILT 5
+
+HUSKYLENS huskylens;
+Servo pan, tilt;
+
+int panAngle  = 90;
+int tiltAngle = 90;
+const float Kp = 0.02f;      /* 每像素对应多少度，大了会来回抖 */
+const int   DEAD_ZONE = 12;  /* 死区，防止舵机持续微抖 */
+
+/* 上电后一直重连，直到协议与接线都正确 */
+static bool husky_begin(void) {
+  for (int attempt = 0; attempt < 20; attempt++) {
+    if (huskylens.begin(Wire)) return true;
+    Serial.printf("[HUSKY] begin 失败 #%d：查 0x32 / 协议类型 / SDA-SCL\n", attempt);
+    delay(500);
+  }
+  return false;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(I2C_SDA, I2C_SCL, 100000);  /* 模块只支持 100kHz，别写 400000 */
+  Wire.setTimeOut(50);
+
+  pan.attach(SERVO_PAN);
+  tilt.attach(SERVO_TILT);
+  pan.write(panAngle);
+  tilt.write(tiltAngle);
+
+  if (!husky_begin()) {
+    Serial.println("[HUSKY] 放弃，重启");
+    ESP.restart();
+  }
+
+  /* 必须与屏幕菜单里的算法一致 */
+  huskylens.writeAlgorithm(ALGORITHM_FACE_RECOGNITION);
+  delay(300);
+}
+
+void loop() {
+  /* 1. 请求一次结果；失败多半是线太长或没共地 */
+  if (!huskylens.request()) {
+    Serial.println("[HUSKY] request 失败");
+    delay(100);
+    return;
+  }
+
+  /* 2. 本轮无目标：available() 为 false，先怀疑没学习 */
+  if (!huskylens.available()) {
+    delay(30);
+    return;
+  }
+
+  /* 3. 逐个读回识别块，一个画面可能有多个目标 */
+  int n = 0;
+  while (huskylens.available()) {
+    HUSKYLENSResult r = huskylens.read();
+    n++;
+    if (r.command != COMMAND_RETURN_BLOCK) continue;  /* 巡线是 ARROW */
+
+    int errX = (int)r.xCenter - 160;                  /* 画面基准 320x240 */
+    int errY = (int)r.yCenter - 120;
+
+    if (abs(errX) > DEAD_ZONE) {
+      panAngle = constrain(panAngle + (int)(errX * Kp), 10, 170);
+      pan.write(panAngle);
+    }
+    if (abs(errY) > DEAD_ZONE) {
+      tiltAngle = constrain(tiltAngle - (int)(errY * Kp), 10, 170);
+      tilt.write(tiltAngle);
+    }
+
+    Serial.printf("ID=%d c=(%d,%d) box=%dx%d err=(%d,%d) pan=%d tilt=%d\n",
+                  r.ID, r.xCenter, r.yCenter, r.width, r.height,
+                  errX, errY, panAngle, tiltAngle);
+  }
+  Serial.printf("本轮目标数 %d\n", n);
+  delay(20);  /* 一轮 20~40ms，25~50fps 够用 */
+}
+```
+
+### UART 版本的关键差异
+
+只改通信部分，算法与坐标逻辑完全一致：
+
+```cpp
+#include <HardwareSerial.h>
+HardwareSerial HuskySerial(1);   /* UART1 */
+
+void setup() {
+  HuskySerial.begin(9600, SERIAL_8N1, 16, 17);  /* RX=16, TX=17，交叉 */
+  while (!huskylens.begin(HuskySerial)) {        /* UART 传串口对象，不传 Wire */
+    Serial.println("UART 无响应：协议切到 UART 了吗？波特率 9600 吗？");
+    delay(500);
+  }
+}
+```
+
+:::danger[UART 模式下三件事必须同时成立]
+1. 屏幕「设置 → 协议类型」= UART
+2. 屏幕里的波特率 = 代码里的波特率（默认 9600）
+3. TX/RX 交叉
+
+缺任何一个都是「一个字节都收不到」。
+:::
+
+## 七、实打实踩过的坑
+
+| 坑 | 现象 | 原因 | 处理 |
+| --- | --- | --- | --- |
+| 峰值 300 mA | 屏幕闪黑、主控复位 | 从主控 LDO 取电 | 5V/1A 独立供电 + 共地 |
+| 没学习 | `available()` 永远 false | 学习数据为空 | 按学习键 + 确认 |
+| 镜头虚焦 | 屏幕一片糊，识别率极低 | 出厂近焦位置 | 对着实际距离手拧镜头筒 |
+| 地址固定 0x32 | 想挂第二块，扫不到 | 地址不可改 | 一块 I2C，一块 UART |
+| 协议不一致 | `begin()` 一直 false | 屏幕 I2C、代码 UART | 先看屏幕左上角 |
+| 算法不一致 | 读到全 0 | 屏幕算法 ≠ `writeAlgorithm` | 两边对齐 |
+| 无外部上拉 | 随机读失败 | 模块内部上拉弱 | 外挂 4.7k~10k 到 3.3V |
+| 线长 > 30 cm | 偶发失败、扫到乱地址 | I2C 抗干扰弱 | 缩短线或换 UART |
+| 强逆光 | 框对不上、颜色乱跳 | 自动增益饱和 | 避开背窗、加柔光 |
+| 换光照后颜色失效 | 日光灯能认，窗边不能 | 色温变化 | 现场重新学习 |
+| 换算法后 ID 归零 | 学习数据像丢了 | 学习数据按算法隔离 | 每次换玩法重新学 |
+
+### 焦距：唯一需要动手拧的坑
+
+镜头筒可以旋转，出厂常在**近焦**位置，对着 30 cm 外的目标一片模糊。
+
+操作：把目标放在**实际使用距离**上（比如小车前方 40 cm），一边看屏幕一边慢旋镜头筒，直到画面最清晰，然后用热熔胶或螺纹胶固定。
+
+:::warning[别对着 10 cm 对焦]
+对着很近的物体调清楚，拿到 40 cm 用就全糊。**按实际工作距离对焦**是唯一标准。
+:::
+
+## 八、排查顺序
+
+```text
+1. 屏幕左上角协议 = 代码协议？        → 否：改屏幕设置
+2. 万用表量 VCC-GND 有 5V？           → 否：查电源
+3. 独立供电时和主控共地了吗？          → 否：补一根 GND
+4. I2C 扫描能看到 0x32 吗？            → 否：查 SDA/SCL、上拉
+5. 屏幕算法 = writeAlgorithm？         → 否：对齐
+6. 这个算法需要学习，学习了吗？         → 否：按学习键
+7. 画面清晰吗？（看模块自己的屏幕）      → 否：手拧镜头对焦
+8. 光照是否逆光/反光？                 → 是：换位置或补光
+```
+
+前 6 步覆盖了 95% 的现场问题。第 7、8 步属于「能通信但识别不准」，只有看模块自己的屏幕才能判断——所以 HuskyLens 自带的 2.0 寸屏不是装饰，调试时先看它，比看串口快。

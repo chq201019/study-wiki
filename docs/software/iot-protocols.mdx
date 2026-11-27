@@ -1,0 +1,477 @@
+---
+title: 物联网通信协议
+description: HTTP/MQTT/WebSocket 选型对比、QoS 0/1/2 的真实代价、JSON 体积优化、断线重连与心跳、OTA 升级与回滚、以及五个真实踩过的坑
+sidebar_position: 99
+---
+
+# 物联网通信协议
+
+设备连上网之后，真正麻烦的是「怎么连、断了怎么办、升级砸了怎么办」。这篇给可直接抄的实现，以及每个选择的实际代价。
+
+## 一、三种协议的适用场景
+
+| 维度 | HTTP | MQTT | WebSocket |
+| --- | --- | --- | --- |
+| 模型 | 请求-响应 | 发布-订阅（经 Broker） | 全双工长连接 |
+| 传输层 | TCP（或 TLS） | TCP（或 TLS） | TCP（或 TLS） |
+| 最小报文 | 约 200 字节（含头部） | **2 字节** | 2~14 字节（帧头） |
+| 服务端主动推送 | 不能（要轮询） | 能 | 能 |
+| 连接开销 | 每次都要握手 | 一次连接长期复用 | 一次连接长期复用 |
+| 需要 Broker | 不需要 | **需要** | 不需要（但要自己管连接） |
+| 适合 | 上报数据、调 API、OTA 下载 | 设备-云双向、多设备联动 | 浏览器实时交互、低延迟遥控 |
+| ESP32 内存占用 | 低（短连接用完就放） | 中（约 30 KB 常驻） | 中（约 25 KB 常驻） |
+
+三条经验法则：
+
+1. **一分钟上报一次数据 → 用 HTTP**。长连接省的那点握手开销抵不过维护连接的心智负担。
+2. **要服务端主动下发指令 → 用 MQTT**。HTTP 轮询在 100 台设备规模下会把服务器打爆。
+3. **浏览器要实时看 / 实时控 → 用 WebSocket**。MQTT 也能通过 WebSocket 桥接给前端。
+
+:::warning[MQTT 不是"更快的 HTTP"]
+MQTT 的优势是**长连接 + 发布订阅**，不是速度快。
+
+单次小数据上报，MQTT 反而可能比 HTTP 慢：它要经过 Broker 中转一跳。选 MQTT 的理由永远是「需要服务端主动推」或「需要一对多分发」。
+:::
+
+### 协议分层的实际选择
+
+```text
+设备 → 网关 / 云：
+  低频上报（间隔 > 60 s）   → HTTP POST + JSON
+  高频 / 双向控制           → MQTT（QoS 1）
+
+浏览器 → 服务器：
+  实时数据看板              → WebSocket
+  一次性查询                → HTTP
+
+跨公网 + 弱网 + 计费流量     → MQTT over TLS（8883）
+```
+
+## 二、MQTT 的 QoS 0/1/2：真实代价
+
+| QoS | 语义 | 发送方行为 | 接收方可能收到 | 代价 |
+| --- | --- | --- | --- | --- |
+| **0** | 最多一次 | 发完就忘 | 0 或 1 次 | 最低，可能丢 |
+| **1** | 至少一次 | 等 PUBACK，超时重发 | **1 次或多次（重复）** | 中，可能重复 |
+| **2** | 恰好一次 | PUBREC / PUBREL / PUBCOMP 四步握手 | 恰好 1 次 | **最高，报文数翻 2.5 倍** |
+
+### QoS 0 的实际含义
+
+发出去就不管了。网络断的瞬间发的消息**彻底丢失**，发送方不会知道。
+
+适合：温度传感器每秒上报（丢一帧无所谓）、状态心跳。
+
+### QoS 1 的实际含义：会重复
+
+发送方等 PUBACK，超时（通常 5~20 秒）就重发。如果 PUBACK 在网络里丢了，接收方会收到**两条一样的消息**。
+
+**这就是为什么设备端必须在 payload 里带消息 ID 或时间戳做幂等**：
+
+```json
+{"id":1723456789,"t":25.3}
+```
+
+服务器收到 id 相同的数据就丢弃。不带 id 的话，一次网络抖动会让数据库出现两条「开灯」记录。
+
+### QoS 2 的实际含义：四步握手，代价翻倍
+
+```text
+发送方 → PUBLISH →
+       ← PUBREC
+       → PUBREL →
+       ← PUBCOMP
+```
+
+报文数从 1 个变成 4 个，还要在两端存会话状态。**ESP32 上慎用**：每个 QoS 2 会话约占 2 KB 内存，同时开 10 个主题就吃掉 20 KB。
+
+:::danger[QoS 提高不能解决"设备离线"问题]
+QoS 只管「消息在链路上不丢」，不管「设备不在线」。
+
+设备离线时发 QoS 1 的消息，要么被丢弃（clean session = true），要么堆积在 Broker（clean session = false，但内存有上限，通常 1000 条或 1 MB）。
+
+**要保证设备重连后收到指令 → 用 retained message（保留消息）或 clean session = false**，不是提高 QoS。
+:::
+
+### 实际推荐
+
+| 场景 | QoS | 理由 |
+| --- | --- | --- |
+| 传感器周期上报 | 0 | 丢一帧无所谓，省带宽 |
+| 控制指令（开灯 / 关门） | **1** | 必须到达，重复可控（幂等） |
+| 计费 / 门禁记录 | 2 | 不能重复不能丢，量小 |
+| 固件分片传输 | 0 | 上层自己做重传 |
+
+## 三、JSON 组包的体积优化
+
+ESP32 上 JSON 的体积直接影响：内存峰值、WiFi 发送时长（越久越费电）、流量。
+
+### 优化前后对比
+
+原始（典型新手写法）：
+
+```json
+{
+  "deviceId": "esp32-001",
+  "temperature": 25.3,
+  "humidity": 61.2,
+  "batteryLevel": 87,
+  "timestamp": 1723456789
+}
+```
+
+**168 字节**。
+
+优化后（短键名 + 去空格）：
+
+```json
+{"d":"e1","t":25.3,"h":61.2,"b":87,"ts":1723456789}
+```
+
+**48 字节**，减少 71%。
+
+### 三条具体规则
+
+**1. 短键名**。键名在每条消息里重复，是最大的浪费来源。
+
+| 长键名 | 短键名 | 每条省 |
+| --- | --- | --- |
+| temperature | t | 9 字节 |
+| humidity | h | 6 字节 |
+| batteryLevel | b | 10 字节 |
+| deviceId | d | 6 字节 |
+| timestamp | ts | 6 字节 |
+
+5 个字段就省 37 字节。一分钟发一次，一天省 53 KB/设备。
+
+**2. 去掉空格和换行**。序列化时不要 pretty print。
+
+ESP32 上用 cJSON 默认就**不带空格**，问题出在有人手动拼字符串时加了缩进。
+
+**3. 定点整数代替浮点**。25.3 是 4 字节，253 是 3 字节；数组场景差距更明显。
+
+```json
+{"t":25.3}   →   {"t":253,"u":0.1}
+```
+
+而且浮点数在 JSON 里可能序列化成 25.299999237060547（float 精度问题），更占空间。
+
+### ESP32 上生成紧凑 JSON
+
+```c
+#include "cJSON.h"
+
+char *build_payload(float t, float h, int batt, uint32_t ts) {
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddStringToObject(root, "d", "e1");
+  cJSON_AddNumberToObject(root, "t", (int)(t * 10));   /* 定点整数 */
+  cJSON_AddNumberToObject(root, "h", (int)(h * 10));
+  cJSON_AddNumberToObject(root, "b", batt);
+  cJSON_AddNumberToObject(root, "ts", ts);
+
+  char *out = cJSON_PrintUnformatted(root);   /* 关键：Unformatted */
+  cJSON_Delete(root);
+  return out;                                  /* 用完 free() */
+}
+```
+
+:::danger[cJSON_Print 会带换行和缩进]
+cJSON_Print() 输出带缩进的多行 JSON，比 Unformatted 版本大 30~50%。
+
+一定要用 cJSON_PrintUnformatted()。这一步在 ESP32 上能省下几百字节的堆内存峰值。
+:::
+
+## 四、断线重连与心跳保活
+
+### 标准结构
+
+```c
+#include "mqtt_client.h"
+
+static esp_mqtt_client_handle_t s_client = NULL;
+static bool s_connected = false;
+
+static void mqtt_event_handler(void *args, esp_event_base_t base,
+                               int32_t id, void *data) {
+  esp_mqtt_event_handle_t e = (esp_mqtt_event_handle_t)data;
+  switch ((esp_mqtt_event_id_t)id) {
+    case MQTT_EVENT_CONNECTED:
+      s_connected = true;
+      esp_mqtt_client_subscribe(s_client, "cmd/e1", 1);
+      ESP_LOGI("mqtt", "已连接");
+      break;
+    case MQTT_EVENT_DISCONNECTED:
+      s_connected = false;
+      ESP_LOGW("mqtt", "断开，库会自动重连");
+      break;
+    case MQTT_EVENT_DATA:
+      /* payload 不一定以 \0 结尾，必须用 e->data_len */
+      handle_command(e->topic, e->topic_len, e->data, e->data_len);
+      break;
+    default:
+      break;
+  }
+}
+
+void mqtt_start(void) {
+  esp_mqtt_client_config_t cfg = {
+      .broker.address.uri = "mqtt://192.168.1.100:1883",
+      .credentials.username = "device",
+      .credentials.authentication.password = "secret",
+      .session.keepalive = 30,                  /* 心跳 30 秒 */
+      .session.last_will = {
+          .topic  = "status/e1",
+          .msg    = "offline",
+          .qos    = 1,
+          .retain = true,
+      },
+      .network.reconnect_timeout_ms = 5000,     /* 自动重连间隔 */
+      .network.timeout_ms = 10000,
+  };
+  s_client = esp_mqtt_client_init(&cfg);
+  esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID,
+                                 mqtt_event_handler, NULL);
+  esp_mqtt_client_start(s_client);
+}
+```
+
+### 心跳等三个时间参数的关系
+
+| 参数 | 含义 | 典型值 | 设错的表现 |
+| --- | --- | --- | --- |
+| keepalive | 客户端多久发一次 PINGREQ | 30~60 s | 太小费电，太大被 Broker 判定掉线 |
+| Broker 的 keepalive 超时 | 通常 1.5 × keepalive | 45~90 s | — |
+| reconnect_timeout_ms | 断线后多久重连一次 | 5 s | 太短会疯狂重连打爆 Broker |
+
+:::warning[keepalive 不能大于 NAT 超时]
+家用路由器的 NAT 表项通常 120 秒超时。keepalive 设成 300 秒的话，连接会被路由器悄悄回收，而双方都以为还连着——表现是「发出去的消息没反应，30 秒后才报错」。
+
+keepalive 设 30~60 秒，比 NAT 超时短得多才安全。
+:::
+
+### WiFi 连接失败要重试，不能死等
+
+```c
+static bool wifi_connect(int max_attempts) {
+  wifi_config_t cfg = { .sta = { .ssid = SSID, .password = PASS } };
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
+  ESP_ERROR_CHECK(esp_wifi_start());
+
+  for (int i = 0; i < max_attempts; i++) {
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) ESP_LOGW("wifi", "connect 返回 0x%x", err);
+
+    /* 等 10 秒，用事件组或标志位都行 */
+    for (int ms = 0; ms < 10000; ms += 100) {
+      if (s_wifi_connected) return true;
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    ESP_LOGW("wifi", "第 %d 次连接超时，重试", i + 1);
+  }
+  return false;
+}
+```
+
+:::danger[while(!WiFi.connected()){} 是死循环]
+最常见的写法，也是最坏的写法：
+
+- 路由器不在范围 → **永远卡住**，看门狗不触发（因为在让出 CPU），设备变砖
+- WiFi 密码改了 → 同上
+- 现场断电重启后路由器还没起来 → 卡在启动阶段，永远不工作
+
+**必须带次数上限 + 延时 + 失败后降级**（进入配网模式或重启）。
+:::
+
+## 五、OTA 升级：完整流程与回滚
+
+### 分区表是前提
+
+OTA 需要至少两个 app 分区（ota_0 / ota_1），当前运行的和待写入的互不干扰：
+
+```csv
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x4000
+otadata,  data, ota,     0xd000,   0x2000
+app0,     app,  ota_0,   0x10000,  0x140000
+app1,     app,  ota_1,   0x150000, 0x140000
+spiffs,   data, spiffs,  0x290000, 0x100000
+```
+
+### 升级流程（六步）
+
+```text
+1. 检查新版本（HTTP GET /version 或 MQTT 下发版本号）
+2. 下载固件到 ota_1 分区（边下边写，不占内存）
+3. 校验（SHA256 或镜像头部的 MD5）
+4. esp_ota_set_boot_partition(ota_1)   ← 只改 otadata，不重启
+5. 重启，从 ota_1 启动
+6. 新固件自检通过 → esp_ota_mark_app_valid_cancel_rollback()
+   （不做第 6 步 = 下次重启自动回滚）
+```
+
+```c
+#include "esp_ota_ops.h"
+#include "esp_http_client.h"
+
+esp_err_t do_ota(const char *url) {
+  const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
+  if (!target) return ESP_ERR_NOT_FOUND;
+
+  esp_ota_handle_t ota = 0;
+  esp_err_t err = esp_ota_begin(target, OTA_WITH_SEQUENTIAL_WRITES, &ota);
+  if (err != ESP_OK) return err;
+
+  esp_http_client_config_t cfg = { .url = url, .timeout_ms = 15000 };
+  esp_http_client_handle_t c = esp_http_client_init(&cfg);
+  esp_http_client_open(c, 0);
+  int total = esp_http_client_fetch_headers(c);
+
+  int written = 0;
+  static uint8_t buf[4096];
+  while (written < total) {
+    int n = esp_http_client_read(c, (char *)buf, sizeof(buf));
+    if (n <= 0) break;
+    if (esp_ota_write(ota, buf, n) != ESP_OK) {   /* 边读边写，不占内存 */
+      esp_ota_abort(ota);
+      return ESP_FAIL;
+    }
+    written += n;
+  }
+  esp_http_client_close(c);
+  esp_http_client_cleanup(c);
+
+  if (esp_ota_end(ota) != ESP_OK) return ESP_FAIL;           /* 校验镜像 */
+  if (esp_ota_set_boot_partition(target) != ESP_OK) return ESP_FAIL;
+
+  ESP_LOGI("ota", "已写入 %d 字节，重启生效", written);
+  esp_restart();
+  return ESP_OK;
+}
+```
+
+### 回滚机制：靠"不确认"
+
+ESP-IDF 的 OTA 回滚**默认就是开着的**（CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y）。机制很简单：
+
+- 新固件第一次启动时处于 **PENDING_VERIFY** 状态
+- 固件调用了 esp_ota_mark_app_valid_cancel_rollback() 才变成 VALID
+- 如果新固件崩溃重启（或一直没调用），bootloader 认为它坏了，**自动切回上一个分区**
+
+所以回滚的正确写法是：**自检通过之后再确认。**
+
+```c
+void app_main(void) {
+  /* 1. 先自检：WiFi 能连？传感器能读？堆够用？ */
+  if (!self_test_passed()) {
+    ESP_LOGE("boot", "自检失败，等待回滚");
+    esp_restart();          /* 重启后 bootloader 自动切回旧固件 */
+  }
+  /* 2. 自检通过才确认，之后不再回滚 */
+  esp_ota_mark_app_valid_cancel_rollback();
+  ESP_LOGI("boot", "新固件确认有效");
+}
+```
+
+:::danger[OTA 中途断电会怎样]
+分区写入到一半断电，ota_1 是不完整的镜像，但 otadata **还没改**（第 4 步才改），所以下次启动仍然从 ota_0 跑。
+
+**这就是「写镜像」和「改启动分区」必须分成两步的原因**——断电最坏的结果是白下载一次，不会变砖。
+
+变砖只发生在一种情况：esp_ota_set_boot_partition() 已执行、otadata 已改，但镜像实际是坏的。所以 esp_ota_end() 的返回值**必须检查**，它会校验镜像合法性。
+:::
+
+### 回滚的两个失效场景
+
+| 场景 | 为什么失效 | 规避 |
+| --- | --- | --- |
+| 新固件不崩溃，但功能就是错的 | bootloader 只看跑不跑得起来 | 自检里加业务检查（能不能连上服务器） |
+| 关掉了 APP_ROLLBACK_ENABLE | 没有 PENDING_VERIFY 状态 | 确认 sdkconfig 里该选项是 y |
+
+## 六、五个实打实踩过的坑
+
+| 坑 | 现象 | 原因 | 处理 |
+| --- | --- | --- | --- |
+| WiFi 死等 | 现场设备变砖 | while(!connected) 无限循环 | 带次数上限 + 延时重试 |
+| MQTT 主题大小写 | 发了没反应 | Cmd/E1 与 cmd/e1 是两个主题 | 全项目统一命名规则 |
+| TCP 粘包 | JSON 解析报错 | 一次 read 拿到两条半 | 自己做长度前缀或分隔符 |
+| OTA 断电 | 担心变砖 | 写镜像和改分区是两步 | 检查 esp_ota_end 返回值 |
+| QoS 1 重复 | 数据库两条记录 | 至少一次投递 | payload 带 id 做幂等 |
+
+### 主题名大小写敏感
+
+MQTT 的主题是**字节串精确匹配**，Sensor/Temp、sensor/temp、SENSOR/TEMP 是三个不同的主题。
+
+约定一套规则并写进项目文档，比如：
+
+```text
+设备上报：tele/<deviceId>/<metric>    全小写，层级用 / 分隔
+设备命令：cmd/<deviceId>/<action>     全小写
+设备状态：status/<deviceId>           全小写
+通配符：  cmd/+/action   （+ 匹配一层，# 匹配多层）
+```
+
+:::warning[# 通配符只能放最后]
+cmd/#/x 是非法的。# 只能在主题末尾且单独成层；+ 可以放中间（匹配一层）。
+
+写错的表现：Broker 直接拒绝订阅，或者收到一堆不该收的消息。
+:::
+
+### TCP 粘包：必须自己做分帧
+
+TCP 是**字节流**，没有消息边界。先后发 {"a":1} 和 {"b":2}，接收方可能一次读到：
+
+```text
+{"a":1}{"b":2}
+```
+
+也可能读成两次半。直接解析必然失败。
+
+三种解决办法：
+
+| 方法 | 做法 | 优点 | 缺点 |
+| --- | --- | --- | --- |
+| **长度前缀** | 先发 2 字节长度，再发内容 | 最可靠 | 要自己实现 |
+| **分隔符** | 每条消息末尾加换行 | 简单 | 内容里不能有换行 |
+| **流式解析** | 按括号配对逐字符解析 | 不改协议 | 实现复杂 |
+
+```c
+/* 长度前缀方案：接收端维护一个缓冲，够长度才取一条 */
+static uint8_t rxbuf[2048];
+static size_t rxlen = 0;
+
+void on_tcp_data(const uint8_t *data, size_t n) {
+  if (rxlen + n > sizeof(rxbuf)) rxlen = 0;      /* 防溢出，直接丢弃 */
+  memcpy(rxbuf + rxlen, data, n);
+  rxlen += n;
+
+  while (rxlen >= 2) {
+    uint16_t mlen = (rxbuf[0] << 8) | rxbuf[1];   /* 大端 */
+    if (rxlen < 2u + mlen) break;                 /* 还没收全，等下次 */
+    handle_message(rxbuf + 2, mlen);
+    memmove(rxbuf, rxbuf + 2 + mlen, rxlen - 2 - mlen);
+    rxlen -= 2 + mlen;
+  }
+}
+```
+
+:::danger[MQTT 不用自己做分帧]
+MQTT 协议自带「剩余长度」字段，ESP-IDF 的 esp-mqtt 已经处理好了，MQTT_EVENT_DATA 回调里拿到的就是完整报文。
+
+**只有裸 TCP / WebSocket 上的 JSON 才需要自己分帧。** 别在 MQTT 上重复实现一遍。
+:::
+
+## 七、上线前的自检清单
+
+```text
+[ ] WiFi 连接带重试上限，失败后能进配网而不是卡死
+[ ] MQTT 有 last will，设备掉线 Broker 能发出 offline
+[ ] keepalive 设 30~60 秒（小于路由器 NAT 超时）
+[ ] 所有 QoS 1 的消息 payload 带唯一 id 做幂等
+[ ] 主题命名有一套固定规则，且全小写
+[ ] JSON 用 PrintUnformatted，键名短
+[ ] 裸 TCP 场景做了分帧
+[ ] OTA 分区表有 ota_0 / ota_1，esp_ota_end 返回值被检查
+[ ] 新固件自检通过后才调 esp_ota_mark_app_valid_cancel_rollback
+[ ] 断电恢复后能自动重连，不需要人工按复位
+```
+
+十条里前五条是现场事故的高发区，后五条是「不出事但会很难查」的隐形问题。

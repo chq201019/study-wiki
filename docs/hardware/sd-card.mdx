@@ -1,0 +1,310 @@
+---
+title: SD 卡与文件系统
+description: SPI 与 SDIO 两种接法、FAT32 与簇大小、DMA 传输上限，以及写卡断电、CS 抢线这些真机上一定会遇到的坑
+sidebar_position: 101
+---
+
+# SD 卡与文件系统
+
+SD 卡在 ESP32 上不是「插上就能用」的外设。它的初始化协议对电源、时序、引脚都有硬性要求，
+一处不对就卡在 `mount` 失败，而且返回的错误码基本不指向真正的原因。
+
+## 接线：SPI 模式只用四根线
+
+| 卡座引脚 | 方向 | ESP32（VSPI 默认） | 说明 |
+|---|---|---|---|
+| CS | ESP32 → 卡 | GPIO5 | **必须独享**，见坑 1 |
+| MOSI (CMD) | ESP32 → 卡 | GPIO23 | 命令和数据共用一条 |
+| MISO (DAT0) | 卡 → ESP32 | GPIO19 | 写卡时卡在这条线上回 busy |
+| SCK (CLK) | ESP32 → 卡 | GPIO18 | 卡端上限 25MHz |
+| VCC | — | **3.3V** | 不能接 5V |
+| GND | — | GND | 必须共地 |
+
+```text
+        ESP32                        microSD 卡座
+   GPIO23 (MOSI) ──────────────── CMD / MOSI
+   GPIO19 (MISO) ──────────────── DAT0 / MISO
+   GPIO18 (SCK)  ──────────────── CLK / SCK
+   GPIO5  (CS)   ──────────────── CS / DAT3
+   3.3V          ──────────────── VDD    ← 先量到 3.3V 再上电
+   GND           ──────────────── VSS
+                                  DAT1 / DAT2 悬空（SPI 模式不用）
+```
+
+18/19/23/5 是绝大多数例程和库的默认值，接了这里能少改一堆配置。
+换别的 GPIO 完全可行（走 GPIO matrix），但 SPI 时钟超过 20MHz 时，
+非默认引脚的走线延迟会开始明显。
+
+## HSPI / VSPI 到底是哪个
+
+ESP-IDF v5 之后不再用 VSPI/HSPI 这套叫法，统一成 `SPI2_HOST` / `SPI3_HOST`：
+
+| 宏 | 老名字 | 哪些芯片有 |
+|---|---|---|
+| `SPI1_HOST` | — | 被内部 flash 占用，**用户不可用** |
+| `SPI2_HOST` | HSPI | 全系列都有 |
+| `SPI3_HOST` | VSPI | **只有 ESP32 有**；S3 / C3 / C6 / H2 没有 |
+
+所以写库的时候直接固定 `SPI2_HOST`，别写 `VSPI`。
+ESP32-S3 上引用 `SPI3_HOST` 编译能过，链接会报未定义，或者运行时初始化返回 `ESP_ERR_INVALID_ARG`。
+
+同时挂 TFT 屏 + SD 卡时：两条设备可以共用一个 host 的 MOSI/MISO/SCK，
+**CS 各自独立**，然后分别 `spi_bus_add_device`。SD 卡这一侧要用
+`sdspi_device_config_t` 而不是裸 `spi_device_interface_config_t`。
+
+## 最小可用示例：esp_vfs_fat_sdspi_mount
+
+```c
+#include <stdio.h>
+#include "esp_log.h"
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
+#include "driver/sdspi_host.h"
+#include "driver/spi_common.h"
+
+#define PIN_CS    GPIO_NUM_5
+#define PIN_SCK   GPIO_NUM_18
+#define PIN_MISO  GPIO_NUM_19
+#define PIN_MOSI  GPIO_NUM_23
+
+static const char *TAG = "sd";
+
+void app_main(void)
+{
+    spi_bus_config_t bus = {
+        .mosi_io_num   = PIN_MOSI,
+        .miso_io_num   = PIN_MISO,
+        .sclk_io_num   = PIN_SCK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4000,      /* 给 0 或给太小，部分 IDF 版本直接 mount 失败 */
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO));
+
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot         = SPI2_HOST;
+    host.max_freq_khz = 20000;        /* 20MHz；杜邦线超过 10cm 降到 10000 */
+
+    sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot.host_id = SPI2_HOST;
+    slot.gpio_cs = PIN_CS;
+
+    esp_vfs_fat_mount_config_t mnt = {
+        .format_if_mount_failed = false,   /* 生产固件永远不要设 true */
+        .max_files              = 5,
+        .allocation_unit_size   = 16 * 1024,
+    };
+
+    sdmmc_card_t *card;
+    esp_err_t err = esp_vfs_fat_sdspi_mount("/sdcard", &host, &slot, &mnt, &card);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "mount 失败: %s", esp_err_to_name(err));
+        return;
+    }
+    sdmmc_card_print_info(stdout, card);   /* 打印厂商、容量、速度等级 */
+
+    FILE *f = fopen("/sdcard/boot.csv", "a");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "fopen 失败");
+    } else {
+        fprintf(f, "%lld,boot\n", esp_timer_get_time() / 1000);
+        fflush(f);          /* 断电前没 flush 的数据就没了 */
+        fclose(f);
+    }
+
+    esp_vfs_fat_sdcard_unmount("/sdcard", card);
+}
+```
+
+`CMakeLists.txt` 里要显式声明依赖（v5.3 起 driver 被拆成多个组件）：
+
+```cmake
+idf_component_register(SRCS "main.c"
+                       PRIV_REQUIRES fatfs sdmmc esp_driver_spi esp_driver_sdspi)
+```
+
+报 `implicit declaration of function 'esp_vfs_fat_sdspi_mount'` 基本都是这里漏了 `fatfs`。
+
+## Arduino 的 SD.h 写法
+
+```cpp
+#include <Arduino.h>
+#include <SPI.h>
+#include <SD.h>
+
+#define SD_CS   5
+#define SD_SCK  18
+#define SD_MISO 19
+#define SD_MOSI 23
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  /* 顺序是 SCK, MISO, MOSI, SS —— 和很多人以为的 MOSI/MISO 是反的 */
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+
+  if (!SD.begin(SD_CS, SPI, 20000000)) {
+    Serial.println("SD 挂载失败");
+    return;
+  }
+  Serial.printf("type=%d  size=%llu MB\n",
+                SD.cardType(), SD.cardSize() / (1024ULL * 1024ULL));
+
+  File f = SD.open("/log.csv", FILE_APPEND);
+  if (!f) { Serial.println("fopen 失败"); return; }
+  f.printf("%lu,23.5\n", millis());
+  f.close();                       /* close 之前数据可能还在缓存里 */
+}
+
+void loop() {}
+```
+
+`SD.begin()` 的第 3 个参数是 SPI 频率。默认 4MHz，很多人不传，跑起来只有 0.2MB/s，
+然后误以为卡慢。先 4MHz 确认能挂上，再往上加。
+
+## FAT32 vs exFAT：这是 mount 失败第一大原因
+
+ESP-IDF 的 FATFS 只认老 FAT：
+
+| 格式 | 能不能挂 | 说明 |
+|---|---|---|
+| FAT12 / FAT16 | 能 | ≤32MB，别用 |
+| FAT32 | 能 | 主力，单个文件上限 4GB − 1 字节 |
+| exFAT | **不能** | 64GB 以上的卡出厂就是它，插上直接失败 |
+| NTFS / ext4 | 不能 | — |
+
+一张 128GB 的卡买回来默认 exFAT，`esp_vfs_fat_sdspi_mount` 返回
+`ESP_ERR_NOT_SUPPORTED` 或 `ESP_FAIL`，日志里只有一句 `f_mount failed`。
+必须用电脑重新格式化成 FAT32（Windows 自带格式化对 >32GB 只给 exFAT，
+要用 guiformat 或 SD Card Formatter）。
+
+### 簇大小直接影响占用和速度
+
+| 卡容量 | 出厂簇大小 | 一个 100 字节的文件实际占 |
+|---|---|---|
+| 2GB | 4KB | 4KB |
+| 8GB | 8KB | 8KB |
+| 32GB | 32KB | 32KB |
+
+- 一天一个小文件、每次几百 KB → 大簇更快（FAT 表项少，寻道少）。
+- 每秒一个文件 → 必须手动指定小簇，否则 100MB 的卡装满实际只存了 3MB 数据。
+  在 `esp_vfs_fat_mount_config_t.allocation_unit_size` 里写 4096 即可。
+
+簇越小，FAT 表越大，随机读取越慢。没有两头都占的选项。
+
+## 速度、DMA 与 max_transfer_sz
+
+| 模式 | 时钟 | 实测顺序写 | 说明 |
+|---|---|---|---|
+| SPI | 20MHz | 0.8 – 1.5 MB/s | 最稳，推荐默认用它 |
+| SPI | 40MHz | 2 – 3 MB/s | 约一半的卡会初始化失败或随机超时 |
+| SDIO 1-bit | 20MHz | 2 – 4 MB/s | 占 CLK + CMD + DAT0 = 3 根 |
+| SDIO 4-bit | 40MHz | 4 – 12 MB/s | 占 6 根，见下面的坑 |
+
+`max_transfer_sz` 是 SPI 驱动预留的 DMA 缓冲上限。SD 卡一次要搬 512 字节的扇区块，
+高时钟下驱动会申请更大的连续缓冲：
+
+```c
+.max_transfer_sz = 4000,   /* 官方例程用的值 */
+```
+
+两条硬约束：
+
+1. DMA 缓冲区必须在**内部 RAM**（`MALLOC_CAP_DMA | MALLOC_CAP_8BIT`）。
+   往 SPI 驱动里塞 PSRAM 指针，日志是 `spi_master: alloc DMA buffer failed`，
+   然后 mount 返回 `ESP_ERR_NO_MEM`。
+2. `max_transfer_sz` 要大于你单次 `fwrite` 的长度。一次写 8KB 而缓冲只给 4000，
+   驱动会静默拆成两次传输，吞吐掉一半。
+
+真想知道手上这张卡多快，跑一次基准，别信标称：
+
+```c
+int64_t t0 = esp_timer_get_time();
+FILE *f = fopen("/sdcard/bench.bin", "wb");
+static uint8_t buf[4096];
+for (int i = 0; i < 256; i++) fwrite(buf, 1, sizeof(buf), f);   /* 1MB */
+fclose(f);
+ESP_LOGI(TAG, "1MB 写入 %lld ms", (esp_timer_get_time() - t0) / 1000);
+```
+
+## SDIO 模式：快很多，但引脚是钉死的
+
+ESP32 的 SDIO slot 0 走 IOMUX，引脚固定：
+
+| 信号 | GPIO | 是不是 strapping pin |
+|---|---|---|
+| CLK | GPIO14 | 否 |
+| CMD | GPIO15 | **是**（上电必须高） |
+| DAT0 | GPIO2 | **是**（上电必须低或浮空） |
+| DAT1 | GPIO4 | 否 |
+| DAT2 | GPIO12 | **是**（MTDI，控制 flash 电压） |
+| DAT3 | GPIO13 | 否 |
+
+4-bit SDIO 正好压在 GPIO2 / 12 / 15 三个 strapping pin 上。
+卡座在 DAT 线上有上拉，上电瞬间 GPIO12 被拉高，ESP32 会认为 flash 要 1.8V ——
+3.3V flash 的板子这样是能变砖的组合。
+
+要用 SDIO 就得接受：只能 1-bit 模式省掉 DAT2（丢掉一半带宽），
+或者换 S3 / C3（引脚可以重新映射，且 strapping 组合不同）。
+
+**结论：除非确实需要 >3MB/s，一律用 SPI。** 六根线换来的速度，在教学项目里用不上。
+
+## 坑（按踩到的频率排序）
+
+1. **CS 必须独享。** 和别的 SPI 设备共用 CS 时，SD 初始化发的 CMD0 会同时打到对方，
+   表现为「两个设备都时好时坏」，而且换什么库都没用。CS 还必须上电即为高 ——
+   所以别选 GPIO0（低电平进下载模式）。
+2. **GPIO6–11 是 flash 的 IOMUX 引脚，接了必重启。** 数据手册写「GPIO9/10/11 可用」
+   是有前提的（flash 走 DIO 模式），而几乎所有模组默认 QIO。
+3. **带 PSRAM 的模组引脚更少。** ESP32-WROVER 占 GPIO16/17；
+   S3 的 N8R8 会占掉一堆管脚。接之前先查模组 datasheet，别查芯片 datasheet。
+4. **5V 模块没有电平转换。** 市面上标「5V 兼容」的 SD 模块，多数只是板载 AMS1117
+   把 5V 降到 3.3V 给卡用，MISO 直接从卡出来、没经过任何转换。
+   ESP32 的 GPIO 绝对最大额定是 3.6V，接上去是慢性损坏，不是立刻冒烟。
+   要 5V 就得用带 TXB0104 / 74LVC125 的模块。
+5. **写入时断电 = 文件系统损坏。** FATFS 的 FAT 表不是事务性的。写扇区时掉电，
+   可能出现 FAT 表项和目录项只更新了一半，结果是整张卡 mount 失败，
+   或者文件显示 0 字节但空间不释放。三个防护：
+   日志用 `"a"` 追加模式而不是反复 close/reopen；
+   配置类文件先写 `x.tmp` 再 `rename`；
+   硬件上加 1000µF 电解 + 掉电检测，给 flush 争取几十毫秒。
+6. **热插拔不会自愈。** 初始化后把卡拔了，下一次 `fwrite` 返回失败，
+   驱动不会自己重连。必须 `esp_vfs_fat_sdcard_unmount` 再重新 mount 一遍。
+7. **`format_if_mount_failed = true` 是危险开关。** 卡上只要有一份学生的实验数据，
+   第一次 mount 失败就全没了。只在自己做实验时临时打开。
+8. **长文件名默认是关的。** `CONFIG_FATFS_LFN_NONE` 是默认值，文件名只能 8.3。
+   `fopen("/sdcard/data20240513.csv")` 会返回 NULL，而且没有任何提示。
+   要开 `CONFIG_FATFS_LFN_HEAP`（用堆，RAM 紧张时用 `_STACK`）。
+   中文文件名同样需要这个开关 + `CONFIG_FATFS_API_ENCODING_UTF_8`。
+9. **`max_files = 5` 真的只有 5 个。** VFS 的文件描述符是静态分配的，
+   第 6 个 `fopen` 直接返回 NULL。日志 + 配置 + 临时文件同时开着很容易撞上。
+10. **便宜卡有 100–250ms 的随机停顿。** 卡内部垃圾回收时会完全不理 SPI。
+    标着 A1/A2 的应用性能卡反而停顿更明显（因为它们优化的是随机 IOPS，不是延迟）。
+    要稳定就用工业级卡或者降频。
+
+## 排错对照表
+
+| 现象 | 大概率原因 | 处理 |
+|---|---|---|
+| mount 返回 `ESP_ERR_TIMEOUT` | 供电不足 / CS 接错 / SCK 太快 | `max_freq_khz` 先降到 400，能挂上再往上加 |
+| mount 返回 `ESP_ERR_NOT_SUPPORTED` | 卡是 exFAT | 电脑上重新格式化成 FAT32 |
+| mount 返回 `ESP_FAIL` | FAT 表已损坏 | SD Card Formatter 全盘覆盖格式化 |
+| mount 返回 `ESP_ERR_NO_MEM` | DMA 缓冲申请失败 | 检查 `max_transfer_sz`、PSRAM 指针 |
+| 能挂载，文件永远 0 字节 | 没 `fflush` / `fclose` | 每批写完 flush，关机前 close |
+| `fopen` 返回 NULL 但卡是好的 | 长文件名没开 / 超过 `max_files` | 用 8.3 文件名，或开 LFN |
+| 一插卡就反复重启 | 用了 GPIO6–11 或 strapping pin | 换引脚 |
+| 写几百毫秒后卡一下 | 卡内部 GC | 加大单次写入长度，减少调用次数 |
+
+## 写卡的正确姿势
+
+不管上层逻辑多复杂，落到卡上的动作只有三种模式：
+
+- **追加日志**：`fopen(..., "a")` 一次打开，攒够 4KB 再 `fwrite` + `fflush`，
+  关机前 `fclose`。这是掉电最安全的模式 —— 已写入的数据最多丢最后一批。
+- **整文件替换**：写 `x.tmp` → `fflush` → `fclose` → `remove(x)` → `rename(x.tmp, x)`。
+  `rename` 在 FATFS 上是原子的，中间掉电最坏结果是留下一个 tmp 文件。
+- **只读资源**：固件镜像里的 `ESP_PARTITION_SUBTYPE_DATA_SPIFFS` 分区比 SD 可靠得多，
+  网页、图片这种出厂就固定的东西不要放 SD。
+
+SD 卡适合「容量大、可以丢一点」的数据；掉一条都不能丢的东西放 NVS 或 Flash 分区。

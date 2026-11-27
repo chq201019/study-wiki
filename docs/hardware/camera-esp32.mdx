@@ -1,0 +1,380 @@
+---
+title: ESP32 摄像头（OV2640 / OV5640）
+description: ESP32-CAM 与 ESP32-S3 的差异、13 根引脚占用、分辨率帧率内存三角、MJPEG/WebSocket/上传三种传输方案与实战坑
+sidebar_position: 120
+---
+
+# ESP32 摄像头（OV2640 / OV5640）
+
+摄像头是 ESP32 项目里最容易「代码没错但不工作」的模块：13 根引脚占掉一大半 IO，PSRAM 决定了能开多大分辨率，WiFi 和摄像头抢同一块内存。
+
+## 一、ESP32-CAM 与 ESP32-S3 + 摄像头模块
+
+| 项目 | ESP32-CAM（AI-Thinker） | ESP32-S3 + OV2640/OV5640 |
+| --- | --- | --- |
+| 芯片 | ESP32-D0WDQ6，双核 240 MHz | ESP32-S3，双核 240 MHz + 向量指令 |
+| PSRAM | 4 MB（部分板 8 MB），**必需** | 2/8 MB，**必需** |
+| Flash | 4 MB | 8/16 MB |
+| 引出 IO | 只有 6 个（含 UART0） | 20+ 个 |
+| USB | **没有**，必须用 USB-TTL 转接板 | 原生 USB-Serial-JTAG（S3） |
+| 摄像头 | 焊死 OV2640，不可换 | 排线可换 OV2640 / OV5640 |
+| 下载方式 | GPIO0 接地 → 上电 → 松手 | 按住 BOOT → 按 RST |
+| 板载 | microSD 卡槽 + 闪光灯 LED | 视板而定 |
+| 供电 | 5V，**不能从 3.3V 引脚反灌** | 5V / USB |
+| JPEG 硬件编码 | 有 | 有（更快） |
+| 典型价格 | 约 25 元 | 60~120 元 |
+
+**结论**：教学入门用 ESP32-CAM 便宜但折腾；要稳定出图、要接屏幕和传感器，选 ESP32-S3。
+
+:::danger[ESP32-CAM 没有 USB]
+它只有 5V/GND/U0R/U0T/IO0 排针，**必须用 USB-TTL 转接板**（CH340/CP2102）下载。
+
+接线：
+
+```text
+USB-TTL    ESP32-CAM
+5V    ────  5V
+GND   ────  GND
+TXD   ────  U0R     ← 交叉
+RXD   ────  U0T     ← 交叉
+GND   ────  IO0     ← 只在下载时接，跑起来必须断开
+```
+
+下载流程：IO0 接 GND → 插 USB → 点上传 → 看到 Connecting... 后按板上 RST → 上传完成 → **断开 IO0** → 再按 RST 运行。
+
+忘了断开 IO0 的表现：程序上传成功但**永远不进 app**，串口一直打印 waiting for download。
+:::
+
+## 二、引脚占用：13 根，基本占满
+
+摄像头走 DVP 并口，引脚是硬绑定的，不能随便改（改了要同步改 camera_config_t）。
+
+| 信号 | AI-Thinker ESP32-CAM | 说明 |
+| --- | --- | --- |
+| D0 (Y2) | GPIO5 | 数据位 0 |
+| D1 (Y3) | GPIO18 | 数据位 1 |
+| D2 (Y4) | GPIO19 | 数据位 2 |
+| D3 (Y5) | GPIO21 | 数据位 3 |
+| D4 (Y6) | GPIO36 | 只输入引脚 |
+| D5 (Y7) | GPIO39 | 只输入引脚 |
+| D6 (Y8) | GPIO34 | 只输入引脚 |
+| D7 (Y9) | GPIO35 | 只输入引脚 |
+| PCLK | GPIO22 | 像素时钟，由摄像头输出 |
+| VSYNC | GPIO25 | 场同步 |
+| HREF | GPIO23 | 行有效 |
+| XCLK | GPIO0 | 主控输出的主时钟，**同时是 strapping pin** |
+| SIOD (SDA) | GPIO26 | SCCB 配置总线（类 I2C） |
+| SIOC (SCL) | GPIO27 | SCCB 时钟 |
+| PWDN | GPIO32 | 掉电控制 |
+| RESET | -1 | 不用 |
+
+**13 根信号 + 2 根电源**，这正是 ESP32-CAM 只引出 6 个 IO 的原因。
+
+:::warning[只剩 6 个可用 IO]
+ESP32-CAM 排针上能自由用的是：GPIO1(TX)、GPIO3(RX)、GPIO4(闪光灯)、GPIO12、GPIO13、GPIO14、GPIO15、GPIO16。
+
+其中 GPIO12/13/14/15 在插了 SD 卡时被占用（CLK/CMD/D0/D3），**摄像头 + SD 卡同时用时一个都不剩**。
+
+要接传感器（DHT11、超声波）就只剩 GPIO1/GPIO3（和串口冲突）或 GPIO16。**要扩展请换 ESP32-S3。**
+:::
+
+:::danger[GPIO0 同时是 XCLK 和下载模式]
+XCLK 接在 GPIO0 上——而 GPIO0 是 strapping pin。
+
+上电瞬间 GPIO0 被拉低就会进下载模式。摄像头模块内部对 XCLK 有下拉，某些板子上电时**会误进下载模式**，表现为程序明明上传成功却一上电就没反应。
+
+规避：上电后再按一次 RST，或者换用 XCLK 接其他脚的自定义接法（S3 板一般接 GPIO15）。
+:::
+
+## 三、分辨率、帧率、内存：三者只能保两个
+
+### 内存怎么算
+
+每一帧的缓冲 = 宽 × 高 × 2 字节（RGB565），或者压缩后的 JPEG 大小。
+
+| 分辨率 | 别名 | RGB565 单帧 | JPEG 典型大小 |
+| --- | --- | --- | --- |
+| 160×120 | QQVGA | 38 KB | 3~6 KB |
+| 320×240 | QVGA | 150 KB | 8~15 KB |
+| 640×480 | VGA | 600 KB | 20~40 KB |
+| 800×600 | SVGA | 960 KB | 35~60 KB |
+| 1024×768 | XGA | 1.5 MB | 50~90 KB |
+| 1600×1200 | UXGA | 3.75 MB | 80~150 KB |
+
+ESP32 内部 SRAM 只有约 **320 KB** 可用（其余被 WiFi 协议栈、FreeRTOS 占掉），所以：
+
+- **QVGA 以上必须开 PSRAM**
+- UXGA 不压缩时需要 3.75 MB 一帧，只有 PSRAM 存得下
+
+### PSRAM 为什么是必需的
+
+| 场景 | 无 PSRAM | 有 PSRAM（4 MB） |
+| --- | --- | --- |
+| QQVGA JPEG 单帧 | 可以 | 可以 |
+| VGA JPEG 双缓冲 | 失败（ESP_ERR_NO_MEM） | 可以 |
+| UXGA | 不可能 | 可以 |
+| WiFi + 摄像头同时 | 经常 OOM 重启 | 稳定 |
+
+没有 PSRAM 时 esp_camera_init() 直接返回 ESP_ERR_NO_MEM，或者初始化成功但一抓图就重启。
+
+**买摄像头板第一件事：确认 PSRAM 型号，并且代码里把 fb_location 设为 CAMERA_FB_IN_PSRAM。**
+
+### 帧率实测（VGA JPEG）
+
+| 配置 | PSRAM | 帧率 |
+| --- | --- | --- |
+| QVGA，1 缓冲 | 有 | 25~30 fps |
+| VGA，1 缓冲 | 有 | 15~20 fps |
+| VGA，2 缓冲 | 有 | 10~12 fps |
+| VGA，2 缓冲 + MJPEG over WiFi | 有 | **5~8 fps** |
+| UXGA，1 缓冲 | 有 | 2~4 fps |
+| VGA | **无** | 起不来 |
+
+规律：**分辨率翻倍 → 帧率约减半 → 内存翻 4 倍**。想要高帧率就降分辨率，别硬刚 UXGA。
+
+### 配置结构体
+
+```cpp
+camera_config_t config = {};
+config.pin_pwdn  = 32;
+config.pin_reset = -1;
+config.pin_xclk  = 0;
+config.pin_sccb_sda = 26;
+config.pin_sccb_scl = 27;
+config.pin_d0 = 5;  config.pin_d1 = 18; config.pin_d2 = 19; config.pin_d3 = 21;
+config.pin_d4 = 36; config.pin_d5 = 39; config.pin_d6 = 34; config.pin_d7 = 35;
+config.pin_vsync = 25;
+config.pin_href  = 23;
+config.pin_pclk  = 22;
+config.xclk_freq_hz = 20000000;           /* OV2640 上限 20MHz */
+config.ledc_timer   = LEDC_TIMER_0;
+config.ledc_channel = LEDC_CHANNEL_0;
+config.pixel_format = PIXFORMAT_JPEG;     /* 网络传输必须用 JPEG */
+config.frame_size   = FRAMESIZE_VGA;
+config.jpeg_quality = 12;                 /* 0~63，数字越小质量越高、体积越大 */
+config.fb_count     = 2;
+config.fb_location  = CAMERA_FB_IN_PSRAM; /* 无 PSRAM 就删掉这行 */
+config.grab_mode    = CAMERA_GRAB_LATEST;
+```
+
+:::warning[OV5640 的 XCLK 不能超 24 MHz]
+OV2640 用 20 MHz 稳定；OV5640 支持更高，但 fb_count = 2 配高分辨率时容易报 Failed to set frame size。
+
+OV5640 先用 24000000，不稳就降到 20000000，并从 FRAMESIZE_VGA 起步。
+:::
+
+## 四、三种图像传输方案
+
+| 方案 | 协议 | 延迟 | 浏览器兼容 | 实现复杂度 | 适用 |
+| --- | --- | --- | --- | --- | --- |
+| **HTTP MJPEG 流** | HTTP multipart | 100~300 ms | img 标签直接看 | 低 | 监控、调试、教学演示 |
+| **WebSocket 推帧** | WS + 二进制 | 50~150 ms | 要写 JS | 中 | 双向控制、低延迟 |
+| **上传到服务器** | HTTP POST / MQTT | 500 ms~数秒 | 不涉及 | 中 | 抓拍存档、云端识别 |
+
+### 方案 A：HTTP MJPEG 流（首选）
+
+浏览器打开 /stream 就能出画面，不需要写任何前端代码。
+
+```cpp
+#include "esp_camera.h"
+#include "esp_http_server.h"
+
+#define PART_BOUNDARY "123456789000000000000987654321"
+
+static const char *_STREAM_CONTENT_TYPE =
+    "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char *_STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char *_STREAM_PART =
+    "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+static esp_err_t stream_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+  char part[64];
+  while (true) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("fb_get 失败：PSRAM 不够或分辨率太高");
+      return ESP_FAIL;
+    }
+    httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+    size_t n = snprintf(part, sizeof(part), _STREAM_PART, fb->len);
+    httpd_resp_send_chunk(req, part, n);
+    httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+    esp_camera_fb_return(fb);        /* 不 return，几帧后内存耗尽 */
+  }
+  return ESP_OK;
+}
+```
+
+:::danger[fb_get 之后必须 fb_return]
+esp_camera_fb_get() 是**借**缓冲区，esp_camera_fb_return() 是**还**。
+
+漏掉 fb_return 的表现：前 1~3 帧正常，之后画面卡死、日志刷 Failed to get frame，几秒后 OOM 重启。
+
+这是 ESP32 摄像头代码的第一号 bug。
+:::
+
+### 方案 B：WebSocket 推帧
+
+需要低延迟（遥控小车第一视角）时用。ESP-IDF 的 esp_http_server 自带 WS 支持：
+
+```cpp
+static esp_err_t ws_handler(httpd_req_t *req) {
+  if (req->method == HTTP_GET) return ESP_OK;   /* 握手请求，直接返回 */
+
+  httpd_ws_frame_t frame = {};
+  frame.type = HTTPD_WS_TYPE_BINARY;
+  uint8_t buf[8];
+  frame.payload = buf;
+  frame.len = sizeof(buf);
+  httpd_ws_recv_frame(req, &frame, 0);          /* 先收长度，再收内容 */
+  return ESP_OK;
+}
+```
+
+推帧思路与 MJPEG 相同，只是把 httpd_resp_send_chunk 换成 httpd_ws_send_frame。前端用 WebSocket + Blob + createObjectURL 渲染。
+
+### 方案 C：上传到服务器
+
+只在需要存档或云端识别时用：
+
+```cpp
+#include "esp_http_client.h"
+
+static bool upload_frame(const uint8_t *jpg, size_t len) {
+  esp_http_client_config_t cfg = {
+      .url = "http://192.168.1.100:8080/upload",
+      .method = HTTP_METHOD_POST,
+      .timeout_ms = 5000,
+  };
+  esp_http_client_handle_t c = esp_http_client_init(&cfg);
+  esp_http_client_set_header(c, "Content-Type", "image/jpeg");
+  esp_http_client_set_post_field(c, (const char *)jpg, len);
+  esp_err_t err = esp_http_client_perform(c);
+  int code = esp_http_client_get_status_code(c);
+  esp_http_client_cleanup(c);
+  return err == ESP_OK && code == 200;
+}
+```
+
+:::warning[别用 HTTPS 做每帧上传]
+TLS 握手要 30~40 KB 内部 SRAM。WiFi 已在跑时再开 TLS，会直接把剩余内存吃光。
+
+要在内网传图就用 http，要加密就一次批量传而不是逐帧传。
+:::
+
+## 五、JPEG 质量参数如何影响带宽
+
+jpeg_quality 取 0~63，**数字越小质量越高、体积越大**（和直觉相反，第一次用的人都会设错）。
+
+| jpeg_quality | VGA 单帧 | QVGA 单帧 | 8 fps 时带宽 |
+| --- | --- | --- | --- |
+| 10 | 约 45 KB | 约 18 KB | 约 2.9 Mbps |
+| 12 | 约 38 KB | 约 15 KB | 约 2.4 Mbps |
+| 20 | 约 22 KB | 约 9 KB | 约 1.4 Mbps |
+| **32** | 约 12 KB | 约 5 KB | **约 0.8 Mbps** |
+
+:::warning[教学演示用 quality = 20~32]
+局域网里多路同时看同一块板子时，quality=10 + VGA 会把 WiFi 打满，表现为**画面越来越卡、最后断开**。
+
+降质量比降分辨率划算：VGA + quality 32 看起来比 QVGA + quality 10 更清楚，字节数还更少。
+:::
+
+## 六、WiFi 与摄像头同时工作的内存账
+
+这是最隐蔽的一类故障：单独测摄像头正常，单独测 WiFi 正常，一起跑就重启。
+
+| 模块 | 占用 |
+| --- | --- |
+| WiFi 协议栈（STA 连接态） | 约 50~70 KB 内部 SRAM |
+| lwIP + socket 缓冲 | 约 40 KB |
+| HTTP server 任务栈 | 8~16 KB |
+| Camera DMA 描述符 | 约 8 KB |
+| 单帧 PSRAM 缓冲（VGA） | 约 40 KB × fb_count |
+
+关键在**内部 SRAM**：WiFi 起来后只剩约 100 KB 可用。此时如果再：
+
+- 把 fb_location 设成 CAMERA_FB_IN_DRAM
+- 开 fb_count = 3
+- 同时跑 HTTPS（TLS 握手额外 30~40 KB）
+
+就会 OOM 重启，日志是 rst:0xc (SW_CPU_RESET) 或 Guru Meditation Error: Cache disabled but cached memory region accessed。
+
+三条硬性建议：
+
+1. fb_location = CAMERA_FB_IN_PSRAM，**永远不要把帧缓冲放内部 SRAM**
+2. fb_count = 2 就够，3 个只多 1 帧延迟却多吃一整帧内存
+3. 先用 VGA 跑通，再往上试，一次只改一个参数
+
+:::danger[先初始化摄像头，再连 WiFi]
+顺序反了，WiFi 已吃掉 50~70 KB 内部 SRAM，摄像头 DMA 描述符可能分配失败，esp_camera_init() 返回 ESP_ERR_NO_MEM。
+
+确实必须先连 WiFi（比如按 WiFi 结果决定分辨率），就连上后 esp_camera_deinit() 再重新 init 一次。
+:::
+
+## 七、实打实踩过的坑
+
+| 坑 | 现象 | 原因 | 处理 |
+| --- | --- | --- | --- |
+| 没有 USB | 无法下载 | ESP32-CAM 只引出 UART 排针 | 用 USB-TTL 转接板 |
+| IO0 忘了断开 | 上传成功但不运行 | 停在下载模式 | 断开 IO0 后按 RST |
+| 没开 PSRAM | fb_get 返回 NULL | 帧缓冲放不下 | 确认 PSRAM + CAMERA_FB_IN_PSRAM |
+| 忘 fb_return | 几帧后卡死重启 | 缓冲区泄漏 | 每次 fb_get 配一次 fb_return |
+| 供电不足 | 重启、画面撕裂 | 摄像头 + WiFi 峰值叠加 | 5V/2A 独立电源 |
+| XCLK 冲突 | 上电进下载模式 | GPIO0 是 strapping pin | 上电后补按 RST |
+| 闪光灯 GPIO4 | 一开灯就花屏 | GPIO4 同时是 SD 卡 D1 | 开灯时不要用 SD 卡 |
+| quality 设成 0 | 带宽打满、卡顿 | 0 是最高质量 | 用 20~32 |
+| 先连 WiFi | cam_init 失败 | 内部 SRAM 不够 | 先初始化摄像头 |
+| 排线反插 | 全黑或全绿 | FPC 方向错误 | 金手指朝向要对 |
+
+### 供电：两个峰值叠在一起
+
+| 时刻 | 电流 |
+| --- | --- |
+| 摄像头空闲 | 约 100 mA |
+| 抓图瞬间 | 约 200 mA |
+| WiFi 发射瞬间 | 约 500 mA（峰值） |
+| **抓图 + WiFi 发射** | **约 700 mA** |
+
+从电脑 USB 口（500 mA）取电时，这两个峰值撞在一起就是必然的欠压复位。
+
+**ESP32-CAM 板载没有稳压余量，务必用 5V/2A 独立电源**，并且电源线不要用细杜邦线：0.5 m 的 26AWG 线在 700 mA 下有约 0.3 V 压降，足够触发 brownout。
+
+### 摄像头花屏的三种典型画面
+
+| 画面 | 原因 |
+| --- | --- |
+| 全绿 / 全粉 | 排线接触不良或方向反了 |
+| 上半正常、下半撕裂 | PCLK 太快，把 xclk_freq_hz 从 20 MHz 降到 10 MHz |
+| 大面积噪点、颜色错位 | 供电不足，先换电源再看代码 |
+
+前两种看画面就能定性，不需要示波器——这是排查摄像头最快的方法。
+
+## 八、最小可跑骨架
+
+```cpp
+void setup() {
+  Serial.begin(115200);
+  /* 1. 先摄像头，后 WiFi —— 顺序反了会 OOM */
+  if (esp_camera_init(&config) != ESP_OK) {
+    Serial.println("摄像头初始化失败：查 PSRAM / 排线 / 供电");
+    return;
+  }
+  /* 2. 连 WiFi */
+  WiFi.begin(SSID, PASS);
+  /* 3. 起 HTTP 服务 */
+  httpd_config_t hc = HTTPD_DEFAULT_CONFIG();
+  hc.server_port = 81;            /* 80 常被别的服务占，用 81 */
+  hc.ctrl_port   = 32768;
+  httpd_start(&server, &hc);
+  httpd_uri_t uri = { .uri = "/stream", .method = HTTP_GET,
+                      .handler = stream_handler };
+  httpd_register_uri_handler(server, &uri);
+  Serial.printf("打开 http://%s:81/stream\n",
+                WiFi.localIP().toString().c_str());
+}
+```
+
+浏览器直接访问 http://板子IP:81/stream 即可看到画面。整个骨架不超过 60 行，是教学项目最省事的起点。

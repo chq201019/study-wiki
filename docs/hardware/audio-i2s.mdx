@@ -1,0 +1,369 @@
+---
+title: 语音输入输出（I2S）
+description: I2S 协议原理与四根线、INMP441/MAX98357A/PCM5102 接法、采样率位深取舍、三种语音识别方案与实战坑
+sidebar_position: 111
+---
+
+# 语音输入输出（I2S）
+
+麦克风和喇叭都不用模拟信号进 ESP32。因为 ESP32 的 ADC 噪声大、精度有限（12 位、有效位约 9~10 位），做音频采集会满是底噪。正确的做法是**让音频从头到尾走数字**：麦克风自己完成 ADC，ESP32 只收 I2S 数据流。
+
+## 一、为什么音频不能走 I2C 或 SPI
+
+| 总线 | 速率上限 | 16 kHz / 16 bit 单声道需要 | 结论 |
+| --- | --- | --- | --- |
+| I2C 100 kHz | 约 100 kbit/s | 256 kbit/s | 差 3 倍，不够 |
+| I2C 400 kHz | 约 400 kbit/s | 256 kbit/s | 勉强，但 CPU 全程搬数据 |
+| SPI 10 MHz | 约 10 Mbit/s | 256 kbit/s | 速率够，但**没有时钟同步语义** |
+| **I2S** | 数十 Mbit/s | 256 kbit/s | 专用音频外设，DMA 搬运 |
+
+I2S 和 SPI 的区别不在速率，在**语义**：
+
+- I2S 有专门的 **LRCLK（左右声道选择）**，硬件按采样点自动切换左右声道，不需要软件拼帧
+- I2S 有 **DMA**，一帧数据搬完才中断一次，CPU 占用接近 0；SPI 高频下频繁中断会吃掉大量 CPU
+- I2S 的位时钟严格等于 采样率 × 位深 × 声道数，时钟由硬件分频产生，抖动小
+
+:::warning[但配置寄存器仍然用 I2C]
+INMP441、MAX98357A 这类模块**不需要配置**（接上就能用），所以没有 I2C。
+
+PCM5102、ES8388 这类编解码器要先通过 I2C 写寄存器才能工作——那是控制通道，音频数据仍然走 I2S。**别把两条总线搞混。**
+:::
+
+## 二、I2S 的四根线
+
+| 信号 | 别名 | 方向 | 作用 |
+| --- | --- | --- | --- |
+| **BCLK** | SCK / SCLK | 主控 → 从机 | 位时钟，每个 bit 一个脉冲 |
+| **LRCLK** | WS / WCLK / LRC | 主控 → 从机 | 声道选择：低=左声道，高=右声道 |
+| **DIN** | SD / SDI / DATA | 从机 → 主控 | 输入数据（麦克风用） |
+| **DOUT** | SD / SDO | 主控 → 从机 | 输出数据（功放用） |
+
+关键关系：
+
+```text
+BCLK 频率 = 采样率 × 位深 × 声道数
+16 kHz / 16 bit / 单声道  → 16000 × 16 × 2 = 512 kHz
+44.1 kHz / 16 bit / 立体声 → 44100 × 16 × 2 = 1.41 MHz
+```
+
+（乘 2 是因为 I2S 标准是双声道帧结构，即使单声道也占满两个时隙）
+
+:::danger[BCLK 和 LRCLK 都由 ESP32 产生]
+模块是**从机**，时钟由 ESP32 做主机产生。所以采集时 ESP32 是 I2S 主机，播放时还是主机。
+
+两块 I2S 外设（I2S_NUM_0 / I2S_NUM_1）可以一个采集一个播放，这就是**全双工**的基础。
+:::
+
+## 三、三个常用模块
+
+### INMP441 —— 数字麦克风
+
+| 项目 | 参数 |
+| --- | --- |
+| 接口 | I2S 从机，只输出 |
+| 供电 | 3.3V（**不能接 5V**） |
+| 电流 | 约 1.4 mA |
+| 位深 | 24 bit（ESP32 侧按 32 bit 读，低位补 0） |
+| 信噪比 | 61 dB |
+| 声道选择 | L/R 引脚：接 GND = 左声道，接 VCC = 右声道 |
+
+接线（ESP32-S3）：
+
+```text
+INMP441      ESP32-S3
+VDD    ────  3.3V
+GND    ────  GND
+L/R    ────  GND        ← 选左声道
+SCK    ────  GPIO14     ← BCLK
+WS     ────  GPIO15     ← LRCLK
+SD     ────  GPIO32     ← DIN，麦克风输出
+```
+
+:::danger[INMP441 的 L/R 必须接，不能悬空]
+L/R 悬空时输出数据在左右时隙里随机出现，表现为**采集到的波形一半是 0、一半是声音**，或者音量忽大忽小。
+
+接 GND 固定左声道，代码里也只读左声道。
+:::
+
+### MAX98357A —— I2S 功放
+
+| 项目 | 参数 |
+| --- | --- |
+| 接口 | I2S 从机，只输入 |
+| 供电 | 2.5~5.5V（5V 输出功率更大） |
+| 输出 | 3.2 W（4Ω 负载，5V 供电） |
+| 需要配置 | 不需要，接上就叫 |
+| 内置 | DAC + D 类功放 |
+| 增益设定 | GAIN 引脚：悬空 9 dB，接 GND 15 dB，接 VDD 12 dB |
+
+接线：
+
+```text
+MAX98357A    ESP32-S3
+VIN    ────  5V         ← 5V，不是 3.3V
+GND    ────  GND
+LRC    ────  GPIO16     ← LRCLK
+BCLK   ────  GPIO17     ← BCLK
+DIN    ────  GPIO18     ← DOUT，主控输出
+SD     ────  悬空        ← 悬空=正常工作；接 GND=关机
+```
+
+:::warning[SD 引脚不是"数据"，是关断]
+MAX98357A 的 SD 是 **shutdown**，拉低就静音。
+
+有人把它当数据线接到了 SPI 的 MOSI 上，结果**永远没声音**。悬空或接 VDD 才是正常工作。
+:::
+
+### PCM5102 —— 纯 DAC
+
+| 项目 | 参数 |
+| --- | --- |
+| 接口 | I2S 从机，只输入 |
+| 输出 | 模拟音频（接有源音箱或耳机） |
+| 供电 | 3.3V |
+| 需要配置 | 板上跳线，一般不用 I2C |
+| 位深 | 最高 32 bit / 384 kHz |
+
+接它是因为要接**有源音箱**（3.5 mm 口）。MAX98357A 只能直推喇叭，不能接音箱。
+
+## 四、采样率与位深的取舍
+
+| 场景 | 采样率 | 位深 | 单声道数据率 |
+| --- | --- | --- | --- |
+| 语音识别（云端 ASR） | **16 kHz** | 16 bit | 32 KB/s |
+| 语音识别（ESP-SR 本地） | **16 kHz** | 16 bit | 32 KB/s |
+| 语音通话 / 对讲 | 8 kHz | 16 bit | 16 KB/s |
+| 音乐播放 | **44.1 kHz** | 16 bit | 88 KB/s |
+| 高保真 | 48 kHz | 24 bit | 144 KB/s |
+
+**16 kHz 是语音识别的标准**，原因很实在：
+
+- 人声主要能量在 300~3400 Hz，按奈奎斯特定理 8 kHz 就够，但 ASR 模型训练时用的是 16 kHz 数据，喂 8 kHz 进去识别率明显下降
+- 44.1 kHz 对语音是纯浪费：数据量翻 2.75 倍，识别率一点不涨，还多占内存和带宽
+
+:::danger[44.1 kHz 才是音乐]
+放 MP3/WAV 必须 44.1 kHz。用 16 kHz 播音乐的表现是**声音发闷、像隔着门听**，8 kHz 以上的频率被丢了，高音全没。
+
+反过来，**不要用 44.1 kHz 采集语音**：数据量翻 2.75 倍，WiFi 上传慢，云端 ASR 还要重采样。
+:::
+
+位深：麦克风采集一律 **32 bit 读、24 bit 有效**（INMP441 是 24 位器件，ESP32 按 32 位左对齐读，低 8 位是噪声，右移后再用）。播放用 16 bit 就够。
+
+## 五、语音识别三种方案
+
+| 方案 | 代表 | 联网 | 延迟 | 识别范围 | 成本 | 上手难度 |
+| --- | --- | --- | --- | --- | --- | --- |
+| **本地离线** | ESP-SR（乐鑫官方） | 不需要 | 100~300 ms | 固定命令词（几十条） | 0（占 Flash） | 中 |
+| **云端 ASR** | 百度 / 讯飞 / Whisper API | 必须 | 500 ms~3 s | 任意语句 | 按次计费 | 中 |
+| **专用模块** | SU-03T、LD3320、ASR-PRO | 不需要 | 100~500 ms | 固定命令词 | 10~50 元 | 低 |
+
+### 本地离线：ESP-SR
+
+乐鑫官方组件，跑在 ESP32-S3 上。两种模式：
+
+- **WakeNet**（唤醒词）：一直监听，听到「你好小智」才唤醒，功耗低
+- **MultiNet**（命令词）：识别 20~200 条自定义命令词，每条 3~5 个汉字
+
+```bash
+idf.py add-dependency "espressif/esp-sr"
+```
+
+:::warning[ESP-SR 只支持 ESP32-S3 和 ESP32-P4]
+经典 ESP32 没有向量指令，算力跑不动；ESP32-C3 单核也不行。
+
+买板子前先确认型号，否则组件装上了也链接不过（undefined reference to esp_srmodel_init）。
+:::
+
+### 云端 ASR：流程与代价
+
+```text
+麦克风 → I2S 采集 16 kHz / 16 bit 单声道
+       → 缓冲 1~3 秒（32~96 KB）
+       → 打包成 WAV（44 字节头）或裸 PCM
+       → HTTP POST / WebSocket 上传
+       → 服务器返回文本
+```
+
+代价三条：必须联网、0.5~3 秒延迟、每句话都要传 32 KB 以上数据。
+
+### 专用模块：SU-03T / ASR-PRO
+
+离线、便宜、接线简单（串口发命令字），缺点是命令词固定、改了要重新烧写模块。
+
+**中小学项目推荐这条**：不占 ESP32 算力，不用联网，改命令词用图形界面就行。
+
+## 六、代码：I2S 采集（INMP441）
+
+```cpp
+#include "driver/i2s_std.h"
+#include "esp_log.h"
+
+static const char *TAG = "mic";
+static i2s_chan_handle_t rx_chan;
+
+void mic_init(void) {
+  /* 1. 创建通道：只收不发 */
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  chan_cfg.dma_desc_num  = 8;      /* DMA 描述符个数 */
+  chan_cfg.dma_frame_num = 256;    /* 每个描述符的帧数 */
+  ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &rx_chan));
+
+  /* 2. 标准模式配置 */
+  i2s_std_config_t std_cfg = {
+      .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(16000),   /* 语音识别用 16k */
+      .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+                      I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+      .gpio_cfg = {
+          .mclk = I2S_GPIO_UNUSED,     /* INMP441 不需要 MCLK */
+          .bclk = GPIO_NUM_14,
+          .ws   = GPIO_NUM_15,
+          .dout = I2S_GPIO_UNUSED,     /* 只收，不用 dout */
+          .din  = GPIO_NUM_32,
+          .invert_flags = {
+              .mclk_inv = false,
+              .bclk_inv = false,
+              .ws_inv   = false,
+          },
+      },
+  };
+  ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_chan, &std_cfg));
+  ESP_ERROR_CHECK(i2s_channel_enable(rx_chan));
+}
+
+/* 读一批采样，转成 int16 */
+size_t mic_read(int16_t *out, size_t samples) {
+  static int32_t raw[512];
+  size_t bytes_read = 0;
+  size_t want = samples * sizeof(int32_t);
+  if (i2s_channel_read(rx_chan, raw, want, &bytes_read, 1000) != ESP_OK) {
+    ESP_LOGE(TAG, "i2s 读超时");
+    return 0;
+  }
+  size_t n = bytes_read / sizeof(int32_t);
+  for (size_t i = 0; i < n; i++) {
+    out[i] = (int16_t)(raw[i] >> 14);   /* 24 位有效 → 16 位 */
+  }
+  return n;
+}
+```
+
+:::danger[24 位麦克风右移多少位]
+INMP441 输出 24 位数据，ESP32 按 32 位读时左对齐（高 24 位有效，低 8 位为 0）。
+
+正确做法是右移 **14~16 位**得到 16 位。移少了声音正常但底噪大，移多了音量小。
+
+**判断标准**：安静环境读到的绝对值应在 100~500，正常说话峰值 8000~20000。超出就调移位数。
+:::
+
+## 七、代码：I2S 播放（MAX98357A）
+
+```cpp
+static i2s_chan_handle_t tx_chan;
+
+void speaker_init(void) {
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
+  ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_chan, NULL));
+
+  i2s_std_config_t std_cfg = {
+      .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(44100),   /* 播放音乐用 44.1k */
+      .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+                      I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+      .gpio_cfg = {
+          .mclk = I2S_GPIO_UNUSED,
+          .bclk = GPIO_NUM_17,
+          .ws   = GPIO_NUM_16,
+          .dout = GPIO_NUM_18,
+          .din  = I2S_GPIO_UNUSED,
+          .invert_flags = { false, false, false },
+      },
+  };
+  ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_chan, &std_cfg));
+  ESP_ERROR_CHECK(i2s_channel_enable(tx_chan));
+}
+
+void speaker_play(const int16_t *pcm, size_t samples) {
+  size_t written = 0;
+  i2s_channel_write(tx_chan, pcm, samples * sizeof(int16_t), &written, 1000);
+}
+```
+
+## 八、实打实踩过的坑
+
+| 坑 | 现象 | 原因 | 处理 |
+| --- | --- | --- | --- |
+| 麦克风与功放共用电源 | 持续「嘶——」底噪 | D 类功放开关噪声串到麦克风 | 两路独立供电 |
+| I2S 时钟抖动 | 高频破音、像碎了 | 时钟引脚走线过长 | 时钟线尽量短、远离功放输出 |
+| 全双工不回声消除 | 喇叭放什么麦克风就收什么 | 声学回授 | 开 AEC 或用半双工 |
+| 喇叭功率不匹配 | 音量一大就重启 | 电流峰值超电源能力 | 算电流 + 大电容 |
+| L/R 悬空 | 波形一半是 0 | 声道时隙未定义 | L/R 接 GND |
+| 32 位当 16 位读 | 全是噪声 | 位深不匹配 | 按 32 位读后右移 |
+| ESP-SR 编译失败 | 链接报错 | 芯片不支持 | 换 ESP32-S3 |
+| MAX98357A SD 接错 | 永远没声音 | SD 是关断脚 | 悬空或接 VDD |
+
+### 底噪：麦克风和功放必须分开供电
+
+这是 I2S 项目的第一号问题，而且**用耳机听不出来，用示波器才看得清**。
+
+D 类功放（MAX98357A）靠高频 PWM 开关输出，开关频率约 300 kHz。噪声通过两条路串进麦克风：
+
+1. **电源路径**：同一条 3.3V 上，功放电流尖峰拉低电压，麦克风的 ADC 参考跟着抖
+2. **空间耦合**：喇叭线离麦克风线近了，直接辐射进去
+
+表现：静音时录音里是持续的「嘶——」或「哒哒哒」，音量跟功放输出功率成正比。
+
+处理方法，按有效性排序：
+
+1. **两路独立电源**（最彻底）：麦克风用一路 3.3V LDO，功放用 5V，只在电源入口共地
+2. 功放电源并联 **470 µF 电解 + 100 nF 陶瓷**，吸收开关尖峰
+3. 麦克风线用**屏蔽线**，屏蔽层单端接地
+4. 软件加**高通滤波**（截止 100 Hz）能去掉低频嗡声，但对高频嘶声无效
+
+:::danger[只加电容不改供电是治不好的]
+470 µF 电容能压住瞬态跌落，但压不住持续的开关噪声耦合。要真静音必须**断开供电路径**。
+:::
+
+### I2S 对时钟抖动敏感
+
+BCLK 抖动 1% 就会让音频出现可闻失真（高频破音、像信号不好）。
+
+具体约束：
+
+- BCLK / LRCLK 走线**尽量短**，别超过 10 cm，不要和功放输出线并行
+- 不要用长杜邦线拉 I2S，尤其是面包板
+- ESP32 的 I2S 时钟由 APLL 或 PLL_D2 分频得到，**44.1 kHz 在 PLL_D2 下存在小数分频误差**，听感上是轻微走音；要求高时用 I2S_CLK_SRC_APLL（但 APLL 只有 I2S_NUM_0 能用）
+
+### 全双工：回声消除是必答题
+
+采集和播放同时跑时，喇叭的声音会被自己的麦克风收进去，形成**正反馈啸叫**（几秒内音量飙到最大）。
+
+三条路：
+
+| 做法 | 效果 | 代价 |
+| --- | --- | --- |
+| 半双工（说完再放） | 彻底没有回声 | 不能像打电话那样打断 |
+| 软件 AEC（ESP-SR 的 aec 组件） | 能压 20~30 dB | 吃 CPU，要参考信号 |
+| 物理隔离（麦克风远离喇叭、加隔音棉） | 压 10~15 dB | 结构受限 |
+
+中小学项目优先**半双工**：按键说话、松开播放。实现简单，效果确定。
+
+### 喇叭功率与电源电流
+
+| 喇叭 | 供电 | 峰值电流 | 需要的电源 |
+| --- | --- | --- | --- |
+| 8Ω 1W | 5V | 约 350 mA | 5V/1A |
+| 4Ω 3W | 5V | 约 700 mA | 5V/2A |
+| 4Ω 3W | 3.3V | 约 500 mA | 3.3V/1.5A |
+
+从 ESP32 开发板的 3.3V 引脚取电给功放，音量开到 70% 以上就会 brownout 重启。
+
+**独立 5V + 1000 µF 电容**是标配。另外注意喇叭阻抗：MAX98357A 标称 4Ω，接 8Ω 只是音量小一半不会坏；接 2Ω 会过流保护。
+
+## 九、最小完整链路
+
+```text
+INMP441 ──I2S0(收)──> ESP32-S3 ──I2S1(发)──> MAX98357A ──> 喇叭
+   3.3V 独立 LDO ──┘         └── 5V 独立电源（1000µF）
+                        GND 单点共地
+```
+
+这个结构能同时避开底噪、欠压复位和啸叫三个坑。接线时唯一容易错的地方是 **INMP441 的 SD 接主控 DIN，MAX98357A 的 DIN 接主控 DOUT**——两个模块都叫 DIN/SD，但方向相反。

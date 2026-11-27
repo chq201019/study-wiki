@@ -1,0 +1,340 @@
+---
+title: Flash 存储与 NVS
+description: 分区表怎么排、NVS 和 LittleFS 怎么选、10 万次擦写寿命怎么绕，以及改分区表把板子变砖的几种方式
+sidebar_position: 102
+---
+
+# Flash 存储与 NVS
+
+ESP32 断电还能记住东西，全靠板载那颗 SPI NOR Flash。它不是硬盘：
+**只能整扇区擦除（4KB），写入只能把 1 变 0**。所有上层机制都在绕这两条。
+
+## Flash 的物理事实
+
+| 参数 | 值 | 影响 |
+|---|---|---|
+| 扇区（sector） | 4096 B | 擦除的最小单位 |
+| 页（page） | 256 B | 编程的最小单位 |
+| 擦写寿命 | 约 100,000 次 | 单扇区，超出后可能变只读或出错 |
+| 写入前 | 必须先擦 | 不能原地覆盖 |
+| 擦后状态 | 全 `0xFF` | 写入是把 1 变 0 |
+
+「覆盖写」在硬件层面不存在。`esp_partition_write` 只能写到已擦除的区域，
+想改一个字节也得先读出整个 4KB 扇区、擦掉、再写回。NVS 和文件系统做的就是这件事的自动化。
+
+容量和芯片型号强绑定，别拿 4MB 的分区表烧到 8MB 的板子上想着「反正够用」：
+多出来的空间不会自动可用，分区之外的部分是浪费的。
+
+## 分区表长什么样
+
+一张 4MB Flash 的典型排布：
+
+```text
+0x000000 ┌──────────────────────────────┐
+         │ bootloader   0x8000 (32KB)   │  ← 二级 bootloader
+0x008000 ├──────────────────────────────┤
+         │ partition table 0x1000 (4KB) │  ← 最多 95 个条目
+0x009000 ├──────────────────────────────┤
+         │ nvs          0x6000 (24KB)   │  ← 键值对
+0x00F000 ├──────────────────────────────┤
+         │ phy_init     0x1000 (4KB)    │  ← RF 校准数据
+0x010000 ├──────────────────────────────┤
+         │ factory app  0x140000 (1.25MB)│ ← 你的程序
+0x150000 ├──────────────────────────────┤
+         │ storage      0x160000        │  ← SPIFFS / LittleFS 数据
+0x2B0000 ├──────────────────────────────┤
+         │ (空闲)                        │
+0x400000 └──────────────────────────────┘
+```
+
+对应 `partitions.csv`：
+
+```csv
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  0x140000,
+storage,  data, spiffs,  0x150000, 0x160000,
+```
+
+```cmake
+# CMakeLists.txt
+idf_component_register(SRCS "main.c")
+# 让 idf.py 用这张表
+```
+
+```text
+# idf.py menuconfig → Partition Table
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+```
+
+三条硬规则，违反一条就是启动失败或变砖：
+
+1. **每个 Offset 必须 4KB 对齐**（`0x1000` 的整数倍）。写 `0x9100` 编译能过，
+   运行到 `esp_partition_find` 时返回 `ESP_ERR_INVALID_ARG`。
+2. **app 分区的 Offset 必须 64KB 对齐**（`0x10000` 的整数倍）。这是 flash 的
+   MMU 页映射要求，错了会在 `esp_image_verify` 阶段挂掉，重启循环。
+3. **分区之间不能重叠**，且 size 加起来不能超过 Flash 容量。烧写时 `esptool` 只会警告，
+   不会阻止你。
+
+## 代码里怎么用这些分区
+
+不用把偏移硬编码进代码 —— 用名字查：
+
+```c
+#include "esp_partition.h"
+
+const esp_partition_t *p = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "storage");
+if (!p) {
+    ESP_LOGE(TAG, "分区不存在，检查 partitions.csv");
+    return;
+}
+ESP_LOGI(TAG, "storage @ 0x%lx, %lu KB", p->address, p->size / 1024);
+
+/* 裸读裸写（必须先擦）*/
+static uint8_t buf[4096];
+ESP_ERROR_CHECK(esp_partition_read(p, 0, buf, sizeof(buf)));
+ESP_ERROR_CHECK(esp_partition_erase_range(p, 0, 4096));
+ESP_ERROR_CHECK(esp_partition_write(p, 0, buf, sizeof(buf)));
+```
+
+改分区表之后，第一次 `idf.py flash` 一定要带擦除：`idf.py erase-flash flash`。
+不擦的话旧分区表还在，新固件按旧布局读数据，会读到错位的内容 —— 表现为
+「代码改了没生效」或者「NVS 里读出乱码」。
+
+## NVS 内部：为什么键名只能 15 个字符
+
+| 结构 | 大小 | 说明 |
+|---|---|---|
+| 页（page） | 4096 B | NVS 的最小管理单位 |
+| 条目（entry） | 32 B | 一条键值记录 |
+| 每页条目 | 126 | 32 × 126 = 4032，剩 64B 是页头 |
+| 键名长度 | **≤ 15 字节** | `NVS_KEY_NAME_MAX_SIZE` − 1 |
+| 命名空间名 | **≤ 15 字节** | 同上 |
+
+键名超了，`nvs_set_*` 返回 `ESP_ERR_NVS_KEY_TOO_LONG`，然后如果你没检查返回值，
+就会以为存进去了，下次开机读不到，再回头怀疑电源。
+
+NVS 的写入是追加式的：**改一个值不是原地改，而是在页末尾追加一条新记录**，
+旧记录标记为已删除。页写满之后才做一次垃圾回收（把有效条目搬到新页、擦掉旧页）。
+这就是它的写入均衡 —— 不是简单的扇区轮转，而是分摊到整个 nvs 分区。
+
+代价：**同一个键高频重写会快速消耗该页的擦写次数**。24KB 的 nvs 只有 6 个页，
+每写约 126 次触发一次 GC。每秒写一次，一天就是 86,400 次 → 几个小时就能吃掉
+一个页的大部分寿命预算。
+
+## NVS 完整示例（ESP-IDF）
+
+```c
+#include "nvs_flash.h"
+#include "nvs.h"
+
+static const char *TAG = "nvs";
+static nvs_handle_t s_h;
+
+void storage_init(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        /* 分区满了，或者旧固件留下不兼容的格式 —— 只能擦掉重来 */
+        ESP_LOGW(TAG, "nvs 需要重新初始化: %s", esp_err_to_name(err));
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+    ESP_ERROR_CHECK(nvs_open("cfg", NVS_READWRITE, &s_h));
+}
+
+void save_threshold(int32_t v)
+{
+    ESP_ERROR_CHECK(nvs_set_i32(s_h, "thr", v));
+    ESP_ERROR_CHECK(nvs_commit(s_h));      /* 不 commit 就是没存 */
+}
+
+int32_t load_threshold(int32_t dflt)
+{
+    int32_t v;
+    esp_err_t err = nvs_get_i32(s_h, "thr", &v);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return dflt;
+    ESP_ERROR_CHECK(err);
+    return v;
+}
+
+/* 存任意结构体 */
+typedef struct { float kp, ki, kd; uint16_t rate; } pid_cfg_t;
+
+void save_pid(const pid_cfg_t *c)
+{
+    nvs_set_blob(s_h, "pid", c, sizeof(*c));
+    nvs_commit(s_h);
+}
+
+bool load_pid(pid_cfg_t *c)
+{
+    size_t len = sizeof(*c);
+    return nvs_get_blob(s_h, "pid", c, &len) == ESP_OK && len == sizeof(*c);
+}
+```
+
+注意 `nvs_get_blob` 的 `len` 是**输入输出参数**：进去时给缓冲区大小，出来时给实际大小。
+只在外面检查返回值、不检查 `len`，结构体加了字段之后就会读到旧长度的数据，
+后面几个字段是随机值。
+
+## Arduino 下的 Preferences 库
+
+```cpp
+#include <Preferences.h>
+
+Preferences prefs;
+
+void setup() {
+  Serial.begin(115200);
+
+  prefs.begin("cfg", false);            // false = 读写；true = 只读
+  int32_t thr = prefs.getInt("thr", 40); // 第二个参数是默认值
+  Serial.printf("thr = %d\n", thr);
+
+  prefs.putInt("thr", 45);
+  prefs.putString("ssid", "my-wifi");
+  prefs.putFloat("kp", 1.25f);
+
+  size_t n = prefs.getBytesLength("pid");
+  if (n) {
+    uint8_t buf[32];
+    prefs.getBytes("pid", buf, n);
+  }
+
+  prefs.remove("thr");   // 删一个键
+  prefs.end();           // 必须调，否则句柄不释放
+}
+
+void loop() {}
+```
+
+`Preferences` 是 NVS 的薄封装，**所有限制完全一样**：键名 15 字符、命名空间 15 字符。
+它比裸 NVS 少了显式 commit（`putXxx` 内部就提交了），所以别在循环里调 `putInt`——
+每次都是一次完整的 NVS 写入。
+
+## SPIFFS / LittleFS：什么时候需要文件
+
+| 需求 | 用 NVS | 用 LittleFS |
+|---|---|---|
+| 存 WiFi 密码、阈值、PID 参数 | ✅ | 小题大做 |
+| 存几百条结构化配置 | ⚠️ 键名不够用 | ✅ |
+| 追加日志、按时间轮转 | ❌ | ✅ |
+| 存网页 / 图片 / 音频 | ❌ | ✅ |
+| 需要目录结构 | ❌ | ✅ |
+| 单条数据要原子更新 | ✅ | ⚠️ 要自己写 tmp+rename |
+| 高频写（每分钟多次） | ⚠️ 磨损 | ⚠️ 磨损更严重 |
+
+**SPIFFS 已经不建议用了**（上游标记为 retired）：它是为极小分区设计的，大于 4MB 时
+挂载时间指数增长，且没有掉电保护和目录。ESP-IDF v5 推荐 LittleFS，
+分区表的 SubType 仍写 `spiffs`（`ESP_PARTITION_SUBTYPE_DATA_SPIFFS` 同时代表两者），
+挂载时用 `esp_littlefs_mount()`，需要额外装 `joltwallet/littlefs` 组件。
+
+```text
+idf.py add-dependency "joltwallet/littlefs^1.14.0"
+```
+
+```c
+#include "esp_littlefs.h"
+
+esp_vfs_littlefs_conf_t conf = {
+    .base_path = "/littlefs",
+    .partition_label = "storage",
+    .format_if_mount_failed = true,   // 首次上电必须 true，量产改成 false
+    .dont_mount = false,
+};
+ESP_ERROR_CHECK(esp_vfs_littlefs_register(&conf));
+
+size_t total = 0, used = 0;
+esp_littlefs_info("storage", &total, &used);
+ESP_LOGI(TAG, "已用 %u / %u KB", (unsigned)(used / 1024), (unsigned)(total / 1024));
+```
+
+`format_if_mount_failed = true` 只在第一次烧写时开。分区是空的，不 format 就挂不上；
+但量产固件里开着它，一次 mount 抖动就会把用户数据全清掉。
+
+## 写入均衡：自己动手的三种做法
+
+Flash 寿命是 10 万次/扇区，这是**物理**上限，软件只能推迟。
+
+**做法一：降低频率。** 最有效。传感器数据在 RAM 里攒够 60 条再写一次，
+写入次数直接降到 1/60。掉电最多丢 60 条。
+
+**做法二：多副本轮转。** 计数器这类「每次开机 +1」的字段，开 8 个键 `cnt0..cnt7`，
+每次写 index = 总次数 % 8，读的时候取所有键里的最大值：
+
+```c
+#define CNT_SLOTS 8
+
+void bump_counter(void)
+{
+    uint32_t best = 0;
+    char key[8];
+    for (int i = 0; i < CNT_SLOTS; i++) {
+        snprintf(key, sizeof(key), "c%d", i);
+        uint32_t v = 0;
+        if (nvs_get_u32(s_h, key, &v) == ESP_OK && v > best) best = v;
+    }
+    snprintf(key, sizeof(key), "c%d", (best + 1) % CNT_SLOTS);
+    nvs_set_u32(s_h, key, best + 1);
+    nvs_commit(s_h);
+}
+```
+
+写放大从 1 降到 1/8，代价是读的时候要遍历 8 个键。8 个键的键名必须是
+`c0`–`c7` 这种短名字，因为总共只有 15 字符可用。
+
+**做法三：直接算，不存。** 累计运行小时数、总开关次数这类指标，
+能用 RTC 内存或时间戳推导的就别写 flash。真要长期保留，用 LittleFS 的追加日志，
+一次写入一整条记录，让文件系统去做扇区轮转。
+
+## 坑
+
+1. **不 `nvs_commit` 就是没存。** `nvs_set_i32` 只改 RAM 里的缓存，
+   commit 才落盘。用 `ESP_ERROR_CHECK(nvs_commit(h))`，不要裸调。
+2. **键名超过 15 字节直接失败。** `"temperature_threshold"`（21 字符）返回
+   `ESP_ERR_NVS_KEY_TOO_LONG`。用 `"thr"`、`"temp_hi"` 这种短名。
+   命名空间同理：`"config"` 可以，`"configuration"` 不行。
+3. **分区表改错会让板子变砖。** 三种死法：
+   - app 分区 Offset 不是 64KB 对齐 → 启动即 `invalid header` 循环重启；
+   - 把 nvs 分区改小了，但里面已有数据 → `ESP_ERR_NVS_NO_FREE_PAGES`；
+   - 分区总大小超过 Flash → 烧写成功但启动找不到分区。
+   救回来用 `esptool.py --chip esp32 erase_flash`（或 `idf.py erase-flash`）全擦，
+   再重新烧 bootloader + 分区表 + app。**这就是为什么改分区表前一定要备份
+   一份能跑的版本。**
+4. **`nvs_flash_erase()` 之后必须重新 `nvs_flash_init()`。** 顺序反了会拿到失效句柄，
+   后续所有操作返回 `ESP_ERR_NVS_INVALID_HANDLE`。
+5. **`ESP_ERR_NVS_NO_FREE_PAGES` 是正常现象，不是坏了。** 分区写满、
+   或者从旧固件升级上来格式不兼容，都会返回它。标准处理就是 erase + init 重试一次。
+6. **NVS 写满了不会自动扩容。** 默认 24KB（`0x6000`）大约能存 1500 条小记录。
+   存历史数据进 NVS 是最常见的误用 —— 那属于文件系统。
+7. **flash 加密 / secure boot 开着的时候，`nvs_keys` 分区不能丢。** 丢了之后
+   所有加密密钥无法解密，板子只能全擦重烧。改分区表时别顺手删掉那一行。
+8. **OTA 之后 NVS 还在，但 SPIFFS 可能被覆盖。** 双 app 分区（`ota_0`/`ota_1`）
+   的布局里，数据分区的位置必须避开两个 app 区。用 `idf.py partition-table` 看实际偏移。
+9. **LittleFS 挂载失败先看分区 SubType。** 类型写 `data, fat` 而不是 `data, spiffs`，
+   编译不报错，运行时 `esp_vfs_littlefs_register` 找不到分区。
+10. **`nvs_open` 的句柄是有限的。** 默认 `CONFIG_NVS_MAX_OPEN_HANDLES` 之类没有，
+    但同名命名空间反复 open 不 close 会一直占条目。用完 `nvs_close`。
+
+## 排错对照表
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `nvs_flash_init` 返回 `NO_FREE_PAGES` | 分区满 / 格式旧 | erase + init |
+| 写入成功但重启后读不到 | 没 commit | 检查每处 commit |
+| `nvs_get_*` 返回 `INVALID_LENGTH` | blob 长度不匹配 | 检查 `len` 输入输出 |
+| `KEY_TOO_LONG` | 键名 >15 字符 | 缩短 |
+| 分区找不到 | csv 没生效 / 没擦除 | `idf.py erase-flash flash` |
+| 启动日志 `invalid header: 0xffffffff` | app Offset 未 64KB 对齐 | 改成 `0x10000` 整数倍 |
+| LittleFS 挂不上 | SubType 写错 / 未 format | 首次 `format_if_mount_failed = true` |
+| 每次重启数据都回默认 | 写在了 `nvs_open(..., NVS_READONLY)` 的句柄上 | 改成 `NVS_READWRITE` |
+
+## 选型一句话
+
+**配置放 NVS，日志和资源放 LittleFS，出厂固定内容放 `const`（编进 app 分区）。
+三样都不要高频写 —— 写入次数是这颗 flash 唯一真正稀缺的资源。**

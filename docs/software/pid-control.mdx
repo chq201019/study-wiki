@@ -1,0 +1,471 @@
+---
+title: PID 控制实战
+description: P/I/D 三项在循迹小车上到底各管什么、积分饱和与 anti-windup 的具体写法、控制周期为什么必须固定，以及一套可直接编译的 PID 类与整定步骤
+sidebar_position: 107
+---
+
+# PID 控制实战
+
+循迹小车跑不直、到弯道冲出去、走 S 形，几乎都能归到同一个原因：**用了比例控制，但没处理稳态误差和超调**。
+PID 解决的就是这两件事。
+
+## 三项到底各管什么
+
+以循迹小车为例：传感器给出一个「偏离中线的量」ERR，正值表示偏右，负值表示偏左，0 表示正中。
+控制器要输出一个转向量 OUT 交给差速驱动。
+
+| 项 | 公式 | 物理意义 | 单独用它会发生什么 |
+|---|---|---|---|
+| **P** | Kp × error | 偏得越多，修得越狠 | 车能回中线，但**在弯道上永远差一点**（稳态误差）；Kp 大了就左右横摆 |
+| **I** | Ki × ∫error·dt | 把小误差累积起来，直到它消失 | 能消掉稳态误差，但**误差存在久了会攒成巨量**，一旦回正，车会猛地甩向反方向（积分饱和） |
+| **D** | Kd × d(error)/dt | 看误差变化的速度，提前刹车 | 能压住横摆、过弯更稳，但**对噪声极其敏感**，传感器抖一下就输出一个尖峰 |
+
+一句话记忆：**P 负责「现在」，I 负责「过去」，D 负责「未来」。**
+
+### 用循迹小车具体讲
+
+假设五路灰度传感器的权重是 -2 -1 0 +1 +2，全是黑线时算出的偏差在 -200 ~ +200 之间（乘了 100 便于整数运算）。
+
+- **只有 P**：输出 = Kp × 偏差。车往右偏，就往左打。但如果右轮比左轮天生慢一点（电机个体差异、电池夹接触电阻），车会稳定地偏在一个固定角度上跑——这时偏差是常数 e₀，P 输出也是常数，正好抵消左右轮差异，**车就永远歪着跑**。这就是稳态误差。
+- **加上 I**：只要有残余 e₀，积分项就持续增长，输出越来越偏向纠正方向，直到偏差真的变成 0。代价是车会先「过冲」一下再回来。
+- **再加上 D**：车从黑线左侧快速摆向右侧时，误差变化率是个大正数，D 项提前给出一个反向修正，摆幅被压下去。
+
+典型参数（五路灰度、误差范围 ±200、控制周期 10 ms、PWM 满量程 1023）：
+
+| 参数 | 取值 | 说明 |
+|---|---|---|
+| Kp | 3.0 | 满偏差时输出 600，接近满舵 |
+| Kd | 30.0 | 微分项在快速摆动时给出 100 ~ 300 的阻尼 |
+| Ki | 0.05 | 积分很慢，只用来吃掉长期偏差 |
+
+注意 Kd 比 Kp 大一个量级很正常：微分量是「误差的变化率」，单位是 error/s，数值天然比 error 大。
+
+## 为什么积分项会饱和
+
+积分项是**累加**：integral += error × dt。问题在于它没有上限。
+
+场景：小车被手按住，或者顶到墙，或者传感器正好卡在两个颜色之间。这时偏差是一个大的常数，比如 200。每 10 ms 累加一次：
+
+```text
+按住 10 秒：integral = 200 × 10 = 2000，Ki = 0.05 → 积分项输出 100
+按住 30 秒：integral = 200 × 30 = 6000，Ki = 0.05 → 积分项输出 300
+```
+
+更糟的是**输出已经限幅在 ±1023 了，但积分还在涨**。等车被放开，P 项已经变号了，积分项却还是 +300 的方向，车会朝错误方向全速冲出去，而且需要**同样长的时间**才能把这个积分「消化」掉。
+
+这就是「积分饱和（integral windup）」。现象：**卡住之后放开，车会朝反方向暴冲，暴冲持续时间约等于被卡住的时长**。
+
+### anti-windup 的三种做法
+
+| 方法 | 做法 | 效果 | 代价 |
+|---|---|---|---|
+| **钳位（clamping）** | 把 integral 限制在 out_min/Ki ~ out_max/Ki | 简单，能解决问题 | 参数跟着 Ki 变，换 Ki 要重调 |
+| **条件积分（conditional integration）** | 输出已饱和且误差方向会让饱和加剧时，**不累加** | 最干净，无需额外参数 | 逻辑多几行 |
+| **反算（back-calculation）** | integral -= (out_sat - out_raw) × Kt × dt | 恢复最平滑 | 多一个参数 Kt 要调 |
+
+工程上首选**条件积分**，代码里就是一个 if：
+
+```cpp
+// 只有在「没有饱和」或者「误差能把饱和拉回来」时才积分
+bool saturated = (out_unclamped > out_max) || (out_unclamped < out_min);
+if (!(saturated && (error * out_unclamped > 0))) {
+    integral += error * dt;
+}
+```
+
+含义：如果输出已经顶到上限，而这次的 error 还是正的（会让它更顶），就不积分。
+如果输出顶到上限但 error 已经变负（正在往回拉），继续积分——否则会僵在饱和状态出不来。
+
+## 控制周期为什么必须固定
+
+PID 的三项全都隐含「时间」：
+
+- 积分项 integral += error × dt：dt 变了，积分速度就变了。
+- 微分项 (error - last_error) / dt：dt 变了，微分增益就变了。
+- 即使你写的是简化版 Kd × (error - last_error)（不带除法），**实际微分增益仍然是 Kd / dt**。
+
+所以如果循环周期是浮动的（有时 8 ms，有时 25 ms，因为串口打印、WiFi 扫描、其他任务抢占），等效的 Ki 和 Kd 就会浮动几十个百分点。表现是：
+
+- 平时跑得好好的，一开 WiFi 就开始摆
+- 一加串口调试输出就震荡
+- 换个传感器（I2C 读得慢）参数就失效
+
+### Arduino：用 millis() 做固定节拍
+
+```cpp
+constexpr uint32_t CONTROL_PERIOD_MS = 10;   // 100 Hz
+
+uint32_t last_tick = 0;
+
+void loop()
+{
+    uint32_t now = millis();
+    if (now - last_tick < CONTROL_PERIOD_MS) return;   // 没到点就跳过
+    float dt = (now - last_tick) / 1000.0f;            // 用真实 dt，不用常数
+    last_tick = now;
+
+    int error = readLineError();
+    float out = pid.compute(error, dt);
+    setMotor(out);
+}
+```
+
+两个细节：
+
+1. 用 now - last_tick 而不是 now > last_tick + period：millis() 49.7 天溢出，前者是安全的。
+2. dt 用实测值而不是常数 0.01：万一某一拍被拖长了，用实测 dt 至少数学上是对的；用常数会让那一拍的等效增益暴涨。
+
+### ESP-IDF：用 xTaskDelayUntil
+
+最稳的是 vTaskDelayUntil，它按绝对节拍唤醒，不受任务执行时间累积漂移的影响：
+
+```c
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_timer.h"
+
+#define CONTROL_PERIOD_MS 10
+
+static void control_task(void *arg)
+{
+    TickType_t last_wake = xTaskGetTickCount();
+    int64_t last_us = esp_timer_get_time();
+
+    while (1) {
+        int64_t now_us = esp_timer_get_time();
+        float dt = (now_us - last_us) / 1000000.0f;
+        last_us = now_us;
+
+        pid_update(dt);
+
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CONTROL_PERIOD_MS));
+    }
+}
+
+void app_main(void)
+{
+    xTaskCreate(control_task, "ctrl", 4096, NULL, 10, NULL);
+}
+```
+
+:::danger[vTaskDelayUntil 在周期小于 tick 时会失效]
+默认 CONFIG_FREERTOS_HZ = 100，一个 tick 就是 10 ms。这时 pdMS_TO_TICKS(5) 会返回 0 或 1，节拍完全乱。
+要跑 5 ms 或更快的控制周期，必须先改 menuconfig：Component config → FreeRTOS → Kernel → configTICK_RATE_HZ = 1000。
+或者干脆用 esp_timer 的周期回调（微秒级），在回调里置个标志位，任务去等这个标志。
+:::
+
+:::warning[控制任务优先级要高于业务任务]
+PID 任务优先级设 10，WiFi/MQTT 那些默认是 5 左右。控制任务优先能保证节拍不被打断，代价是别的任务延迟变大——对小车来说这是正确的取舍。
+但**不要**把控制放在中断里：中断里除了 ledc_set_duty 这类操作不能做别的，且浮点运算在 ISR 里要保存 FPU 上下文，代价很高。
+:::
+
+## 可直接用的 PID 类（带限幅、抗饱和、微分先行）
+
+这个类在 Arduino 和 ESP-IDF（作为 C++ 组件）下都能直接编译，不依赖任何第三方库。
+
+```cpp
+// pid.hpp
+#pragma once
+#include <algorithm>
+
+class Pid {
+public:
+    struct Gains { float kp, ki, kd; };
+
+    Pid(Gains g, float out_min, float out_max)
+        : g_(g), out_min_(out_min), out_max_(out_max) {}
+
+    void setGains(Gains g) { g_ = g; }
+    void setSetpoint(float sp) { setpoint_ = sp; }
+
+    // 每个固定周期调一次。measurement 是实测值，dt 单位秒
+    float compute(float measurement, float dt)
+    {
+        if (dt <= 0.0f) return last_out_;
+
+        float error = setpoint_ - measurement;
+
+        // ---- 积分项：条件积分抗饱和 ----
+        float integral_candidate = integral_ + g_.ki * error * dt;
+        float p_term = g_.kp * error;
+        float d_term = -g_.kd * (measurement - last_measurement_) / dt;  // 微分先行
+        float out_unclamped = p_term + integral_candidate + d_term;
+
+        bool will_saturate_high = out_unclamped > out_max_;
+        bool will_saturate_low  = out_unclamped < out_min_;
+
+        // 饱和时，只有当误差能把输出往回拉，才继续积分
+        if ((will_saturate_high && error < 0.0f) ||
+            (will_saturate_low  && error > 0.0f) ||
+            (!will_saturate_high && !will_saturate_low)) {
+            integral_ = integral_candidate;
+            // 积分项自身也钳位，双保险，防止 dt 异常导致积分跳变
+            const float ki_guard = (g_.ki > 1e-6f) ? g_.ki : 1e-6f;
+            integral_ = std::clamp(integral_, out_min_ / ki_guard, out_max_ / ki_guard);
+        }
+
+        float out = g_.kp * error + integral_ + d_term;
+
+        // ---- 输出限幅 ----
+        if (out > out_max_) out = out_max_;
+        if (out < out_min_) out = out_min_;
+
+        last_measurement_ = measurement;
+        last_error_ = error;
+        last_out_ = out;
+        return out;
+    }
+
+    void reset(float measurement = 0.0f)
+    {
+        integral_ = 0.0f;
+        last_measurement_ = measurement;
+        last_error_ = 0.0f;
+        last_out_ = 0.0f;
+    }
+
+    float integralTerm() const { return integral_; }
+
+private:
+    Gains g_;
+    float out_min_, out_max_;
+    float setpoint_ = 0.0f;
+    float integral_ = 0.0f;
+    float last_measurement_ = 0.0f;
+    float last_error_ = 0.0f;
+    float last_out_ = 0.0f;
+};
+```
+
+### 用法（循迹小车）
+
+```cpp
+#include "pid.hpp"
+
+// 误差范围 ±200，输出是转向修正量 ±300
+Pid steer_pid({3.0f, 0.05f, 30.0f}, -300.0f, +300.0f);
+
+constexpr int BASE_SPEED = 500;
+constexpr uint32_t PERIOD_MS = 10;
+
+uint32_t last_tick = 0;
+
+void loop()
+{
+    uint32_t now = millis();
+    if (now - last_tick < PERIOD_MS) return;
+    float dt = (now - last_tick) / 1000.0f;
+    last_tick = now;
+
+    int error = readLineError();               // -200 .. +200，0 为居中
+
+    // setpoint = 0，measurement = -error（符号按你的传感器方向定）
+    float steer = steer_pid.compute((float)(-error), dt);
+
+    int l = BASE_SPEED - (int)steer;
+    int r = BASE_SPEED + (int)steer;
+    motorLeft (std::clamp(l, -1023, 1023));
+    motorRight(std::clamp(r, -1023, 1023));
+}
+```
+
+:::tip[微分先行（derivative on measurement）为什么更好]
+上面代码里微分项写成 -Kd × (measurement - last_measurement) / dt，而不是 Kd × (error - last_error) / dt。
+两者在**目标值不变**时完全等价，但目标值突变时（比如从「走直线」切到「走弧线」，目标偏差从 0 跳到 100）：
+误差微分会产生一个 100 / 0.01 = 10000 的尖峰，乘以 Kd 后输出直接顶死限幅，车会猛地一抽；测量微分完全不受影响，因为测量值是连续变化的。
+**凡是目标值会跳变的应用，都应该用测量微分。**
+:::
+
+## 参数整定：先 P 后 D 再 I
+
+不要三个参数一起调，那样永远调不出来。按这个顺序，每步只动一个：
+
+### 第 0 步：确认基础设定
+
+- dt 固定，已实测打印确认是 10 ms（误差 < 1 ms）。
+- 输出限幅已设。
+- 积分、微分先清零：Ki = 0, Kd = 0。
+- 传感器读数已滤波（见下面「坑 1」）。
+
+### 第 1 步：调 P，加到开始震荡再回退一半
+
+| Kp | 现象 |
+|---|---|
+| 太小 | 车反应迟钝，过弯冲出去 |
+| 合适 | 能回中线，但弯道上稳定偏移一点 |
+| 太大 | 左右横摆，摆幅越来越大 |
+
+找到「刚开始等幅摆」的 Kp，取它的 **50 %** 作为起点。比如加到 6.0 开始摆，就用 3.0。
+
+### 第 2 步：调 D，压住 P 留下来的横摆
+
+Kd 从 0 开始，每次加上 Kp 的 5 倍量级往上试（微分单位不同，Kd 通常比 Kp 大一个数量级）。
+判据：**入弯不再甩尾，直道不再左右微摆**。Kd 太大反而会有高频抖动（一顿一顿），这时说明你踩到了噪声，回去做滤波。
+
+### 第 3 步：调 I，最后才动，而且只加一点点
+
+只有当车在**直道上稳定地偏向一侧**（不是摆，是恒定偏移）时才需要 I。
+Ki 从 Kp × 0.01 开始，加大到偏移消失就停。加多了会看到「过弯后车头甩一下再回正」——那就是积分过冲。
+
+### 参考参数表（五路灰度循迹，输出 ±1023，误差 ±200，dt = 10 ms）
+
+| 场景 | Kp | Ki | Kd | 备注 |
+|---|---|---|---|---|
+| 慢速稳跑 | 2.0 | 0.02 | 15 | 优先稳定，比赛调试起点 |
+| 中速标准 | 3.0 | 0.05 | 30 | 常用值 |
+| 快速激进 | 4.5 | 0.08 | 45 | 需要低延迟传感器 |
+| 只有两路传感器 | 8.0 | 0 | 40 | 误差只有 -1/0/+1，Kp 要大 |
+
+## 坑 1：采样噪声没滤波就进微分项
+
+微分项是「差分 ÷ dt」。dt = 0.01 s 时，一个 1 单位的噪声就变成 100/秒 的变化率，乘 Kd = 30 就是 3000 的输出——**直接顶死限幅，电机全速抽一下**。
+
+现象：车不动的时候电机也「哒哒」抖，或者舵机持续轻微抽动。
+
+三种滤波，按代价从低到高：
+
+```cpp
+// ① 一阶低通（指数平滑），最常用，alpha 越小越平滑但延迟越大
+class LowPass {
+public:
+    explicit LowPass(float alpha) : a_(alpha) {}
+    float update(float x) { y_ = a_ * x + (1.0f - a_) * y_; return y_; }
+    void reset(float y) { y_ = y; }
+private:
+    float a_, y_ = 0.0f;
+};
+
+LowPass line_filter(0.4f);          // 循迹用 alpha = 0.4，延迟约 1.5 个控制周期
+float filtered = line_filter.update(readLineError());
+```
+
+```cpp
+// ② 中值滤波：专门杀孤立尖峰（比如反光点导致的错误读数）
+int median3(int a, int b, int c)
+{
+    if (a > b) { int t = a; a = b; b = t; }
+    if (b > c) { int t = b; b = c; c = t; }
+    if (a > b) { int t = a; a = b; b = t; }
+    return b;
+}
+error = median3(prev1, prev2, readLineError());
+```
+
+```cpp
+// ③ 微分项单独低通：只滤微分，不拖慢 P
+static float d_filt = 0;
+d_filt = 0.7f * d_raw + 0.3f * d_filt;
+```
+
+:::warning[滤波不是万能的]
+滤波引入相位延迟。alpha = 0.3 的一阶低通在 10 ms 周期下，等效延迟约 2 ~ 3 拍 = 20 ~ 30 ms。
+小车以 0.5 m/s 跑，30 ms 就是 1.5 cm 的滞后——对快速循迹是致命的。
+**原则：先解决噪声源（加遮光罩、稳定电源、传感器离地高度固定），再上滤波。**
+:::
+
+## 坑 2：输出没有限幅，电机疯转
+
+不加限幅的 PID 有两个爆炸点：
+
+1. **上电第一拍**：last_measurement 初始化为 0，第一拍测量值可能是 200，微分项 (200-0)/0.01 = 20000，乘 Kd 后输出 60 万。送进 PWM 就是全速。
+2. **积分累积**：上面讲过的 windup。
+
+必须做的三件事：
+
+```cpp
+// ① 输出限幅
+out = std::clamp(out, out_min, out_max);
+
+// ② 积分项限幅（即使有 anti-windup 也要加，防 dt 异常）
+integral = std::clamp(integral, i_min, i_max);
+
+// ③ 初始化时把 last_measurement 设为当前实测值，而不是 0
+pid.reset(readLineError());
+```
+
+第 ③ 条最容易被忽略。正确的初始化是在 setup() 里先读一次传感器，把这个值作为 last_measurement 传给 reset()，这样第一拍的微分项是 0 而不是一个巨大的尖峰。
+
+## 坑 3：积分饱和后要很久才能恢复
+
+前面讲过现象，这里给出可观测的验证方法和恢复手段。
+
+**验证**：把 pid.integralTerm() 打到串口。手按住小车 3 秒，看这个值涨了多少。
+如果按住 3 秒后它已经停在 out_max / Ki，说明钳位在工作；如果它涨到 10 倍 out_max 还没停，说明 anti-windup 没生效。
+
+| 恢复手段 | 做法 | 适用 |
+|---|---|---|
+| 条件积分 | 上文代码里的 if | 默认方案 |
+| 误差死区 | if (fabs(error) < 5) error = 0; | 传感器有噪声时顺便降抖 |
+| 饱和时清积分 | 输出顶死超过 N 拍就 integral_ = 0 | 简单粗暴，会有顿挫 |
+| 停机复位 | 检测到堵转/卡死（PWM 满但编码器不动）时 pid.reset() | 有编码器的场景最佳 |
+
+:::danger[不要用「积分分离」代替 anti-windup]
+常见写法是「误差大于阈值就不积分」。这确实能防饱和，但会引入新问题：误差在阈值附近来回穿越时，积分时断时续，输出会跳变。
+条件积分没有这个毛病，因为它判断的是**输出是否饱和**，而不是误差大小。
+:::
+
+## 坑 4：Kp 调到不摆就以为调好了
+
+直道上不摆、一进弯就冲出去，是**纯 P 控制的必然结果**，不是 Kp 没调好。
+弯道上是持续的大误差，纯 P 输出一个恒定转向量，如果这个量不足以维持弯道曲率，车就冲出去。加大 Kp 能让它转过去，但直道就开始摆。
+
+正确做法是加 D（提供超前）或者提高控制频率（减少延迟）。**Kp 只能解决「当前偏多少」，解决不了「正在快速偏过去」。**
+
+## 坑 5：整数运算的截断
+
+为了省 CPU 用整数写 PID 时：
+
+```cpp
+int out = Kp_int * error / 100;     // Kp_int = 300 表示 3.0
+```
+
+error = 1 时，300 × 1 / 100 = 3，还行。但如果 Kp_int = 30（表示 0.3），30 × 1 / 100 = 0——**小误差被完全吃掉**，表现为车在小偏差时不修正，累积成大偏差后才猛修一次，一顿一顿的。
+
+解决：中间量用 int32_t 并先乘后除，或者干脆用 float。ESP32 有硬件 FPU，单精度浮点加减乘除都是单周期，**不要为了省那点 CPU 用定点数**。
+
+## 坑 6：Ki 和 dt 的耦合
+
+很多人调好的参数换了个控制周期就失效。原因：Ki 的实际效果是 Ki × dt。
+周期从 10 ms 改成 5 ms，同样的 Ki 积分速度减半；从 10 ms 改成 20 ms，积分速度翻倍，本来调好的车会过冲。
+
+两种做法：
+
+1. **归一化到周期**：代码里统一 dt 单位是秒，参数按「每秒」标定，换周期自动适应。上面的类就是这么做的。
+2. **锁定周期**：把 CONTROL_PERIOD_MS 做成常量并在文档里写清楚「参数仅在此周期下有效」。
+
+推荐第 1 种，但要注意：**换了周期仍需要重新微调**，因为微分项对采样延迟的敏感度也变了——这不是数学问题，是物理上的采样延迟变了。
+
+## 调参速查表
+
+| 现象 | 大概率原因 | 处理 |
+|---|---|---|
+| 车走 S 形，摆幅越来越大 | Kp 太大或 Kd 太小 | Kp × 0.7，Kd × 1.5 |
+| 车反应迟钝，过弯冲出去 | Kp 太小或控制周期太长 | Kp × 1.5，检查周期是否真的是 10 ms |
+| 直道恒定偏向一侧 | 需要 I 项，或左右电机差异 | 加 Ki（小），或做电机标定 |
+| 过弯后车头甩一下再回正 | Ki 太大（积分过冲） | Ki × 0.5 |
+| 静止时电机持续抖动 | 微分噪声 | 微分项加低通，或检查传感器读数稳定性 |
+| 卡住放开后朝反方向暴冲 | 积分饱和 | 上 anti-windup |
+| 一开 WiFi 就开始摆 | 控制周期被打断 | 提高控制任务优先级，或用 vTaskDelayUntil |
+| 上电第一瞬间全速冲一下 | 初始 last_measurement 为 0 | pid.reset(首次读数) |
+| 换电池后参数失效 | 电压变化导致电机增益变化 | 做电压前馈补偿，或接受重新微调 |
+
+## 更省事的替代方案：只调差速，不做全 PID
+
+循迹小车其实不一定需要完整 PID。用「基础速度 + 比例差速 + 微分阻尼」就能跑得不错，代码量是 PID 的三分之一：
+
+```cpp
+int base = 500;
+static float prev_error = 0;
+
+float error = (float)readLineError();              // ±200
+float d = (error - prev_error) / 0.01f;            // 微分（不带 I）
+prev_error = error;
+
+float steer = 3.0f * error + 0.02f * d;            // 0.02 × 1000 = 30，等价于 Kd = 30
+
+motorLeft (base - (int)steer);
+motorRight(base + (int)steer);
+```
+
+只有在需要「长期无偏移」或者「速度闭环（有编码器）」时，才值得上完整 PID。
+**没有编码器的循迹小车，I 项的价值很低**——因为误差来源是机械不对称，I 项治标，硬件调平治本。

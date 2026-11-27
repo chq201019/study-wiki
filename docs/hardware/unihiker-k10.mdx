@@ -1,0 +1,280 @@
+---
+title: 行空板 K10 开发指南（ESP32-S3 / MicroPython / Arduino）
+sidebar_position: 10
+description: 行空板 K10 的真实引脚能力、FQBN 与 BSP 差异、MicroPython 与 Arduino 两套 API、板载传感器与 AI 功能。重点写清"哪些脚是全功能、哪些只能数字读写"这个最容易踩错的点。
+---
+
+# 行空板 K10 开发指南
+
+> 资料依据：DFRobot 官方 Wiki 整页归档（`unihiker.com.cn/wiki/k10/*`，抓取于 2026-11-19），
+> 共 23 篇。本文只写**能从官方原文里找到依据**的内容，推断的部分单独标明。
+
+## 一、这块板最容易被误解的地方
+
+K10 是 ESP32-S3，但它**不是一块"把所有 GPIO 都引出来的开发板"**。
+摄像头和 2.8 寸屏占了芯片大量引脚，所以官方原文写得很明白：
+
+> 「由于摄像头和显示屏占用了 K10 上 ESP32 芯片上大量 GPIO 接口，
+> 所以我们**仅在 P0、P1 位置保留了两个全功能 GPIO**（支持数字输入/输出、模拟输入、PWM 输出）。
+> **金手指引出的所有 GPIO 均由板载 GPIO 扩展芯片驱动，仅具备数字输入/输出功能。**」
+> —— `Arduino_PIO_Example.md`
+
+MicroPython 文档的说法一致：
+
+> 「注：除板载 P0/P1 外，其余 GPIO 是通过 I2C 转 GPIO 芯片外接。**只有基础的 GPIO 拉高/拉低功能**」
+> —— `micropython_unihiker_k10.md`
+
+**这条决定了三件事**：
+
+1. 想做**模拟采集**（电位器、光敏电阻、NTC）只能接 **P0 或 P1**，接别的脚读数不会变，而且**不报错**。
+2. 想做 **PWM**（调光、舵机以外的调速）同样只有 P0/P1 是硬件 PWM。
+3. 金手指那排脚在 Arduino 里的写法是 **`eP2`、`eP3`**（e 前缀 = expander），
+   和 `P0`/`P1` 不是一个命名空间。写成 `P2` 编不过或行为不对。
+
+> ⚠️ 注意区分两套编号：**板载 P0/P1**（芯片直连，全功能）与 **金手指 eP0…eP16**（扩展芯片，仅数字）。
+> 两者数字相同但不是同一个东西。这是查资料时最容易被误导的点——网上很多 micro:bit 教程
+> 里 P0/P1/P2 是并列的，在 K10 上不是。
+
+## 二、烧录与编译
+
+### 2.1 Arduino：必须装 DFRobot 的 BSP，不是通用 esp32 core
+
+官方要求添加这个 BSP URL：
+
+```
+https://downloadcd.dfrobot.com.cn/UNIHIKER/package_unihiker_index.json
+```
+
+装完后在 `Tools → Board` 里选 **`unihiker k10`**，**不是** `ESP32S3 Dev Module`。
+
+为什么这条很重要：K10 的屏幕、摄像头、板载传感器、AI 库都封在 `unihiker_k10` 库里，
+而那个库依赖 DFRobot BSP 的引脚定义。用通用 esp32 core 编译，轻则找不到头文件，
+重则引脚映射错位、屏幕不亮。
+
+BSP 安装常见故障（官方 FAQ 原文）：
+
+| 现象 | 原因与处理 |
+|---|---|
+| 空程序也报 `xtensa-esp32s3-elf-g++: error: CreateProcess: No such file or directory` | BSP 的 esp32 组件没装全。退出杀毒与防火墙后重装，必要时需要能访问境外源 |
+| `Failed to install platform UNIHIKER:0.0.x / 4 DEADLINE EXCEEDED` | 安装包大、网速慢导致 IDE 误判超时。把 `arduino-cli.yaml` 里 `network.connection_timeout` 改成 `600s` 再重装 |
+
+### 2.2 PlatformIO
+
+官方给的 `platformio.ini`（注意 `board` 名和 platform 源都不是常见值）：
+
+```ini
+[env:unihiker]
+platform = https://github.com/DFRobot/platform-unihiker.git
+board = unihiker_k10
+framework = arduino
+build_flags =
+  -DARDUINO_USB_CDC_ON_BOOT=1
+  -DARDUINO_USB_MODE=1
+  -DModel=None
+```
+
+`platform` 指向 DFRobot 自己的 git 仓库，**不能用 `espressif32`**。
+`build_flags` 里那三个宏不能省：`ARDUINO_USB_CDC_ON_BOOT=1` 决定串口走 USB CDC
+（不设的话 `Serial.print` 无输出，学生以为程序没跑）。
+
+### 2.3 MicroPython：固件是测试版
+
+官方明确标注「此固件处于测试阶段，可能会存在一些bug」。烧录要点：
+
+- 固件包形如 `micropython_unihiker_k10&Box_20260430_V0.9.8.zip`
+- 用 flash_download_tool 选择 **ESP32-S3**，**先 ERASE 再 START**
+- **按住 BOOT 键再插线**才进烧录模式，松开后点烧录
+- 烧完后按 **RST** 复位
+- 想回到 Mind+ 图形化，需要「按住 boot → 接数据线 → 识别到端口后松开 → 恢复初始设置」
+
+## 三、MicroPython API
+
+### 3.1 屏幕
+
+```python
+from unihiker_k10 import screen
+
+screen.init(dir=2)          # 方向 0-3，不调用时默认 2
+screen.show_bg(color=0xFFFF00)
+screen.set_width(width=5)
+screen.draw_line(x0=0, y0=0, x1=80, y1=80, color=0x0000FF)
+screen.draw_point(x=100, y=10, color=0xFF0000)
+screen.draw_rect(x=120, y=100, w=80, h=120, bcolor=0xFF6666, fcolor=0x0000FF)
+screen.draw_circle(x=80, y=80, r=40, bcolor=0x00FF00, fcolor=0x0000FF)
+screen.draw_text(text="你好\n23", x=10, y=0, font_size=24, color=0xFF0000)
+screen.show_draw()
+screen.clear()
+```
+
+**画完必须 `show_draw()` 才会真正显示**，这是新手第一个坑（画了半天屏幕没反应）。
+
+摄像头画面：
+
+```python
+from unihiker_k10 import screen
+from k10_base import Camera
+
+camera = Camera()
+camera.init()
+screen.init(dir=2)
+screen.show_camera(camera)
+```
+
+### 3.2 GPIO（再次强调只有 P0/P1 全功能）
+
+```python
+from unihiker_k10 import pin
+
+p0 = pin(0)                      # 全功能
+p1 = pin(1)                      # 全功能
+p2 = pin(2)                      # 仅数字
+
+p0.read_digital();  p0.write_digital(1)
+p0.read_analog()                 # 仅 P0/P1
+p1.write_analog(value=500, freq=255)   # 仅 P0/P1
+p2.write_digital(0)              # 扩展芯片，只有这个
+```
+
+### 3.3 板载按键
+
+```python
+from unihiker_k10 import button
+
+bt_a = button(button.a)
+bt_b = button(button.b)
+bt_a.event_pressed  = lambda: print("A pressed")
+bt_a.event_released = lambda: print("A released")
+# 也可以用状态查询：bt_a.status()
+```
+
+### 3.4 板载温湿度 / 环境光 / 加速度
+
+```python
+from unihiker_k10 import temp_humi
+temp_humi.read()     # 返回温度与湿度
+```
+
+板载传感器型号（来自官方参数表，可直接用于查寄存器）：
+
+| 传感器 | 型号 | 关键指标 |
+|---|---|---|
+| 温湿度 | **AHT20** | -40~85℃ ±0.3℃，0~100%RH ±2%RH |
+| 环境光 | **LTR303ALS** | 0~64k Lux，输出物理量而非档位 |
+| 三轴加速度 | **SC7A20H** | ±2G/±4G/±8G/±16G |
+| 屏幕 | 2.8" 240×320 | 驱动 **ILI9341** |
+| 摄像头 | 200 万像素 80° | **GC2145** |
+| RGB 灯 | WS2812 ×3 | 侧发光 |
+
+> 这些型号是排查时序/寄存器问题的一手依据。比如 AHT20 走上拉电阻、LTR303 需要配置增益，
+> 有型号就能查到原厂手册。
+
+### 3.5 通讯
+
+```python
+# WiFi / MQTT / 蓝牙 HID 都封在 unihiker_k10 里
+# 官方给了完整示例：WiFi 连接、MQTT 发布订阅、蓝牙 HID（可把板子当键盘用）
+```
+
+### 3.6 AI 功能（端侧，无需联网）
+
+官方 MicroPython 库内置这些模型，都是**离线**跑在 ESP32-S3 上的：
+
+| 功能 | 说明 |
+|---|---|
+| 语音识别 + 语音合成 | 板载双麦克风 + 2W 扬声器 |
+| 人脸识别 | `getFaceData()` 之类接口 |
+| 猫脸检测 | 官方有独立示例 `getCatData()` |
+| 二维码识别 | — |
+| 移动检测 | 基于摄像头画面变化 |
+
+**能力边界**：ESP32-S3 没有 NPU，这些是「够用级」的轻量模型。
+分辨率开太高或同时开 WiFi 传输容易 OOM 重启（GC2145 + PSRAM 带宽紧张）。
+
+### 3.7 外接常见模块
+
+官方 MicroPython 示例覆盖：舵机、RGB 灯带、DHT11/DHT22、DS18B20、超声波、
+重量传感器（KIT0176）。注意超声波和 DHT 这类**需要微秒级时序**的模块，
+在 K10 上要确认官方库是否用了硬件定时器——扩展 GPIO 走 I2C 是有延迟的。
+
+## 四、Arduino / PlatformIO API
+
+`unihiker_k10.h` 里的核心类 `UNIHIKER_K10`：
+
+```cpp
+#include "unihiker_k10.h"
+UNIHIKER_K10 k10;
+
+void setup() {
+  k10.begin();
+  k10.initScreen(2);            // dir=2, frame=0
+  k10.creatCanvas();            // 注意：官方拼写就是 creat 不是 create
+  k10.setScreenBackground(0xFFFFFF);
+}
+void loop() {
+  k10.canvas->canvasCircle(120, 160, 10, 0x00FF00, 0x00FF00, true);
+  k10.canvas->updateCanvas();   // 同 MicroPython：要手动提交
+  delay(1000);
+}
+```
+
+**`creatCanvas` 少一个 e**，这是官方 API 的真实拼写，写 `createCanvas` 会编译失败。
+这类"官方 API 拼写就是错的"情况不要自作聪明改。
+
+绘制类 API（前缀统一 `canvas`）：`canvasText` / `canvasPoint` / `canvasLine` /
+`canvasCircle` / `canvasRect`，最后都要 `updateCanvas()`。
+
+金手指 IO 用 `digital_write(eP2, HIGH)` / `digital_read(eP3)`。
+
+## 五、小智 AI 接入（不需要自己编译）
+
+官方提供了**免编译固件**，直接把 K10 变成一个可语音对话的智能终端
+（基于开源项目 `xiaozhi-esp32`，可接 DeepSeek 等模型）：
+
+| 版本 | 特点 |
+|---|---|
+| 2.1.0 | 支持自定义唤醒词和界面 |
+| 1.8.5 | 优化运行速度和识别效果 |
+| 1.7.5 | 微信对话界面可预览摄像头画面；支持"把所有灯设为蓝色"这类灯控指令 |
+| 1.6.6b / 1.6.6 | 中文界面，支持"帮我拍张照片""你看到了什么"视觉识别 |
+
+烧录流程与 MicroPython 固件相同（flash_download_tool + BOOT 键 + ERASE 后 START）。
+**这对教学很有价值**：不用配 ESP-IDF 环境就能让学生体验完整语音助手。
+
+## 六、扩展板兼容性（官方明确结论）
+
+| 扩展板 | 兼容性 |
+|---|---|
+| DFR1216 行空板多功能扩展板 | ✅ 完全兼容 |
+| DFR1231 行空板 K10 IO 扩展板 | ✅ 完全兼容 |
+| MBT0008 micro:bit 掌控板 IO 扩展板 | ✅ 完全兼容（K10 要插在 micro:bit 一侧） |
+| MBT0014 micro:bit 掌控 I/O 扩展板 | ✅ 完全兼容 |
+| **DFR1136 M10 双路电机驱动扩展板** | ❌ **不兼容**：只能用它引出的 IO 和 I2C，电机驱动/RGB/红外全部不可用 |
+
+**结论**：K10 插 micro:bit 扩展板时，**扩展板上的功能未必能用**——
+因为 K10 金手指是扩展芯片驱动的数字 IO，很多 micro:bit 扩展板上的模拟/特殊功能依赖芯片直连。
+官方只说"兼容 IO 扩展"，不等于"兼容所有扩展板功能"。
+
+## 七、踩坑清单（每条都有官方出处或实测依据）
+
+1. **只有 P0/P1 能做模拟和 PWM**，其余脚接上去读数不变、不报错。最隐蔽的坑。
+2. **金手指要写 `eP2` 不是 `P2`**（Arduino）。命名空间不同。
+3. **画完要 `show_draw()` / `updateCanvas()`**，否则屏幕不更新。
+4. **`creatCanvas` 是官方拼写**，少个 e，别"修正"它。
+5. **Arduino 必须用 unihiker BSP（board=unihiker k10）**，不能用 ESP32S3 Dev Module。
+6. **PlatformIO 的 platform 要指向 DFRobot 的 git**，不能写 `espressif32`。
+7. **三个 build_flags 不能省**，否则串口无输出。
+8. **MicroPython 固件是测试版**，官方自己标了可能有 bug，教学用要留退路（能刷回）。
+9. **刷完 MicroPython 想回 Mind+**，必须按住 BOOT 再上电进入恢复流程。
+10. **摄像头 + WiFi 同时高负载容易 OOM**（GC2145 + PSRAM 带宽）。
+11. **DFR1136 电机驱动扩展板不兼容**，别按 M10 的配件买。
+
+## 八、教学定位建议
+
+| 场景 | 是否合适 |
+|---|---|
+| 端侧 AI 体验（人脸/语音/二维码） | ✅ 板载全套，开箱即用，不用外接摄像头麦克风 |
+| 物联网节点（WiFi + 屏幕 + 传感器） | ✅ 集成度高 |
+| 需要多路模拟采集 | ❌ 只有 P0/P1 两路全功能 |
+| 需要多路 PWM（多个舵机） | ⚠️ 只有 P0/P1 硬件 PWM；但官方 `servo()` 库可接 P1 等脚，需按库文档确认 |
+| 语音助手 | ✅ 有免编译小智固件，也可以自己用内置语音识别 |
+| 大规模配备 | ⚠️ 单价约 399 元偏高，但"一块板搞定 AI+IoT"能省外设钱 |
