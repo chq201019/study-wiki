@@ -533,7 +533,7 @@ const sidebars: SidebarsConfig = {
     {
       // 来自知识库同步的模块实战篇（docs/hardware/*.mdx 顶层文件，与 ESP32 强相关）
       type: 'category',
-      label: '模块实战（15 篇）',
+      label: '模块实战（13 篇）',
       collapsed: true,
       items: [
         'hardware/power-levels',
@@ -549,8 +549,6 @@ const sidebars: SidebarsConfig = {
         'hardware/audio-i2s',
         'hardware/camera-esp32',
         'hardware/motor-4ch-encoder',
-        'hardware/unihiker-k10',
-        'hardware/unihiker-m10',
       ],
     },
   ],
@@ -733,6 +731,15 @@ const sidebars: SidebarsConfig = {
 
       ],
     },
+    {
+      // 知识库同步：非 ESP32/STM32 的开发板（Linux 系）
+      type: 'category',
+      label: '开发板：行空板',
+      collapsed: true,
+      items: [
+        'hardware/unihiker-m10',
+      ],
+    },
   ],
   // 其他芯片
   othersSidebar: [
@@ -745,6 +752,15 @@ const sidebars: SidebarsConfig = {
       items: [
         'chips/others/classic-mcu',
         'chips/others/domestic-special',
+      ],
+    },
+    {
+      // 知识库同步：非 ESP32/STM32 的开发板（ESP32-S3 内核但独立板卡体系）
+      type: 'category',
+      label: '开发板：行空板',
+      collapsed: true,
+      items: [
+        'hardware/unihiker-k10',
       ],
     },
   ],
