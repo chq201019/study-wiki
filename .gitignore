@@ -32,3 +32,5 @@ _ops/cookies.txt
 /_shots/
 /HANDOVER.md
 /scripts/push.ps1
+
+_deploy*.ps1
